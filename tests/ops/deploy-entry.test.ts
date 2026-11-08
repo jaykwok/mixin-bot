@@ -6,6 +6,7 @@ import { parseCandidateRecord } from "../../ops/core/docker-deployment.ts";
 import { readDeployStage } from "../../ops/core/deploy-stage.ts";
 import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 // The Linux deployment entry (scripts/deploy.sh): first its hand-over pieces cut out with the preview container and
 // the record writers stubbed, then the unmodified script run up to the hand-over with Docker, the build and the core
@@ -215,7 +216,7 @@ test.skipIf(!linux)("部署入口：核心预检拒绝、构建失败或有未�
     const build = await f.run({ FIXTURE_BUILD: "1" });
     expect(build.code).toBe(1); expect(build.output).toContain("镜像构建失败（原因见上方）；服务尚未停止");
     expect(handover(build.events)).toBe(-1);
-    const name = "deploy-" + "a".repeat(32), snapshot = join(f.root, "backup/snapshots", name);
+    const name = "deploy-" + "a".repeat(32), snapshot = join(f.root, transactionDirectory(name));
     mkdirSync(snapshot, { recursive: true });
     writeFileSync(join(snapshot, "transaction"), serializeTransactionRecord({ format: "2", operation: "deploy", snapshot: name, target_sha: f.head, original_sha: "",
       original_branch: "", original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "3000", reconfigure_ai: "0" }));

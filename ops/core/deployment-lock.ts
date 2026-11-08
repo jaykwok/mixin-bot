@@ -1,9 +1,10 @@
 // The existing deploy.lock, shared with flock in Bash and FileShare.None in PowerShell.
 // Its pathname is permanent: releasing a lock never unlinks/replaces the file.
 import { dlopen, FFIType, ptr, read } from "bun:ffi";
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { WindowsHandles } from "../../src/core/windows-handles.ts";
+import { AT_FDCWD, close, descriptorPath, O, openAt, tryLock } from "../../src/lib/darwin.ts";
 import { MaintenanceRefused } from "./maintenance.ts";
 
 export class DeploymentBusy extends MaintenanceRefused {
@@ -11,7 +12,7 @@ export class DeploymentBusy extends MaintenanceRefused {
 }
 export interface DeploymentLock {
   readonly path: string;
-  /** Called again before mutations; on Linux, a removed/replaced lock is no longer exclusive for this pathname. */
+  /** Called again before mutations; on Linux and macOS, a removed/replaced lock is no longer exclusive for this pathname. */
   assertHeld(): void;
   close(): void;
 }
@@ -22,6 +23,15 @@ function linuxNative() {
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     __errno_location: { args: [], returns: FFIType.ptr },
   }).symbols;
+}
+/** Non-blocking exclusive flock; false when another open file description holds it. */
+function lockFile(fd: number): boolean {
+  if (process.platform === "darwin") return tryLock(fd);
+  const native = libc ??= linuxNative();
+  if (native.flock(fd, 2 | 4) === 0) return true; // LOCK_EX | LOCK_NB
+  const errno = read.i32(native.__errno_location()!);
+  if (errno === 11) return false; // EWOULDBLOCK
+  throw new Error(`无法取得部署锁（flock errno ${errno}）`);
 }
 const longPath = (path: string) => path.startsWith("\\\\?\\") ? path
   : path.startsWith("\\\\") ? "\\\\?\\UNC\\" + path.slice(2) : "\\\\?\\" + path;
@@ -36,26 +46,51 @@ function inheritedLock(path: string): number | undefined {
   } catch { return undefined; }
 }
 
+/**
+ * macOS: data/ belongs to the service account, which could put a link in place of data or data/state. The lock is opened
+ * from the project directory (the operator's) one level at a time without following a link, so root never creates or locks
+ * a file elsewhere. Mode 0644: the account's offline proof opens it to test the lock.
+ */
+function openDarwinLock(project: string): number {
+  const opened: number[] = [];
+  try {
+    let dir = openAt(AT_FDCWD, project, O.RDONLY | O.DIRECTORY);
+    opened.push(dir);
+    for (const name of ["data", "state"]) { dir = openAt(dir, name, O.RDONLY | O.DIRECTORY | O.NOFOLLOW); opened.push(dir); }
+    return openAt(dir, "deploy.lock", O.CREAT | O.RDWR | O.NOFOLLOW | O.NONBLOCK, 0o644);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP" || (error as NodeJS.ErrnoException).code === "ENOTDIR") throw new Error("部署锁的路径含有链接，未继续操作");
+    throw error;
+  } finally { for (const fd of opened) close(fd); }
+}
+
 /** Non-blocking, same native lock as the shipping CLI; it is not a PID file or a second lock namespace. */
 export function acquireDeploymentLock(project: string): DeploymentLock {
-  if (process.platform !== "linux" && process.platform !== "win32") throw new Error("此平台不支持部署锁");
+  if (!["linux", "darwin", "win32"].includes(process.platform)) throw new Error("此平台不支持部署锁");
   const state = join(resolve(project), "data", "state");
+  if (process.platform === "darwin") {
+    for (const path of [join(resolve(project), "data"), state]) {
+      try { if (lstatSync(path).isSymbolicLink()) throw new Error("部署锁的路径含有链接，未继续操作"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  }
   mkdirSync(state, { recursive: true });
   const directory = realpathSync(state), path = join(directory, "deploy.lock");
   let closed = false, closeError: unknown;
   const assertOpen = () => { if (closed) throw new Error("部署锁已经释放"); };
-  if (process.platform === "linux") {
-    const native = libc ??= linuxNative(), inherited = inheritedLock(path);
-    const fd = inherited ?? openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  if (process.platform !== "win32") {
+    const inherited = inheritedLock(path);
+    const darwin = process.platform === "darwin", root = realpathSync(resolve(project));
+    const fd = inherited ?? (darwin ? openDarwinLock(root) : openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600));
     const release = () => { if (inherited === undefined) closeSync(fd); };
     try {
       const held = fstatSync(fd, { bigint: true });
       if (!held.isFile()) throw new Error("部署锁不是普通文件");
-      if (native.flock(fd, 2 | 4) !== 0) { // LOCK_EX | LOCK_NB
-        const errno = read.i32(native.__errno_location()!);
-        if (errno === 11) throw new DeploymentBusy(); // EWOULDBLOCK
-        throw new Error(`无法取得部署锁（flock errno ${errno}）`);
-      }
+      // The lock this project names: on macOS exactly data/state/deploy.lock of the project, and the file it opened.
+      if (darwin && (path !== join(root, "data", "state", "deploy.lock") || descriptorPath(fd) !== path)) throw new Error("部署锁路径已被替换，未继续操作");
+      if (!lockFile(fd)) throw new DeploymentBusy();
+      // macOS: the service account's offline proof opens the lock to test it; root's own lock (never a second name) is readable to it.
+      if (darwin && process.geteuid?.() === 0 && held.uid === 0n && held.nlink === 1n && (Number(held.mode) & 0o777) !== 0o644) fchmodSync(fd, 0o644);
       const lock: DeploymentLock = {
         path,
         assertHeld() {

@@ -1,4 +1,4 @@
-// Inbound attachments of direct chats (plan 5.5): registered in arrival order, downloaded in the background, bound to the
+// Inbound attachments of direct chats: registered in arrival order, downloaded in the background, bound to the
 // member's next admitted request in its admission commit.
 //
 // - Registration (DurableService.attach) commits the receipt and a `pending` record in one commit; a registration that

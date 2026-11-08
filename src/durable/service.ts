@@ -127,7 +127,7 @@ export interface DurableServiceOptions {
   relay: RelayConfig | null;
   /** The platform: sends, uploads and link refreshes. */
   outbound: Outbound;
-  /** Direct-chat attachments (plan 5.5): the platform download. Without it attachments are registered as refused. */
+  /** Direct-chat attachments (./attachments.ts): the platform download. Without it attachments are registered as refused. */
   attachments?: { source: AttachmentSource; limits?: Partial<AttachmentLimits> };
   auxiliary?: AuxiliaryConfig;
   mcp?: McpTools;

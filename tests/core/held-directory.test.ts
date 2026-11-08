@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { holdDirectory } from "../../src/core/held-directory.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { type HandleEvent, WindowsHandles } from "../../src/core/windows-handles.ts";
+import { RemovalPermit, removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 test("removal is relative to the held parent when its pathname is replaced by a junction or link", async () => {
   const fixture = await tempFixture("held-parent-"), base = join(fixture.root, "parent"), moved = base + "-moved", foreign = join(fixture.root, "foreign");
@@ -25,9 +26,9 @@ test("removal is relative to the held parent when its pathname is replaced by a 
         return true;
       },
     }));
-    expect(exchanged).toBe(process.platform === "linux");
-    expect(removed).toHaveLength(1); expect(removed[0]).toMatchObject({ name: "owned", status: process.platform === "linux" ? "deferred" : "removed" });
-    if (process.platform === "linux") expect(await readFile(join(moved, "owned/marker"), "utf8")).toBe("authorized");
+    expect(exchanged).toBe(removalNeedsPermit());
+    expect(removed).toHaveLength(1); expect(removed[0]).toMatchObject({ name: "owned", status: removalNeedsPermit() ? "deferred" : "removed" });
+    if (removalNeedsPermit()) expect(await readFile(join(moved, "owned/marker"), "utf8")).toBe("authorized");
     expect(await readFile(join(foreign, "owned/unrelated.txt"), "utf8")).toBe("keep");
   } finally { await held.release(); if (exchanged) await rm(base); await fixture.cleanup(); }
 });
@@ -173,3 +174,30 @@ test.skipIf(process.platform !== "win32")("an independent process holding a dire
     clearTimeout(timer); child.kill(); await child.exited; await reader.cancel(); await stderr; await fixture.cleanup();
   }
 }, 20_000);
+
+// macOS confirms a removal only on APFS (src/lib/darwin.ts directoryRemoved): elsewhere the removal is refused before the
+// policy records anything (an offline removal's intent) and before anything is deleted. An HFS+ disk image stands in.
+test.skipIf(process.platform !== "darwin")("macOS: removal from a volume that is not APFS is refused first: nothing recorded, nothing deleted", async () => {
+  const fixture = await tempFixture("held-hfs-"), image = join(fixture.root, "hfs.dmg"), mount = join(fixture.root, "mount");
+  const hdiutil = (...args: string[]) => {
+    const result = Bun.spawnSync(["/usr/bin/hdiutil", ...args], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode !== 0) throw new Error(`hdiutil ${args[0]}: ${result.stderr.toString()}`);
+  };
+  await mkdir(mount);
+  hdiutil("create", "-quiet", "-size", "8m", "-fs", "HFS+", "-volname", "mixin-hfs", image);
+  hdiutil("attach", "-quiet", "-nobrowse", "-noautoopen", "-mountpoint", mount, image);
+  try {
+    await mkdir(join(mount, "parent/owned"), { recursive: true });
+    await writeFile(join(mount, "parent/owned/marker"), "keep");
+    const held = await holdDirectory(mount, ["parent"], false);
+    try {
+      const child = await lstat(join(mount, "parent/owned"), { bigint: true });
+      const permit = new RemovalPermit(held.identity, { dev: child.dev, ino: child.ino });
+      let asked = 0;
+      await expect(held.use(entries => entries.removeDirectories({ select: name => name === "owned", permit, requireRemoval: true,
+        beforeRemove: async () => { asked++; return true; } }))).rejects.toThrow("不是 APFS");
+      expect(asked).toBe(0);
+      expect(await readFile(join(mount, "parent/owned/marker"), "utf8")).toBe("keep");
+    } finally { await held.release(); }
+  } finally { Bun.spawnSync(["/usr/bin/hdiutil", "detach", "-quiet", "-force", mount]); await fixture.cleanup(); }
+}, 60_000);

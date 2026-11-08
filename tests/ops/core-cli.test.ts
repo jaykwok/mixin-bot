@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { runCore } from "../../ops/core/cli.ts";
 import type { ServiceHostOptions } from "../../ops/core/service-host.ts";
 import type { ServiceControlHost } from "../../ops/core/service.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 test("核心 CLI 只接受当前动作参数；未知参数和拼错的动作在平台初始化前拒绝", async () => {
   let calls = 0;
@@ -66,9 +67,11 @@ test("恢复路径不依赖服务配置：核心和事务中途运行的工具�
   try {
     const snapshot = "deploy-damaged", project = join(f.root, "含空格 项目"), core = join(repo, "ops/core/cli.ts");
     await mkdir(join(project, "data/state"), { recursive: true }); await mkdir(join(project, "data/config"), { recursive: true });
-    await mkdir(join(project, "backup/snapshots", snapshot), { recursive: true });
+    await mkdir(join(project, transactionDirectory(snapshot)), { recursive: true });
+    // macOS keeps the records in .console, which the core refuses to use while others can list it.
+    if (process.platform === "darwin") await chmod(join(project, ".console"), 0o711);
     await writeFile(join(project, "data/state/upgrade-transaction"), snapshot + "\n");
-    await writeFile(join(project, "backup/snapshots", snapshot, "transaction"), ["format=2", "operation=upgrade", "snapshot=" + snapshot, "target_sha=" + "a".repeat(40),
+    await writeFile(join(project, transactionDirectory(snapshot), "transaction"), ["format=2", "operation=upgrade", "snapshot=" + snapshot, "target_sha=" + "a".repeat(40),
       "original_sha=" + "b".repeat(40), "original_branch=main", "original_workspace_root=", "target_workspace_root=", "was_running=1", "bot_port=2022", "reconfigure_ai=0"].join("\n") + "\n");
     const run = async (name: "rollback" | "resume" | "uninstall", env: Record<string, string>) => {
       const upgrade = ["deployment", "upgrade", "--project", project, "--original", "b".repeat(40), "--target", "a".repeat(40), "--branch", "main", "--json"];

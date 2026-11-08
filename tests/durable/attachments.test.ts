@@ -1,4 +1,4 @@
-// Direct-chat attachments (plan 5.5, src/durable/attachments.ts): registration in arrival order, binding at the next
+// Direct-chat attachments (src/durable/attachments.ts): registration in arrival order, binding at the next
 // admitted request, download limits, voiding by /stop, /clear and expiry, and restarts around a download. The platform
 // download runs against the local fake platform; the model is a faux provider that records what the member asked.
 import { afterAll, test } from "bun:test";

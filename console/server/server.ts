@@ -12,8 +12,8 @@ export interface ConsoleServerOptions {
   auth: Auth;
   /** Not secret: lets a second `bun run console` recognise a live instance. */
   instanceId: string;
-  /** False after code replacement: only login and stable task records may be used. */
-  current?: () => boolean;
+  /** False after code replacement: only login and stable task records may be used. `read`: a check of the last few seconds will do. */
+  current?: (read: boolean) => boolean;
   dataSignal?: AbortSignal;
   overview: () => Promise<Overview>;
   /** Further API routes by `METHOD /path`, all behind the session. */
@@ -76,6 +76,16 @@ function classify(path: string): RequestKind | null {
   return null;
 }
 
+/** Routes that only read rely on a code check of the last few seconds. Named one by one: any other route, a new one included, checks in full. */
+const READ_ROUTES: ReadonlySet<string> = new Set([
+  "GET /api/overview", "GET /api/spaces", "GET /api/storage/scopes", "GET /api/forms/runtime", "GET /api/directory/selection", "GET /api/push/settings",
+  "GET /api/configuration/catalog", "GET /api/configuration/state", "GET /api/lifecycle", "GET /api/lifecycle/deploy", "GET /api/lifecycle/upgrade",
+  "POST /api/conversation/activity", "POST /api/conversation/boundaries", "POST /api/conversation/entries", "POST /api/conversation/entry", "POST /api/conversation/requests",
+  "POST /api/conversation/search", "POST /api/views/close", "POST /api/views/search", "POST /api/views/space", "POST /api/views/stats", "POST /api/search", "POST /api/stats",
+  "POST /api/exports/status", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/groups", "POST /api/directory/children",
+  "POST /api/lifecycle/directory/open", "POST /api/lifecycle/directory/children",
+]);
+
 export function createHandler(options: ConsoleServerOptions): (request: Request, server?: RequestTimeouts) => Promise<Response> {
   const { auth, bundle } = options;
   const clearCookie = { "Set-Cookie": `${auth.cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0` };
@@ -117,10 +127,11 @@ export function createHandler(options: ConsoleServerOptions): (request: Request,
     if (!session) return failure(401, "登录已失效。请在运行控制台的终端按 Enter 获取新链接。", "session", clearCookie);
     const stable = route === "GET /api/session" || route === "POST /api/session/touch" || route === "POST /api/session/logout"
       || /^GET \/api\/tasks(?:\/task-[a-f0-9]{32}(?:\/events)?)?$/.test(route) || /^POST \/api\/tasks\/task-[a-f0-9]{32}\/log$/.test(route);
-    const current = () => options.current?.() ?? true;
+    const read = kind === "download" || READ_ROUTES.has(route);
+    const current = () => options.current?.(read) ?? true;
     const replaced = () => failure(409, "代码已变化。当前控制台只能查看任务结果；请退出并重新运行 bun run console。", "version-changed");
     if (route === "GET /api/runtime") return json({ current: current() });
-    if (!current() && !stable) return replaced();
+    if (!stable && !current()) return replaced();
 
     if (kind === "download") {
       if (!options.download) return failure(404, "没有这个地址", "not-found");

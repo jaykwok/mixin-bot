@@ -4,13 +4,14 @@
 // 页面只看到姓名和打码号码：打开一条推送时，接收人和抄送人各得一个随机键（只在这次打开、这次登录内有效），补推送、
 // 改抄送和按人下载都用键；新加的抄送人由管理员输入完整手机号。群在接收人里按群名列出（号码一栏写“群”），群名单里的
 // 群也按本次读取的随机键指代。打开推送（看得到回复内容）、补推送、改抄送、删除、下载和改群名单都记审计，只记推送编号、
-// 人数和群号。下载与导出一样先领一次性票据，再由浏览器按普通下载取文件，文件不在本机落地。
+// 人数和群号。下载与导出一样先领一次性票据，再由浏览器按普通下载取文件，文件不在本机落地；登录结束或代码变化时，
+// 进行中的下载连同机器人一侧的传输立即停止。
 import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type {
   PushChatGroupsResponse, PushChatGroupView, PushDetailResponse, PushGroupKey, PushListItemView, PushListResponse, PushPersonView, PushRecipientView, PushTicket,
 } from "../ui/src/contract.ts";
-import type { PushDetail, PushGroupRow, PushListItem } from "../../src/push/service.ts";
+import type { PushCursor, PushDetail, PushGroupRow, PushListItem } from "../../src/push/service.ts";
 import { memberGroup, type PushTotals } from "../../src/push/store.ts";
 import { adminPost, adminStream } from "../../ops/tools/directory-admin.ts";
 import { maskUser } from "../../ops/lib/format.ts";
@@ -57,14 +58,26 @@ export class PushPage {
   readonly #views = new Map<string, DetailView>();
   readonly #groupViews = new Map<string, GroupsView>();
   readonly #tickets = new Map<string, Ticket>();
+  /** Downloads under way, each with its login: the login's end or a code change stops them. */
+  readonly #downloads = new Set<{ session: string; controller: AbortController }>();
 
   constructor(readonly project: string, readonly audit: AuditLog, readonly source = servicePushSource(join(project, "data/state/instance.json")),
     readonly now: () => number = Date.now) {}
 
-  end(session: string): void {
+  /** A login ended: its views and tickets go, and its downloads stop. */
+  end(session: string, reason = "登录已结束"): void {
     for (const [key, view] of this.#views) if (view.session === session) this.#views.delete(key);
     for (const [key, view] of this.#groupViews) if (view.session === session) this.#groupViews.delete(key);
     for (const [key, ticket] of this.#tickets) if (ticket.session === session) this.#tickets.delete(key);
+    for (const active of this.#downloads) if (active.session === session) active.controller.abort(new Error(reason));
+  }
+
+  /** Every login's (the code changed, or the console exits). */
+  endAll(reason = "控制台已退出"): void {
+    this.#views.clear();
+    this.#groupViews.clear();
+    this.#tickets.clear();
+    for (const active of this.#downloads) active.controller.abort(new Error(reason));
   }
 
   #prune(): void {
@@ -144,8 +157,15 @@ export class PushPage {
       "POST /api/push/list": wrap(async ({ body, signal }) => {
         const { group, before } = params(body, ["group", "before"]);
         if (group !== undefined && group !== null && !GROUPS.includes(group as PushGroupKey)) input("筛选无效");
-        if (before !== undefined && before !== null && !(typeof before === "number" && Number.isSafeInteger(before) && before > 0)) input("翻页位置无效");
-        const reply = await this.source.call("list", { group: group ?? null, before: before ?? null, limit: 50 }, signal);
+        // The last push of the page before (the list is newest first, then by ID).
+        let cursor: PushCursor | null = null;
+        if (before !== undefined && before !== null) {
+          const raw = typeof before === "object" && !Array.isArray(before) ? before as Record<string, unknown> : {}, { createdAt, id } = raw;
+          if (Object.keys(raw).some(key => key !== "createdAt" && key !== "id") || !(typeof createdAt === "number" && Number.isSafeInteger(createdAt) && createdAt > 0)
+            || typeof id !== "string" || !PUSH_ID.test(id)) input("翻页位置无效");
+          cursor = { createdAt: createdAt as number, id: id as string };
+        }
+        const reply = await this.source.call("list", { group: group ?? null, before: cursor, limit: 50 }, signal);
         const totals = reply.totals as PushTotals;
         return { pushes: (reply.pushes as PushListItem[]).map(push => this.#listItem(push)), more: reply.more === true,
           totals: { sent: totals.sent, followUps: totals.followUps, live: totals.live, delivered: totals.delivered, acked: totals.acked,
@@ -224,36 +244,55 @@ export class PushPage {
     };
   }
 
-  /** `/download/push-…`: the bot's archive, passed through to the browser; the outcome is audited. */
+  /** `/download/push-…`: the bot's archive, passed through to the browser; the outcome is audited. The login's end or a code change stops it. */
   async download(ticket: string, context: { session: { label: string }; signal: AbortSignal }): Promise<Response> {
     this.#prune();
     const found = this.#tickets.get(ticket);
     if (!found || found.session !== context.session.label) return plain(404, "下载链接无效或已过期，请在控制台重新下载。");
     this.#tickets.delete(ticket);
+    const active = { session: found.session, controller: new AbortController() };
+    this.#downloads.add(active);
+    const signal = AbortSignal.any([context.signal, active.controller.signal]);
+    const why = () => (signal.reason instanceof Error ? signal.reason.message : String(signal.reason)).slice(0, 200);
+    let recorded = false;
     const record = (action: "export-sent" | "export-interrupted" | "export-failed", bytes: number, note?: string) => {
+      if (recorded) return;
+      recorded = true;
+      this.#downloads.delete(active);
       try {
         this.audit.write({ action, session: found.session, scope: found.scope, mode: "default", export: ticket, format: "zip", bytes, ...(note ? { note } : {}) });
       } catch { console.error("推送汇总包下载的结果没能写进审计记录。"); }
     };
     let response: Response;
-    try { response = await this.source.package({ id: found.push, ...(found.member ? { member: found.member } : {}) }, context.signal); }
+    try { response = await this.source.package({ id: found.push, ...(found.member ? { member: found.member } : {}) }, signal); }
     catch (error) {
+      if (signal.aborted) { record("export-interrupted", 0, why()); return plain(410, `下载已停止：${why()}`); }
       const message = error instanceof Error ? error.message : String(error);
       record("export-failed", 0, message.slice(0, 200));
       return plain(409, `汇总包没有生成：${message}`);
     }
     const reader = response.body!.getReader();
-    let bytes = 0;
+    let bytes = 0, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    // Stopped: at once, also while the browser is not reading; the bot's side of the transfer is cancelled with it.
+    const stop = () => {
+      record("export-interrupted", bytes, why());
+      try { stream?.error(signal.reason); } catch {}
+      void reader.cancel(signal.reason).catch(() => {});
+    };
+    if (active.controller.signal.aborted) stop(); else active.controller.signal.addEventListener("abort", stop, { once: true });
     const body = new ReadableStream<Uint8Array>({
+      start(controller) { stream = controller; },
       async pull(controller) {
         try {
           const next = await reader.read();
+          // An end after a stop is not a complete archive.
+          if (signal.aborted) throw signal.reason;
           if (next.done) { record("export-sent", bytes); controller.close(); return; }
           bytes += next.value.byteLength;
           controller.enqueue(next.value);
         } catch (error) {
-          record(context.signal.aborted ? "export-interrupted" : "export-failed", bytes, (error instanceof Error ? error.message : String(error)).slice(0, 200));
-          controller.error(error);
+          record(signal.aborted ? "export-interrupted" : "export-failed", bytes, signal.aborted ? why() : (error instanceof Error ? error.message : String(error)).slice(0, 200));
+          try { controller.error(error); } catch {}
         }
       },
       async cancel() { record("export-interrupted", bytes, "浏览器断开了下载"); await reader.cancel().catch(() => {}); },

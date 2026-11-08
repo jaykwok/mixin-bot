@@ -4,7 +4,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { api } from "./api.ts";
 import type {
-  PushDetailResponse, PushGroupKey, PushListItemView, PushListResponse, PushRecipientView, PushState, PushTicket, PushTotalsView,
+  PushDetailResponse, PushGroupKey, PushListCursor, PushListItemView, PushListResponse, PushRecipientView, PushState, PushTicket, PushTotalsView,
 } from "./contract.ts";
 import { dateTime } from "./format.ts";
 import { Chip, Segmented, type Tone } from "./ui.tsx";
@@ -56,7 +56,7 @@ export function PushRecords() {
   const [pushes, setPushes] = useState<PushListItemView[]>([]), [more, setMore] = useState(false);
   const [totals, setTotals] = useState<PushTotalsView | null>(null);
   const [error, setError] = useState(""), [busy, setBusy] = useState(false), [open, setOpen] = useState<string | null>(null);
-  const load = async (before?: number) => {
+  const load = async (before?: PushListCursor) => {
     setBusy(true); setError("");
     try {
       const result = await api<PushListResponse>("/api/push/list", { method: "POST", body: { group: group === "all" ? null : group, ...(before ? { before } : {}) },
@@ -87,7 +87,7 @@ export function PushRecords() {
           <td>{push.counts.answered}/{push.counts.delivered}{push.counts.failed ? <span class="muted">（失败 {push.counts.failed}）</span> : null}</td>
           <td><button class="btn ghost" onClick={() => setOpen(open === push.id ? null : push.id)}>{open === push.id ? "收起" : "查看"}</button></td>
         </tr>)}</tbody></table></div>}
-      {more && <button class="btn" disabled={busy} onClick={() => void load(pushes.at(-1)!.createdAt)}>更早的推送</button>}
+      {more && <button class="btn" disabled={busy} onClick={() => { const last = pushes.at(-1)!; void load({ createdAt: last.createdAt, id: last.id }); }}>更早的推送</button>}
     </section>
     {open && <PushDetailCard key={open} id={open} onChanged={() => void load()} onDeleted={() => { setOpen(null); void load(); }} />}
   </>;

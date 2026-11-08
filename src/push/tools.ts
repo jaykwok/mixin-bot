@@ -1,6 +1,6 @@
 // `mixin.push`: push_prepare and push_status, with the prompt section that explains them. Only pushers' direct
 // conversations select it (src/server/app.ts passes it to the message service as a member extension), so everyone
-// else has neither the tools nor the text (push-plan-20261103.md section 3).
+// else has neither the tools nor the text.
 //
 // Model-only like the send tools: push_prepare sends the preview card, which cannot be taken back. It never sends to a
 // recipient: that takes 「确认推送」 on the preview, which only the service sees (./service.ts).

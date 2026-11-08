@@ -83,6 +83,7 @@ try {
     $snapshotPath = Join-Path $project ('backup\snapshots\' + $request.snapshot)
     Assert-SnapshotParent $snapshotPath $project
     $env:BOT_DEPLOY_BACKUP_ID = $request.snapshot
+    # The snapshot set of ops/lib/settings-files.ts (snapshotPaths("windows")); tests/contracts/settings-files.test.ts compares the two.
     $paths = @('data\config','data\runtime\pi\settings.json','data\runtime\models-store.json','data\runtime\bot-launcher.ps1','data\state\bot-port','data\state\workspace-root')
     $task = Get-NativeTask 'mixin-bot'
     $identity = Get-NativeIdentity $task $project
@@ -99,7 +100,7 @@ try {
         # A bot this project runs in the foreground has no task to stop or restore.
         if (@(Get-NativeBotPids $project).Count -gt 0 -and -not ($task -and $task.State -eq 'Running')) { throw 'A foreground bot of this project is running; no snapshot taken' }
         foreach ($relative in $paths) { Assert-SnapshotParent (Join-Path $project $relative) $project; Assert-OrdinaryTree (Join-Path $project $relative) }
-        $savedPaths = Save-DeploymentFiles $project $snapshotPath
+        $savedPaths = Save-DeploymentFiles $project $snapshotPath $paths
         $state = [pscustomobject]@{ CoreFormat=1; Operation=$request.operation; Project=$project; Path=$snapshotPath; Paths=$savedPaths; TaskName='mixin-bot';
             TaskXml=$(if ($task) { Export-ScheduledTask -TaskName 'mixin-bot' -ErrorAction Stop } else { $null }); ServiceIdentity=$identity;
             WasRunning=[bool]($task -and $task.State -eq 'Running'); DependenciesMoved=$false; DependenciesAttempted=$false;

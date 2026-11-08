@@ -11,19 +11,19 @@ import type { preflightWindowsUpgrade } from "../../ops/core/windows-lifecycle.t
 import type { DockerInput, DockerUpgradeInput, preflightDockerDeploy, runDockerLifecycle } from "../../ops/core/docker-lifecycle.ts";
 import type { OpsResult } from "../../ops/core/result.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { confirmTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { confirmTransaction, transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 import { TaskStore } from "../../ops/core/tasks.ts";
 import { consoleDir } from "../../ops/core/console-state.ts";
 
 const original = "a".repeat(40), target = "b".repeat(40);
 const args = (project: string) => ["upgrade", "--project", project, "--original", original, "--target", target, "--branch", "main"];
 /** A new upgrade's choices on this platform; Docker also takes the candidate-image record and the facts prepared before the stop. */
-const fresh = (root: string) => ["--plan", join(root, "plan.json"), ...(process.platform === "win32" ? [] : ["--candidate", join(root, "candidate-image"), "--facts", join(root, "upgrade-facts")])];
+const fresh = (root: string) => ["--plan", join(root, "plan.json"), ...(process.platform !== "linux" ? [] : ["--candidate", join(root, "candidate-image"), "--facts", join(root, "upgrade-facts")])];
 const done: OpsResult = { protocol: "mixin-ops", version: 1, command: "update", outcome: "success", exitCode: 0,
   wasRunning: false, finalState: "stopped", message: "合成部署完成" };
 
 async function pending(project: string, operation: "deploy" | "upgrade" = "upgrade") {
-  const name = "deploy-clifixture", snapshot = join(project, "backup/snapshots", name), upgrade = operation === "upgrade";
+  const name = "deploy-clifixture", snapshot = join(project, transactionDirectory(name)), upgrade = operation === "upgrade";
   await mkdir(snapshot, { recursive: true }); await mkdir(join(project, "data/state"), { recursive: true });
   await writeFile(join(snapshot, "transaction"), serializeTransactionRecord({ format: "2", operation, snapshot: name,
     target_sha: target, original_sha: upgrade ? original : "", original_branch: upgrade ? "original-branch" : "", was_running: "0", bot_port: "1011",
@@ -60,7 +60,7 @@ test("共享入口转交部署命令且保留结果文件、退出码与中文�
       deployment: (argv, options, signal) => runDeploymentCli(argv, { ...options, host }, signal) });
     expect(result).toEqual({ result: done, json: true }); expect(JSON.parse(await readFile(file, "utf8"))).toEqual(done);
     expect(calls).toHaveLength(1); expect(calls[0]).toMatchObject({ command: "update", original, target, branch: "main", plan: join(f.root, "plan.json"),
-      ...(process.platform === "win32" ? {} : { candidate: join(f.root, "candidate-image"), facts: join(f.root, "upgrade-facts") }) });
+      ...(process.platform !== "linux" ? {} : { candidate: join(f.root, "candidate-image"), facts: join(f.root, "upgrade-facts") }) });
     await expect(runDeploymentCli(args(f.root), { host })).rejects.toThrow("新升级必须"); expect(calls).toHaveLength(1);
     await expect(runDeploymentCli([...input, "--no-backup"], { host })).rejects.toThrow("用法"); expect(calls).toHaveLength(1);
   } finally { await f.cleanup(); }
@@ -74,7 +74,8 @@ test("Docker 新升级缺停机前的候选镜像记录或准备记录时拒绝�
     for (const extra of [[], ["--candidate", "c"], ["--facts", "f"]])
       await expect(runDeploymentCli([...base, ...extra], { host, platform: "linux" }), extra.join(" ")).rejects.toThrow("候选镜像记录和准备记录");
     for (const extra of [["--candidate", "c"], ["--facts", "f"], ["--candidate", "c", "--facts", "f"]])
-      await expect(runDeploymentCli([...base, ...extra], { host, platform: "win32" }), extra.join(" ")).rejects.toThrow("Windows 升级不使用");
+      for (const [platform, label] of [["win32", "Windows"], ["darwin", "macOS"]] as const)
+        await expect(runDeploymentCli([...base, ...extra], { host, platform }), extra.join(" ")).rejects.toThrow(`${label} 升级不使用`);
     expect(calls).toEqual([]);
     expect((await runDeploymentCli([...base, "--candidate", "c", "--facts", "f"], { host, platform: "linux" })).result).toEqual(done);
     expect((await runDeploymentCli(base, { host, platform: "win32" })).result).toEqual(done);

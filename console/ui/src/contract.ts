@@ -19,7 +19,7 @@ export interface ConsoleInfo {
   version: string;
   build: string;
   hostname: string;
-  platform: "windows" | "linux";
+  platform: "windows" | "linux" | "macos";
   port: number;
   pid: number;
   startedAt: number;
@@ -44,8 +44,8 @@ export interface ServiceView {
 }
 
 export interface DeploymentView {
-  platform: "windows" | "linux";
-  runtime: "scheduled-task" | "docker";
+  platform: "windows" | "linux" | "macos";
+  runtime: "scheduled-task" | "docker" | "launchd";
   mode: string;
   port: number;
   dataRoot: string;
@@ -256,6 +256,8 @@ export interface PushListItemView {
  */
 export interface PushTotalsView { sent: number; followUps: number; live: number; delivered: number; acked: number; replyDelivered: number; replied: number }
 export interface PushListResponse { pushes: PushListItemView[]; more: boolean; totals: PushTotalsView }
+/** Where the list goes on (`before` of /api/push/list): the last push of the page before; the list is newest first, then by ID. */
+export type PushListCursor = Pick<PushListItemView, "createdAt" | "id">;
 /** A person of a push view by key: name and masked phone. */
 export interface PushPersonView { key: string; name: string; phone: string }
 /**

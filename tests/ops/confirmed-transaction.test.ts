@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { assertConfirmedTransaction, confirmTransaction, readTransaction, transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 import { opsCommand } from "../../ops/core/platform.ts";
 import { operationPreparer } from "../../console/server/prepare-operation.ts";
 import { operationArgs, operationScope } from "../../ops/core/operations.ts";
@@ -11,7 +11,8 @@ import { tempFixture } from "../helpers/temp.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// The Docker entries' Bash (with /proc, flock and GNU tools) does not run on macOS, which has its own launcher.
+const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const first = "deploy-" + "a".repeat(32), second = "deploy-" + "b".repeat(32);
 
@@ -19,7 +20,7 @@ async function synthetic(root: string) {
   const state = join(root, "data/state");
   await mkdir(state, { recursive: true });
   for (const [name, sha] of [[first, "1".repeat(40)], [second, "2".repeat(40)]]) {
-    const directory = join(root, "backup/snapshots", name!);
+    const directory = join(root, transactionDirectory(name!));
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "transaction"), Object.entries({
       format: "2", operation: "deploy", snapshot: name!, target_sha: sha!, original_sha: "", original_branch: "",
@@ -37,7 +38,7 @@ for (const action of ["continue", "rollback"] as const) test(`confirmation binds
     expect(() => assertConfirmedTransaction(fixture.root, action, token)).not.toThrow();
     expect(() => assertConfirmedTransaction(fixture.root, action === "continue" ? "rollback" : "continue", token)).toThrow();
     for (const change of ["pointer", "same-id", "missing", "committed", "plan"] as const) {
-      const state = join(fixture.root, "data/state"), directory = join(fixture.root, "backup/snapshots", first);
+      const state = join(fixture.root, "data/state"), directory = join(fixture.root, transactionDirectory(first));
       await synthetic(fixture.root);
       if (change === "pointer") await writeFile(join(state, "deploy-transaction"), second);
       if (change === "same-id") await writeFile(join(directory, "transaction"), (await readFile(join(directory, "transaction"), "utf8")).replace("1".repeat(40), "3".repeat(40)));

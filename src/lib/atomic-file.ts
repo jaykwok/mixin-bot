@@ -1,16 +1,30 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readlinkSync, realpathSync } from "node:fs";
 import { link, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { setTimeout } from "node:timers/promises";
+import { descriptorPath } from "./darwin.ts";
 
-/** mode: the new file's permission bits (0600 unless a reader under another identity needs more). */
-export interface PublishOptions { owner?: { uid: number; gid: number }; createOnly?: boolean; mode?: number }
+/**
+ * mode: the new file's permission bits (0600 unless a reader under another identity needs more).
+ * within: a directory the writer trusts (the project) when the directories below it may belong to another account. The new
+ * file must really be at its path under it: one created through a directory replaced by a link is removed again and refused,
+ * so a root writer never leaves a file of its choosing elsewhere (Linux and macOS).
+ */
+export interface PublishOptions { owner?: { uid: number; gid: number }; createOnly?: boolean; mode?: number; within?: string }
 export async function publish(path: string, value: Uint8Array | string | AsyncIterable<Uint8Array>, options: PublishOptions = {}): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = path + ".atomic-" + randomUUID();
   try {
     const handle = await open(temporary, "wx", options.mode ?? 0o600);
     try {
+      if (options.within && process.platform !== "win32") {
+        const actual = process.platform === "darwin" ? descriptorPath(handle.fd) : readlinkSync(`/proc/self/fd/${handle.fd}`);
+        if (actual !== join(realpathSync(options.within), relative(options.within, temporary))) {
+          await unlink(actual).catch(() => {});
+          throw new Error(`写入位置经过了被替换的目录：${dirname(path)}`);
+        }
+      }
       if (typeof value === "string" || value instanceof Uint8Array) await handle.writeFile(value);
       else for await (const chunk of value) await handle.writeFile(chunk);
       if (options.owner && process.platform !== "win32") await handle.chown(options.owner.uid, options.owner.gid);

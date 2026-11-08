@@ -1,5 +1,5 @@
-// Pushes (push-plan-20261103.md): a pusher asks the model, the model calls push_prepare (./tools.ts), the pusher confirms
-// on a preview card, cards go to the recipients, and their clicks and replies are collected here without the model.
+// Pushes: a pusher asks the model, the model calls push_prepare (./tools.ts), the pusher confirms on a preview card,
+// cards go to the recipients, and their clicks and replies are collected here without the model.
 //
 // Flow of one push:
 // - prepare: the people are checked against the address book (in the sync scope, name and phone matching) and the
@@ -13,16 +13,21 @@
 //   are recorded into it (the inbound router asks `directText` / `directAttachment` first) instead of reaching the model;
 //   「已回复」 or /完成 submits it, 「取消」 or /取消 drops it, 「修改回复」 starts a new revision. The last submitted
 //   revision is the reply.
-// - Deadline, or everyone answered: `closed`; an open draft with content is submitted; the summary (message and
-//   package) goes to the pusher and the CCs; then the held reply attachments are released.
-// - Conversation notes (section 7) go through an outbox in the state database into the members' conversations as passive
-//   entries, so the model later knows what happened.
+// - Deadline, or everyone answered: `closed`; an open draft with content is submitted. The deadline counts by the time
+//   input is handled: a click, message or attachment after it ends the push first (the timer may not have run yet) and
+//   counts for nothing. The summary (message and package) goes to the pusher and the CCs once the cards still being
+//   sent have their result and the reply attachments in effect are received and downloaded, or `settleWaitMs` after the
+//   end: a card still without a result then stays uncertain, whatever comes back later, so the summary stays true. Then
+//   the held reply attachments are released, each one still being received or downloaded once that ends (its file stays
+//   for the console's package).
+// - Conversation notes go through an outbox in the state database into the members' conversations as passive entries,
+//   so the model later knows what happened.
 //
-// Groups (section 5): the bot learns a group only when someone there @-mentions it (`groupText`, every group text the
-// inbound router has); an admin names it with /登记群 (or the console does), and only registered groups take pushes. A
-// group gets one card and one recipient row (`group:<ID>`), answered by anyone there: clicks cannot be traced to people,
-// so 「已收到」 counts clicks, and options are refused. While the group replies, every text @-mentioning the bot is a
-// reply item with its sender; group members' conversations learn of a live push the next time they @-mention the bot.
+// Groups: the bot learns a group only when someone there @-mentions it (`groupText`, every group text the inbound
+// router has); an admin names it with /登记群 (or the console does), and only registered groups take pushes. A group
+// gets one card and one recipient row (`group:<ID>`), answered by anyone there: clicks cannot be traced to people, so
+// 「已收到」 counts clicks, and options are refused. While the group replies, every text @-mentioning the bot is a reply
+// item with its sender; group members' conversations learn of a live push the next time they @-mention the bot.
 //
 // All state is in the state database (./store.ts); what runs in the background (sends, card updates, notes, the summary)
 // picks up from there after a restart.
@@ -49,7 +54,7 @@ import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, groupReplyText, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
-import { buildSummary, effectiveItems, type HeldFile, maskPhone, replyText, senders, type SummaryPackage } from "./summary.ts";
+import { buildSummary, effectiveItems, type HeldFile, replyText, senders, type SummaryPackage } from "./summary.ts";
 import { type ChatGroup, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushMode, type PushRole, type PushState, type PushStore,
   type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
 
@@ -67,6 +72,8 @@ export const PUSH_LIMITS = {
   sendAttempts: 3,
   sendRetryMs: [60_000, 5 * 60_000] as readonly number[],
   summaryRetryMs: [60_000, 5 * 60_000, 30 * 60_000] as readonly number[],
+  /** The summary waits this long after the end for cards still being sent and reply attachments still being received or downloaded. */
+  settleWaitMs: 10 * 60_000,
   tickMs: 15_000,
   /** Cards sent at once (the message sender also limits the rate): a large push never queues ahead of other replies by more. */
   concurrency: 4,
@@ -147,6 +154,8 @@ export type PushGroup = keyof typeof PUSH_GROUPS;
 
 /** Recipient rows; `groups` of them are groups. */
 export type PushCounts = Omit<RecipientCounts, "unsettled">;
+/** Where the console's list goes on: the last push of the page before (the list is newest first, then by ID). */
+export type PushCursor = Pick<Push, "createdAt" | "id">;
 export type PushListItem = Pick<Push, "id" | "subject" | "mode" | "state" | "pusher" | "pusherName" | "createdAt" | "confirmedAt" | "deadline" | "closedAt"
   | "closeReason" | "summaryState" | "followUp"> & { of: string | null; counts: PushCounts };
 export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "replyState"
@@ -653,10 +662,12 @@ export class PushService {
     if (this.#clicks.has(key)) return;
     if (this.#clicks.size >= 20_000) this.#clicks.delete(this.#clicks.values().next().value!);
     this.#clicks.add(key);
-    const push = this.#store.push(data.push);
-    if (!push) { log.info(`推送 ${data.push} 不存在，忽略点击`); return; }
+    const found = this.#store.push(data.push);
+    if (!found) { log.info(`推送 ${data.push} 不存在，忽略点击`); return; }
     const click: Click = { event, data, userId, card };
     try {
+      // Past the deadline the push ends first: the click only shows the end.
+      const push = this.#closeIfDue(found) ? this.#store.push(found.id)! : found;
       // Previews and summaries go to the pusher's direct chat only.
       if (groupId) {
         if (data.action === "confirm" || data.action === "cancel" || data.action === "remind") log.warn(`推送 ${push.id} 的预览或汇总按钮出现在群里，忽略`);
@@ -797,6 +808,7 @@ export class PushService {
       try { return { followUp: await this.#prepareFollowUp(push, members) }; }
       finally { this.#refreshSummary(pushId); }
     }
+    if (this.#closeIfDue(push)) throw new PushRefused("这条推送已经截止，请刷新后再补推送");
     if (!LIVE_STATES.includes(push.state)) throw new PushRefused("这条推送没有发出，不能补推送");
     const chosen = this.#unanswered(push).filter(recipient => (!members || members.includes(recipient.member))
       && recipient.sendState !== "pending" && recipient.sendState !== "sending");
@@ -820,8 +832,8 @@ export class PushService {
     if (push.state === "preview") this.#refreshPreview(pushId);
   }
 
-  /** The console's list: newest first; `before`: older than this creation time. With the totals over all pushes. */
-  list(query: { group: PushGroup | null; before: number | null; limit: number }): { pushes: PushListItem[]; more: boolean; totals: PushTotals } {
+  /** The console's list: newest first, then by ID; `before`: after this push of the page before. With the totals over all pushes. */
+  list(query: { group: PushGroup | null; before: PushCursor | null; limit: number }): { pushes: PushListItem[]; more: boolean; totals: PushTotals } {
     const page = this.#store.page(query.group ? PUSH_GROUPS[query.group] : null, query.before, query.limit + 1), shown = page.slice(0, query.limit);
     const counts = this.#store.recipientCounts(shown.map(push => push.id));
     return { pushes: shown.map(push => this.#listItem(push, counts.get(push.id))), more: page.length > query.limit, totals: this.#store.totals() };
@@ -865,9 +877,9 @@ export class PushService {
     if (!push) throw new PushRefused("推送不存在");
     if (push.state === "preview" || LIVE_STATES.includes(push.state)) throw new PushRefused("推送还没有结束，不能删除；未确认的预览会在 24 小时后失效");
     if (push.state === "closed" && (push.summaryState === "pending" || this.#refreshing.has(`summary:${id}`))) throw new PushRefused("汇总还没有发出，请稍后再删除");
-    if (!push.released && this.#store.items(id).some(item => item.attachment)) {
+    if (!push.released) {
       await this.#releasePush(id);
-      if (!this.#store.push(id)?.released) throw new PushRefused("回复附件的占用没有解除，请稍后再删除");
+      if (!this.#store.push(id)?.released) throw new PushRefused("回复附件的占用没有解除（可能还在接收或下载），请稍后再删除");
     }
     this.#store.remove(id);
     log.info(`推送 ${id} 已在控制台删除`);
@@ -889,7 +901,7 @@ export class PushService {
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const pack = await buildSummary({ push, recipients, items, files: await this.#heldFiles(id, items), dir, partBytes: Number.MAX_SAFE_INTEGER, now: this.#now(),
-        phone: maskPhone, signal: signal ? AbortSignal.any([this.#signal, signal]) : this.#signal });
+        signal: signal ? AbortSignal.any([this.#signal, signal]) : this.#signal });
       if (pack.parts.length !== 1) throw new PushRefused("回复附件合计超过 4 GiB，请按人下载");
       const part = pack.parts[0]!, person = recipients[0]!;
       return { path: part.path, size: part.size, done,
@@ -1052,7 +1064,13 @@ export class PushService {
   directText(identity: DirectoryIdentity, reply: ReplyContext, text: string): boolean {
     const command = isSlashCommandMessage(text) ? canonicalCommand(text) : undefined;
     if (command === "/登记群") { this.#notice(reply, "请在要登记的群里发送“@机器人 /登记群 群名”。"); return true; }
-    const replying = this.#store.replying(identity.phone);
+    let replying = this.#store.replying(identity.phone);
+    const late = this.#lateReply(replying);
+    if (late) {
+      // Other commands keep their meaning; there is no reply open any more.
+      if (command !== undefined && command !== "/完成" && command !== "/取消") replying = undefined;
+      else { this.#notice(reply, `「${late.subject}」已过截止时间，${command === undefined ? "这条消息没有记入回复" : "回复已经结束"}。`); return true; }
+    }
     if (command === "/完成" || command === "/取消") {
       if (!replying) this.#notice(reply, "当前没有回复中的推送。");
       else this.#endReply(replying, command, reply);
@@ -1075,6 +1093,8 @@ export class PushService {
   directAttachment(identity: DirectoryIdentity, reply: ReplyContext, attachment: AttachmentEvent): boolean {
     const replying = this.#store.replying(identity.phone);
     if (!replying) return false;
+    const late = this.#lateReply(replying);
+    if (late) { this.#notice(reply, `「${late.subject}」已过截止时间，这个附件没有记入回复。`); return true; }
     const push = this.#store.push(replying.pushId)!;
     // The item first: a crash before the registration commits leaves an item the startup reconciliation settles.
     const id = this.#store.addItem({ pushId: push.id, member: identity.phone, revision: replying.draft, msgUid: reply.msgUid, kind: attachment.kind, text: null,
@@ -1091,7 +1111,7 @@ export class PushService {
       this.#report(error);
       this.#store.updateItem(id, { error: "附件未能登记" });
       this.#notice(reply, "⚠️ 附件未能登记，请重新发送。");
-    }).finally(() => this.#refreshCard(push.id, identity.phone)));
+    }).finally(() => { this.#refreshCard(push.id, identity.phone); this.#settled(push.id); }));
     this.#recorded(push, replying, reply);
     return true;
   }
@@ -1118,7 +1138,13 @@ export class PushService {
     this.#groupSeen(groupId);
     const command = isSlashCommandMessage(text) ? canonicalCommand(text) : undefined;
     if (command === "/登记群") { this.#registerCommand(groupId, identity, reply, text); return true; }
-    const member = groupMember(groupId), replying = this.#store.replying(member);
+    const member = groupMember(groupId);
+    let replying = this.#store.replying(member);
+    const late = this.#lateReply(replying);
+    if (late) {
+      if (command !== undefined && command !== "/完成" && command !== "/取消") replying = undefined;
+      else { this.#notice(reply, `「${late.subject}」已过截止时间，${command === undefined ? "这条消息没有记入回复" : "回复已经结束"}。`); return true; }
+    }
     if (command === "/完成" || command === "/取消") {
       if (!replying) this.#notice(reply, "本群当前没有回复中的推送。");
       else this.#endReply(replying, command, reply);
@@ -1141,11 +1167,11 @@ export class PushService {
   /** The group's live pushes, noted once in this member's group conversation (they may not have seen the card). */
   #groupNotes(groupId: string, phone: string): void {
     for (const recipient of this.#store.reached(groupMember(groupId))) {
-      const key = `${recipient.pushId}|${groupId}|${phone}`;
-      if (this.#groupNoted.has(key)) continue;
+      const key = `${recipient.pushId}|${groupId}|${phone}`, push = this.#store.push(recipient.pushId)!;
+      if (this.#groupNoted.has(key) || this.#now() >= push.deadline) continue;
       if (this.#groupNoted.size >= 20_000) this.#groupNoted.delete(this.#groupNoted.values().next().value!);
       this.#groupNoted.add(key);
-      this.#cardNote(this.#store.push(recipient.pushId)!, groupScope(groupId), phone);
+      this.#cardNote(push, groupScope(groupId), phone);
     }
   }
 
@@ -1167,10 +1193,11 @@ export class PushService {
     this.#refreshCard(push.id, replying.member);
   }
 
-  /** Not replying: a member with a push waiting for their reply is told once in a while how to reply. */
+  /** Not replying: a member with a push waiting for their reply is told once in a while how to reply (not past its deadline). */
   #hint(phone: string, reply: ReplyContext): void {
     const now = this.#now();
-    const waiting = this.#store.awaitingReply(phone).filter(recipient => recipient.hintedAt === null || now - recipient.hintedAt >= this.#limits.hintMs);
+    const waiting = this.#store.awaitingReply(phone).filter(recipient => (recipient.hintedAt === null || now - recipient.hintedAt >= this.#limits.hintMs)
+      && now < this.#store.push(recipient.pushId)!.deadline);
     if (!waiting.length) return;
     for (const recipient of waiting) this.#store.updateRecipient(recipient.pushId, phone, { hintedAt: now });
     const subjects = waiting.map(recipient => `「${this.#store.push(recipient.pushId)!.subject}」`).join("、");
@@ -1192,7 +1219,7 @@ export class PushService {
       }
       for (const push of this.#store.pushesIn(LIVE_STATES)) {
         if (now >= push.deadline) { this.#close(push.id, "deadline"); continue; }
-        // Groups get no reminder: their reply stays open until someone ends it or the deadline (section 5).
+        // Groups get no reminder: their reply stays open until someone ends it or the deadline.
         for (const recipient of this.#store.unreminded(push.id)) {
           if (now - recipient.activityAt! < this.#limits.idleReminderMs || !this.#store.items(push.id, recipient.member, recipient.draft).length) continue;
           this.#store.updateRecipient(push.id, recipient.member, { remindedAt: now });
@@ -1234,20 +1261,26 @@ export class PushService {
     const push = this.#store.push(due.pushId);
     const recipient = this.#store.recipient(due.pushId, due.member);
     if (!push || !recipient || !LIVE_STATES.includes(push.state) || (recipient.sendState !== "pending" && recipient.sendState !== "failed")) return;
+    // Past the deadline no card goes out: the push ends, its cards not sent yet count as failed.
+    if (this.#closeIfDue(push)) return;
     const attempts = recipient.sendAttempts + 1;
     this.#store.updateRecipient(push.id, recipient.member, { sendState: "sending", sendAttempts: attempts, retryAt: null });
     let outcome;
     try {
       outcome = await this.#outbound.send(this.#memberTarget(recipient), cardMessage(this.#recipientCard(push.id, recipient.member)!), { signal: this.#signal });
     } catch (error) { outcome = { status: "failed" as const, reason: String(error) }; }
+    // The summary stopped waiting and reported this card as unknown: what it said stays true.
+    if (this.#store.recipient(push.id, recipient.member)?.sendState !== "sending") return;
+    // The push may have ended during the send: no further try, and its summary may be waiting for this result.
+    const live = LIVE_STATES.includes(this.#store.push(push.id)!.state);
     if (outcome.status === "failed" && this.#signal.aborted) {
-      // Never dispatched: the next start sends it.
-      this.#store.updateRecipient(push.id, recipient.member, { sendState: "pending", sendAttempts: recipient.sendAttempts });
+      // Never dispatched: the next start sends it, while the push is still on.
+      this.#store.updateRecipient(push.id, recipient.member, live ? { sendState: "pending", sendAttempts: recipient.sendAttempts } : { sendState: "failed", sendError: "截止前没有发出" });
       return;
     }
     const now = this.#now();
     if (outcome.status === "failed") {
-      const retry = attempts < this.#limits.sendAttempts ? now + (this.#limits.sendRetryMs[attempts - 1] ?? this.#limits.sendRetryMs.at(-1)!) : null;
+      const retry = live && attempts < this.#limits.sendAttempts ? now + (this.#limits.sendRetryMs[attempts - 1] ?? this.#limits.sendRetryMs.at(-1)!) : null;
       this.#store.updateRecipient(push.id, recipient.member, { sendState: "failed", sendError: outcome.reason, retryAt: retry });
       if (retry === null) log.warn(`推送 ${push.id}：一张卡片发送失败（已试 ${attempts} 次）：${outcome.reason}`);
     } else {
@@ -1256,6 +1289,7 @@ export class PushService {
       if (memberGroup(recipient.member) === undefined) this.#cardNote(push, DIRECT_SCOPE, recipient.member);
     }
     this.#progress(push.id);
+    if (!live) this.#settled(push.id);
   }
 
   /** The preview card's sending progress, at most every `progressMs`: a large push spends its sends on the cards. */
@@ -1291,6 +1325,19 @@ export class PushService {
     if (counts && !counts.unsettled && counts.delivered > 0 && counts.answered === counts.delivered) this.#close(pushId, "complete");
   }
 
+  /** A live push past its deadline closes now, before the input at hand is handled (the timer may not have seen it yet). True when it did. */
+  #closeIfDue(push: Push): boolean {
+    if (!LIVE_STATES.includes(push.state) || this.#now() < push.deadline) return false;
+    this.#close(push.id, "deadline");
+    return true;
+  }
+
+  /** The push of an open reply, when it is past its deadline: closed now, so what came in is not part of the reply. */
+  #lateReply(replying: Recipient | undefined): Push | undefined {
+    const push = replying && this.#store.push(replying.pushId);
+    return push && this.#closeIfDue(push) ? push : undefined;
+  }
+
   /** Close a live push: open drafts with content are submitted, the cards show the end, the summary is due. */
   #close(pushId: string, reason: "deadline" | "complete"): void {
     const push = this.#store.push(pushId);
@@ -1313,7 +1360,11 @@ export class PushService {
     this.#track(this.#summarize(pushId));
   }
 
-  /** Build and send the summary to the pusher and the CCs. One person's failure holds nobody else back; a retry sends only what did not go out. */
+  /**
+   * Build and send the summary to the pusher and the CCs, once the cards still being sent have their result and the reply
+   * attachments in effect are received and downloaded (or `settleWaitMs` after the end: the summary says what is unknown
+   * or missing). One person's failure holds nobody else back; a retry sends only what did not go out.
+   */
   async #summarize(pushId: string): Promise<void> {
     const key = `summary:${pushId}`;
     if (this.#refreshing.has(key) || this.#closing) return;
@@ -1322,8 +1373,16 @@ export class PushService {
     this.#refreshing.set(key, { again: false });
     const dir = join(userTmp(this.options.layout, DIRECT_SCOPE, push.pusher), `push-${push.id}`);
     try {
-      const recipients = this.#store.recipients(pushId), items = this.#store.items(pushId);
+      const items = this.#store.items(pushId);
       const files = push.mode === "reply" ? await this.#heldFiles(pushId, items) : new Map<string, HeldFile>();
+      // Read after the await, so a send that ended during it is in them.
+      const current = this.#store.recipients(pushId);
+      // Waiting: a send or a registration that ends, or the timer, tries again.
+      if (this.#now() - (push.closedAt ?? 0) < this.#limits.settleWaitMs
+        && current.some(recipient => recipient.sendState === "sending" || effectiveItems(recipient, items).some(item => unsettled(item, files)))) return;
+      // A card still without a result is unknown for good (#send leaves it so), then the counts below cannot change.
+      for (const recipient of current) if (recipient.sendState === "sending") this.#store.updateRecipient(pushId, recipient.member, { sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
+      const recipients = this.#store.recipients(pushId);
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const pack = await buildSummary({ push, recipients, items, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, now: this.#now(), signal: this.#signal });
@@ -1331,7 +1390,9 @@ export class PushService {
       const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && (push.mode === "ack"
         ? recipient.ackedAt === null : push.mode === "options" ? recipient.choice === null : recipient.submitted === 0))
         .map(recipient => memberGroup(recipient.member) === undefined ? recipient.name : `群 ${recipient.name}`);
+      const unknown = recipients.filter(recipient => recipient.sendState === "uncertain").length;
       const lines = [`推送「${push.subject}」${push.closeReason === "complete" ? "已全部答复" : "已截止"}（推送编号 ${push.id}）`, tally,
+        ...(unknown ? [`有 ${unknown} 张卡片发送结果未知，按已发出统计`] : []),
         ...(missing.length ? [`${push.mode === "reply" ? "未回复" : push.mode === "ack" ? "未确认" : "未选择"}：${missing.slice(0, 30).join("、")}${missing.length > 30 ? ` 等 ${missing.length} 个` : ""}`] : []),
         ...(pack.missingFiles ? [`有 ${pack.missingFiles} 个附件没能打包（原因见汇总表）`] : []),
         pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : "汇总表和回复内容见下面的压缩包。"];
@@ -1419,24 +1480,41 @@ export class PushService {
     }
   }
 
-  /** Release every held attachment of a push whose summary is done (sent or given up). */
+  /**
+   * Release the held attachments of a push whose summary is done (sent or given up). A reply's file still downloading
+   * stays held until the download ends, so where it is gets kept, and an attachment still being received has no record
+   * yet: the push counts as released only once neither is left (the timer and the registration's end try again).
+   */
   async #releasePush(pushId: string): Promise<void> {
     const key = `release:${pushId}`;
     if (this.#refreshing.has(key)) return;
     this.#refreshing.set(key, { again: false });
     try {
-      const byMember = new Map<string, ReplyItem[]>();
-      for (const item of this.#store.items(pushId)) if (item.attachment) byMember.set(item.member, [...byMember.get(item.member) ?? [], item]);
+      const items = this.#store.items(pushId).filter(item => item.kind !== "text");
+      const effective = new Set(this.#store.recipients(pushId).flatMap(recipient => effectiveItems(recipient, items)));
+      const files = await this.#heldFiles(pushId, items);
       // The records go; where the files are stays with the items, for the console's downloads until the tmp cleanup takes them.
-      const files = await this.#heldFiles(pushId, [...byMember.values()].flat());
-      for (const item of [...byMember.values()].flat()) {
-        const file = files.get(item.attachment!);
-        if (file?.state === "ready" && file.path && item.path !== file.path) this.#store.updateItem(item.id, { path: file.path });
+      const byMember = new Map<string, string[]>();
+      let waiting = false;
+      for (const item of items) {
+        const file = item.attachment ? files.get(item.attachment) : undefined;
+        if (unsettled(item, files) && (item.attachment === null || effective.has(item))) { waiting = true; continue; }
+        if (!file) continue;
+        if (file.state === "ready" && file.path && item.path !== file.path) this.#store.updateItem(item.id, { path: file.path });
+        byMember.set(item.member, [...byMember.get(item.member) ?? [], item.attachment!]);
       }
-      for (const [member, items] of byMember) await this.#host!.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), items.map(item => item.attachment!));
-      this.#store.updatePush(pushId, { released: true });
+      for (const [member, ids] of byMember) await this.#host!.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids);
+      if (!waiting) this.#store.updatePush(pushId, { released: true });
     } catch (error) { if (!this.#signal.aborted) this.#report(error); }
     finally { this.#refreshing.delete(key); }
+  }
+
+  /** A card's send or a reply attachment's registration ended: a closed push's summary or release may be waiting for it. */
+  #settled(pushId: string): void {
+    const push = this.#store.push(pushId);
+    if (this.#closing || push?.state !== "closed") return;
+    if (push.summaryState === "pending") this.#track(this.#summarize(pushId));
+    else if (!push.released) this.#track(this.#releasePush(pushId));
   }
 
   /** Release the attachments of replaced or dropped revisions now (best effort; the summary release covers what is left). */
@@ -1599,4 +1677,9 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 
 function countsOf(items: readonly ReplyItem[]): Counts {
   return { texts: items.filter(item => item.kind === "text").length, files: items.filter(item => item.kind !== "text").length };
+}
+
+/** A reply attachment still being received (its registration has not ended) or downloaded. */
+function unsettled(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): boolean {
+  return item.kind !== "text" && item.error === null && (item.attachment === null || files.get(item.attachment)?.state === "pending");
 }

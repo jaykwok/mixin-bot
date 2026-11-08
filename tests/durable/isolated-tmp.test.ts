@@ -1,4 +1,4 @@
-// PR-1 (docs/dev/prompt-review-20261102.md): under rootless isolation every bash command runs in its own directory below
+// Under rootless isolation every bash command runs in its own directory below
 // the member's tmp and sees it as PI_USER_TMP, while edit/write may only write the request's directory. The old prompt
 // told the model to look the path up in bash, which under isolation names a directory write refuses; the prompt now names
 // the request's directory in the tail (closeout.ts) and says how isolated commands differ. Only the rootless backend is a

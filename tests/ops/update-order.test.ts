@@ -134,6 +134,7 @@ exit "\${FIXTURE_UPGRADER_EXIT:-0}"
 
     // Pending transactions: origin is unreachable and has moved on; nothing is fetched and the recorded target is used.
     await git("remote", "set-url", "origin", join(f.root, "missing.git"));
+    // The shell update reads the Docker layout (macOS runs its own entry), so the record is where the shell looks.
     const snapshot = join(work, "backup/snapshots/deploy-fixture");
     await mkdir(snapshot, { recursive: true });
     const record = (overrides: Record<string, string> = {}) => writeFile(join(snapshot, "transaction"), Object.entries({

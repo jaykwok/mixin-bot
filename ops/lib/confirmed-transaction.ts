@@ -6,8 +6,13 @@ import { join, resolve } from "node:path";
 const stateFiles = ["deploy-transaction", "upgrade-transaction", "release-data.json", "data-version.json", "verify-only", "ops-deployment.json"];
 const snapshotFiles = ["transaction", "deployment.xml", "target-sha", "was-running", "previous-image", "data-plan.json",
   "directory-scope-plan.json", "candidate-image", "service-user", "task-runtime", "task-previous-cid", "host-runtime",
-  "runtime-values.json", "configuration-app.json", "configuration-models.json", "windows-tools"];
+  "runtime-values.json", "configuration-app.json", "configuration-models.json", "windows-tools", "macos-tools", "macos-state.json", "service.plist"];
 const hash = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
+/**
+ * Where the records of transaction `name` live, relative to the project. macOS keeps them in root's .console: there the
+ * service account owns backup/, and root must not trust or install what it could replace. Elsewhere the snapshot holds them.
+ */
+export const transactionDirectory = (name: string) => process.platform === "darwin" ? `.console/deployments/${name}` : `backup/snapshots/${name}`;
 export type TransactionReadSet = { operation: "deploy" | "upgrade"; id: string; digest: string; text(path: string): string | null };
 export type ConfirmedTransaction = { version: 1; operation: "deploy" | "upgrade"; id: string; digest: string; action: "continue" | "rollback" };
 
@@ -71,9 +76,9 @@ export function readTransaction(project: string): TransactionReadSet | null {
   if (!deploy && !upgrade) return null;
   const id = (upgrade ?? deploy)!;
   for (const name of new Set([deploy, upgrade])) if (name) {
-    for (const file of snapshotFiles) read(`backup/snapshots/${name}/${file}`);
+    for (const file of snapshotFiles) read(`${transactionDirectory(name)}/${file}`);
   }
-  const record = text(`backup/snapshots/${id}/transaction`) ?? "";
+  const record = text(`${transactionDirectory(id)}/transaction`) ?? "";
   const operation = upgrade || /^operation=upgrade$/m.test(record) ? "upgrade" : "deploy";
   const digest = hash(JSON.stringify([...files].sort(([a], [b]) => a.localeCompare(b, "en")).map(([file, bytes]) => [file, bytes === null ? null : hash(bytes)])));
   return { operation, id, digest, text };

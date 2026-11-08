@@ -23,7 +23,7 @@ export type OutboundMessage =
   | { readonly msgType: "card"; readonly content: CardContent };
 
 /**
- * 交互卡片（docs/dev/app-bot-card-probe-20261024.md、push-plan-20261103.md 第 11 节）。正文是 Markdown，实测上限约 5000 字符。
+ * 交互卡片（推送用，src/push/cards.ts）。正文是 Markdown，实测上限约 5000 字符。
  * 按钮点击经 Stream 推送 `callback:card_interaction`，带卡片 `msgUid` 和按钮的 `data`；带上 `msgUid` 再发一次即原地更新这张卡片。
  */
 export interface CardContent {

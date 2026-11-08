@@ -6,7 +6,7 @@ import { lstatSync, rmSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { publish } from "../../src/lib/atomic-file.ts";
-import { assertConfirmedTransaction } from "../lib/confirmed-transaction.ts";
+import { assertConfirmedTransaction, transactionDirectory } from "../lib/confirmed-transaction.ts";
 import { decodeReleaseData, type ReleaseDataCommand } from "../lib/release-data-protocol.ts";
 import { configurationSnapshot } from "../config/configuration-form.ts";
 import { sameConfiguration, stageName, STAGED_KINDS, type StagedKind } from "../config/configuration-stage.ts";
@@ -101,6 +101,8 @@ export interface DeploymentSession {
   prepare(git: DeploymentGit): Promise<void>;
   /** Fresh, before the pointer exists: the platform's own snapshot material. Never stops the bot. */
   capture(record: TransactionRecord): Promise<{ wasRunning: boolean }>;
+  /** Removes an unpublished capture where the platform keeps it (macOS: its own records, the snapshot as the service account). */
+  discard?(): Promise<void>;
   /** After publication and on every recovery: the snapshot's platform facts agree with the record. */
   confirm(record: TransactionRecord): Promise<void>;
   /** A data tool of the target release, run as the deployment writer. */
@@ -180,9 +182,10 @@ const STAGED_LABELS: Record<StagedKind, string> = { app: "应用机器人配置"
  * Until a pointer names it, a new snapshot is no transaction's recovery material (the captures copy, never move): a failed
  * publication removes it. A pointer that names it, or one that cannot be read, keeps it.
  */
-function discardUnpublished(project: string, snapshot: string, name: string): void {
+async function discardUnpublished(project: string, snapshot: string, name: string, session: DeploymentSession): Promise<void> {
   try {
     for (const pointer of ["deploy-transaction", "upgrade-transaction"]) if (readText(join(project, "data/state", pointer))?.trim() === name) return;
+    if (session.discard) { await session.discard(); return; }
     const stat = lstatSync(snapshot);
     if (stat.isDirectory() && !stat.isSymbolicLink()) rmSync(snapshot, { recursive: true, force: true });
   } catch { /* Left for the backup cleanup; the publication failure is what the operator needs. */ }
@@ -242,7 +245,10 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
       if (!pending && deploy && !deploy.stage) throw new MaintenanceRefused("没有未完成的部署事务");
       const fresh = !pending, name = pending?.snapshot ?? "deploy-" + randomUUID().replaceAll("-", "");
       const stage = !pending && deploy ? readDeployStage(deploy.stage!) : undefined;
-      const snapshot = join(project, "backup/snapshots", name), pointer = join(project, "data/state", deploy ? "deploy-transaction" : platform.upgradePointer);
+      const snapshot = join(project, transactionDirectory(name)), pointer = join(project, "data/state", deploy ? "deploy-transaction" : platform.upgradePointer);
+      // macOS: data/state belongs to the service account, so every file root writes there must land where its path says
+      // (atomic-file.ts within).
+      const confined = process.platform === "darwin" ? { within: project } : {};
       const pinned = deploymentRuntime(project, options.source, pending);
       if (pinned.root !== fixed.root || pinned.digest !== fixed.digest || codeDigest(options.source) !== pinned.digest)
         throw new MaintenanceRefused("取得部署锁后固定运维运行包变化，保留现场");
@@ -286,7 +292,7 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
           if (upgrade!.directoryPlan && directoryPlan === null) throw new MaintenanceRefused("通讯录范围计划缺失");
           const workspace = readText(join(project, "data/state/workspace-root"))?.trim() ?? "";
           if (workspace) directory(workspace);
-          const port = readText(join(project, "data/state/bot-port"))?.trim() || "1011";
+          const port = readText(join(project, "data/state/bot-port"))?.trim() || "10000";
           chosen = { format: "2", operation: "upgrade", snapshot: name, target_sha: upgrade!.target, original_sha: upgrade!.original,
             original_branch: upgrade!.branch, original_workspace_root: workspace, target_workspace_root: workspace, was_running: start!.wasRunning ? "1" : "0",
             bot_port: port, reconfigure_ai: "0" };
@@ -306,13 +312,13 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
           // Capturing private config/service metadata does not stop the bot. No conversation database is copied.
           const captured = await session.capture(chosen);
           record = { ...chosen, was_running: captured.wasRunning ? "1" : "0" };
-          await publish(join(snapshot, "transaction"), serializeTransactionRecord(record), { createOnly: true });
-          for (const file of publication) await publish(join(snapshot, file.name), file.text, { createOnly: true, ...(file.tool ? { owner: session.owner } : {}) });
-          await publish(join(snapshot, "host-runtime"), pinned.digest + "\n", { createOnly: true });
+          await publish(join(snapshot, "transaction"), serializeTransactionRecord(record), { createOnly: true, ...confined });
+          for (const file of publication) await publish(join(snapshot, file.name), file.text, { createOnly: true, ...confined, ...(file.tool ? { owner: session.owner } : {}) });
+          await publish(join(snapshot, "host-runtime"), pinned.digest + "\n", { createOnly: true, ...confined });
           lock.assertHeld();
           if (loadDeploymentState(project)) throw new MaintenanceRefused("准备期间出现另一事务，未发布本次快照");
-          await publish(pointer, name + "\n", { createOnly: true });
-        } catch (error) { discardUnpublished(project, snapshot, name); throw error; }
+          await publish(pointer, name + "\n", { createOnly: true, ...confined });
+        } catch (error) { await discardUnpublished(project, snapshot, name, session); throw error; }
         pending = loadDeploymentState(project);
       }
       if (!pending || !record) throw new Error(`${noun}事务未完整发布`);
@@ -320,7 +326,7 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
       store = new DeploymentRecord(project, record, pinned.digest, () => lock.assertHeld());
       const request: DeploymentRequest = { command: input.rollback ? "rollback" : !fresh ? "resume" : deploy ? deploy.command === "repair" ? "repair" : "deploy" : "update",
         action: input.rollback ? "rollback" : "continue", snapshot: name, runtime: pinned.digest };
-      const tools = session.tools, workspace = tools.workspace(record), saved = (file: string) => state().confirmation.text("backup/snapshots/" + name + "/" + file);
+      const tools = session.tools, workspace = tools.workspace(record), saved = (file: string) => state().confirmation.text(transactionDirectory(name) + "/" + file);
       const data = async (action: ReleaseDataCommand, cancellation?: AbortSignal) => {
         const result = await session.tool("ops/tools/data-current.ts", [action, "--project", tools.project, "--deployment", name,
           "--plan", tools.file("data-plan.json"), ...(workspace === undefined ? [] : ["--workspace", workspace]), "--json"], cancellation);
@@ -392,13 +398,13 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
               // A first deployment had no configuration to preview before the stop. A resume keeps the plan of its first attempt.
               if (saved("data-plan.json") === null) await data("preview", cancellation);
               await data("apply", cancellation); return;
-            case "enable-verification": await publish(join(project, "data/state/verify-only"), "verify\n", { owner: session.owner }); return;
+            case "enable-verification": await publish(join(project, "data/state/verify-only"), "verify\n", { owner: session.owner, ...confined }); return;
             case "commit-data":
               await session.beforeCommit?.(cancellation);
               if (deploy) {
                 // Inside the snapshot's restore range. Readiness has passed; the ops entries read these from now on.
-                await publish(join(project, "data/state/bot-port"), record!.bot_port, { owner: session.owner });
-                await publish(join(project, "data/state/workspace-root"), record!.target_workspace_root, { owner: session.owner });
+                await publish(join(project, "data/state/bot-port"), record!.bot_port, { owner: session.owner, ...confined });
+                await publish(join(project, "data/state/workspace-root"), record!.target_workspace_root, { owner: session.owner, ...confined });
               }
               await data("commit", cancellation); return;
             case "disable-verification":

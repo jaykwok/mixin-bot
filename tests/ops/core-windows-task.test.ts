@@ -15,8 +15,9 @@ async function until<T>(work: () => Promise<T | null>): Promise<T> {
   while (performance.now() < limit) { const value = await work(); if (value !== null) return value; await Bun.sleep(25); }
   throw new Error("fixture did not reach ready state");
 }
+/** null while the file is missing or still being written (the writer fixture creates it before filling it). */
 async function json(path: string): Promise<any | null> {
-  try { return JSON.parse(await readFile(path, "utf8")); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+  try { return JSON.parse(await readFile(path, "utf8")); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return null; throw error; }
 }
 
 test.skipIf(!windows)("Windows 持久 Global Job：中文进程输出完成后回收；取消返回前子进程确实退出", async () => {

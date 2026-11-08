@@ -1,8 +1,9 @@
 // Bootstrap diagnostics: built-ins only, independent of configuration and installed packages.
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync,
+import { closeSync, constants, existsSync, fchownSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync,
   unlinkSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { descriptorPath } from "./darwin.ts";
 import { redactSecrets as redact } from "./redact.ts";
 
 const namePattern = /^(upgrade|deploy|startup)-[\dTZ]+-[\w-]+\.log$/;
@@ -11,12 +12,12 @@ const maxBytes = 2 * 1024 * 1024;
 // append opens without O_CREAT, refusing a link (O_NOFOLLOW) or a FIFO (O_NONBLOCK, then fstat) in place of the log.
 const appendFlags = constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
-/** Exclusive creation. On Linux the new file must be the project's own logs/operations entry; one created through a replaced directory is removed again. */
+/** Exclusive creation. On Linux and macOS the new file must be the project's own logs/operations entry; one created through a replaced directory is removed again. */
 function createLog(project: string, path: string): void {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
   try {
-    if (process.platform !== "linux") return;
-    const actual = readlinkSync(`/proc/self/fd/${fd}`);
+    if (process.platform === "win32") return;
+    const actual = process.platform === "darwin" ? descriptorPath(fd) : readlinkSync(`/proc/self/fd/${fd}`);
     if (actual !== join(realpathSync(join(project, "logs")), "operations", basename(path))) {
       unlinkSync(actual);
       throw new Error("diagnostic directory was replaced");
@@ -85,7 +86,8 @@ export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "
     try {
       fd = openSync(path, appendFlags);
       const stat = fstatSync(fd), size = stat.size;
-      if (!stat.isFile()) throw new Error("diagnostic file is not a regular file");
+      // A second name means a hard link the service identity planted to another file, e.g. one root runs or reads.
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error("diagnostic file is not a regular file of its own");
       if (size >= maxBytes) return;
       if (level === "output" && size >= maxBytes / 2) {
         if (outputLimited) return;
@@ -101,4 +103,20 @@ export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "
     } finally { if (fd !== undefined) closeSync(fd); }
   };
   return { path, name, event, ownsLog: !parentName };
+}
+
+/**
+ * Gives a log this process created to `owner` (the service identity whose tools append to it). Through a descriptor of the
+ * very file: never a link, never a file with a second name or another owner, so no other file changes hands. False when the
+ * log is no longer that file; the operation goes on, its tools then only fail to append.
+ */
+export function handOverLog(path: string, owner: { uid: number; gid: number }): boolean {
+  let fd: number;
+  try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { return false; }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.geteuid?.()) return false;
+    fchownSync(fd, owner.uid, owner.gid);
+    return true;
+  } finally { closeSync(fd); }
 }

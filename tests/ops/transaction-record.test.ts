@@ -7,9 +7,11 @@ import { opsCommand } from "../../ops/core/platform.ts";
 import { describePendingTransaction, loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { parseTransactionRecord, serializeTransactionRecord, transactionValueValid, type TransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// The Docker entries' Bash (with /proc, flock and GNU tools) does not run on macOS, which has its own launcher.
+const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : process.platform === "linux" ? Bun.which("bash") : null;
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const quotePS = (text: string) => "'" + text.replaceAll("'", "''") + "'";
 
@@ -49,7 +51,7 @@ test("事务记录逐键校验：重复、未知、缺失或非法的值拒绝�
 
 test("控制台按指针读取事务，数据已提交只看本事务的当前格式回执", async () => {
   const fixture = await tempFixture("transaction-pending-");
-  const root = fixture.root, state = join(root, "data/state"), snapshot = join(root, "backup/snapshots/deploy-abc123");
+  const root = fixture.root, state = join(root, "data/state"), snapshot = join(root, transactionDirectory("deploy-abc123"));
   try {
     await mkdir(state, { recursive: true }); await mkdir(snapshot, { recursive: true });
     expect(loadPendingTransaction(root)).toBeNull();

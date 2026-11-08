@@ -2,7 +2,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 const registered = !GlobalRegistrator.isRegistered;
-if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
+if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
 const { PushRecords } = await import("../../console/ui/src/push-records.tsx");
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
@@ -116,5 +116,25 @@ test("推送记录里的群：按群名列出，号码一栏写“群”，确�
     expect(rows).toEqual([["张三", "138****0001"], ["销售一部", "群"], ["客服", "群"]]);
     expect(root.textContent).toMatch(/已确认（首次 [^）]*09:30[^）]*，共点击 3 次）/);
     expect(button(root, "给没有答复的 1 个群重发卡片")).toBeDefined();
+  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+});
+
+test("推送记录翻页：「更早的推送」带上本页最后一条推送的创建时间和编号", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  const calls: unknown[] = [];
+  globalThis.fetch = (async (url: string, options?: RequestInit) => {
+    if (String(url) !== "/api/push/list") return new Response("{}");
+    const body = JSON.parse(String(options!.body)) as { before?: unknown };
+    calls.push(body);
+    return Response.json({ pushes: body.before ? [item("eeee2345", "closed", { createdAt: 5 })] : [item("dddd2345", "open", { createdAt: 7 }), item("ffff2345", "open", { createdAt: 7 })],
+      more: !body.before, totals: { sent: 3, followUps: 0, live: 2, delivered: 0, acked: 0, replyDelivered: 0, replied: 0 } });
+  }) as typeof fetch;
+  try {
+    render(<PushRecords />, root);
+    await until(() => root.textContent!.includes("推送ffff2345"));
+    button(root, "更早的推送").click();
+    await until(() => root.textContent!.includes("推送eeee2345"));
+    expect(calls).toEqual([{ group: null }, { group: null, before: { createdAt: 7, id: "ffff2345" } }]);
+    expect(button(root, "更早的推送")).toBeUndefined();
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });

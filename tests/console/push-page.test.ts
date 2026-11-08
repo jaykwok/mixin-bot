@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AuditLog } from "../../console/server/audit.ts";
-import { PushPage, servicePushSource } from "../../console/server/push-page.ts";
+import { PushPage, type PushSource, servicePushSource } from "../../console/server/push-page.ts";
 import type { RouteContext } from "../../console/server/routes.ts";
 import { PushRefused, type PushAdmin, type PushDetail, type PushListItem } from "../../src/push/service.ts";
 import { createApp } from "../../src/server/http-app.ts";
@@ -47,6 +47,12 @@ test("推送页：经本机控制接口读列表和详情，页面只见打码�
     expect(list.totals).toEqual(TOTALS);
     expect(calls.at(-1)).toEqual(["list", { group: "live", before: null, limit: 50 }]);
     await expect(run("POST /api/push/list", { group: "other" })).rejects.toThrow("筛选无效");
+    // The next page goes on after the last push shown: its creation time and ID.
+    await run("POST /api/push/list", { before: { createdAt: 5, id: ITEM.id } });
+    expect(calls.at(-1)).toEqual(["list", { group: null, before: { createdAt: 5, id: ITEM.id }, limit: 50 }]);
+    for (const before of [5, { createdAt: 5 }, { createdAt: 5, id: "../x" }, { createdAt: 5, id: ITEM.id, more: 1 }]) {
+      await expect(run("POST /api/push/list", { before })).rejects.toThrow("翻页位置无效");
+    }
     const detail = await run("POST /api/push/detail", { id: ITEM.id }) as { view: string; push: { target: string[]; cc: { key: string; phone: string }[] };
       recipients: { key: string; name: string; phone: string }[] };
     const text = JSON.stringify(detail);
@@ -79,6 +85,8 @@ test("推送页：经本机控制接口读列表和详情，页面只见打码�
     await expect(source.call("remind", { id: ITEM.id, members: "all" })).rejects.toThrow("members 必须是");
     await expect(source.call("detail", { id: "../x" })).rejects.toThrow("推送编号无效");
     await expect(source.call("list", { limit: 1000 })).rejects.toThrow("limit 超出范围");
+    await expect(source.call("list", { before: 5 })).rejects.toThrow("before 无效");
+    await expect(source.call("list", { before: { createdAt: 5, id: "../x" } })).rejects.toThrow("推送编号无效");
   } finally { await server.stop(true); await f.cleanup(); }
 });
 
@@ -130,6 +138,49 @@ test("推送页下载：先领一次性票据，浏览器取到机器人打的�
     expect(audit).toContain(`"scope":"push:${ITEM.id},member:138****0002"`);
     expect(audit).not.toContain(LI);
   } finally { await server.stop(true); await f.cleanup(); }
+});
+
+test("推送页下载：登录结束或代码变化时，进行中的下载立即停止，连同机器人一侧的传输，审计记为中断", async () => {
+  const f = await tempFixture("console-push-stop-");
+  try {
+    // The bot's side: an archive that streams for as long as it is read, and what stopped it.
+    const upstream = { signals: [] as AbortSignal[], cancelled: 0 };
+    const source: PushSource = {
+      call: async name => { if (name !== "detail") throw new Error(name); return DETAIL as unknown as Record<string, unknown>; },
+      package: async (_body, signal) => {
+        upstream.signals.push(signal);
+        return new Response(new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(new Uint8Array(1024)); }, cancel() { upstream.cancelled++; } },
+          { highWaterMark: 0 }));
+      },
+    };
+    const page = new PushPage(f.root, new AuditLog(join(f.root, "audit")), source);
+    const routes = page.routes();
+    const run = (route: string, body: unknown, session: string) => routes[route]!.run({ body, signal: new AbortController().signal, session: { label: session } } as RouteContext);
+    const start = async (session: string) => {
+      const detail = await run("POST /api/push/detail", { id: ITEM.id }, session) as { view: string };
+      const { url } = await run("POST /api/push/package", { view: detail.view, id: ITEM.id }, session) as { url: string };
+      const reader = (await page.download(url.slice("/download/".length), { session: { label: session }, signal: new AbortController().signal })).body!.getReader();
+      expect((await reader.read()).done).toBe(false);
+      return reader;
+    };
+    const mine = await start("s"), other = await start("t");
+    // Logout: that login's download stops with the bot's transfer; the other login's goes on.
+    page.end("s");
+    await expect(mine.read()).rejects.toThrow("登录已结束");
+    expect(upstream.signals.map(signal => signal.aborted)).toEqual([true, false]);
+    expect((await other.read()).done).toBe(false);
+    // The code changed: every download stops.
+    page.endAll("代码已变化，请重新运行控制台");
+    await expect(other.read()).rejects.toThrow("代码已变化");
+    expect(upstream.signals.map(signal => signal.aborted)).toEqual([true, true]);
+    await Bun.sleep(20);
+    expect(upstream.cancelled).toBe(2);
+    const audit = readdirSync(join(f.root, "audit")).map(name => readFileSync(join(f.root, "audit", name), "utf8")).join("");
+    expect(audit.match(/"action":"export-interrupted"/g)).toHaveLength(2);
+    expect(audit).toContain("登录已结束");
+    expect(audit).toContain("代码已变化");
+    expect(audit).not.toContain(`"action":"export-sent"`);
+  } finally { await f.cleanup(); }
 });
 
 test("推送页的群：群名单按随机键登记、改名和停用并记审计，拒绝原样转达；接收人里的群按群名列出，补推送和下载按键找回群", async () => {

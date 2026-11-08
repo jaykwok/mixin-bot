@@ -1,7 +1,8 @@
-// The summary package of a closed push (push-plan-20261103.md section 8): a workbook with one row per recipient (a group
+// The summary package of a closed push: a workbook with one row per recipient (a group
 // is one row, with who replied), and per recipient a folder with the reply text and the reply attachments of the
-// submission in effect. A package larger than one file may be (the native limit, or the relay's when one is configured)
-// is split into numbered archives; an attachment that alone does not fit is listed as not packed.
+// submission in effect. Phones are masked everywhere in it: it goes to the pusher, the CCs and the console. A package
+// larger than one file may be (the native limit, or the relay's when one is configured) is split into numbered
+// archives; an attachment that alone does not fit is listed as not packed.
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { access, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -25,8 +26,6 @@ export type SummaryInput = {
   /** Largest archive one send may carry. */
   partBytes: number;
   now: number;
-  /** How phones are written (the console's packages mask them). */
-  phone?: (phone: string) => string;
   /** Stops the copying into the archives. */
   signal?: AbortSignal;
 };
@@ -56,12 +55,13 @@ export function senders(items: readonly ReplyItem[]): string[] {
   return [...new Map(items.flatMap(item => item.sender ? [[item.sender, item.senderName ?? item.sender] as const] : [])).values()];
 }
 
-/** A phone as the console shows it by default: the first three and the last four digits. */
-export const maskPhone = (phone: string) => phone.length <= 7 ? (phone.length <= 2 ? phone : `${phone.slice(0, 1)}***`) : `${phone.slice(0, 3)}****${phone.slice(-4)}`;
+/** A phone as the package writes it: the first three and the last four digits. */
+const maskPhone = (phone: string) => phone.length <= 7 ? (phone.length <= 2 ? phone : `${phone.slice(0, 1)}***`) : `${phone.slice(0, 3)}****${phone.slice(-4)}`;
 
 /** Where a held attachment's file is (still held, or recorded when the hold was released), or why it is not there. */
 async function located(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): Promise<{ path: string; size: number } | { missing: string }> {
   if (item.error) return { missing: item.error };
+  if (!item.attachment && !item.path) return { missing: "还在接收" };
   const file = (item.attachment ? files.get(item.attachment) : undefined) ?? (item.path ? { state: "ready", path: item.path } : undefined);
   if (!file) return { missing: "附件记录已不存在" };
   if (file.state === "pending") return { missing: "还在下载" };
@@ -75,7 +75,7 @@ type Entry = { name: string; size: number } & ({ path: string } | { data: Uint8A
 const entrySize = (entry: Entry) => ENTRY_OVERHEAD + 2 * Buffer.byteLength(entry.name) + entry.size;
 
 export async function buildSummary(input: SummaryInput): Promise<SummaryPackage> {
-  const { push, recipients, items, now } = input, phone = input.phone ?? (value => value);
+  const { push, recipients, items, now } = input, phone = maskPhone;
   const limit = Math.min(input.partBytes, ZIP_MAX);
   const base = safeFileName(`推送汇总-${push.subject}-${push.id}`);
   const workbookName = `${base}.xlsx`, workbook = join(input.dir, workbookName);

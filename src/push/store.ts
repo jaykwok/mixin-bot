@@ -355,15 +355,15 @@ export class PushStore {
       .all(...states) as Row[]).map(decodePush);
   }
 
-  /** The console's list: newest first, before a creation time, optionally only some states. */
-  page(states: readonly PushState[] | null, before: number | null, limit: number): Push[] {
-    const where = [...(states ? [`state IN (${states.map(() => "?").join(", ")})`] : []), ...(before === null ? [] : ["created_at < ?"])];
+  /** The console's list: newest first, then by ID; after `before` (the last push of the page before), optionally only some states. */
+  page(states: readonly PushState[] | null, before: Pick<Push, "createdAt" | "id"> | null, limit: number): Push[] {
+    const where = [...(states ? [`state IN (${states.map(() => "?").join(", ")})`] : []), ...(before === null ? [] : ["(created_at < ? OR (created_at = ? AND id > ?))"])];
     return (this.db.query(`SELECT * FROM pushes ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC, id LIMIT ?`)
-      .all(...states ?? [], ...(before === null ? [] : [before]), limit) as Row[]).map(decodePush);
+      .all(...states ?? [], ...(before === null ? [] : [before.createdAt, before.createdAt, before.id]), limit) as Row[]).map(decodePush);
   }
 
   /**
-   * The console's totals (plan section 9) over the pushes kept here: those that went out, and over the closed ones the
+   * The console's totals over the pushes kept here: those that went out, and over the closed ones the
    * delivered recipients (a person or a group each) that confirmed (「已收到」, a choice, or 「回复」) and, of the pushes
    * asking for a reply, that replied. A push deleted in the console no longer counts.
    */

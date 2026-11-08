@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promise
 import { join } from "node:path";
 import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
 import { parseTransactionRecord, serializeTransactionRecord, type TransactionRecord } from "../../ops/core/transaction-record.ts";
-import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { assertConfirmedTransaction, confirmTransaction, readTransaction, transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 import { recoveryView } from "../../ops/core/recovery-plan.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -11,7 +11,7 @@ const record: TransactionRecord = { format: "2", operation: "upgrade", snapshot:
   original_sha: "b".repeat(40), original_branch: "main", original_workspace_root: "", target_workspace_root: "",
   was_running: "1", bot_port: "2022", reconfigure_ai: "0" };
 async function fixture() {
-  const f = await tempFixture("core-deployment-state-"), state = join(f.root, "data/state"), snapshot = join(f.root, "backup/snapshots", record.snapshot);
+  const f = await tempFixture("core-deployment-state-"), state = join(f.root, "data/state"), snapshot = join(f.root, transactionDirectory(record.snapshot));
   await mkdir(state, { recursive: true }); await mkdir(snapshot, { recursive: true });
   await writeFile(join(state, "deploy-transaction"), record.snapshot + "\n");
   await writeFile(join(snapshot, "transaction"), serializeTransactionRecord(record));
@@ -77,7 +77,7 @@ test("确认摘要覆盖候选镜像、服务身份、任务 daemon 与验证标
       const path = join(name === "verify-only" ? f.state : f.snapshot, name);
       await writeFile(path, "first\n");
       const captured = readTransaction(f.root)!, token = confirmTransaction(captured, "continue");
-      const key = name === "verify-only" ? "data/state/verify-only" : "backup/snapshots/" + record.snapshot + "/" + name;
+      const key = name === "verify-only" ? "data/state/verify-only" : transactionDirectory(record.snapshot) + "/" + name;
       expect(captured.text(key)).toBe("first\n");
       expect(() => assertConfirmedTransaction(f.root, "continue", token)).not.toThrow();
       await writeFile(path, "second\n");

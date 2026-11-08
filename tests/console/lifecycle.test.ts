@@ -5,12 +5,12 @@ import { recoveryPlan, recoveryView, assertLifecycleTarget } from "../../ops/cor
 import { operationArgs, operationScope } from "../../ops/core/operations.ts";
 import { operationPreparer } from "../../console/server/prepare-operation.ts";
 import { Views } from "../../console/server/views.ts";
-import { assertConfirmedTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { assertConfirmedTransaction, transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 async function fixture() {
   const f = await tempFixture("console-recovery-");
-  const state = join(f.root, "data/state"), id = "deploy-" + "a".repeat(32), snapshot = join(f.root, "backup/snapshots", id);
+  const state = join(f.root, "data/state"), id = "deploy-" + "a".repeat(32), snapshot = join(f.root, transactionDirectory(id));
   mkdirSync(state, { recursive: true }); mkdirSync(snapshot, { recursive: true });
   writeFileSync(join(state, "deploy-transaction"), id);
   writeFileSync(join(snapshot, "transaction"), Object.entries({ format: "2", operation: "deploy", snapshot: id, target_sha: "a".repeat(40), original_sha: "",

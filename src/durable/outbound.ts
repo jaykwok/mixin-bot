@@ -1,4 +1,4 @@
-// What the service sends, and how a reply context shapes it (plan 5.4).
+// What the service sends, and how a reply context shapes it.
 //
 // Group: every message is Markdown; the first segment of a reply or notice starts with the summary line
 // `> 回复 <name>：<question>`, and that of a final reply or a terminal error also @-mentions the sender (`a[].i`,
@@ -35,7 +35,7 @@ export function platformOutbound(client: PlatformClient, sender: MessageSender):
   };
 }
 
-/** Messages older than this when received are maintenance redeliveries (plan 2.7). */
+/** Messages older than this when received are maintenance redeliveries (the platform redelivers after an outage). */
 const LATE_MS = 60_000;
 
 export function lateMinutes(reply: ReplyContext): number | undefined {

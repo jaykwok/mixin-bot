@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EntryDraft } from "@earendil-works/pi-durable";
-import { PUSH_LIMITS, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput } from "../../src/push/service.ts";
+import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput } from "../../src/push/service.ts";
 import { type Grants, PushStore } from "../../src/push/store.ts";
 import { scopeKey } from "../../src/core/layout.ts";
 import { DepartmentTree, emptyWalk } from "../../src/integrations/open-platform/department-tree.ts";
@@ -44,8 +44,8 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   const sent: Sent[] = [], uploads: { name: string; data: Buffer }[] = [], reports: unknown[] = [];
   const clock = { now: START };
   const failing: { when?: (item: Sent) => SendOutcome | undefined } = {};
-  /** Recipients' card sends: a wait each, clock time each, and how many were under way at once. */
-  const gate = { delayMs: 0, advanceMs: 0, inFlight: 0, max: 0 };
+  /** Recipients' card sends: a wait each, clock time each, and how many were under way at once; while `held` is set they wait for it too. */
+  const gate = { delayMs: 0, advanceMs: 0, inFlight: 0, max: 0, held: null as Promise<void> | null };
   const outbound: Outbound = {
     async send(target, message, sendOptions) {
       const item: Sent = { to: target.receiveId, kind: target.kind, message, ...(sendOptions ? { options: sendOptions } : {}) };
@@ -56,6 +56,7 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
         gate.inFlight--;
         clock.now += gate.advanceMs;
       }
+      if (gate.held && message.msgType === "card" && target.receiveId !== im(PUSHER)) await gate.held;
       return failing.when?.(item) ?? { status: "sent" };
     },
     sequence(target, work) { return work((message, sendOptions) => outbound.send(target, message, sendOptions)); },
@@ -77,15 +78,21 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   const records = new Map<string, MemberRecords>();
   const notes: { scope: string; phone: string; requestId: string; entry: EntryDraft }[] = [];
   const attached: InboundAttachment[] = [], released: { phone: string; holder: string; ids: string[] }[] = [];
+  /** Registrations wait for `gate` while it is set (still under way); with `pending` they leave the download to `finishDownload`. */
+  const registering: { gate: Promise<void> | null; pending: boolean } = { gate: null, pending: false };
   const host: PushHost = {
     async attach(message): Promise<AttachResult> {
       attached.push(message);
+      if (registering.gate) await registering.gate;
       const id = `att-${message.reply.msgUid}`, path = join(root, "files", `${id}.bin`);
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, `content of ${message.attachment.name}`);
+      if (!registering.pending) {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, `content of ${message.attachment.name}`);
+      }
       const own = records.get(message.phone) ?? { requests: {}, attachments: {} };
       own.attachments[id] = { id, msgUid: message.reply.msgUid, receivedAt: clock.now, epoch: 0, fileId: message.attachment.fileId, kind: message.attachment.kind,
-        name: message.attachment.name, reply: message.reply, state: "ready", path, at: clock.now, ...(message.hold ? { heldBy: message.hold } : {}) } satisfies Attachment;
+        name: message.attachment.name, reply: message.reply, at: clock.now, ...(registering.pending ? { state: "pending" } : { state: "ready", path }),
+        ...(message.hold ? { heldBy: message.hold } : {}) } satisfies Attachment;
       records.set(message.phone, own);
       return { status: "accepted", attachment: id };
     },
@@ -101,6 +108,16 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
       const key = scopeKey(scope);
       if (!notes.some(note => note.scope === key && note.requestId === requestId && note.phone === phone)) notes.push({ scope: key, phone, requestId, entry });
     },
+  };
+  /** The downloader finishing a pending attachment: `ready` only while the record is still pending (as src/durable/attachments.ts commits it), else the file is dropped. */
+  const finishDownload = async (phone: string, id: string): Promise<boolean> => {
+    const stored = records.get(phone)?.attachments[id];
+    if (stored?.state !== "pending") return false;
+    const path = join(root, "files", `${id}.bin`);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `content of ${stored.name}`);
+    Object.assign(stored, { state: "ready", path, at: clock.now });
+    return true;
   };
   const abort = new AbortController();
   const make = () => {
@@ -155,7 +172,8 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   });
   const groupText = (groupId: string, phone: string, value: string, context = groupReply(groupId, phone)) => service.groupText(groupId, byPhone.get(phone)!, context, value);
   return {
-    root, store, sent, uploads, reports, clock, failing, gate, records, notes, attached, released, abort, reply, identity, cards, texts, files, card, buttonOf, click,
+    root, store, sent, uploads, reports, clock, failing, gate, records, notes, attached, released, registering, finishDownload, abort, reply, identity, cards, texts,
+    files, card, buttonOf, click,
     settle, prepare, pushId, tree, grant, groupReply, groupCards, groupTexts, groupClick, groupText, get service() { return service; },
     async restart() { await service.close(); service = make(); },
     async close() { await service.close(); },
@@ -711,6 +729,254 @@ test("the pusher named as a CC gets the pusher's one summary", async () => {
   } finally { await h.close(); }
 });
 
+/** One summary archive (default: the last uploaded): its entries as text and the workbook's sheet. */
+async function summaryArchive(h: Harness, upload = h.uploads.at(-1)!): Promise<{ files: Map<string, string>; sheet: string }> {
+  const zip = join(fixture.root, `summary-${++counter}.zip`), workbook = join(fixture.root, `book-${++counter}.xlsx`);
+  await writeFile(zip, upload.data);
+  const entries = readZip(zip);
+  await writeFile(workbook, entries[0]!.data);
+  return { files: new Map(entries.map(entry => [entry.name, entry.data.toString("utf8")])),
+    sheet: readZip(workbook).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8") };
+}
+
+/** Wait for `done` without waiting for all the service's work (a registration held at its gate is part of it). */
+async function until(done: () => boolean): Promise<void> {
+  for (let round = 0; round < 2000 && !done(); round++) await Bun.sleep(5);
+  expect(done()).toBe(true);
+}
+
+test("summary: the archive sent at the end masks phones in the workbook and in the reply texts", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }], cc: [{ name: "王五", phone: WANG }] });
+    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    await h.settle();
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
+    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
+    await h.settle();
+    expect(h.store.push(id)!.summaryState).toBe("sent");
+    // The pusher's archive and the CC's.
+    expect(h.uploads).toHaveLength(2);
+    for (const upload of h.uploads) {
+      const { files, sheet } = await summaryArchive(h, upload);
+      expect(sheet).toContain("138****0001");
+      expect(sheet).not.toContain(ZHANG);
+      expect(files.get("回复/001-张三-0001/回复.txt")).toStartWith("张三（138****0001）的回复");
+    }
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("summary: a reply attachment still downloading holds it back; then it is packed and its hold released", async () => {
+  const h = harness();
+  try {
+    h.registering.pending = true;
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
+    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    await h.settle();
+    const file = h.reply(ZHANG), att = `att-${file.msgUid}`;
+    expect(h.service.directAttachment(h.identity(ZHANG), file, { fileId: "f-1", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
+    await h.settle();
+    // 已回复 answers the last one: the push closes while the file is still downloading.
+    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
+    await h.settle();
+    h.service.tick();
+    await h.settle();
+    expect([h.store.push(id)!.state, h.store.push(id)!.summaryState, h.uploads.length]).toEqual(["closed", "pending", 0]);
+    expect(h.records.get(ZHANG)!.attachments[att]!.heldBy).toBe(`push:${id}`);
+    // Downloaded: the next check sends the summary with the file, then releases the hold.
+    expect(await h.finishDownload(ZHANG, att)).toBe(true);
+    h.service.tick();
+    await h.settle();
+    const push = h.store.push(id)!;
+    expect([push.summaryState, push.summaryAttempts, push.released]).toEqual(["sent", 0, true]);
+    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/01-盘点.xlsx")).toBe("content of 盘点.xlsx");
+    expect(h.records.get(ZHANG)!.attachments[att]).toBeUndefined();
+    expect(h.store.items(id, ZHANG).find(item => item.kind === "file")!.path).toEndWith(`${att}.bin`);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("summary: after the wait it goes out without a file still downloading; the hold stays until the download ends, then the console's package has the file", async () => {
+  const h = harness();
+  try {
+    h.registering.pending = true;
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
+    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    await h.settle();
+    const file = h.reply(ZHANG), att = `att-${file.msgUid}`;
+    expect(h.service.directAttachment(h.identity(ZHANG), file, { fileId: "f-1", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
+    await h.settle();
+    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
+    await h.settle();
+    h.clock.now += PUSH_LIMITS.settleWaitMs;
+    h.service.tick();
+    await h.settle();
+    expect([h.store.push(id)!.summaryState, h.store.push(id)!.released]).toEqual(["sent", false]);
+    expect(h.store.push(id)!.summaryText).toContain("有 1 个附件没能打包");
+    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/回复.txt")).toContain("盘点.xlsx：未打包，还在下载");
+    h.service.tick();
+    await h.settle();
+    expect(h.records.get(ZHANG)!.attachments[att]!.heldBy).toBe(`push:${id}`);
+    // The download ends: the next check releases the hold, and the file stays packable.
+    expect(await h.finishDownload(ZHANG, att)).toBe(true);
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.released).toBe(true);
+    expect(h.records.get(ZHANG)!.attachments[att]).toBeUndefined();
+    const pack = await h.service.package(id);
+    try { expect(readZip(pack.path).map(entry => entry.name)).toContain("回复/001-张三-0001/01-盘点.xlsx"); } finally { await pack.done(); }
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("summary: a reply attachment still registering holds it back; one registered only after the summary went out is released all the same", async () => {
+  const h = harness();
+  let open = () => {};
+  const gate = () => { h.registering.gate = new Promise(resolve => { open = () => { h.registering.gate = null; resolve(); }; }); };
+  try {
+    // 甲: the registration ends within the wait, and the summary follows it.
+    const a = await confirmed(h, { mode: "reply", subject: "甲", recipients: [{ name: "张三", phone: ZHANG }] });
+    h.click(ZHANG, h.card(ZHANG, a), "回复", "card-a");
+    await h.settle();
+    gate();
+    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-1", kind: "file", name: "甲.xlsx", size: 20 })).toBe(true);
+    h.click(ZHANG, h.card(ZHANG, a), "已回复", "card-a");
+    expect(h.store.push(a)!.state).toBe("closed");
+    h.service.tick();
+    await Bun.sleep(100);
+    expect([h.store.push(a)!.summaryState, h.uploads.length]).toEqual(["pending", 0]);
+    open();
+    await h.settle();
+    expect([h.store.push(a)!.summaryState, h.store.push(a)!.released]).toEqual(["sent", true]);
+    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/01-甲.xlsx")).toBe("content of 甲.xlsx");
+    // 乙: the registration ends after the summary went out at the end of the wait; its hold is released, not kept for ever.
+    const b = await confirmed(h, { mode: "reply", subject: "乙", recipients: [{ name: "张三", phone: ZHANG }] });
+    h.click(ZHANG, h.card(ZHANG, b), "回复", "card-b");
+    await h.settle();
+    gate();
+    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-2", kind: "file", name: "乙.xlsx", size: 20 })).toBe(true);
+    h.click(ZHANG, h.card(ZHANG, b), "已回复", "card-b");
+    h.clock.now += PUSH_LIMITS.settleWaitMs;
+    h.service.tick();
+    await until(() => h.store.push(b)!.summaryState === "sent");
+    await Bun.sleep(100);
+    expect(h.store.push(b)!.released).toBe(false);
+    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/回复.txt")).toContain("乙.xlsx：未打包，还在接收");
+    open();
+    await h.settle();
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(b)!.released).toBe(true);
+    expect(Object.values(h.records.get(ZHANG)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+    expect(h.reports).toEqual([]);
+  } finally { open(); await h.close(); }
+});
+
+/** A 补推送 begun 1 ms before the deadline whose result is held back (`held.open` lets it return), with the timer having ended the push. */
+async function cardSendingAtDeadline(h: Harness, held: { open: () => void }): Promise<string> {
+  const id = await confirmed(h, { recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-03 09:10" });
+  h.gate.held = new Promise(resolve => { held.open = () => { h.gate.held = null; resolve(); }; });
+  h.clock.now = h.store.push(id)!.deadline - 1;
+  await h.service.remind(id, [ZHANG]);
+  expect(h.store.recipient(id, ZHANG)!.sendState).toBe("sending");
+  h.clock.now += 1;
+  h.service.tick();
+  await Bun.sleep(100);
+  expect(h.store.push(id)!.state).toBe("closed");
+  return id;
+}
+
+test("summary: a card still being sent at the deadline holds it back; delivered after the deadline, it counts", async () => {
+  const h = harness(), held = { open: () => {} };
+  try {
+    const id = await cardSendingAtDeadline(h, held);
+    expect([h.store.push(id)!.summaryState, h.uploads.length]).toEqual(["pending", 0]);
+    held.open();
+    await h.settle();
+    expect(h.store.recipient(id, ZHANG)!.sendState).toBe("sent");
+    expect(h.store.push(id)!.summaryState).toBe("sent");
+    expect(h.store.push(id)!.summaryText).toContain("共 1 人；已确认 0，未确认 1");
+    expect(h.store.push(id)!.summaryText).toContain("未确认：张三");
+    expect(h.reports).toEqual([]);
+  } finally { held.open(); await h.close(); }
+});
+
+test("summary: a card refused after the deadline counts as failed and is not tried again; one uncertain counts as delivered and says so", async () => {
+  const h = harness(), held = { open: () => {} };
+  try {
+    const refused = await cardSendingAtDeadline(h, held);
+    expect(h.store.push(refused)!.summaryState).toBe("pending");
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "failed", reason: "HTTP 500" } : undefined;
+    held.open();
+    await h.settle();
+    expect(h.store.recipient(refused, ZHANG)).toMatchObject({ sendState: "failed", sendError: "HTTP 500", retryAt: null });
+    expect(h.store.push(refused)!.summaryText).toContain("共 1 人（发送失败 1）；已确认 0，未确认 0");
+    h.failing.when = undefined;
+
+    h.clock.now = START;
+    const unknown = await cardSendingAtDeadline(h, held);
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "uncertain", reason: "timeout" } : undefined;
+    held.open();
+    await h.settle();
+    expect(h.store.recipient(unknown, ZHANG)!.sendState).toBe("uncertain");
+    expect(h.store.push(unknown)!.summaryText).toContain("未确认 1");
+    expect(h.store.push(unknown)!.summaryText).toContain("有 1 张卡片发送结果未知，按已发出统计");
+    expect(h.reports).toEqual([]);
+  } finally { held.open(); await h.close(); }
+});
+
+test("summary: a card with no result when the wait ends is unknown for good; a result arriving after that changes nothing the summary said", async () => {
+  const h = harness(), held = { open: () => {} };
+  try {
+    const id = await cardSendingAtDeadline(h, held);
+    h.clock.now += PUSH_LIMITS.settleWaitMs;
+    h.service.tick();
+    await until(() => h.store.push(id)!.summaryState === "sent");
+    expect(h.store.recipient(id, ZHANG)).toMatchObject({ sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
+    const text = h.store.push(id)!.summaryText!;
+    expect(text).toContain("未确认 1");
+    expect(text).toContain("有 1 张卡片发送结果未知，按已发出统计");
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "failed", reason: "HTTP 500" } : undefined;
+    held.open();
+    await h.settle();
+    h.service.tick();
+    await h.settle();
+    expect(h.store.recipient(id, ZHANG)).toMatchObject({ sendState: "uncertain", sendError: "截止后一直没有得到发送结果", retryAt: null });
+    expect(h.store.push(id)!.summaryText).toBe(text);
+    expect(h.reports).toEqual([]);
+  } finally { held.open(); await h.close(); }
+});
+
+test("summary: a process that ended during the wait for a card leaves it unknown, and the summary goes out at the next start", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-03 09:10" });
+    h.store.updateRecipient(id, ZHANG, { sendState: "sending" });
+    h.clock.now = h.store.push(id)!.deadline;
+    h.service.tick();
+    await h.settle();
+    expect([h.store.push(id)!.state, h.store.push(id)!.summaryState]).toEqual(["closed", "pending"]);
+    await h.restart();
+    await h.settle();
+    expect(h.store.recipient(id, ZHANG)!.sendState).toBe("uncertain");
+    expect(h.store.push(id)!.summaryState).toBe("sent");
+    expect(h.store.push(id)!.summaryText).toContain("未确认 1");
+  } finally { await h.close(); }
+});
+
+test("a send the shutdown cancels after the deadline is not left to go out again: the push has ended, the card counts as not sent", async () => {
+  const h = harness(), held = { open: () => {} };
+  try {
+    const id = await cardSendingAtDeadline(h, held);
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "failed", reason: "发送前已取消" } : undefined;
+    h.abort.abort();
+    held.open();
+    await h.service.idle();
+    expect(h.store.recipient(id, ZHANG)).toMatchObject({ sendState: "failed", sendError: "截止前没有发出", retryAt: null });
+  } finally { held.open(); await h.close(); }
+});
+
 test("confirming: a given deadline that has passed cancels the push; a default one starts now", async () => {
   const h = harness();
   try {
@@ -844,7 +1110,7 @@ test("console: the list pages newest first by state; one push shows every recipi
     await h.settle();
     const first = h.service.list({ group: null, before: null, limit: 2 });
     expect([first.pushes.map(push => push.id), first.more]).toEqual([[c, b], true]);
-    const rest = h.service.list({ group: null, before: first.pushes.at(-1)!.createdAt, limit: 2 });
+    const rest = h.service.list({ group: null, before: { createdAt: first.pushes.at(-1)!.createdAt, id: first.pushes.at(-1)!.id }, limit: 2 });
     expect([rest.pushes.map(push => push.id), rest.more]).toEqual([[a], false]);
     expect(h.service.list({ group: "live", before: null, limit: 10 }).pushes.map(push => [push.id, push.counts]))
       .toEqual([[a, { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1, replying: 0 }]]);
@@ -869,6 +1135,23 @@ test("console: the list pages newest first by state; one push shows every recipi
     expect(h.service.list({ group: null, before: null, limit: 10 }).totals)
       .toEqual({ sent: 1, followUps: 0, live: 0, delivered: 2, acked: 1, replyDelivered: 2, replied: 1 });
     expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("console: pushes created in the same millisecond page through without a gap or a repeat", async () => {
+  const h = harness();
+  try {
+    const ids: string[] = [];
+    for (let n = 0; n < 52; n++) ids.push(h.pushId(await h.prepare({ subject: `同时 ${n}` })));
+    const seen: string[] = [];
+    let before: PushCursor | null = null, pages = 0;
+    do {
+      const page = h.service.list({ group: null, before, limit: 50 }), last = page.pushes.at(-1);
+      seen.push(...page.pushes.map(push => push.id));
+      before = page.more && last ? { createdAt: last.createdAt, id: last.id } : null;
+    } while (before && ++pages < 5);
+    expect([seen.length, new Set(seen).size]).toEqual([52, 52]);
+    expect(seen.sort()).toEqual(ids.sort());
   } finally { await h.close(); }
 });
 
@@ -1105,6 +1388,66 @@ test("group push: /取消 drops the group's draft; the deadline submits one with
     const followUp = h.store.push(id)!.followUp!;
     expect(h.store.push(followUp)!.target.groups).toEqual([{ id: G1, name: "销售一部" }]);
     expect(previewOf(h, followUp).content).toContain(`**对象**：推送编号 ${id} 中没有答复的：群 销售一部`);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("deadline: a click, an attachment or a group text after the deadline, before the timer has run, ends the push at its deadline and counts for nothing", async () => {
+  const h = harness();
+  try {
+    // ack: the last 已收到 a second after the deadline does not complete the push.
+    const a = await confirmed(h, { subject: "甲", deadline: "2026-11-04 18:00" });
+    h.click(ZHANG, h.card(ZHANG, a), "已收到", "card-zhang-a");
+    await h.settle();
+    h.clock.now = h.store.push(a)!.deadline + 1000;
+    h.click(LI, h.card(LI, a), "已收到", "card-li-a");
+    await h.settle();
+    expect([h.store.push(a)!.state, h.store.push(a)!.closeReason, h.store.recipient(a, LI)!.ackedAt]).toEqual(["closed", "deadline", null]);
+    expect(summaryOf(h).content).toContain("未确认：李四");
+    // reply: an attachment at the deadline is neither recorded nor registered; the draft is submitted as the deadline submits it.
+    const b = await confirmed(h, { subject: "乙", mode: "reply", deadline: "2026-11-05 18:00" });
+    h.click(ZHANG, h.card(ZHANG, b), "回复", "card-zhang-b");
+    await h.settle();
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "截止前发的")).toBe(true);
+    await h.settle();
+    h.clock.now = h.store.push(b)!.deadline;
+    const attached = h.attached.length;
+    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-late", kind: "file", name: "晚了.xlsx", size: 20 })).toBe(true);
+    await h.settle();
+    expect([h.store.push(b)!.state, h.store.push(b)!.closeReason, h.attached.length]).toEqual(["closed", "deadline", attached]);
+    expect(h.store.items(b, ZHANG).map(item => item.text ?? item.name)).toEqual(["截止前发的"]);
+    expect(h.texts(ZHANG).some(text => text.includes("「乙」已到截止时间，你已发送的内容（文字 1 段）按已回复提交"))).toBe(true);
+    expect(h.texts(ZHANG).at(-1)).toBe("「乙」已过截止时间，这个附件没有记入回复。");
+    // A group: a text after the deadline ends the push and is not the group's reply.
+    roles(h, { group: true });
+    h.groupText(G1, WANG, "你好");
+    h.service.saveGroup(G1, { name: "销售一部", state: "registered" });
+    const c = await confirmed(h, { subject: "丙", mode: "reply", recipients: [], groups: [{ name: "销售一部" }], deadline: "2026-11-06 18:00" });
+    h.groupClick(G1, h.groupCards(G1).at(-1)!, "回复", "card-g1");
+    await h.settle();
+    h.clock.now = h.store.push(c)!.deadline;
+    expect(h.groupText(G1, WANG, "截止后才发")).toBe(true);
+    await h.settle();
+    expect([h.store.push(c)!.state, h.store.push(c)!.closeReason, h.store.items(c)]).toEqual(["closed", "deadline", []]);
+    expect(h.groupTexts(G1).at(-1)).toContain("「丙」已过截止时间，这条消息没有记入回复。");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("deadline: past it, the console's 补推送 ends the push instead of sending cards, and a question gets no reply hint for it", async () => {
+  const h = harness();
+  try {
+    const a = await confirmed(h, { subject: "甲", deadline: "2026-11-04 18:00" });
+    h.clock.now = h.store.push(a)!.deadline;
+    const cards = h.cards(LI).length;
+    await expect(h.service.remind(a)).rejects.toThrow("已经截止");
+    await h.settle();
+    expect([h.store.push(a)!.state, h.store.push(a)!.closeReason, h.cards(LI).length]).toEqual(["closed", "deadline", cards]);
+    const b = await confirmed(h, { subject: "乙", mode: "reply", deadline: "2026-11-05 18:00", recipients: [{ name: "张三", phone: ZHANG }] });
+    h.clock.now = h.store.push(b)!.deadline;
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "一个问题")).toBe(false);
+    await h.settle();
+    expect(h.texts(ZHANG).filter(text => text.includes("推送待回复"))).toEqual([]);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });

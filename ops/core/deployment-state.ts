@@ -1,5 +1,5 @@
 // One captured disk state for the host workflow and the recovery UI. Child stdout is never a commit receipt.
-import { readTransaction, type TransactionReadSet } from "../lib/confirmed-transaction.ts";
+import { readTransaction, transactionDirectory, type TransactionReadSet } from "../lib/confirmed-transaction.ts";
 import { parseTransactionRecord, TRANSACTION_NAME, type TransactionRecord } from "./transaction-record.ts";
 import { parseDeploymentExecution, type DeploymentExecution } from "./deployment-contract.ts";
 import { OPS_DEPLOYMENT_FILE, readOpsDeploymentRecord } from "../../src/core/ops-deployment-state.ts";
@@ -46,7 +46,7 @@ export function loadDeploymentState(project: string): DeploymentState | null {
   const upgrade = confirmation.text("data/state/upgrade-transaction")?.trim();
   if (deploy && upgrade && deploy !== upgrade) throw new Error("部署与升级指针不一致，不能选择其中一个执行");
   const snapshot = (upgrade ?? deploy)!;
-  const directory = "backup/snapshots/" + snapshot + "/", text = confirmation.text(directory + "transaction");
+  const text = confirmation.text(transactionDirectory(snapshot) + "/transaction");
   if (text === null) throw new Error("事务格式不匹配，请用对应版本完成原操作");
   const record = parseTransactionRecord(text);
   if (record.snapshot !== snapshot) throw new Error("事务记录与快照不一致");

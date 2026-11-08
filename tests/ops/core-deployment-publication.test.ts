@@ -11,6 +11,7 @@ import { MaintenanceRefused } from "../../ops/core/maintenance.ts";
 import type { OpsResult } from "../../ops/core/result.ts";
 import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 type Hooks = { start?(context: DeploymentContext<UpgradeInput>): void; capture?(context: DeploymentContext<UpgradeInput>): void };
 const other = { format: "2", operation: "upgrade", snapshot: "deploy-other", target_sha: "c".repeat(40), original_sha: "d".repeat(40), original_branch: "main",
@@ -58,7 +59,8 @@ test("新事务发布：名称已被占用时拒绝且不动原有内容；发�
       const input: UpgradeInput = { operation: "upgrade", original: "a".repeat(40), target: "b".repeat(40), branch: "main", plan, command: "update" };
       const result = await runDeploymentHost(input, { project, source: pinned.root, async verify() {}, async finish(value) { results.push(value); },
         output: () => {} }, platform(hooks));
-      const snapshots = existsSync(join(project, "backup/snapshots")) ? readdirSync(join(project, "backup/snapshots")) : [];
+      const records = join(project, transactionDirectory("x"), "..");
+      const snapshots = existsSync(records) ? readdirSync(records).filter(entry => entry.startsWith("deploy-")) : [];
       return { project, result, results, snapshots };
     };
 
@@ -69,12 +71,12 @@ test("新事务发布：名称已被占用时拒绝且不动原有内容；发�
 
     value = await run({ start: context => { name = context.name; mkdirSync(context.snapshot, { recursive: true }); writeFileSync(join(context.snapshot, "someone"), "keep"); } });
     expect(value.result).toMatchObject({ outcome: "refused", message: "事务名称已有快照，未采用此快照名称" });
-    expect(readFileSync(join(value.project, "backup/snapshots", name, "someone"), "utf8")).toBe("keep");
+    expect(readFileSync(join(value.project, transactionDirectory(name), "someone"), "utf8")).toBe("keep");
 
     // Another transaction published its pointer while this one captured: the copy is no transaction's material and goes.
     value = await run({ capture: context => {
-      mkdirSync(join(context.project, "backup/snapshots", other.snapshot), { recursive: true });
-      writeFileSync(join(context.project, "backup/snapshots", other.snapshot, "transaction"), serializeTransactionRecord(other));
+      mkdirSync(join(context.project, transactionDirectory(other.snapshot)), { recursive: true });
+      writeFileSync(join(context.project, transactionDirectory(other.snapshot), "transaction"), serializeTransactionRecord(other));
       mkdirSync(join(context.project, "data/state"), { recursive: true }); writeFileSync(join(context.project, "data/state/upgrade-transaction"), other.snapshot + "\n");
     } });
     expect(value.result).toMatchObject({ outcome: "refused", message: "准备期间出现另一事务，未发布本次快照" });

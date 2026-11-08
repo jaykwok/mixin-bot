@@ -10,6 +10,7 @@ import { CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts"
 import { OPS_MAINTENANCE_FILE } from "../../src/core/ops-maintenance-state.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 const repo = fileURLToPath(new URL("../../", import.meta.url));
 const ps = (value: string) => "'" + value.replaceAll("'", "''") + "'";
@@ -26,9 +27,9 @@ async function project(root: string, setup: Setup) {
   await mkdir(join(root, "data/config"), { recursive: true });
   await writeFile(join(root, "data/config/marker"), "keep");
   if (setup === "transaction") {
-    await mkdir(join(root, "backup/snapshots", record.snapshot), { recursive: true });
+    await mkdir(join(root, transactionDirectory(record.snapshot)), { recursive: true });
     await writeFile(join(root, "data/state/upgrade-transaction"), record.snapshot + "\n");
-    await writeFile(join(root, "backup/snapshots", record.snapshot, "transaction"), serializeTransactionRecord(record));
+    await writeFile(join(root, transactionDirectory(record.snapshot), "transaction"), serializeTransactionRecord(record));
   }
   if (setup === "maintenance") await writeFile(join(root, OPS_MAINTENANCE_FILE), JSON.stringify({ version: 1, checkpoint }));
   if (setup === "finished-maintenance") await writeFile(join(root, OPS_MAINTENANCE_FILE), JSON.stringify({ version: 1, checkpoint, result: finished }));

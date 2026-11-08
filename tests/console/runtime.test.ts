@@ -23,6 +23,7 @@ test("固定运行包只包含代码，代码替换后固定副本不变；校�
     writeFileSync(join(f.root, "uv.lock"), "fixture lock\n");
     writeFileSync(join(f.root, ".python-version"), "3.12\n");
     writeFileSync(join(f.root, "scripts/helper.py"), "print('fixture')\n");
+    writeFileSync(join(f.root, "src/fonts.conf"), "<fontconfig/>\n");
     writeFileSync(join(f.root, "scripts/.env"), "PRIVATE_KEY=fixture-private");
     writeFileSync(join(f.root, ".env"), "PRIVATE_KEY=fixture-private");
     writeFileSync(join(f.root, "data/chat.json"), '{"body":"private-fixture"}');
@@ -31,13 +32,50 @@ test("固定运行包只包含代码，代码替换后固定副本不变；校�
     expect(fence.current()).toBe(true); expect(codeDigest(runtime.root)).toBe(runtime.digest);
     for (const file of [".env", "scripts/.env", "data/chat.json", "node_modules"]) expect(() => readFileSync(join(runtime.root, file))).toThrow();
     expect(freezeRuntime(join(f.root, ".console"), f.root)).toEqual(runtime);
-    for (const name of ["pyproject.toml", "uv.lock", ".python-version", "scripts/helper.py"]) expect(readFileSync(join(runtime.root, name), "utf8")).toBe(readFileSync(join(f.root, name), "utf8"));
+    for (const name of ["pyproject.toml", "uv.lock", ".python-version", "scripts/helper.py", "src/fonts.conf"]) expect(readFileSync(join(runtime.root, name), "utf8")).toBe(readFileSync(join(f.root, name), "utf8"));
     writeFileSync(join(f.root, "src/version.ts"), 'export const value = 2');
     expect(fence.current()).toBe(false); expect(readFileSync(join(runtime.root, "src/version.ts"), "utf8")).toContain("= 1");
     writeFileSync(join(f.root, "src/version.ts"), 'export const value = 1');
     expect(fence.current()).toBe(false); expect(changed).toBe(1);
     writeFileSync(join(runtime.root, "src/version.ts"), "corrupted");
     expect(() => freezeRuntime(join(f.root, ".console"), f.root)).toThrow("摘要不符");
+  } finally { await f.cleanup(); }
+});
+
+test("代码目录里版本控制内的文件都进入固定运行包：漏掉的类型改了也不会让旧控制台失效", async () => {
+  const f = await tempFixture("console-runtime-tree-");
+  try {
+    const project = fileURLToPath(new URL("../..", import.meta.url));
+    const listed = Bun.spawnSync(["git", "-C", project, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "console", "ops", "scripts", "src"], { stdout: "pipe", stderr: "pipe" });
+    expect(listed.exitCode, listed.stderr.toString()).toBe(0);
+    const files = listed.stdout.toString().split("\0").filter(name => name && !name.split("/").some(part => part.startsWith(".")) && existsSync(join(project, name)));
+    expect(files.length).toBeGreaterThan(100);
+    const { root } = freezeRuntime(join(f.root, ".console"), project);
+    expect(files.filter(name => !existsSync(join(root, name)))).toEqual([]);
+  } finally { await f.cleanup(); }
+}, 30_000);
+
+test("读取可以沿用几秒内通过的完整核对；到期或不带窗口时重新核对，发现变化后不再恢复", async () => {
+  const f = await tempFixture("console-fence-window-");
+  try {
+    for (const dir of ["console", "ops", "scripts", "src"]) mkdirSync(join(f.root, dir));
+    const version = join(f.root, "src/version.ts");
+    writeFileSync(version, "export const value = 1");
+    const expected = codeDigest(f.root);
+    let now = 1000, changed = 0;
+    const within = new CodeFence(f.root, expected, () => changed++, () => now), expired = new CodeFence(f.root, expected, () => changed++, () => now);
+    expect([within.current(3000), expired.current(3000)]).toEqual([true, true]);
+    writeFileSync(version, "export const value = 2");
+    now += 2999;
+    expect([within.current(3000), changed]).toEqual([true, 0]);
+    // The window counts from the check that passed, and a full check does not use it.
+    expect([within.current(), changed]).toEqual([false, 1]);
+    expect(within.current(3000)).toBe(false);
+    now += 1;
+    expect([expired.current(3000), changed]).toEqual([false, 2]);
+    writeFileSync(version, "export const value = 1");
+    now += 10_000;
+    expect([expired.current(3000), expired.current(), changed]).toEqual([false, false, 2]);
   } finally { await f.cleanup(); }
 });
 
@@ -74,8 +112,11 @@ test.skipIf(process.platform === "win32")("固定代码可供容器身份只读�
     writeFileSync(join(f.root, "src/version.ts"), "export const value = 1");
     writeFileSync(join(f.root, "console/icon.svg"), "<svg/>");
     writeFileSync(join(f.root, "ops/tool.ts"), "export {};");
-    const directory = join(f.root, ".console"), runtime = freezeRuntime(directory, f.root);
-    for (const path of [directory, join(directory, "runtime")]) expect(statSync(path).mode & 0o777).toBe(0o700);
+    // As every caller does: .console is prepared before the runtime is frozen in it.
+    const directory = join(f.root, ".console"); prepareConsoleDir(directory);
+    const runtime = freezeRuntime(directory, f.root);
+    // macOS: the service account's data tools pass through both to the frozen code; they still cannot list them.
+    for (const path of [directory, join(directory, "runtime")]) expect(statSync(path).mode & 0o777).toBe(process.platform === "darwin" ? 0o711 : 0o700);
     for (const path of [runtime.root, join(runtime.root, "scripts"), join(runtime.root, "scripts/lib")]) expect(statSync(path).mode & 0o777).toBe(0o755);
     expect(statSync(join(runtime.root, "scripts/lib/test.ts")).mode & 0o777).toBe(0o644);
   } finally { process.umask(previous); await f.cleanup(); }

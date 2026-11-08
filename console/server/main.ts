@@ -39,15 +39,19 @@ import { statsRoutes } from "./stats.ts";
 import { loadOverview } from "./status.ts";
 import { conversationRoutes, Views } from "./views.ts";
 import { hostPlatform, PROJECT_DIR, SOURCE_DIR } from "../../ops/core/platform.ts";
+import { trustCheckout } from "../../ops/core/launchd-host.ts";
 import { localProgram, shortBuild } from "../../ops/tools/version-info.ts";
 import { CodeFence, codeDigest } from "../../ops/core/source-runtime.ts";
+
+/** How often the code on disk is compared with the code this console started from; reads rely on a comparison this recent. */
+const CODE_CHECK_MS = 3000;
 
 const USAGE = `bun run console [--port <端口>] [--forwarded-port <本地端口>] [--no-open]
 
 在本机 127.0.0.1 启动网页控制台，打印一次性登录链接（5 分钟内有效，只能使用一次）。
-  --port <端口>            控制台端口；成功启动后保存，之后默认沿用（初始为 11012）
+  --port <端口>            控制台端口；成功启动后保存，之后默认沿用（初始为 10001）
   --forwarded-port <端口>  SSH 转发时你电脑上使用的本地端口与控制台端口不同时指定，只允许这一个额外来源
-  --no-open                Windows 上不自动打开浏览器`;
+  --no-open                Windows 和 macOS 上不自动打开浏览器`;
 
 /** Returns an exit code, or undefined while the server keeps the process alive. */
 async function main(argv: string[]): Promise<number | undefined> {
@@ -57,6 +61,8 @@ async function main(argv: string[]): Promise<number | undefined> {
   });
   if (values.help) { console.log(USAGE); return 0; }
   process.chdir(PROJECT_DIR);
+  // macOS runs the console as root (sudo): Git reads the operator's checkout only when told it may.
+  if (process.platform === "darwin") trustCheckout(PROJECT_DIR);
   const dir = consoleDir(PROJECT_DIR);
   prepareConsoleDir(dir);
 
@@ -120,10 +126,11 @@ async function main(argv: string[]): Promise<number | undefined> {
   const fence = new CodeFence(PROJECT_DIR, process.env.MIXIN_CONSOLE_CODE_DIGEST ?? codeDigest(PROJECT_DIR), () => {
     dataReads.abort(new Error("代码已变化，请重新运行控制台"));
     exporter.endAll("代码已变化，请重新运行控制台");
+    pushPage.endAll("代码已变化，请重新运行控制台");
     void queries.stop().catch(() => { console.error("旧版查询回收失败，请检查运维日志。"); });
   });
   setQueryRunner((command, args, options) => {
-    if (!fence.current()) return Promise.reject(new Error("代码已变化，请重新运行控制台"));
+    if (!fence.current(CODE_CHECK_MS)) return Promise.reject(new Error("代码已变化，请重新运行控制台"));
     return queries.capture(command, args, { ...options, signal: options.signal ? AbortSignal.any([options.signal, dataReads.signal]) : dataReads.signal });
   });
   const startedAt = Date.now();
@@ -131,14 +138,14 @@ async function main(argv: string[]): Promise<number | undefined> {
     port: choice.port, pid: process.pid, startedAt };
   const server = startServer({
     port: choice.port, guard: guardConfig(choice.port, forwarded === undefined ? [] : [forwarded]),
-    bundle, auth, instanceId, current: () => fence.current(), dataSignal: dataReads.signal, overview: () => loadOverview(info),
+    bundle, auth, instanceId, current: read => fence.current(read ? CODE_CHECK_MS : 0), dataSignal: dataReads.signal, overview: () => loadOverview(info),
     routes: { ...conversationRoutes({ bot, audit, views }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(),
       ...taskRoutes({ tasks, plans, observers, audit, hosting: hostingCheck, current: () => fence.current(), prepare: operationPreparer(PROJECT_DIR, views, undefined, uploads, backups, forms, configurations, deploymentDirectory),
         created: request => { uploads.bind(request); backups.bind(request); if (request.operation === "configuration-apply") configurations.bind(String(request.params.draft), String(request.params.digest), request.id); },
         launch: id => launchTask(tasks, id, executorBundle) }) },
     download: (ticket, context) => ticket.startsWith("push-") ? pushPage.download(ticket, context) : exporter.download(ticket, context),
   });
-  const versionTimer = setInterval(() => fence.current(), 3000); versionTimer.unref();
+  const versionTimer = setInterval(() => fence.current(), CODE_CHECK_MS); versionTimer.unref();
 
   let closing = false;
   /** Ends every login, removes our instance record and closes the port. */
@@ -148,6 +155,7 @@ async function main(argv: string[]): Promise<number | undefined> {
     clearInterval(configurationTimer);
     clearInterval(versionTimer);
     exporter.endAll();
+    pushPage.endAll();
     auth.revokeAll();
     try { removeInstance(dir, instanceId); } catch {}
     return Promise.all([server.stop(true), queries.stop()]);
@@ -171,7 +179,9 @@ async function main(argv: string[]): Promise<number | undefined> {
     const build = shortBuild(program.build);
     console.log(`量子密信应用机器人控制台 v${program.appVersion}${build ? `（构建 ${build}）` : ""}`);
     console.log(`  监听      http://127.0.0.1:${choice.port}/   端口来源：${choice.source}，已保存到 .console/port`);
-    if (info.platform === "linux" || forwarded !== undefined) {
+    // Over SSH the browser is on the operator's own computer; a Mac reached in person opens its own.
+    const remote = info.platform === "linux" || forwarded !== undefined || info.platform === "macos" && !!process.env.SSH_CONNECTION;
+    if (remote) {
       const hint = sshForwardHint(choice.port, browserPort);
       console.log("  在你自己的电脑上转发端口后，用那台电脑的浏览器打开登录链接：");
       console.log(`    ${hint.command}`);
@@ -181,7 +191,7 @@ async function main(argv: string[]): Promise<number | undefined> {
     console.log(`  登录链接  ${first}`);
     console.log("            5 分钟内有效，只能使用一次。");
     console.log("  按 Enter 生成新的登录链接（旧链接随即失效），按 Ctrl+C 退出控制台。");
-    if (info.platform === "windows" && !values["no-open"] && forwarded === undefined) {
+    if ((info.platform === "windows" || info.platform === "macos") && !remote && !values["no-open"]) {
       openBrowser(first).then(() => console.log("  已在默认浏览器打开登录链接；没有打开时复制上面的链接。"),
         error => console.log(`  无法自动打开浏览器（${(error as Error).message}），请复制上面的链接。`));
     }

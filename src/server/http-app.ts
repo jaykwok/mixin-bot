@@ -7,7 +7,7 @@ import { type DirectoryScope, parseDepartmentIds, parseScopeRequest } from "../i
 import { readStatus } from "../durable/read/client.ts";
 import { parseReadOp, ReadRequestError, type ReadOp } from "../durable/read/protocol.ts";
 import { PUSH_ID } from "../push/cards.ts";
-import { PUSH_GROUPS, type PushAdmin, type PushGroup } from "../push/service.ts";
+import { PUSH_GROUPS, type PushAdmin, type PushCursor, type PushGroup } from "../push/service.ts";
 import { constantTimeEqual } from "./http.ts";
 
 export interface AppOptions {
@@ -56,6 +56,14 @@ const phone = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_+\-]
 const groupId = (value: unknown) => typeof value === "string" && /^[0-9]{1,64}$/.test(value) ? value : fail("群号无效");
 /** A recipient: a person's phone, or a group's `group:<ID>`. */
 const member = (value: unknown) => typeof value === "string" && value.startsWith("group:") ? `group:${groupId(value.slice("group:".length))}` : phone(value);
+/** Where the list goes on: the last push of the page before. */
+function cursor(value: unknown): PushCursor {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : fail("before 无效");
+  if (Object.keys(raw).some(key => key !== "createdAt" && key !== "id") || !(typeof raw.createdAt === "number" && Number.isSafeInteger(raw.createdAt) && raw.createdAt > 0)) {
+    fail("before 无效");
+  }
+  return { createdAt: raw.createdAt, id: pushId(raw.id) };
+}
 function fail(message: string): never { throw new PushInput(message); }
 function members(value: unknown, max: number): string[] | undefined {
   if (value === undefined || value === null) return undefined;
@@ -198,11 +206,10 @@ export function createApp(options: AppOptions): Hono {
       }
     });
   pushRoute("list", (push, body, c) => {
-    const group = body.group ?? null, before = body.before ?? null, limit = body.limit ?? 50;
+    const group = body.group ?? null, before = body.before === undefined || body.before === null ? null : cursor(body.before), limit = body.limit ?? 50;
     if (group !== null && !(typeof group === "string" && group in PUSH_GROUPS)) fail("group 无效");
-    if (before !== null && !(typeof before === "number" && Number.isSafeInteger(before) && before > 0)) fail("before 无效");
     if (!(typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 1 && limit <= 100)) fail("limit 超出范围 1–100");
-    return c.json({ status: "ok", ...push.list({ group: group as PushGroup | null, before: before as number | null, limit: limit as number }) });
+    return c.json({ status: "ok", ...push.list({ group: group as PushGroup | null, before, limit: limit as number }) });
   });
   pushRoute("detail", (push, body, c) => c.json({ status: "ok", ...push.detail(pushId(body.id)) }));
   pushRoute("remind", async (push, body, c) => c.json({ status: "ok", ...await push.remind(pushId(body.id), members(body.members, 5000)) }));

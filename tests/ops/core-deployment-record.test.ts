@@ -10,9 +10,10 @@ import type { DockerTaskRecord } from "../../src/contracts/ops-writer.ts";
 import { recoveryPlan, recoveryView } from "../../ops/core/recovery-plan.ts";
 import type { OpsResult } from "../../ops/core/result.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
 async function fixture() {
-  const f = await tempFixture("deployment-journal-"), state = join(f.root, "data/state"), snapshot = join(f.root, "backup/snapshots/deploy-journal");
+  const f = await tempFixture("deployment-journal-"), state = join(f.root, "data/state"), snapshot = join(f.root, transactionDirectory("deploy-journal"));
   await mkdir(state, { recursive: true }); await mkdir(snapshot, { recursive: true });
   const record: TransactionRecord = { format: "2", operation: "upgrade", snapshot: "deploy-journal", target_sha: "a".repeat(40), original_sha: "b".repeat(40),
     original_branch: "main", original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "2022", reconfigure_ai: "0" };

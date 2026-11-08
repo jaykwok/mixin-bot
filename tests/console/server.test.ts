@@ -5,7 +5,7 @@ import { guardConfig, SECURITY_HEADERS } from "../../console/server/guard.ts";
 import { createHandler, startServer } from "../../console/server/server.ts";
 import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
-const PORT = 11012, ORIGIN = `http://127.0.0.1:${PORT}`;
+const PORT = 10001, ORIGIN = `http://127.0.0.1:${PORT}`;
 const bundle: Bundle = {
   index: { path: "/", type: "text/html; charset=utf-8", body: new TextEncoder().encode("<!doctype html><title>t</title>") },
   assets: new Map([["/assets/app.abc.js", { path: "/assets/app.abc.js", type: "text/javascript; charset=utf-8", body: new TextEncoder().encode("1") }]]),
@@ -48,7 +48,7 @@ test("Host 必须精确匹配，Origin/Sec-Fetch-Site 只接受控制台自身�
     expect(response.status, text).toBe(403);
     expect((await response.json() as { error: string }).error).toContain(text);
   };
-  await refusedWith(request("/api/instance", { host: "localhost:11012" }), "Host");
+  await refusedWith(request("/api/instance", { host: "localhost:10001" }), "Host");
   await refusedWith(request("/api/instance", { host: "127.0.0.1:11013" }), "Host");
   await refusedWith(request("/api/instance", { host: "evil.example" }), "Host");
   await refusedWith(request("/api/instance", { headers: { host: "" } }), "Host");
@@ -108,6 +108,29 @@ test("升级后的旧入口只保留登录和任务结果，拒绝新读取/写�
   expect((await handle(request("/api/session", { headers }))).status).toBe(200);
   expect((await handle(request("/api/session/logout", { method: "POST", body: "{}", headers }))).status).toBe(200);
   expect((await handle(request("/api/tasks", { headers }))).status).toBe(401);
+});
+
+test("只读接口接受几秒内的代码核对；其余接口和 /api/runtime 每次完整核对", async () => {
+  const auth = new Auth(), login = auth.exchange(auth.issueToken().token)!, asked: boolean[] = [];
+  const handle = createHandler({ port: PORT, guard: guardConfig(PORT), bundle, auth, instanceId: "frozen",
+    current: read => { asked.push(read); return true; }, overview: async () => ({} as Overview), download: () => new Response("file"),
+    routes: Object.fromEntries(["GET /api/lifecycle", "POST /api/conversation/entries", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/delete", "POST /api/plans", "POST /api/exports", "POST /api/directory/apply",
+      // New routes under the paths of read routes: not named, so they check in full.
+      "GET /api/lifecycle/new", "GET /api/new", "POST /api/conversation/new", "POST /api/views/new", "POST /api/lifecycle/directory/new", "GET /api/tasks"].map(route => [route, { run: async () => ({}) }])) });
+  const headers = { cookie: auth.cookieName + "=" + login.sessionId };
+  const post = { method: "POST", body: "{}", headers };
+  for (const [path, init, expected] of [
+    ["/api/lifecycle", { headers }, [true, true]], ["/api/overview", { headers }, [true, true]], ["/api/runtime", { headers }, [false]],
+    ["/api/conversation/entries", post, [true, true]], ["/api/push/list", post, [true, true]], ["/api/push/detail", post, [true, true]],
+    ["/api/push/delete", post, [false, false]], ["/api/plans", post, [false, false]], ["/api/exports", post, [false, false]], ["/api/directory/apply", post, [false, false]],
+    ["/api/lifecycle/new", { headers }, [false, false]], ["/api/new", { headers }, [false, false]], ["/api/conversation/new", post, [false, false]], ["/api/views/new", post, [false, false]],
+    ["/api/lifecycle/directory/new", post, [false, false]], ["/download/ticket", { headers }, [true]],
+    // Login and task records are served whatever the code: no check at all.
+    ["/api/session", { headers }, []], ["/api/tasks", { headers }, []],
+  ] as const) {
+    expect((await handle(request(path, init))).status).toBe(200);
+    expect(asked.splice(0), path).toEqual([...expected]);
+  }
 });
 
 test("每个响应（含拒绝和错误）都带安全响应头", async () => {

@@ -107,13 +107,16 @@ test("a reply summary: the submission in effect per person, its files, and why a
   expect(entries.map(entry => entry.name)).toEqual(["推送汇总-机房盘点-abcd2345.xlsx", "回复/001-张三-0001/01-盘点.xlsx", "回复/001-张三-0001/回复.txt"]);
   expect(entries[1]!.data.toString()).toBe("PLAN");
   const note = entries[2]!.data.toString("utf8");
+  expect(note).toStartWith("张三（138****0001）的回复");
   expect(note).toContain("第一段\n\n第二段");
   expect(note).toContain("照片.jpg：未打包，文件已被临时文件清理删除");
   expect(note).toContain("坏.pdf：未打包，下载失败：平台拒绝");
   // Revision 1 was replaced: its photo is not in the package.
   expect(note).not.toContain("旧照片");
   const sheet = readZip(join(out, "推送汇总-机房盘点-abcd2345.xlsx")).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8");
-  for (const text of ["回复文字", "张三", "第一段\n\n第二段", "李四", "王五", "发送失败"]) expect(sheet).toContain(text);
+  for (const text of ["回复文字", "张三", "第一段\n\n第二段", "李四", "王五", "发送失败", "138****0001", "138****0003"]) expect(sheet).toContain(text);
+  // Phones are masked everywhere.
+  for (const phone of ["13800000001", "13800000002", "13800000003"]) expect(sheet + note).not.toContain(phone);
 });
 
 test("a package larger than one send splits into numbered parts within the limit; a file that alone cannot fit is listed", async () => {

@@ -7,6 +7,7 @@ import { loadDeploymentState, type DeploymentState } from "./deployment-state.ts
 import { parseDeploymentExecution, validateDeploymentCheckpoint, type DeploymentCheckpoint, type DeploymentDirection,
   type DeploymentExecution } from "./deployment-contract.ts";
 import { serializeTransactionRecord, type TransactionRecord } from "./transaction-record.ts";
+import { transactionDirectory } from "../lib/confirmed-transaction.ts";
 import type { OpsResult } from "./result.ts";
 import { OPS_DEPLOYMENT_FILE } from "../../src/core/ops-deployment-state.ts";
 import { validateHostProcess } from "../../src/contracts/ops-host-process.ts";
@@ -31,7 +32,7 @@ export class DeploymentRecord {
     const state = loadDeploymentState(this.project);
     if (!state || state.snapshot !== this.selected.snapshot || serializeTransactionRecord(state.record) !== this.choices)
       throw new Error("部署事务的指针或选择已变化，未改写执行记录");
-    const directory = lstatSync(join(this.project, "backup/snapshots", this.selected.snapshot), { bigint: true });
+    const directory = lstatSync(join(this.project, transactionDirectory(this.selected.snapshot)), { bigint: true });
     if (!directory.isDirectory() || directory.isSymbolicLink()
       || this.directory && (directory.dev !== this.directory.dev || directory.ino !== this.directory.ino)) throw new Error("部署快照目录被替换，未改写执行记录");
     this.directory ??= { dev: directory.dev, ino: directory.ino };
@@ -49,7 +50,8 @@ export class DeploymentRecord {
     if (record.checkpoint.direction === "rollback" && state.committed) throw new Error("数据已经提交，不能记录回滚步骤");
     parseDeploymentExecution(JSON.stringify(record), this.selected.snapshot, this.selected.was_running === "1");
     const owner = lstatSync(join(this.project, "data/state"));
-    await publishJson(join(this.project, OPS_DEPLOYMENT_FILE), record, { owner: { uid: owner.uid, gid: owner.gid } });
+    // macOS: data/state is the service account's; the record must land where its path says (atomic-file.ts within).
+    await publishJson(join(this.project, OPS_DEPLOYMENT_FILE), record, { owner: { uid: owner.uid, gid: owner.gid }, ...(process.platform === "darwin" ? { within: this.project } : {}) });
     this.owned(); this.assertHeld();
   }
   async checkpoint(checkpoint: DeploymentCheckpoint): Promise<void> {

@@ -1,4 +1,4 @@
-// The inbound router (plan 5.2): event checks, identity, notices, late commands, in-process dedupe and ordering.
+// The inbound router: event checks, identity, notices, late commands, in-process dedupe and ordering.
 import { expect, test } from "bun:test";
 import type { DirectoryIdentity } from "../../src/integrations/open-platform/identity-directory.ts";
 import type { OutboundMessage, Target } from "../../src/integrations/open-platform/messages.ts";

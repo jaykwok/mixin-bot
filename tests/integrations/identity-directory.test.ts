@@ -1,4 +1,4 @@
-// The member directory (plan 5.8) against the local fake platform: paging, revocation and recheck rules, applying a saved
+// The member directory against the local fake platform: paging, revocation and recheck rules, applying a saved
 // scope in one switch, retries, ID replacement, conflicts.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
