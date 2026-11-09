@@ -212,7 +212,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 
 设置文件登记在 [settings-files.ts](../ops/lib/settings-files.ts)：路径、写入方、是否含凭据、由什么校验、重新部署是否必需、哪些平台的部署快照保存它。部署快照和重新部署的前提检查从这里读取；Shell 和 PowerShell 入口各自的列表由 [settings-files.test.ts](../tests/contracts/settings-files.test.ts) 与它比对，代码里出现未登记的 `data/config` 文件时同一测试失败。新增设置文件时先在这里登记。
 
-CI 配置了 Windows、Linux、macOS 15 和 26 的检查（macOS 另以 root 运行真实 LaunchDaemon、服务账户、控制台后台任务和 Office 预览测试），以及受限 Linux 镜像中的解析器、进程回收、部署登记和文档集成（文档加工、Durable 引擎、Office 预览）验证。部署验收还需在目标机器和真实客户端中检查服务、事件 Stream、通讯录同步和真实交付流程。
+CI 在 GitHub 托管运行器的 Windows、Linux 和 macOS latest 版本上检查（macOS 另以 root 运行真实 LaunchDaemon、服务账户、控制台后台任务和 Office 预览测试），以及受限 Linux 镜像中的解析器、进程回收、部署登记和文档集成（文档加工、Durable 引擎、Office 预览）验证。部署验收还需在目标机器和真实客户端中检查服务、事件 Stream、通讯录同步和真实交付流程。
 
 ### Linux 任务隔离与物理回收
 

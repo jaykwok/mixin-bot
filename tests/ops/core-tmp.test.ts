@@ -74,7 +74,8 @@ test("真实共用宿主：查询不停止，执行清单才停止并恢复；�
     });
     expect(refused).toMatchObject({ outcome: "failed", finalState: "running" }); expect(f.effects).toEqual([]);
   } finally { await f.close(); }
-});
+  // Seventeen maintenance runs, each checking .console's ACL through PowerShell on Windows; CI runners needed more than 20 s.
+}, 60_000);
 
 test("临时文件中断恢复保留原清单，只恢复原运行状态；不会重做归档或永久删除", async () => {
   const f = await fixture();
