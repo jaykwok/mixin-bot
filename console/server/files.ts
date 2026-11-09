@@ -169,7 +169,10 @@ function choice(host: Host, purpose: BrowsePurpose, kind: BrowseEntry["kind"], p
   }
 }
 
-async function describe(host: Host, purpose: BrowsePurpose, dir: string, realDir: string, item: Dirent): Promise<BrowseEntry> {
+/** What describe() reads of a directory entry. */
+type Item = Pick<Dirent, "name" | "isSymbolicLink">;
+
+async function describe(host: Host, purpose: BrowsePurpose, dir: string, realDir: string, item: Item): Promise<BrowseEntry> {
   const path = join(dir, item.name), link = item.isSymbolicLink();
   let info: Stats | null = null, real = join(realDir, item.name), hidden = hiddenName(item.name, host.platform);
   try { info = link ? await stat(path) : await lstat(path); } catch {}
@@ -190,23 +193,46 @@ async function describe(host: Host, purpose: BrowsePurpose, dir: string, realDir
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const order = (a: BrowseEntry, b: BrowseEntry) => Number(b.kind === "directory") - Number(a.kind === "directory") || collator.compare(a.name, b.name);
 
-async function list(host: Host, purpose: BrowsePurpose, dir: string, hidden: boolean, keep: string | null): Promise<{ entries: BrowseEntry[]; truncated: boolean }> {
-  const deadline = Date.now() + LIST_BUDGET_MS, items: Dirent[] = [];
-  let truncated = false;
+/**
+ * Lists a directory, at most MAX_ENTRIES entries within the time budget. The entry to select (`keep`) is always in the
+ * result, wherever the listing stops; `selected` is its listed name.
+ */
+async function list(host: Host, purpose: BrowsePurpose, dir: string, hidden: boolean, keep: string | null)
+  : Promise<{ entries: BrowseEntry[]; truncated: boolean; selected: string | null }> {
+  const deadline = Date.now() + LIST_BUDGET_MS, items: Item[] = [];
+  // The entry the path names. Windows and macOS usually ignore case, so a typed path may differ in case from the listed
+  // name; but a macOS volume (or a Windows directory) may tell case apart and hold both. The exact name wins, and a name
+  // differing only in case is the same entry only when it is the same file.
+  const target = keep === null ? null : await lstat(join(dir, keep)).catch(() => null);
+  const folded = keep !== null && target && host.platform !== "linux" ? keep.toLowerCase() : null;
+  const aliases: Item[] = [];
+  let truncated = false, kept: Item | null = null;
   const handle = await opendir(dir).catch(error => { throw unreadable(dir, error); });
   try {
     for await (const item of handle) {
-      if (!hidden && item.name !== keep && hiddenName(item.name, host.platform)) continue;
+      if (target && item.name === keep) { kept = item; continue; }
+      if (folded !== null && item.name.toLowerCase() === folded) { aliases.push(item); continue; }
+      if (!hidden && hiddenName(item.name, host.platform)) continue;
       if (items.length >= MAX_ENTRIES || Date.now() > deadline) { truncated = true; break; }
       items.push(item);
     }
   } catch (error) { throw unreadable(dir, error); }
-  const realDir = await realpath(dir).catch(() => dir), entries: BrowseEntry[] = [];
+  for (const alias of aliases) {
+    const info = kept ? null : await lstat(join(dir, alias.name)).catch(() => null);
+    if (info && target && info.dev === target.dev && info.ino === target.ino) kept = alias;
+    // Another file: listed like any other.
+    else if (hidden || !hiddenName(alias.name, host.platform)) {
+      if (items.length < MAX_ENTRIES) items.push(alias); else truncated = true;
+    }
+  }
+  // Not reached before the listing stopped: looked up by itself.
+  if (keep !== null && target && !kept) kept = { name: keep, isSymbolicLink: () => target.isSymbolicLink() };
+  const realDir = await realpath(dir).catch(() => dir), entries: BrowseEntry[] = kept ? [await describe(host, purpose, dir, realDir, kept)] : [];
   for (let index = 0; index < items.length; index += 64) {
     if (Date.now() > deadline) { truncated = true; break; }
     entries.push(...await Promise.all(items.slice(index, index + 64).map(item => describe(host, purpose, dir, realDir, item))));
   }
-  return { entries: entries.filter(entry => hidden || !entry.hidden || entry.name === keep).sort(order), truncated };
+  return { entries: entries.filter(entry => hidden || !entry.hidden || entry.name === kept?.name).sort(order), truncated, selected: kept?.name ?? null };
 }
 
 function unreadable(path: string, error: unknown): ApiProblem {
@@ -287,12 +313,12 @@ export async function browse(project: string, body: unknown, platform: Platform 
   if (unavailable) throw problem(unavailable);
   const host = hostOf(resolve(project), platform);
   const { dir, keep } = await opening(host, purpose, params.path as string | undefined, params.from as string | undefined);
-  const { entries, truncated } = await list(host, purpose, dir, params.hidden === true, keep);
+  const { entries, truncated, selected } = await list(host, purpose, dir, params.hidden === true, keep);
   const parent = dirname(dir);
   return {
     purpose, select: selects(purpose), path: dir, parent: parent === dir ? null : parent, crumbs: crumbs(dir), places: await places(host, purpose), entries,
     current: selects(purpose) === "directory" ? choice(host, purpose, "directory", dir, realOrEmpty(dir)) : null,
-    selected: keep !== null && entries.some(entry => entry.name === keep) ? keep : null, truncated, note: note(host, purpose),
+    selected, truncated, note: note(host, purpose),
   };
 }
 

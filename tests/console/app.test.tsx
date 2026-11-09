@@ -1,14 +1,15 @@
 /** @jsxImportSource preact */
 // Page components under happy-dom with a scripted fetch: the login gate, losing the session (never through a late
-// answer to an earlier login's page), the command palette, and which requests renew the idle timer.
+// answer to an earlier login's page), the server's clock, the command palette, and which requests renew the idle timer.
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { GlobalRegistrator } from "../helpers/dom.tsx";
 import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
 GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
 const { Root } = await import("../../console/ui/src/app.tsx");
 const { takeLoginToken } = await import("../../console/ui/src/login.ts");
+const { adoptServerTime, serverTime } = await import("../../console/ui/src/clock.ts");
 
 type Call = { path: string; method: string; headers: Record<string, string>; body?: string; signal: boolean };
 type Reply = { status: number; body: unknown } | "offline";
@@ -45,10 +46,11 @@ function mount(token: string | null) {
   render(<Root loginToken={token} />, container);
 }
 
+// performance.now(), not Date.now(): tests move this computer's clock.
 async function until(check: () => boolean, what: string): Promise<void> {
-  const deadline = Date.now() + 2_000;
+  const deadline = performance.now() + 2_000;
   while (!check()) {
-    if (Date.now() > deadline) throw new Error(`等待超时：${what}\n${container.textContent}`);
+    if (performance.now() > deadline) throw new Error(`等待超时：${what}\n${container.textContent}`);
     await new Promise(resolve => setTimeout(resolve, 5));
   }
 }
@@ -68,13 +70,9 @@ test("登录链接兑换成功后进入总览；兑换和轮询都不带续期�
     expect(call.headers["X-Console-Request"]).toBe("1");
     expect(call.headers["X-Console-Intent"]).toBeUndefined();
   }
-  // W1b read pages are now reachable. Write pages still wait for their stage.
-  const planned = [...container.querySelectorAll(".nav-item.disabled")].map(item => item.textContent);
-  expect(planned).not.toContain("体检规划中");
-  expect(planned).not.toContain("会话规划中");
-  expect(has('a[href="#/health"]')).toBe(true);
-  expect(has('a[href="#/conversations"]')).toBe(true);
-  expect(has('a[href="#/stats"]')).toBe(true);
+  // Every section is a link.
+  expect([...container.querySelectorAll(".nav-item")].every(item => item.tagName === "A")).toBe(true);
+  for (const id of ["health", "conversations", "stats", "push", "settings"]) expect(has(`a[href="#/${id}"]`)).toBe(true);
 });
 
 test("通讯录卡片显示保存的范围是否已生效，应用失败时写明之前的范围仍然生效；同步进行中显示同步中", async () => {
@@ -345,6 +343,82 @@ for (const [what, late, gone] of [["401", unauthorized, "登录已失效"], ["�
     expect(has(".layout")).toBe(false);
   });
 }
+
+test("旧登录的续期请求在新链接登录之后才应答：服务器时间仍按新登录校准", async () => {
+  const real = Date.now;
+  let releaseOld!: () => void, touches = 0;
+  const oldAnswered = new Promise<void>(resolve => { releaseOld = resolve; });
+  routes = {
+    ...ready(),
+    "POST /api/session/exchange": () => ({ status: 200, body: session() }),
+    // The late answer says the server's time is 11 minutes behind this computer's.
+    "POST /api/session/touch": async () => { touches++; await oldAnswered; return { status: 200, body: { ...session(), now: real() - 11 * 60_000 } }; },
+  };
+  try {
+    mount(null);
+    await shows("机器人运行中");
+    // Past the touch interval: activity renews the session.
+    Date.now = () => real() + 2 * 60_000;
+    window.dispatchEvent(new Event("pointerdown"));
+    await until(() => touches === 1, "旧登录的续期请求");
+    const overviews = () => calls.filter(call => call.path === "/api/overview").length, before = overviews();
+    location.hash = `#login=${"n".repeat(43)}`;
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    // The new page reads the overview once the exchange's answer (and its time) is taken.
+    await until(() => overviews() > before && text().includes("机器人运行中"), "新登录");
+    const offset = serverTime(0);
+    releaseOld();
+    await Bun.sleep(30);
+    expect(serverTime(0)).toBe(offset);
+    expect(text()).toContain("机器人运行中");
+  } finally { Date.now = real; releaseOld(); }
+});
+
+for (const [label, token, path] of [["登录链接兑换", "s".repeat(43), "POST /api/session/exchange"], ["已有会话的检查", null, "GET /api/session"]] as const) {
+  test(`首次登录（${label}）耗时 11 秒、浏览器时钟快 31 分钟：按这次应答校时，服务器还剩 30 分钟的会话正常进入`, async () => {
+    const real = Date.now;
+    let delay = 0;
+    // The server's clock; this computer's runs 31 minutes ahead of it.
+    const server = () => real() + delay;
+    routes = {
+      ...ready(),
+      // The answer takes 11 seconds; the server reads its clock halfway.
+      [path]: (): Reply => {
+        delay += 5_500;
+        const at = server();
+        delay += 5_500;
+        return { status: 200, body: { session: { label: "s-test", createdAt: at, idleExpiresAt: at + 30 * 60_000, expiresAt: at + 8 * 3_600_000 }, now: at } };
+      },
+    };
+    try {
+      // A fresh tab: no estimate of the server's clock yet.
+      adoptServerTime(real(), real());
+      Date.now = () => server() + 31 * 60_000;
+      mount(token);
+      await shows("机器人运行中");
+      await Bun.sleep(30);
+      expect(text()).not.toContain("登录已失效");
+      expect(Math.abs(serverTime() - server())).toBeLessThan(1_000);
+    } finally { Date.now = real; adoptServerTime(Date.now(), Date.now()); }
+  });
+}
+
+test("服务器时间取请求往返的中点；登录的应答总是采用，其他应答往返超过 10 秒或本机时钟回拨时不用", () => {
+  try {
+    adoptServerTime(50_000, 1_000, { receivedAt: 3_000 });
+    expect(serverTime(2_000)).toBe(50_000);
+    adoptServerTime(900_000, 1_000, { receivedAt: 12_000 });
+    expect(serverTime(2_000)).toBe(50_000);
+    adoptServerTime(900_000, 5_000, { receivedAt: 4_000 });
+    expect(serverTime(2_000)).toBe(50_000);
+    // A login's answer: the middle of an 11-second round trip.
+    adoptServerTime(900_000, 1_000, { login: true, receivedAt: 12_000 });
+    expect(serverTime(6_500)).toBe(900_000);
+    // A login's answer while this computer's clock went back: the arrival.
+    adoptServerTime(70_000, 5_000, { login: true, receivedAt: 4_000 });
+    expect(serverTime(4_000)).toBe(70_000);
+  } finally { adoptServerTime(Date.now(), Date.now()); }
+});
 
 test("登录片段在读取时即从地址栏移除，其他片段不受影响", () => {
   location.hash = "#login=abc%2Ddef";

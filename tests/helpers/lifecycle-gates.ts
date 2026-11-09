@@ -1,4 +1,6 @@
-// An exported fixture hook, never used by the product. The synthetic image's health command reaches this gate.
+// An exported fixture hook, never used by the product. It goes at the top of the service entry (src/server/index.ts):
+// the core takes the service as ready from its own /health answer, so the selected committed target is held before it
+// starts. It marks the hold in data/state, which the service identity may write; data/ itself belongs to the deployer.
 export const webHealthGate = `{
   const fixtureGateFs = await import("node:fs");
   if (fixtureGateFs.existsSync("data/hold-health") && !fixtureGateFs.existsSync("data/state/verify-only") &&

@@ -21,7 +21,8 @@ test.skipIf(process.platform !== "linux" || process.env.MIXIN_CORE_DOCKER !== "1
     for (const path of [data, backup]) { await mkdir(path, { mode: 0o700 }); if (!uid) await chown(path, 10001, 10001); }
     for (const tree of ["console", "ops", "scripts", "src"]) await mkdir(join(f.root, tree));
     await writeFile(join(f.root, "src/version.ts"), 'export const version="frozen fixture";');
-    await writeFile(join(f.root, "ui/fixture.ts"), "export {};");
+    await writeFile(join(f.root, "console/fixture.ts"), "export {};");
+    await writeFile(join(f.root, "scripts/fixture.sh"), ":\n");
     await writeFile(join(f.root, "ops/input.ts"), `import {createHash} from 'node:crypto'; import {version} from '../src/version.ts';
 await Bun.write(Bun.stderr,'中文进度\\n'.repeat(40000));
 const input=new Uint8Array(await Bun.stdin.arrayBuffer());

@@ -4,11 +4,12 @@
 import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { ActivityTray, TaskSheet } from "./activity.tsx";
-import { api, ApiFailure, newLoginGeneration, onConnectionLost } from "./api.ts";
+import { api, ApiFailure, type CallOptions, loginGeneration, newLoginGeneration, onConnectionLost } from "./api.ts";
+import { adoptServerTime, serverTime } from "./clock.ts";
 import type { Overview, SessionResponse, SessionView } from "./contract.ts";
 import { duration, platformName } from "./format.ts";
 import { BrandMark, Icon, type IconName } from "./icons.tsx";
-import { available, NAV, routeFromHash, type NavItem } from "./nav.ts";
+import { NAV, routeFromHash, type NavItem } from "./nav.ts";
 import { ConversationsPage } from "./conversations.tsx";
 import { resetExports } from "./exports.tsx";
 import { OverviewPage, StatusPill } from "./overview.tsx";
@@ -42,7 +43,7 @@ const failureOf = (error: unknown) => error instanceof ApiFailure ? error : new 
 
 export function Root({ loginToken }: { loginToken: string | null }) {
   const [gate, setGate] = useState<Gate>(loginToken ? "exchanging" : "checking");
-  const [session, setSession] = useState<{ view: SessionView; offset: number } | null>(null);
+  const [session, setSession] = useState<SessionView | null>(null);
   const [message, setMessage] = useState("");
   // Every login check, exchange and logout takes a new number; an answer that arrives after a newer one started is
   // dropped, so a slow old exchange cannot overwrite the result of a link opened later. The shown page's requests are
@@ -65,13 +66,13 @@ export function Root({ loginToken }: { loginToken: string | null }) {
   };
 
   const enter = async (token: string | null) => {
-    const id = begin(token === null ? "checking" : "exchanging");
+    const id = begin(token === null ? "checking" : "exchanging"), sentAt = Date.now();
     try {
       const result = token === null
         ? await api<SessionResponse>("/api/session", { quiet: true })
         : await api<SessionResponse>("/api/session/exchange", { method: "POST", body: { token }, quiet: true });
       if (id !== attempt.current) return;
-      setSession({ view: result.session, offset: result.now - Date.now() });
+      adoptServerTime(result.now, sentAt, { login: true }); setSession(result.session);
       setGate("ready");
     } catch (error) {
       const failure = failureOf(error);
@@ -150,7 +151,7 @@ function useNow(intervalMs: number): number {
   return now;
 }
 
-function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; offset: number }; onEnd: (gate: Gate) => void; onLogout: () => void }) {
+function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gate: Gate) => void; onLogout: () => void }) {
   const [session, setSession] = useState(initial);
   const [route, setRoute] = useState(() => routeFromHash(location.hash));
   const [theme, setTheme] = useState<Theme>(storedTheme);
@@ -167,11 +168,21 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
   const lastTouch = useRef(Date.now());
   const now = useNow(1_000);
 
-  const serverNow = now + session.offset;
-  const idleLeft = session.view.idleExpiresAt - serverNow;
-  const absoluteLeft = session.view.expiresAt - serverNow;
+  const serverNow = serverTime(now);
+  const idleLeft = session.idleExpiresAt - serverNow;
+  const absoluteLeft = session.expiresAt - serverNow;
 
-  const adopt = useCallback((response: SessionResponse) => setSession({ view: response.session, offset: response.now - Date.now() }), []);
+  /**
+   * Asks for the session state and takes the answer's clock and session, unless a login check, login or logout began
+   * after it was sent: that answer belongs to an earlier login, and the clock is shared by every page of this tab.
+   */
+  const refreshSession = useCallback((path: string, options: CallOptions = {}) => {
+    const sentIn = loginGeneration(), sentAt = Date.now();
+    api<SessionResponse>(path, options).then(response => {
+      if (sentIn !== loginGeneration()) return;
+      adoptServerTime(response.now, sentAt); setSession(response.session);
+    }, () => {});
+  }, []);
 
   const loadOverview = useCallback(async (intent: boolean) => {
     if (intent) setRefreshing(true);
@@ -200,7 +211,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
   useEffect(() => {
     void loadOverview(false);
     const overviewTimer = setInterval(() => void loadOverview(false), OVERVIEW_POLL_MS);
-    const sessionTimer = setInterval(() => { api<SessionResponse>("/api/session").then(adopt, () => {}); }, SESSION_POLL_MS);
+    const sessionTimer = setInterval(() => refreshSession("/api/session"), SESSION_POLL_MS);
     // Leaving the shell (logout, expiry, a lost console) forgets the exports it was following.
     return () => { clearInterval(overviewTimer); clearInterval(sessionTimer); resetExports(); resetTasks(); };
   }, []);
@@ -213,7 +224,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
     const touch = () => {
       if (Date.now() - lastTouch.current < TOUCH_INTERVAL_MS) return;
       lastTouch.current = Date.now();
-      api<SessionResponse>("/api/session/touch", { method: "POST", intent: true }).then(adopt, () => {});
+      refreshSession("/api/session/touch", { method: "POST", intent: true });
     };
     const events = ["pointerdown", "keydown", "wheel"] as const;
     for (const name of events) window.addEventListener(name, touch, { passive: true });
@@ -236,7 +247,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
   const changeTheme = (value: Theme) => { applyTheme(value); setTheme(value); };
 
   const commands = useMemo<Command[]>(() => [
-    ...NAV.filter(item => available(item) && (!resultsOnly || item.id === "maintain")).map(item => ({ id: `go-${item.id}`, label: `前往${item.label}`, hint: item.description, icon: item.icon,
+    ...NAV.filter(item => !resultsOnly || item.id === "maintain").map(item => ({ id: `go-${item.id}`, label: `前往${item.label}`, hint: item.description, icon: item.icon,
       tint: item.tint, keywords: item.id, run: () => { location.hash = `#/${item.id}`; } })),
     { id: "refresh", label: "刷新数据", icon: "refresh", keywords: "reload refresh", run: () => void loadOverview(true) },
     ...(["system", "light", "dark"] as const).filter(value => value !== theme).map(value => ({
@@ -332,14 +343,10 @@ function Sidebar({ route, overview, resultsOnly = false, onSearch, onClose }: { 
           return (
             <div class="nav-group" key={group || "top"}>
               {group && <div class="nav-group-label">{group}</div>}
-              {shown.map(item => available(item) ? (
+              {shown.map(item => (
                 <a key={item.id} class="nav-item" href={`#/${item.id}`} aria-current={route === item.id ? "page" : undefined}>
                   <Tile icon={item.icon} tint={item.tint} /><span>{item.label}</span>
                 </a>
-              ) : (
-                <span key={item.id} class="nav-item disabled" aria-disabled="true" data-tip={`${item.description}（计划在 ${item.stage} 阶段提供）`}>
-                  <Tile icon={item.icon} tint={item.tint} /><span>{item.label}</span><span class="nav-badge">规划中</span>
-                </span>
               ))}
             </div>
           );

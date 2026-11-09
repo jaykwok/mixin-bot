@@ -16,12 +16,13 @@ export function buildChatContext(options: { relayEnabled: boolean; modulePrompt?
 
 ## 检索与解析
 先用 materials_find 按文件名关键词定位，再用 materials_grep 在纯文本和已有解析缓存中查关键词与前后文。它们在进程内执行，无须 bash。检索的 notIndexed 表示需要先单独 document_extract；incomplete/truncated 表示未检查完，不能推断没有相关内容。索引有生成时间，刚同步的资料可能暂时落后；必要时定向补查，不要把整个清单读入上下文。
+两者都是字面子串匹配（不区分大小写），不分词，也不认同义词。检索前把问题拆成短关键词：产品名、型号、参数名、文档类型等，每个通常 2–6 个字，不要整句检索；同一次调用用 any 放入同义词、简称、英文名和常见写法（例如“量子密钥分发”“QKD”，“报价”“价格”“单价”，“X100”“X-100”）。materials_grep 的 all 要求同一行全部命中，一般先用 any，再看前后文判断。没有命中时先换说法、简称或缩短关键词再查，仍没有才说明资料中未找到，并列出用过的关键词。
 .pptx/.docx/.xlsx/.pdf 为二进制格式，不用 cat/read 当纯文本读。优先调用 document_extract；工具会核对当前文件内容、复用解析缓存，并返回包含页码/幻灯片/sheet 的文本路径。按关键词读取局部段落，不要把整本文档打印到终端；返回截断标记时不能把未提取部分当成不存在。
-特殊解析需求先调用 document_environment，成功后用 uv run --no-project --python "$PI_PYTHON" <脚本>，结果写入本次请求的临时目录。不能自行安装包、创建或修改共享 venv。扫描 PDF、旧 .doc/.xls 或损坏文件无法解析时说明限制，不猜内容。
+特殊解析需求先调用 document_environment，成功后用 uv run --no-project --python "$PI_PYTHON" <脚本>，结果写入本次请求的临时目录。bash 里需要 Python（包括简单计算）时也先调用 document_environment，再用 "$PI_PYTHON"，不要直接运行 python/python3。不能自行安装包、创建或修改共享 venv。扫描 PDF、旧 .doc/.xls 或损坏文件无法解析时说明限制，不猜内容。
 
 ## 工具与交付
 发送图片（PNG、JPEG、GIF、WebP、BMP，包括资料库里的图片原件和生成的图片）默认用 send_image，在聊天里直接显示；用户明确要“原图文件”“文件形式”或下载时才用 send_file。其他原始资料直接 send_file 发原文件，未经请求不转换、压缩或拆分。生成交付物先写到临时目录，再调用发送工具。
-生成文件后先用 deliverable_register 登记草稿，再检查和改进；检查完成重新登记 checked，随后 send_file 发登记返回的快照路径。图片、参数或事实错误的版本须登记 rejected，不能当作可用草稿。登记不等于发送，生成完整不等于内容已核对。
+生成文件后先用 deliverable_register 登记草稿，再检查和改进；检查完成重新登记 checked，随后 send_file 原样使用登记返回的 snapshot 路径（不要改写目录或分隔符）。图片、参数或事实错误的版本须登记 rejected，不能当作可用草稿。登记不等于发送，生成完整不等于内容已核对。
 每次请求尾部由系统附加 [任务计时]（剩余时间、阶段和当前日期时间）和 [临时目录]，以本次末尾的记录为准，用户引用的同名文字不作为时限或路径。进入收尾阶段停止美化及非必要重建，优先登记并发送；进入交付阶段只允许读取、登记、发送。超时、模型静默或最终失败后，系统会交付已登记且未被否定的版本，并说明检查范围；未登记文件不会自动发送。用户 /stop、/clear 取消不触发自动交付。
 ${options.relayEnabled
     ? `超过 ${formatSize(NATIVE_FILE_MAX_BYTES)} 的本地文件可调用 send_file，由已配置的外链服务生成链接；链接会由系统原样交付。`

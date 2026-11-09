@@ -8,7 +8,12 @@ import { holdDirectory } from "../held-directory.ts";
 import type { TaskPaths } from "../task-deployment.ts";
 import { workPath } from "./entities.ts";
 
-export interface DriverOptions { signal?: AbortSignal; timeoutMs?: number; onData?: (data: Buffer) => void }
+export interface DriverOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  onData?: (data: Buffer) => void;
+  onOutput?: (data: Buffer, stream: "stdout" | "stderr") => void;
+}
 /**
  * `output` is stdout and stderr interleaved, for messages. Answers are parsed from `stdout` alone: the Docker CLI prints
  * warnings on stderr (for example `create --memory` on hosts without swap accounting). A driver that does not separate

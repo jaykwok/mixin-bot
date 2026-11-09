@@ -14,6 +14,14 @@ const project = fileURLToPath(new URL("../../", import.meta.url));
 // The Docker entries' Bash (with /proc, flock and GNU tools) does not run on macOS, which has its own launcher.
 const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
+// The child's only PATH key, with Git's own tools first. Under PowerShell the inherited key is `Path`; a second `PATH`
+// beside it loses the directories the Git Bash launcher puts first, and Windows-native coreutils (other path forms, no
+// /proc) would answer the lock check.
+function childEnv(): Record<string, string | undefined> {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== "PATH"));
+  const tools = process.platform === "win32" ? [join(dirname(dirname(bash!)), "usr", "bin")] : [];
+  return { ...env, PATH: [...tools, dirname(process.execPath), process.env.PATH ?? ""].join(delimiter) };
+}
 const first = "deploy-" + "a".repeat(32), second = "deploy-" + "b".repeat(32);
 
 async function synthetic(root: string) {
@@ -100,7 +108,7 @@ transaction_command "$3" --confirmed-transaction "$4"
     for (const action of ["continue", "rollback"] as const) for (const named of [false, true]) {
       await synthetic(root); const token = confirmTransaction(readTransaction(root)!, action);
       await writeFile(join(root, "data/state/deploy-transaction"), second);
-      const env: Record<string, string | undefined> = { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH ?? ""), MIXIN_OPS_BUN: "" };
+      const env: Record<string, string | undefined> = { ...childEnv(), MIXIN_OPS_BUN: "" };
       // A function named bun shadows every bare `bun`; the named runtime is an absolute path and is not affected.
       if (named) Object.assign(env, { MIXIN_OPS_BUN: process.execPath, "BASH_FUNC_bun%%": "() { echo 'bare bun' >&2; return 99;\n}" });
       delete env.MSYS_NO_PATHCONV; delete env.MSYS2_ARG_CONV_EXCL;

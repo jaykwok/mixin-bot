@@ -83,14 +83,15 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 
 Codemode 的进程级预算为 2，单聊和所有群（全服务）共享同步 `acquireWorker()`。满额明确拒绝；构造失败或真实 worker exit 才释放。result、取消或 `close()` 完成不能当成线程退出。关机先停止准入，等待实际退出仍受整个应用的统一关机期限约束。
 
-Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
+Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代，macOS 没有 subreaper，监督进程自成会话，按会话和父子关系结束后代（自建会话且父进程已退出的后代够不到）；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
 
 上面的进程监督只负责回收进程，不限制文件访问。文件边界按平台不同：
 
 - **Linux Docker**：bash、文档处理与解析在独立 rootless 任务 daemon 的一次性容器里运行，使用 `--network none`；共享资料、资料索引和显式列出的输入只读可见，只有该任务自己的工作目录可写，见[任务隔离部署](deployment.md#任务隔离部署)。服务容器本身非 root、只读镜像并移除 capabilities，外置资料目录只读挂载。
 - **Windows 原生部署**：bash 不隔离，保有服务运行账户的操作系统权限，能读写该账户可访问的文件，工具说明里也不出现隔离参数。
+- **macOS 原生部署**（实验性支持）：与 Windows 相同，bash 不隔离，保有服务账户 `_mixinbot` 的权限。
 
-MCP stdio 程序在两个平台上都具有服务用户权限。当前部署面向可信内部成员；不可信用户需要独立的 OS 隔离方案。
+MCP stdio 程序在各平台上都具有服务用户权限。当前部署面向可信内部成员；不可信用户需要独立的 OS 隔离方案。
 
 ### 资料索引与文档解析
 
@@ -163,7 +164,7 @@ bun run check
 bun audit
 ```
 
-配置向导和配置变更需要先停止服务。已有应用机器人凭据（`data/config/app-bot.json`）与模型配置时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。一个应用同时只能有一条服务 Stream：本地开发要使用单独的测试应用，不能和生产服务共用凭据，否则两边会互相抢占连接。自动测试使用本地假平台（`tests/helpers`），不连接真实开放平台。
+本地开发直接运行 `bun run configure` 或 `bun run configure-app-bot` 时，向导在维护租约下直接写入配置，要先停止本地运行的服务。已部署的实例走另一条路：控制台的配置和运维命令 `model-configure`、`configure-app-bot` 填写期间服务照常运行，先确认，再短暂停机写入并按原运行状态恢复，见[日常控制](operations.md#日常控制)。已有应用机器人凭据（`data/config/app-bot.json`）与模型配置时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。一个应用同时只能有一条服务 Stream：本地开发要使用单独的测试应用，不能和生产服务共用凭据，否则两边会互相抢占连接。自动测试使用本地假平台（`tests/helpers`），不连接真实开放平台。
 
 `bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 是工作根目录下的 `tests-*`，工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 用系统临时目录，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`，其余平台用项目 `tmp/`。Windows 在创建工作目录前用 `realpath` 展开 TEMP 或指定根目录的短路径、目录联接等别名，cwd、夹具环境变量和回执统一使用完整物理路径。默认夹具放在工作区之外，减少编辑器目录扫描对重命名的干扰。全部通过后删除，失败时保留现场并打印路径，诊断日志仍在项目 `tmp/`。
 
@@ -181,7 +182,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 - **不能直接传入的选项**：Bun 自带的 `--parallel`、`--shard`、`--timings` 和 `--update-timings` 由运行器接管。`--parallel` 的 worker 共用一个工作目录，而测试里相对工作目录的路径会互相干扰。
 - **默认超时**：没有自带超时的测试，默认超时为 20 秒（Bun 的默认是 5 秒），因为启动子进程的测试在多组同时运行时会变慢。命令行给了 `--timeout` 时以它为准。
 
-`package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本。`patches` 只保留一份构建期补丁：Knip 传播 Bun 脚本入口的 production 标记。Pi 依赖不打补丁。Knip 6.40.0 原版仍会排除这个生产入口，即使在配置中显式声明；`tests/ops/knip.test.ts` 同时验证已用代码不误报、无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、补丁、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
+`package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本，依赖不打补丁。`tests/ops/knip.test.ts` 在普通和 production 两种模式下验证 Knip 把 Bun 脚本启动的入口算作生产代码：已用的代码和依赖不误报，无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
 
 命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。截图维护见[截图说明](assets/README.md)。
 
@@ -215,9 +216,9 @@ CI 配置了 Windows、Linux、macOS 15 和 26 的检查（macOS 另以 root 运
 
 ### Linux 任务隔离与物理回收
 
-Linux Docker 部署的新部署和升级强制使用每任务 rootless Docker 隔离，缺少条件时部署在停机前拒绝，不回退到共享身份执行（配置要求见 [deployment.md](deployment.md)）。rootful 服务首次部署默认 UID 1001，需要属于 UID 1001 的 rootless daemon 与 socket；这一组合目前只在合成测试中检查过脚本的判断，尚未在真实 UID 1001 rootless daemon 上验收。Linux 原生运行可选启用同一隔离。配置：`BOT_TASK_IMAGE` 必须是本机已存在的完整 `sha256:` 镜像 ID；`BOT_TASK_CONTROL_ROOT` 指向用户 tmp 之外、管理端拥有的普通 0700 目录。daemon 必须通过当前身份拥有的本机 Unix socket 连接，并报告 rootless。管理端本身需要访问 Docker；工作进程不获得 socket、宿主 PID namespace 或管理回执。启用前停止旧实例并确认旧工作进程退出，管理端、原生 MCP 和其他宿主服务仍属于可信控制面。0700 本身不能隔离同一宿主身份的恶意进程。
+Linux Docker 部署的新部署和升级强制使用每任务 rootless Docker 隔离，缺少条件时部署在停机前拒绝，不回退到共享身份执行（配置要求见 [deployment.md](deployment.md)）。rootful 服务首次部署默认 UID 1001，需要属于 UID 1001 的 rootless daemon 与 socket；这一组合已在 WSL 的真实 Docker 环境中验证部署和任务读写边界，使用合成数据与独立测试 daemon。Linux 原生运行可选启用同一隔离。配置：`BOT_TASK_IMAGE` 必须是本机已存在的完整 `sha256:` 镜像 ID；`BOT_TASK_CONTROL_ROOT` 指向用户 tmp 之外、管理端拥有的普通 0700 目录。daemon 必须通过当前身份拥有的本机 Unix socket 连接，并报告 rootless。管理端本身需要访问 Docker；工作进程不获得 socket、宿主 PID namespace 或管理回执。启用前停止旧实例并确认旧工作进程退出，管理端、原生 MCP 和其他宿主服务仍属于可信控制面。0700 本身不能隔离同一宿主身份的恶意进程。
 
-服务身份直接写入的 tmp 条目（不在隔离任务中产生），以及隔离任务的产物，同时使用服务内自动回收和停机离线回收。自动回收只处理签名登记、已退出写者和已核对实体；离线 `tmp reclaim` 保存固定计划、摘要和可恢复进度，物理操作与空间库账本结算保持同一维护租约。Windows 由持删除句柄的回收后端续做；Linux 服务身份条目的物理删除只能由宿主 UID 0、独立停机维护身份显式运行，不能通过普通服务包装器自动恢复。自动回收失败会保留结果登记和下一次重试时间，离线计划失败会保留原目录与清单。
+服务身份直接写入的 tmp 条目（不在隔离任务中产生），以及隔离任务的产物，同时使用服务内自动回收和停机离线回收。自动回收只处理签名登记、已退出写者和已核对实体；离线 `tmp reclaim` 保存固定计划、摘要和可恢复进度，物理操作与空间库账本结算保持同一维护租约。Windows 由持删除句柄的回收后端续做；macOS 在停机维护中证明服务账户没有其他进程、部署锁仍被持有后按删除日志删除和续做；Linux 服务身份条目的物理删除只能由宿主 UID 0、独立停机维护身份显式运行，不能通过普通服务包装器自动恢复。自动回收失败会保留结果登记和下一次重试时间，离线计划失败会保留原目录与清单。
 
 bash、文档操作与解析在任务容器中运行。镜像需要预先具备 bash、Python 所需系统库、字体、LibreOffice 等实际使用的能力；环境准备是管理操作。容器禁止网络、使用只读根文件系统、移除 capabilities，限制为 128 个 PID、1 GiB 内存和 2 CPU；来源、资料索引和解释器环境只读，只有本任务 `work` 可写。`PI_USER_TMP` 指向本任务工作目录，其他已封存任务的产物通过只读快照读取。管理端签名登记的 results 任务也可在 codemode 仍执行时提供只读快照，供后续子调用读取；results 任务不允许启动容器。其他活动工作任务不进入快照。管理根即使被列入额外只读目录，也不向 read/write/edit 工具开放。导出的产物拒绝链接、FIFO 和其他特殊文件。超过输入限制或隔离依赖失败时调用报错。
 

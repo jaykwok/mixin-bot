@@ -48,7 +48,8 @@ const daemonId = (host: string[]) => must("docker", [...host, "info", "--format"
 // Only the files the small image needs, taken from the working tree (tracked and untracked, not ignored).
 function exportTree(target: string): void {
   const listed = (...args: string[]) => must("git", ["-c", "safe.directory=*", "-C", project, "ls-files", "-z", ...args]).split("\0").filter(Boolean);
-  const wanted = (path: string) => ["package.json", "bun.lock"].includes(path) || ["src/", "scripts/"].some(prefix => path.startsWith(prefix));
+  const wanted = (path: string) => ["package.json", "bun.lock"].includes(path) ||
+    ["src/", "ops/lib/", "ops/config/", "ops/tools/", "scripts/"].some(prefix => path.startsWith(prefix));
   for (const path of new Set([...listed(), ...listed("--others", "--exclude-standard")])) {
     const from = join(project, path);
     if (!wanted(path) || !existsSync(from) || lstatSync(from).isDirectory() || lstatSync(from).isSymbolicLink()) continue;
@@ -59,8 +60,10 @@ function exportTree(target: string): void {
     `FROM ${cliImage} AS docker_cli`, `FROM ${baseImage}`,
     "COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker",
     "RUN groupadd -r -g 1001 appgroup && useradd -r -u 1001 -g appgroup -m -d /home/appuser -s /bin/bash appuser",
-    "WORKDIR /app", "COPY package.json bun.lock ./", "COPY patches ./patches",
-    "RUN bun install --frozen-lockfile --production", "COPY src ./src", "COPY scripts ./scripts", ""].join("\n"));
+    "WORKDIR /app", "COPY package.json bun.lock ./",
+    "RUN bun install --frozen-lockfile --production", "COPY src ./src",
+    // The ops parts the service image has (the task preflight runs ops/tools/task-deployment.ts in it).
+    "COPY ops/lib ./ops/lib", "COPY ops/config ./ops/config", "COPY ops/tools ./ops/tools", "COPY scripts ./scripts", ""].join("\n"));
 }
 
 // Names, types, sizes, content digests and modification times of a tree (never access times).

@@ -1,11 +1,14 @@
 /** @jsxImportSource preact */
-import { afterAll, expect, test } from "bun:test";
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { afterAll, beforeEach, expect, test } from "bun:test";
+import { GlobalRegistrator } from "../helpers/dom.tsx";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
-const { TaskAction, TasksPage, readTaskEvents, resetTasks, RecoveryActions, UpgradeForm, DeployForm } = await import("../../console/ui/src/tasks.tsx");
+const { TaskAction, TasksPage, readTaskEvents, resetTasks, useFollowed, RecoveryActions, UpgradeForm, DeployForm } = await import("../../console/ui/src/tasks.tsx");
 const { DirectoryForm, RuntimeForm } = await import("../../console/ui/src/write-forms.tsx");
+const { adoptServerTime } = await import("../../console/ui/src/clock.ts");
+// These views mount without the login flow; earlier page tests may have adopted their fixture's server clock.
+beforeEach(() => { const now = Date.now(); adoptServerTime(now, now, { login: true, receivedAt: now }); });
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const until = async (check: () => boolean) => { const limit = Date.now() + 3000; while (!check() && Date.now() < limit) await Bun.sleep(10); expect(check()).toBe(true); };
 const find = (root: Element, text: string) => [...root.querySelectorAll("button")].find(button => button.textContent === text)!;
@@ -149,6 +152,44 @@ test("任务对话框呈现范围、过期和拒绝；断线后重试保留同�
     expect(root.textContent).not.toContain("这份预览不能再执行"); find(root, "确认执行").click();
     await until(() => !root.querySelector('[role="dialog"]')); expect(submissions).toHaveLength(3); expect(submissions[2]!.key).not.toBe(submissions[0]!.key);
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; resetTasks(); location.hash = ""; }
+});
+
+test("预览有效期按服务器时间计算：浏览器时钟快 11 分钟时，服务器还有 5 分钟的预览仍可确认执行", async () => {
+  const previous = globalThis.fetch, localNow = Date.now, root = document.createElement("div"); document.body.append(root);
+  const real = () => localNow.call(Date), submissions: unknown[] = [];
+  globalThis.fetch = (async (url: string, options?: RequestInit) => {
+    if (String(url) === "/api/plans") return Response.json({ id: "plan-fixture", operation: "stop", summary: ["停止机器人"], expiresAt: real() + 5 * 60_000 });
+    submissions.push(JSON.parse(String(options?.body))); return Response.json({ id: "task-skew", operation: "stop", state: "queued" });
+  }) as typeof fetch;
+  try {
+    Date.now = () => real() + 11 * 60_000;
+    // A session answer carries the server's time.
+    adoptServerTime(real(), Date.now());
+    render(<TaskAction operation="stop" params={{}}>停止</TaskAction>, root); find(root, "停止").click();
+    await until(() => !!root.querySelector('[role="dialog"]'));
+    expect(root.textContent).not.toContain("预览已过期"); expect(root.querySelector('[aria-label="预览剩余有效时间"]')).not.toBeNull();
+    find(root, "确认执行").click(); await until(() => submissions.length === 1);
+  } finally { Date.now = localNow; adoptServerTime(Date.now(), Date.now()); render(null, root); root.remove(); globalThis.fetch = previous; resetTasks(); location.hash = ""; }
+});
+
+test("退出登录后才到的提交回答不再跟踪任务：任务面板和活动托盘保持清空", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"), probe = document.createElement("div"); document.body.append(root, probe);
+  let answer: () => void = () => {}, opened = 0;
+  const onTask = () => { opened++; };
+  window.addEventListener("console-task", onTask);
+  globalThis.fetch = (async (url: string) => {
+    if (String(url) === "/api/plans") return Response.json({ id: "plan-fixture", operation: "stop", summary: ["停止机器人"], expiresAt: Date.now() + 60_000 });
+    if (String(url) === "/api/tasks") { await new Promise<void>(resolve => { answer = resolve; }); return Response.json({ id: "task-late", operation: "stop", state: "queued" }); }
+    return Response.json({ id: "task-late", operation: "stop", state: "queued" });
+  }) as typeof fetch;
+  function Followed() { const { followed, shown } = useFollowed(); return <span>{followed.length}:{shown ?? "-"}</span>; }
+  try {
+    render(<Followed />, probe); render(<TaskAction operation="stop" params={{}}>停止</TaskAction>, root); find(root, "停止").click();
+    await until(() => !!find(root, "确认执行")); find(root, "确认执行").click(); await Bun.sleep(20);
+    // The session ends (logout) while the submission is on its way; the page unmounts and the answer comes after.
+    render(null, root); resetTasks(); answer(); await Bun.sleep(50);
+    expect({ followed: probe.textContent, opened }).toEqual({ followed: "0:-", opened: 0 });
+  } finally { render(null, root); render(null, probe); root.remove(); probe.remove(); globalThis.fetch = previous; window.removeEventListener("console-task", onTask); resetTasks(); }
 });
 
 test("SSE 使用来源保护请求头和 Last-Event-ID，跨分块 UTF-8 和重复事件不重复显示", async () => {

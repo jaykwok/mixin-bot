@@ -290,10 +290,6 @@ function walFiles(dir: string): string[] {
 // The migration preview of targets with this hook waits while data/preview-gate exists (the data mount is read-only in
 // the preview; /preview is its writable scratch).
 const previewGate = 'if (process.argv.includes("preview") && (await import("node:fs")).existsSync("/app/data/preview-gate")) { (await import("node:fs")).writeFileSync("/preview/held", ""); while ((await import("node:fs")).existsSync("/app/data/preview-gate")) await Bun.sleep(200); } // fixture: preview gate';
-// The health check of targets with this hook waits while data/hold-health exists, but only once the data is committed:
-// not for the verification instance (verify-only marker, --allow-verification), only for the activation afterwards.
-// It marks the hold in data/state, which the service identity may write; data/ itself belongs to the deployer.
-const holdHealth = 'if ((await import("node:fs")).existsSync("data/hold-health") && !(await import("node:fs")).existsSync("data/state/verify-only") && !process.argv.includes("--allow-verification")) { (await import("node:fs")).writeFileSync("data/state/health-held", ""); while ((await import("node:fs")).existsSync("data/hold-health")) await Bun.sleep(200); } // fixture: hold health';
 // The data apply of targets with this hook waits after the stop, inside the candidate's data container, while
 // data/hold-apply exists, and writes its host name (the container ID) to data/state/apply-held.
 const applyPoint = '    if (action === "apply") {\n';
@@ -326,7 +322,7 @@ function exportWithFakePlatform(target: string): void {
   if (webLifecycle) {
     // Shared fault gates start inert. Any selected web test can use the first deployment as its prerequisite;
     // rerunning a later failure need not repeat the successful disconnect test just to install these hooks.
-    prepend(join(target, "ops/tools/health-check.ts"), webHealthGate);
+    prepend(join(target, "src/server/index.ts"), webHealthGate);
     holdDataApply(target);
   }
 }
@@ -523,6 +519,8 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       };
 
       first("first deployment starts the service from synthetic data", async () => {
+        // The preceding layout may have stopped after a failed step or completed only the web lifecycle.
+        removeOurContainers();
         const base = join(root, layout);
         ({ work, upstream } = repository(base, exportWithFakePlatform));
         projects.push(projectId(work));
@@ -940,7 +938,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         await Bun.sleep(1000);
         const polling = sampler(port, join(root, "logs", `${layout}-slow-build-samples.log`));
         const upgrade = start(root, `${layout}-slow-build`, ["scripts/ops.sh", "update"], work, { ...env(), PATH: observed.path });
-        const at = marks(upgrade, { build: "构建目标版本", built: "镜像构建成功", stop: "记录升级事务并停止机器人服务", done: "升级完成" });
+        const at = marks(upgrade, { build: "构建目标版本", built: "镜像构建成功", stop: "记录事务并停止机器人服务", done: "升级完成" });
         const started = Date.now();
         const result = await upgrade.done;
         await polling.finish();
@@ -1052,18 +1050,18 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         accepted = target;
       }, 1_200_000);
 
-      // Killed after the data commit, while the new instance's first health check waits: the transaction stays with the
+      // Killed after the data commit, while the new instance waits before it starts: the transaction stays with the
       // new code and the committed data. Rollback is refused before anything changes; resume only activates the recorded
       // image (no build, pull or migration), publishes the official tag and releases the reserved and rollback tags.
       if (layout === "default") dependent("an upgrade killed after the data commit refuses rollback and is finished by resume on the recorded image", async () => {
-        const healthPath = join(upstream, "ops/tools/health-check.ts");
+        const entryPath = join(upstream, "src/server/index.ts");
         const hold = join(work, "data/hold-health"), heldMark = join(work, "data/state/health-held");
         const target = publish(upstream, "hold after commit", () => {
-          if (!readFileSync(healthPath, "utf8").includes("fixture: hold health")) prepend(healthPath, holdHealth);
+          if (!readFileSync(entryPath, "utf8").includes("fixture: web health gate")) prepend(entryPath, webHealthGate);
           writeFileSync(join(upstream, "src/upgrade-marker.txt"), "K");
         });
         const previous = bot().image;
-        writeFileSync(hold, "");
+        writeFileSync(hold, "K");
         const upgrade = start(root, `${layout}-kill-committed`, ["scripts/ops.sh", "update"], work, env(), [], true);
         await until("the held activation", () => existsSync(heldMark), 900_000, upgrade);
         process.kill(-upgrade.child.pid!, "SIGKILL");
@@ -1076,12 +1074,13 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         const killed = state();
         expect(killed).toEqual({ pending: true, head: target, running: true, image: recorded, official: previous });
         const rollback = await start(root, `${layout}-kill-committed-rollback`, ["scripts/ops.sh", "rollback"], work, env()).done;
-        expect({ failed: rollback.code !== 0, committed: rollback.output.includes("已经提交") }, rollback.output.slice(-3000)).toEqual({ failed: true, committed: true });
+        expect({ failed: rollback.code !== 0, committed: rollback.output.includes("数据已提交，不能回滚") }, rollback.output.slice(-3000)).toEqual({ failed: true, committed: true });
         expect(state()).toEqual(killed);
         rmSync(hold);
         const resume = await start(root, `${layout}-kill-committed-resume`, ["scripts/ops.sh", "resume"], work, env()).done;
         expect({ code: resume.code, tail: resume.output.slice(-3000) }).toMatchObject({ code: 0 });
-        expect(resume.output).toContain("不再迁移或重建"); expect(resume.output).not.toContain("构建目标版本");
+        expect(resume.output).toContain("继续上次升级"); expect(resume.output).not.toContain("构建目标版本");
+        expect(resume.output).not.toContain("forward/prepare-data"); expect(resume.output).not.toContain("forward/commit-data");
         expect({ ...state(), marker: marker() }).toEqual({ pending: false, head: target, running: true, image: recorded, official: recorded, marker: "K" });
         expect(labelled("{{.Tag}}").split("\n").filter(tag => tag.startsWith("candidate-") || tag === "previous")).toEqual([]);
         expect(docker("container", "inspect", "mixin-bot-rollback").code).not.toBe(0);

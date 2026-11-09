@@ -156,7 +156,7 @@ export class RootlessTasks {
         const cid = await this.#containers.create(receipt, name, mounts, options, env);
         receipt.containers.push(cid); receipt.mounts[cid] = bindings; receipt.pendingNames = receipt.pendingNames.filter(candidate => candidate !== name); await this.#control.save(receipt);
         await this.#containers.inspect(receipt, cid);
-        const result = await this.#containers.runToEnd(receipt, cid, { signal, timeoutMs: options.timeoutMs, onData: options.onData });
+        const result = await this.#containers.runToEnd(receipt, cid, { signal, timeoutMs: options.timeoutMs, onData: options.onData, onOutput: options.onOutput });
         await validateWork(path);
         return result;
       }, AbortSignal.any([application.signal, ...(options.signal ? [options.signal] : [])]))),

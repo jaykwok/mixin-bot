@@ -50,6 +50,26 @@ async function savedReceipt(control: string, id: string) {
   return JSON.parse(JSON.parse(await readFile(join(control, "receipts", id + ".json"), "utf8")).payload);
 }
 
+test.skipIf(process.platform !== "linux")("isolated commands stream stdout and stderr to their caller", async () => {
+  const f = await tempFixture("task-output-streams-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp);
+  const backend = syntheticDriver(), received: [string, string][] = [], combined: string[] = [];
+  const driver: TaskDriver = { async run(args, options) {
+    if (args[0] === "start") for (const stream of ["stdout", "stderr"] as const) {
+      const data = Buffer.from(stream === "stdout" ? "命令输出\n" : "诊断信息\n");
+      options?.onOutput?.(data, stream); options?.onData?.(data);
+    }
+    return backend.driver.run(args, options);
+  } };
+  const tasks = new RootlessTasks(control, image, driver), task = await tasks.create(temp);
+  try {
+    await task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000,
+      onOutput: (data, stream) => received.push([stream, data.toString()]), onData: data => combined.push(data.toString()) });
+    expect(received).toEqual([["stdout", "命令输出\n"], ["stderr", "诊断信息\n"]]);
+    expect(combined).toEqual(["命令输出\n", "诊断信息\n"]);
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
 test.skipIf(process.platform !== "linux")("explicit document inputs bypass unrelated tmp and sealed tasks release input snapshots", async () => {
   const f = await tempFixture("task-explicit-inputs-"), temp = join(f.root, "caller"), control = join(f.root, "control");
   await mkdir(temp); await writeFile(join(temp, "unrelated"), "must not copy");

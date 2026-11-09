@@ -1,5 +1,5 @@
 // Disk is the task protocol. Neither a live PID nor a successful launcher means an operation succeeded.
-import { appendFileSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
+import { appendFileSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync,
   rmSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -298,24 +298,45 @@ export class TaskStore {
   }
 
   events(id: string, after = 0): TaskEvent[] {
+    return this.eventReader(id, after)();
+  }
+
+  /**
+   * One task's events as they are appended. Each call reads on from where the previous one stopped and gives the events
+   * added since that come after `after`, at most the latest `window` of them (the lines before those are not parsed). A
+   * line still being written waits for the next call; a file that shrank, was replaced or is over the limit fails.
+   */
+  eventReader(id: string, after: number, window = Infinity): () => TaskEvent[] {
     if (!number(after)) throw new Error("事件序号无效");
     const path = join(this.dir(id), "events.jsonl");
-    let source: string;
-    try {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > EVENT_LIMIT) throw new Error("事件文件无效");
-      source = readFileSync(path, "utf8");
-    } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
-    const events: TaskEvent[] = [];
-    let seq = 0;
-    // The last append may still be in flight. An incomplete tail is never emitted.
-    for (const line of source.slice(0, source.lastIndexOf("\n") + 1).split("\n").filter(Boolean)) {
-      const event: unknown = JSON.parse(line);
-      if (!object(event) || event.seq !== ++seq || !number(event.at) || typeof event.text !== "string"
-        || !["output", "phase", "error", "truncated"].includes(String(event.kind))) throw new Error("事件记录损坏");
-      if (event.seq > after) events.push(event as unknown as TaskEvent);
-    }
-    return events;
+    let offset = 0, seq = 0, inode: number | undefined;
+    return () => {
+      let stat;
+      try { stat = lstatSync(path); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT" && inode === undefined) return []; throw error; }
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > EVENT_LIMIT || stat.size < offset || (inode !== undefined && stat.ino !== inode)) {
+        throw new Error("事件文件无效");
+      }
+      inode = stat.ino;
+      if (stat.size === offset) return [];
+      const added = Buffer.alloc(stat.size - offset), fd = openSync(path, "r");
+      let length = 0;
+      try { for (let got = 1; got && length < added.length; length += got) got = readSync(fd, added, length, added.length - length, offset + length); }
+      finally { closeSync(fd); }
+      // The last append may still be in flight. An incomplete tail is never emitted.
+      const end = added.subarray(0, length).lastIndexOf(0x0a) + 1;
+      offset += end;
+      const lines = added.toString("utf8", 0, end).split("\n").filter(Boolean), base = seq;
+      seq += lines.length;
+      const events: TaskEvent[] = [];
+      for (let index = Math.max(0, after - base, lines.length - window); index < lines.length; index++) {
+        const event: unknown = JSON.parse(lines[index]!);
+        if (!object(event) || event.seq !== base + index + 1 || !number(event.at) || typeof event.text !== "string"
+          || !["output", "phase", "error", "truncated"].includes(String(event.kind))) throw new Error("事件记录损坏");
+        events.push(event as unknown as TaskEvent);
+      }
+      return events;
+    };
   }
 
   /** Single writer: only the winning executor opens this after acceptance. */

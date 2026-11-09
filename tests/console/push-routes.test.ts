@@ -2,9 +2,15 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AuditLog } from "../../console/server/audit.ts";
+import { Auth } from "../../console/server/auth.ts";
+import type { Bundle } from "../../console/server/bundle.ts";
+import { guardConfig } from "../../console/server/guard.ts";
 import { type PushSettingsSource, PushRoutes } from "../../console/server/push-routes.ts";
 import type { RouteContext } from "../../console/server/routes.ts";
-import { type PushAdmin, PushSettingsRefused } from "../../src/push/service.ts";
+import { createHandler } from "../../console/server/server.ts";
+import type { Overview } from "../../console/ui/src/contract.ts";
+import { parseRoles, type PushAdmin, PushSettingsRefused } from "../../src/push/service.ts";
+import { ROLE_LIMITS } from "../../src/push/role-limits.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -13,15 +19,15 @@ type Shown = { view: string; departments: { key: string; path: string; gone?: tr
   pusher: boolean; dailyLimit: number | null; grants: { all: boolean; group: boolean; department: "none" | "any" | string[] }; updatedAt: number }[] };
 const DEPARTMENTS = [{ id: "10", path: "技术部" }, { id: "11", path: "技术部/研发组" }];
 
-function source(initial: Role[]) {
+function source(initial: Role[], departments = DEPARTMENTS) {
   let roles = initial;
   const saved: unknown[][] = [];
   const settings: PushSettingsSource = {
-    read: async () => ({ roles, departments: DEPARTMENTS }),
+    read: async () => ({ roles, departments }),
     save: async next => {
       saved.push(next);
       roles = (next as Role[]).map(role => ({ ...role, name: role.phone === "13900000003" ? "王五" : "张三", updatedAt: 2 }));
-      return { roles, departments: DEPARTMENTS };
+      return { roles, departments };
     },
   };
   return { settings, saved };
@@ -117,4 +123,36 @@ test("经本机控制接口读写：服务拒绝的号码打码后给页面，�
     await expect(unaudited["POST /api/push/settings"]!.run({ ...context, body: { view: again.view, roles: [] } })).rejects.toMatchObject({ status: 503, code: "audit" });
     expect(saved).toHaveLength(1);
   } finally { await server.stop(true); await f.cleanup(); }
+});
+
+test("推送设置经控制台服务保存时，服务接受的最大名单（1000 人、每人 200 个部门和全部其他授权）能保存；更大的请求和其余接口超过 16 KiB 时都是 400", async () => {
+  const f = await tempFixture("console-push-settings-size-");
+  try {
+    const departments = Array.from({ length: ROLE_LIMITS.departments }, (_, index) => ({ id: `d${index}`, path: `分公司/部门 ${index}` }));
+    const roles: Role[] = Array.from({ length: ROLE_LIMITS.people }, (_, index) => ({ phone: `138${String(index).padStart(8, "0")}`, name: "张三", admin: true, pusher: true,
+      grants: { department: { departments: departments.map(department => department.id) }, all: true, group: true }, dailyLimit: ROLE_LIMITS.dailyLimit, updatedAt: 1 }));
+    const fake = source(roles, departments);
+    const routes = new PushRoutes(f.root, new AuditLog(join(f.root, "audit")), fake.settings).routes();
+    const auth = new Auth(), login = auth.exchange(auth.issueToken().token)!;
+    const bundle: Bundle = { index: { path: "/", type: "text/html; charset=utf-8", body: new Uint8Array() }, assets: new Map() };
+    const handle = createHandler({ port: 10001, guard: guardConfig(10001), bundle, auth, instanceId: "i", overview: async () => ({} as Overview),
+      routes: { ...routes, "POST /api/echo": { run: async ({ body }) => body } } });
+    const request = (path: string, body?: string) => new Request(`http://127.0.0.1:10001${path}`, { method: body === undefined ? "GET" : "POST", body,
+      headers: { host: "127.0.0.1:10001", "sec-fetch-site": "same-origin", "x-console-request": "1", cookie: `${auth.cookieName}=${login.sessionId}`,
+        ...(body === undefined ? {} : { origin: "http://127.0.0.1:10001", "content-type": "application/json" }) } });
+    const shown = await (await handle(request("/api/push/settings"))).json() as Shown;
+    const body = JSON.stringify({ view: shown.view, roles: shown.roles.map(role => ({ key: role.key, admin: role.admin, pusher: role.pusher,
+      dailyLimit: role.dailyLimit, grants: role.grants })) });
+    expect(body.length).toBeGreaterThan(7_900_000);
+    const response = await handle(request("/api/push/settings", body));
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBe(200);
+    // What reached the service passes its own check, every person with all 200 departments.
+    const parsed = parseRoles(fake.saved[0]);
+    expect(parsed).toHaveLength(ROLE_LIMITS.people);
+    expect(parsed.every(role => role.grants.department && "departments" in role.grants.department && role.grants.department.departments.length === ROLE_LIMITS.departments)).toBe(true);
+    const tooLarge = (path: string, size: number) => handle(request(path, JSON.stringify({ text: "x".repeat(size) })));
+    for (const large of [await tooLarge("/api/push/settings", 16 * 1024 * 1024), await tooLarge("/api/echo", 17 * 1024)]) {
+      expect({ status: large.status, body: await large.json() }).toEqual({ status: 400, body: { error: "请求内容过大", code: "input" } });
+    }
+  } finally { await f.cleanup(); }
 });

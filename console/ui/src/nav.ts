@@ -1,10 +1,9 @@
-// Console sections. Items with a `stage` are planned and shown disabled until that stage ships. `tint` colours the
-// item's icon tile, as the system settings colour theirs.
+// Console sections. `tint` colours the item's icon tile, as the system settings colour theirs.
 import type { IconName } from "./icons.tsx";
 
 export type Tint = "blue" | "green" | "orange" | "pink" | "gray" | "cyan" | "indigo" | "graphite" | "mint" | "red" | "purple" | "yellow";
 
-export interface NavItem { id: string; label: string; icon: IconName; tint: Tint; group: string; description: string; stage?: string }
+export interface NavItem { id: string; label: string; icon: IconName; tint: Tint; group: string; description: string }
 
 export const NAV: NavItem[] = [
   { id: "overview", label: "总览", icon: "dashboard", tint: "blue", group: "", description: "部署身份、机器人状态与版本" },
@@ -20,9 +19,7 @@ export const NAV: NavItem[] = [
   { id: "settings", label: "设置", icon: "gear", tint: "gray", group: "系统", description: "模型、机器人凭据与运行参数" },
 ];
 
-export const available = (item: NavItem) => item.stage === undefined;
-
 export function routeFromHash(hash: string): string {
   const id = hash.replace(/^#\/?/, "");
-  return NAV.some(item => item.id === id && available(item)) ? id : "overview";
+  return NAV.some(item => item.id === id) ? id : "overview";
 }

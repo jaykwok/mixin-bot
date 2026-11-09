@@ -21,6 +21,8 @@ export interface Route {
   slow?: boolean;
   /** Authenticated streaming upload; the route enforces a declared byte limit before writing. */
   raw?: boolean;
+  /** A larger JSON body than the server's default, for a route whose own limits allow more. */
+  maxBody?: number;
 }
 
 export class ApiProblem extends Error {

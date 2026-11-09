@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { deploymentOptions, deploymentEnvironment, deploymentScope } from "../../ops/core/deployment-options.ts";
+import { assertDeploymentEnvironment, deploymentOptions, deploymentEnvironment, deploymentScope } from "../../ops/core/deployment-options.ts";
 import { operationArgs, operationCommand } from "../../ops/core/operations.ts";
 import { codeDigest } from "../../ops/core/source-runtime.ts";
 import { checkTaskPlan } from "../../ops/core/check-plan.ts";
@@ -15,6 +15,17 @@ import type { LaunchdHostFacts } from "../../ops/core/launchd-host.ts";
 
 const target = "a".repeat(40);
 const choice = { target, switchMain: false, directory: "saved" };
+test("升级脚本 unset 已清空的运行参数后仍可复核计划，显式覆盖和缺失的部署选择仍被拒绝", () => {
+  const project = process.cwd(), env = deploymentEnvironment("update", choice, project);
+  for (const [key, value] of Object.entries(env)) if (value === "") delete env[key];
+  expect(() => assertDeploymentEnvironment("update", choice, project, env)).not.toThrow();
+  expect(() => assertDeploymentEnvironment("update", choice, project, { ...env, BOT_PORT: "9999" })).toThrow("BOT_PORT");
+  expect(() => assertDeploymentEnvironment("update", choice, project, { ...env, BOT_RUN_TIMEOUT_SECONDS: "5" })).toThrow("BOT_RUN_TIMEOUT_SECONDS");
+  expect(() => assertDeploymentEnvironment("update", choice, project, { ...env, MIXIN_OPS_DIRECTORY: undefined })).toThrow("MIXIN_OPS_DIRECTORY");
+  const deploy = { port: 2022, workspace: "", directory: "saved" };
+  expect(() => assertDeploymentEnvironment("deploy", deploy, project, { ...deploymentEnvironment("deploy", deploy, project), BOT_PORT: undefined })).toThrow("BOT_PORT");
+});
+
 async function fixture() {
   const f = await tempFixture("console-deployment-");
   for (const name of ["console", "ops", "scripts", "src"]) mkdirSync(join(f.root, name), { recursive: true });

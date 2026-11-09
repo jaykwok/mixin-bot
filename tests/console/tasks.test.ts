@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TaskStore } from "../../ops/core/tasks.ts";
 import type { TaskObservers, TaskRequest } from "../../ops/core/tasks.ts";
@@ -182,6 +182,40 @@ test("事件按序续读，脱敏后落盘，2 MB 内截断但保留阶段和错
     expect(store.events(id)).toEqual([]);
     writeFileSync(join(store.dir(id), "events.jsonl"), '{"seq":1}\n');
     expect(() => store.events(id)).toThrow("损坏");
+  } finally { await fixture.cleanup(); }
+});
+
+test("事件跟读：先给游标之后最近的一个窗口，之后只读追加的部分；写了一半的行等下次；文件变短或被替换时报错", async () => {
+  const fixture = await tempFixture("console-tasks-reader-");
+  try {
+    const store = new TaskStore(fixture.root), { id } = store.create(input(fixture.root), "reader");
+    store.accept(id, actor);
+    const path = join(store.dir(id), "events.jsonl"), line = (seq: number) => JSON.stringify({ seq, at: 1, kind: "output", text: `line ${seq}` }) + "\n";
+    const read = store.eventReader(id, 2, 5);
+    expect(read()).toEqual([]);
+    const log = store.eventWriter(id);
+    for (let seq = 1; seq <= 10; seq++) log("output", `line ${seq}`);
+    expect(read().map(event => event.seq)).toEqual([6, 7, 8, 9, 10]);
+    expect(read()).toEqual([]);
+    // Only what was appended is read: the first line broken in place after that read is not read again.
+    log("output", "line 11");
+    const bytes = readFileSync(path); bytes[0] = 0x78; writeFileSync(path, bytes);
+    expect(read().map(event => event.text)).toEqual(["line 11"]);
+    expect(() => store.events(id)).toThrow();
+    // A line still being written waits for its end.
+    appendFileSync(path, line(12).slice(0, 20));
+    expect(read()).toEqual([]);
+    appendFileSync(path, line(12).slice(20));
+    expect(read().map(event => event.text)).toEqual(["line 12"]);
+    // The window holds for every read: a reader that fell behind gets the latest five.
+    for (let seq = 13; seq <= 20; seq++) appendFileSync(path, line(seq));
+    expect(read().map(event => event.seq)).toEqual([16, 17, 18, 19, 20]);
+    writeFileSync(path, line(1));
+    expect(() => read()).toThrow("事件文件无效");
+    const again = store.eventReader(id, 0);
+    expect(again().map(event => event.seq)).toEqual([1]);
+    writeFileSync(`${path}.new`, line(1) + line(2)); renameSync(`${path}.new`, path);
+    expect(() => again()).toThrow("事件文件无效");
   } finally { await fixture.cleanup(); }
 });
 

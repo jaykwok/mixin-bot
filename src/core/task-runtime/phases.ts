@@ -1,5 +1,5 @@
 // Isolated-task receipt protocol: every phase change of a receipt is one of these named steps. Each step only edits the
-// receipt in memory; the caller saves it before the side effect the step permits (see the R0 state table):
+// receipt in memory; the caller saves it before the side effect the step permits:
 //
 //   allocating ─(reserved → entity-registered → marker-written → work-created)→ active
 //   allocating ─(any allocation error)→ allocation-failed

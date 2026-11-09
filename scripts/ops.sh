@@ -251,7 +251,7 @@ doctor() {
     fi
 }
 
-# 结构化结果（W2 计划 §2 第 3 条）：调用方设置 MIXIN_OPS_RESULT_FILE 时，命令结束写一份 JSON（先写临时文件再改名），
+# 结构化结果（控制台的任务执行器读它，console/server/executor.ts）：调用方设置 MIXIN_OPS_RESULT_FILE 时，命令结束写一份 JSON（先写临时文件再改名），
 # 人类可读的输出不变。用法：ops_result <outcome> <原来在运行 0|1> <最终状态> <退出码> <说明>。
 ops_result() {
     [ -n "${MIXIN_OPS_RESULT_FILE:-}" ] || return 0

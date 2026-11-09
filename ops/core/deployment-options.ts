@@ -57,7 +57,8 @@ export function assertDeploymentEnvironment(operation: string, input: Record<str
   if (operation !== "update" && operation !== "deploy" && operation !== "repair") return;
   const expectedEnvironment = operation === "repair" ? repairEnvironment(project, input) : deploymentEnvironment(operation, input, project);
   for (const [key, expected] of Object.entries(expectedEnvironment)) {
-    if (env[key] !== expected) throw new Error(`部署选择未完整传递（${key}），未执行操作`);
+    // The upgrader unsets cleared runtime overrides before handing off to the core.
+    if ((env[key] ?? "") !== expected) throw new Error(`部署选择未完整传递（${key}），未执行操作`);
   }
 }
 

@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { browse } from "../../console/server/files.ts";
 import type { BrowseEntry, BrowseResponse } from "../../console/ui/src/contract.ts";
@@ -56,6 +58,56 @@ test("原生部署：选择框按主机路径填值，模板在共享资料里�
     const places = (await run({ purpose: "stats" })).places;
     expect(places.slice(0, 3)).toEqual([{ label: "项目目录", path: f.project, kind: "project" }, { label: "数据目录", path: join(f.project, "data"), kind: "data" },
       { label: "共享资料", path: join(f.project, "workspace"), kind: "workspace" }]);
+  } finally { await f.cleanup(); }
+});
+
+test("超过 2000 项的目录只列前 2000 项，但输入的完整路径或字段当前值指向的文件总在结果里并被选中", async () => {
+  const f = await project("console-files-large-");
+  try {
+    const big = join(f.project, "elsewhere/big");
+    await mkdir(big);
+    for (let start = 0; start < 2100; start += 100) {
+      await Promise.all(Array.from({ length: 100 }, (_, index) => writeFile(join(big, `stats-${String(start + index).padStart(4, "0")}.sqlite`), "")));
+    }
+    const run = (body: unknown) => browse(f.project, body, "windows");
+    const listing = await run({ purpose: "stats", path: big });
+    expect({ count: listing.entries.length, truncated: listing.truncated }).toEqual({ count: 2000, truncated: true });
+    // The listing order is the file system's: take a file it left out.
+    const shown = new Set(listing.entries.map(item => item.name));
+    const outside = Array.from({ length: 2100 }, (_, index) => `stats-${String(index).padStart(4, "0")}.sqlite`).find(name => !shown.has(name))!;
+    for (const body of [{ purpose: "stats", path: join(big, outside) }, { purpose: "stats", from: join(big, outside) }]) {
+      const opened = await run(body);
+      expect({ path: opened.path, selected: opened.selected, truncated: opened.truncated }).toEqual({ path: big, selected: outside, truncated: true });
+      expect(entry(opened, outside).value).toBe(join(big, outside));
+      expect(opened.entries.filter(item => item.name === outside)).toHaveLength(1);
+    }
+    // Windows and macOS ignore case: a typed path in another case selects the listed name, listed once.
+    if (process.platform !== "linux") {
+      const listed = listing.entries[0]!.name, typed = await run({ purpose: "stats", path: join(big, listed.toUpperCase()) });
+      expect(typed.selected).toBe(listed);
+      expect(typed.entries.filter(item => item.name.toLowerCase() === listed.toLowerCase()).map(item => item.name)).toEqual([listed]);
+    }
+  } finally { await f.cleanup(); }
+}, 60_000);
+
+/** Whether the temporary directory tells case apart (Linux; a case-sensitive macOS volume or Windows directory). */
+const caseSensitive = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "console-files-case-probe-"));
+  try { writeFileSync(join(dir, "a"), ""); return !existsSync(join(dir, "A")); } finally { rmSync(dir, { recursive: true, force: true }); }
+})();
+
+test.skipIf(!caseSensitive)("区分大小写的目录里，Windows 和 macOS 的规则也先认精确的名字；只差大小写的是另一个文件，单独列出", async () => {
+  const f = await project("console-files-case-");
+  try {
+    const dir = join(f.project, "elsewhere/case");
+    await mkdir(dir);
+    await writeFile(join(dir, "report.sqlite"), "lower"); await writeFile(join(dir, "Report.sqlite"), "upper!");
+    for (const platform of ["macos", "windows"] as const) for (const typed of ["report.sqlite", "Report.sqlite"]) {
+      const opened = await browse(f.project, { purpose: "stats", path: join(dir, typed) }, platform);
+      expect(opened.selected).toBe(typed);
+      expect(opened.entries.map(item => item.name).sort()).toEqual(["Report.sqlite", "report.sqlite"]);
+      expect(entry(opened, typed)).toMatchObject({ size: typed === "report.sqlite" ? 5 : 6, value: join(dir, typed) });
+    }
   } finally { await f.cleanup(); }
 });
 

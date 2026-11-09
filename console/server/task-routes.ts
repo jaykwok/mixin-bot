@@ -24,10 +24,18 @@ const record = (body: unknown, allowed: string[]): Record<string, unknown> => {
 const display = (view: TaskView) => ({ id: view.id, state: view.state, needsRecovery: view.needsRecovery,
   operation: view.request?.operation, createdAt: view.request?.createdAt, result: view.result, reason: view.reason });
 
+/** The page keeps the latest this many events (console/ui/src/tasks.tsx): a connection never sends more at once. */
+const EVENT_WINDOW = 2000;
+
+/**
+ * A task's events as server-sent events: first the latest window after the browser's cursor, then each second what was
+ * appended (read on from where the last read stopped), all of it at once; a keepalive when nothing was.
+ */
 function events(tasks: TaskStore, id: string, context: RouteContext): Response {
   const header = context.request?.headers.get("last-event-id") ?? "0";
   if (!/^\d{1,10}$/.test(header)) throw new ApiProblem(400, "input", "事件序号无效");
-  let cursor = Number(header), timer: ReturnType<typeof setInterval> | undefined, stopped = false;
+  const read = tasks.eventReader(id, Number(header), EVENT_WINDOW);
+  let timer: ReturnType<typeof setInterval> | undefined, stopped = false;
   const encoder = new TextEncoder();
   let stop = () => {};
   const stream = new ReadableStream<Uint8Array>({
@@ -42,12 +50,8 @@ function events(tasks: TaskStore, id: string, context: RouteContext): Response {
         if (context.signal.aborted || !context.sessionAlive?.()) { stop(); return; }
         if ((controller.desiredSize ?? 0) <= 0) return;
         try {
-          const batch = tasks.events(id, cursor).slice(0, 50);
-          if (!batch.length) controller.enqueue(encoder.encode(": keepalive\n\n"));
-          for (const event of batch) {
-            controller.enqueue(encoder.encode(`id: ${event.seq}\nevent: task\ndata: ${JSON.stringify(event)}\n\n`));
-            cursor = event.seq;
-          }
+          const batch = read();
+          controller.enqueue(encoder.encode(batch.length ? batch.map(event => `id: ${event.seq}\nevent: task\ndata: ${JSON.stringify(event)}\n\n`).join("") : ": keepalive\n\n"));
         } catch { controller.enqueue(encoder.encode('event: error\ndata: {"message":"事件记录无法读取"}\n\n')); stop(); }
       };
       context.signal.addEventListener("abort", stop, { once: true });

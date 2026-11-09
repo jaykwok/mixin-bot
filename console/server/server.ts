@@ -53,7 +53,7 @@ function cookie(request: Request, name: string): string | undefined {
   return undefined;
 }
 
-async function readJson(request: Request): Promise<unknown> {
+async function readJson(request: Request, limit = MAX_BODY): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) throw new Error("请求格式应为 JSON");
   if (!request.body) throw new Error("缺少请求内容");
   const reader = request.body.getReader(), decoder = new TextDecoder(); let text = "", bytes = 0;
@@ -61,7 +61,7 @@ async function readJson(request: Request): Promise<unknown> {
     for (;;) {
       const chunk = await reader.read(); if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > MAX_BODY) { await reader.cancel(); throw new Error("请求内容过大"); }
+      if (bytes > limit) { await reader.cancel(); throw new Error("请求内容过大"); }
       text += decoder.decode(chunk.value, { stream: true });
     }
     return JSON.parse(text + decoder.decode());
@@ -165,7 +165,7 @@ export function createHandler(options: ConsoleServerOptions): (request: Request,
     if (custom.slow) server?.timeout(request, SLOW_ROUTE_SECONDS);
     let body: unknown;
     if (request.method === "POST" && !custom.raw) {
-      try { body = await readJson(request); }
+      try { body = await readJson(request, custom.maxBody); }
       catch (error) { return failure(400, (error as Error).message, "input"); }
     }
     try {

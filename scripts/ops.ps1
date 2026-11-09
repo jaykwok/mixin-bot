@@ -169,7 +169,7 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
     return (Invoke-CoreMaintenance $coreArgs)
 }
 
-# 结构化结果（W2 计划 §2 第 3 条），与 ops.sh 的 ops_result 相同：调用方设置 MIXIN_OPS_RESULT_FILE 时写一份 JSON（先写
+# 结构化结果（控制台的任务执行器读它，console/server/executor.ts），与 ops.sh 的 ops_result 相同：调用方设置 MIXIN_OPS_RESULT_FILE 时写一份 JSON（先写
 # 临时文件再改名），人类可读的输出不变。写不进去时返回 $false。
 function Write-OpsResult([string]$Outcome, [bool]$WasRunning, [string]$FinalState, [int]$ExitCode, [string]$Message) {
     $path = $env:MIXIN_OPS_RESULT_FILE

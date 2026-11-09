@@ -5,6 +5,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api, ApiFailure } from "./api.ts";
+import { serverTime } from "./clock.ts";
 import { dateTime, platformName } from "./format.ts";
 import { PathField } from "./files.tsx";
 import { Icon, type IconName } from "./icons.tsx";
@@ -103,26 +104,30 @@ export function useFollowed(): { followed: Followed[]; shown: string | null; han
 export function TaskAction({ operation, params, children, disabled, danger = false, primary = false, onStarted }: {
   operation: string; params: Record<string, unknown>; children: ComponentChildren; disabled?: boolean; danger?: boolean; primary?: boolean; onStarted?: () => void;
 }) {
-  const [plan, setPlan] = useState<Plan | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [now, setNow] = useState(Date.now());
+  // The preview's expiry is the server's: `now` and `received` are server time.
+  const [plan, setPlan] = useState<Plan | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [now, setNow] = useState(serverTime);
   const [submitting, setSubmitting] = useState(false), [received, setReceived] = useState(0);
   // The console refused this preview (facts changed, plan used or expired, executor unavailable): only a new preview can go on.
   const [refused, setRefused] = useState(false);
   const key = useRef(""), lock = useRef(false), live = useRef(true);
   useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
-  useEffect(() => { if (!plan) return; const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [plan]);
+  useEffect(() => { if (!plan) return; const timer = setInterval(() => setNow(serverTime()), 1000); return () => clearInterval(timer); }, [plan]);
   const preview = async () => {
     if (lock.current) return; lock.current = true; setBusy(true); setError(""); setRefused(false);
     try {
       const result = await api<Plan>("/api/plans", { method: "POST", body: { operation, params }, intent: true, timeoutMs: 120_000 });
-      if (live.current) { key.current = crypto.randomUUID(); setPlan(result); setNow(Date.now()); setReceived(Date.now()); }
+      if (live.current) { key.current = crypto.randomUUID(); setPlan(result); setNow(serverTime()); setReceived(serverTime()); }
     } catch (error) { if (live.current) setError(message(error)); }
     finally { lock.current = false; if (live.current) setBusy(false); }
   };
   const submit = async () => {
-    if (!plan || refused || lock.current || Date.now() >= plan.expiresAt) return;
+    if (!plan || refused || lock.current || serverTime() >= plan.expiresAt) return;
     lock.current = true; setBusy(true); setSubmitting(true); setError("");
+    const sentIn = epoch;
     try {
       const task = await api<TaskView>("/api/tasks", { method: "POST", body: { plan: plan.id, key: key.current }, intent: true, timeoutMs: 90_000 });
+      // The session ended meanwhile (logout): the task runs on, but this page no longer follows it.
+      if (sentIn !== epoch) return;
       if (live.current) { setPlan(null); onStarted?.(); }
       followTask({ ...task, operation: task.operation ?? operation, createdAt: task.createdAt ?? Date.now(), needsRecovery: task.needsRecovery ?? false });
     } catch (error) {

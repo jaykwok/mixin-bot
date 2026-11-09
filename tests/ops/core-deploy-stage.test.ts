@@ -104,3 +104,28 @@ test("部署读 HEAD：不是仓库或还没有提交时为空，读取失败时
     await expect(failing.head(controller.signal)).rejects.toThrow("spawn failed");
   } finally { await f.cleanup(); }
 });
+
+test("升级沿用已装依赖：只改代码时沿用；锁文件变化或清单带依赖补丁时重新安装", async () => {
+  const f = await tempFixture("core-deploy-reuse-");
+  try {
+    const git = async (...args: string[]) => {
+      const child = Bun.spawn(["git", "-C", f.root, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], { stdout: "pipe", stderr: "pipe" });
+      const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(code).toBe(0); return out.trim();
+    };
+    const commit = async (file: string, text: string) => {
+      await writeFile(join(f.root, file), text); await git("add", "-A"); await git("commit", "--quiet", "-m", file); return git("rev-parse", "HEAD");
+    };
+    const manifest = { name: "fixture", private: true, dependencies: { "fixture-dep": "1.0.0" } };
+    await mkdir(join(f.root, "node_modules/fixture-dep"), { recursive: true });
+    await writeFile(join(f.root, "node_modules/fixture-dep/package.json"), JSON.stringify({ name: "fixture-dep", version: "1.0.0" }));
+    await writeFile(join(f.root, "package.json"), JSON.stringify(manifest));
+    await git("init", "--quiet");
+    const base = await commit(".gitignore", "node_modules/\n"), code = await commit("app.ts", "export {};\n"), lock = await commit("bun.lock", "{}\n");
+    const core = new DeploymentGit(f.root);
+    expect(await core.dependenciesReusable(base, code)).toBe(true);
+    expect(await core.dependenciesReusable(code, lock)).toBe(false);
+    await writeFile(join(f.root, "package.json"), JSON.stringify({ ...manifest, patchedDependencies: { "fixture-dep@1.0.0": "patches/fixture-dep@1.0.0.patch" } }));
+    expect(await core.dependenciesReusable(base, code)).toBe(false);
+  } finally { await f.cleanup(); }
+});

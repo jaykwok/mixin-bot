@@ -29,6 +29,9 @@
 // 「已收到」 counts clicks, and options are refused. While the group replies, every text @-mentioning the bot is a reply
 // item with its sender; group members' conversations learn of a live push the next time they @-mention the bot.
 //
+// Lookup (directory_lookup): a pusher finds people in the synced address book by part of the name, phone or department,
+// with their full phones and departments, to name recipients they know only by name or department.
+//
 // All state is in the state database (./store.ts); what runs in the background (sends, card updates, notes, the summary)
 // picks up from there after a restart.
 import { randomBytes } from "node:crypto";
@@ -52,6 +55,7 @@ import { cardMessage, type CardContent, splitText, type Target, textMessage } fr
 import type { StreamEvent } from "../integrations/open-platform/stream.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
+import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, groupReplyText, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
 import { buildSummary, effectiveItems, type HeldFile, replyText, senders, type SummaryPackage } from "./summary.ts";
@@ -88,6 +92,8 @@ export const PUSH_LIMITS = {
   /** A known group's "last @-mentioned" time is written at most this often. */
   groupSeenMs: 10 * 60_000,
   cc: 10,
+  /** People one directory_lookup answer lists. */
+  lookup: 50,
   subjectChars: 40,
   bodyChars: 3000,
   options: [2, 6] as readonly [number, number],
@@ -106,8 +112,8 @@ export interface PushHost {
 export interface PushDirectory {
   lookup(imUserId: string): DirectoryIdentity | undefined;
   byPhone(phone: string): DirectoryIdentity | undefined;
-  /** The synced department tree (department-tree.ts): department targets, everyone, department grants. */
-  readonly departments: Pick<DepartmentTree, "updatedAt" | "get" | "all" | "find" | "within" | "members" | "everyone">;
+  /** The synced department tree (department-tree.ts): department targets, everyone, department grants, lookups. */
+  readonly departments: Pick<DepartmentTree, "updatedAt" | "get" | "all" | "find" | "within" | "members" | "everyone" | "departmentsOf">;
 }
 
 export interface PushOptions {
@@ -137,6 +143,16 @@ export type PrepareInput = {
   options?: readonly string[];
   deadline?: string;
   cc?: readonly { name: string; phone: string }[];
+};
+
+/** What directory_lookup passes on (./tools.ts): at least one of name, phone and department; together they narrow down. */
+export type LookupInput = {
+  /** Part of the name. */
+  name?: string;
+  phone?: string;
+  /** By name or path; `children: false` leaves the sub-departments out. */
+  department?: string;
+  children?: boolean;
 };
 
 /** A refusal the model passes on to the pusher. */
@@ -177,7 +193,9 @@ export type PushGroupRow = ChatGroup & { registeredByName: string | null };
 export type PushAdmin = Pick<PushService, "settings" | "saveSettings" | "list" | "detail" | "remind" | "setCc" | "remove" | "package" | "groups" | "saveGroup">;
 
 export const holderOf = (pushId: string) => `push:${pushId}`;
-const sameName = (a: string, b: string) => a.replace(/\s+/g, "").toLowerCase() === b.replace(/\s+/g, "").toLowerCase();
+/** A name as names are compared: no white space, lower case. */
+const compactName = (text: string) => text.replace(/\s+/g, "").toLowerCase();
+const sameName = (a: string, b: string) => compactName(a) === compactName(b);
 const chars = (text: string) => [...text].length;
 const truncate = (text: string, max: number) => chars(text) > max ? [...text].slice(0, max).join("") + "…" : text;
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
@@ -211,7 +229,7 @@ export function parseDeadline(text: string): number | undefined {
 
 /** The role list a settings save carries (the console, through the local control interface). */
 export function parseRoles(value: unknown): Omit<PushRole, "updatedAt">[] {
-  if (!Array.isArray(value) || value.length > 1000) throw new Error("名单必须是不超过 1000 项的数组");
+  if (!Array.isArray(value) || value.length > ROLE_LIMITS.people) throw new Error(`名单必须是不超过 ${ROLE_LIMITS.people} 项的数组`);
   const seen = new Set<string>();
   return value.map((raw, index) => {
     const item = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
@@ -221,7 +239,9 @@ export function parseRoles(value: unknown): Omit<PushRole, "updatedAt">[] {
     seen.add(item.phone);
     if (typeof item.admin !== "boolean" || typeof item.pusher !== "boolean") throw new Error(`${at}缺少管理员或推送人标记`);
     const limit = item.dailyLimit ?? null;
-    if (limit !== null && (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)) throw new Error(`${at}的频次上限必须是 1 到 1000 的整数`);
+    if (limit !== null && (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > ROLE_LIMITS.dailyLimit)) {
+      throw new Error(`${at}的频次上限必须是 1 到 ${ROLE_LIMITS.dailyLimit} 的整数`);
+    }
     return { phone: item.phone, admin: item.admin, pusher: item.pusher, grants: parseGrants(item.grants, at), dailyLimit: limit };
   });
 }
@@ -237,7 +257,8 @@ function parseGrants(value: unknown, at: string): Grants {
   const department = raw.department as Record<string, unknown> | undefined | null;
   if (department !== undefined && department !== null) {
     if (department.any === true && Object.keys(department).length === 1) grants.department = { any: true };
-    else if (Array.isArray(department.departments) && Object.keys(department).length === 1 && department.departments.length >= 1 && department.departments.length <= 200
+    else if (Array.isArray(department.departments) && Object.keys(department).length === 1 && department.departments.length >= 1
+      && department.departments.length <= ROLE_LIMITS.departments
       && department.departments.every(id => typeof id === "string" && /^[0-9A-Za-z_-]{1,64}$/.test(id))) grants.department = { departments: [...new Set(department.departments as string[])] };
     else throw new Error(`${at}的部门授权无效`);
   }
@@ -644,6 +665,42 @@ export class PushService {
     if (!own.length) return (recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复") + replying;
     const text = replyText(own), files = own.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
     return `已回复：${text ? truncate(oneLine(text), 200) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}${replying}`;
+  }
+
+  // ---- directory_lookup -----------------------------------------------------------------------------------------------
+
+  /**
+   * People in the synced address book, for a pusher: by part of the name, by phone, or in a department (with its
+   * sub-departments unless `children` is false); given together they narrow down. Each comes with the full phone and
+   * the departments, at most `lookup` of them. The model's answer.
+   */
+  lookup(phone: string, input: LookupInput): string {
+    if (!this.isPusher(phone)) throw new PushRefused("你没有推送权限，不能查通讯录。");
+    const tree = this.#directory.departments;
+    const name = compactName(input.name ?? ""), number = (input.phone ?? "").replace(/[\s-]/g, ""), department = oneLine(input.department ?? "");
+    if (!name && !number && !department) throw new PushRefused("请给出姓名（可以只写其中几个字）、手机号或部门，至少一项。");
+    const lines: string[] = [];
+    let people: readonly DirectoryIdentity[];
+    if (department) {
+      if (tree.updatedAt === undefined) return "机器人还没有同步到部门信息，暂时不能按部门查，请稍后再试；按姓名或手机号可以查。";
+      const { matches, similar } = tree.find(department);
+      if (!matches.length) return `找不到部门「${department}」${similar.length ? `，是不是：${similar.map(each => each.path).join("、")}` : ""}。`;
+      if (matches.length > 1) return `有 ${matches.length} 个部门叫「${department}」，请用完整路径再查：${matches.map(each => each.path).join("；")}。`;
+      const found = matches[0]!, children = input.children !== false;
+      const below = tree.all().filter(each => each.parent === found.id).map(each => each.name);
+      lines.push(`部门 ${found.path}（${children ? "含下级" : "不含下级"}）`
+        + (below.length ? `，下级部门：${below.slice(0, 30).join("、")}${below.length > 30 ? ` 等 ${below.length} 个` : ""}` : "，没有下级部门"));
+      people = tree.members([found.id], children);
+    } else people = number ? [this.#directory.byPhone(number)].filter(person => person !== undefined) : tree.everyone();
+    const matched = people.filter(person => (!name || compactName(person.name).includes(name)) && (!number || person.phone === number));
+    if (!matched.length) return [...lines, "没有找到符合的人（只查机器人同步的通讯录范围）。"].join("\n");
+    const limit = this.#limits.lookup, shown = matched.slice(0, limit), places = tree.departmentsOf(shown.map(person => person.phone));
+    lines.push(matched.length > limit ? `找到 ${matched.length} 人，只列出前 ${limit} 人；可以加上姓名或改查下级部门缩小范围：` : `找到 ${matched.length} 人：`);
+    for (const person of shown) {
+      const paths = places.get(person.phone) ?? [];
+      lines.push(`- ${person.name}，手机号 ${person.phone}${paths.length ? `，部门：${paths.join("；")}` : ""}`);
+    }
+    return lines.join("\n");
   }
 
   // ---- clicks ---------------------------------------------------------------------------------------------------------

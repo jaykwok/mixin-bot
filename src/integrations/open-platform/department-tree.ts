@@ -1,4 +1,4 @@
-// 同步范围内的部门树与部门成员：推送按部门找对象、展开名单和核对部门授权都读这里（src/push/service.ts）。
+// 同步范围内的部门树与部门成员：推送按部门找对象、展开名单、核对部门授权和推送人查通讯录都读这里（src/push/service.ts）。
 //
 // 由通讯录扫描维护（identity-directory.ts）：遍历完整的一轮整体替换；应用新范围时与新名单在同一个事务里替换，没换上新名单
 // 就不动。成员按手机号记，读出时与有效映射（member_directory）取交集，所以只给出能收消息的人。范围的顶层部门是同步范围
@@ -123,6 +123,16 @@ export class DepartmentTree {
     return this.db.query(`SELECT DISTINCT m.phone, m.im_user_id AS imUserId, m.name FROM directory_department_members dm
       JOIN member_directory m ON m.phone = dm.phone WHERE dm.department IN (SELECT value FROM json_each(?)) ORDER BY m.name, m.phone`)
       .all(JSON.stringify(departments)) as DirectoryIdentity[];
+  }
+
+  /** 这些成员直属的部门路径（每人按路径排序）；不在任何部门里的人不列出。 */
+  departmentsOf(phones: readonly string[]): Map<string, string[]> {
+    const result = new Map<string, string[]>();
+    if (!phones.length) return result;
+    const rows = this.db.query(`SELECT dm.phone, d.path FROM directory_department_members dm JOIN directory_departments d ON d.id = dm.department
+      WHERE dm.phone IN (SELECT value FROM json_each(?)) ORDER BY d.path`).all(JSON.stringify(phones)) as { phone: string; path: string }[];
+    for (const row of rows) result.set(row.phone, [...result.get(row.phone) ?? [], row.path]);
+    return result;
   }
 
   /** 同步范围内全部有有效映射的成员。 */

@@ -186,10 +186,13 @@ test("a note into a group nobody has asked in yet creates the space and the memb
 
 test("only a pusher's conversation selects the push tools and section; a revoked pusher's next request has neither", async () => {
   const where = root(), out = recordingOutbound();
-  const status: string[] = [];
+  const status: string[] = [], lookups: unknown[] = [];
   const pushers = new Set([ALICE]);
-  const fake = { prepare: async () => "预览已发出", status: (phone: string) => { status.push(phone); return "没有推送"; } };
-  const m = model([() => fauxAssistantMessage([fauxToolCall("push_status", {}, { id: "status-1" })], { stopReason: "toolUse" })]);
+  const fake = { prepare: async () => "预览已发出", status: (phone: string) => { status.push(phone); return "没有推送"; },
+    lookup: (phone: string, input: unknown) => { lookups.push([phone, input]); return "找到 1 人"; } };
+  const m = model([() => fauxAssistantMessage([fauxToolCall("push_status", {}, { id: "status-1" }),
+    fauxToolCall("directory_lookup", { department: "华东分公司" }, { id: "lookup-1" })], { stopReason: "toolUse" })]);
+  const pushTools = (names: Set<string>) => [...names].filter(name => name.startsWith("push_") || name === "directory_lookup");
   const service = open(where, m, out.outbound, {
     memberExtensions: {
       install: scope => scope.kind === "direct" ? [pushExtension(fake, { layout: appLayout(where) })] : [],
@@ -200,20 +203,22 @@ test("only a pusher's conversation selects the push tools and section; a revoked
     await service.admit(ask(out, ALICE, "how are my pushes"));
     await until(() => replyTexts(out.sent).length === 1, "Alice's answer");
     expect(status).toEqual([ALICE]);
+    expect(lookups).toEqual([[ALICE, { department: "华东分公司" }]]);
     const alice = declared(m.requests[0]!);
-    expect(alice.tools.has("push_prepare")).toBe(true); expect(alice.tools.has("push_status")).toBe(true);
+    expect(pushTools(alice.tools).sort()).toEqual(["directory_lookup", "push_prepare", "push_status"]);
     expect(alice.sections.has("push")).toBe(true);
     expect(m.requests[1]!.some(message => message.role === "toolResult" && text(message) === "没有推送")).toBe(true);
+    expect(m.requests[1]!.some(message => message.role === "toolResult" && text(message) === "找到 1 人")).toBe(true);
     await service.admit(ask(out, BOB, "hello"));
     await until(() => replyTexts(out.sent).length === 2, "Bob's answer");
     const bob = declared(m.requests[2]!);
-    expect([...bob.tools].filter(name => name.startsWith("push_"))).toEqual([]);
+    expect(pushTools(bob.tools)).toEqual([]);
     expect(bob.sections.has("push")).toBe(false);
     pushers.delete(ALICE);
     await service.admit(ask(out, ALICE, "and now"));
     await until(() => replyTexts(out.sent).length === 3, "Alice's answer after the revocation");
     const revoked = declared(m.requests[3]!);
-    expect([...revoked.tools].filter(name => name.startsWith("push_"))).toEqual([]);
+    expect(pushTools(revoked.tools)).toEqual([]);
     expect(revoked.sections.has("push")).toBe(false);
   } finally { await service.close(); }
 });

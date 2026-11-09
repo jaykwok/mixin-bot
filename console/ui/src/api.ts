@@ -26,6 +26,9 @@ export function newLoginGeneration(): void {
   generation++;
 }
 
+/** The current generation: an answer to a request sent in an earlier one belongs to a page no longer shown. */
+export const loginGeneration = (): number => generation;
+
 export interface CallOptions {
   method?: "GET" | "POST";
   body?: unknown;

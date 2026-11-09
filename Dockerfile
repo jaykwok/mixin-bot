@@ -22,7 +22,6 @@ WORKDIR /app
 # 先装依赖（利用层缓存；.dockerignore 排除本地 node_modules，容器内重装）
 COPY package.json bun.lock ./
 COPY pyproject.toml uv.lock .python-version ./
-COPY patches ./patches
 RUN bun install --frozen-lockfile --production
 
 # Explicit build inputs prevent local credentials and tool workspaces entering image layers.

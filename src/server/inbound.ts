@@ -1,4 +1,4 @@
-// 入站（方案 5.2）：Stream 事件 → 解析 → 身份 → 分派（推送、命令、提问、附件）。
+// 入站：Stream 事件 → 解析 → 身份 → 分派（推送、命令、提问、附件）。
 //
 // 回调里同步完成：字段校验、会话识别、身份查询（本地映射表）、生成回复上下文，并调用推送服务或 admit/control/attach，
 // 它们在第一个 await 之前取到达序号并占住成员顺序，所以同一成员的消息按事件到达顺序处理。之后的等待在后台进行。
@@ -262,7 +262,7 @@ function replyContext(message: Parsed, identity: DirectoryIdentity | undefined):
   };
 }
 
-/** 单聊附件事件的内容（方案 2.2）：fileId 必需；文件带 filename、size、mimeType。 */
+/** 单聊附件事件的内容：fileId 必需；文件带 filename、size、mimeType。 */
 function attachmentEvent(type: AttachmentEvent["kind"], content: Record<string, unknown>): AttachmentEvent | undefined {
   const { fileId, filename, size, mimeType } = content;
   if (typeof fileId !== "string" || !/^[\x21-\x7e]{1,512}$/.test(fileId)) return undefined;

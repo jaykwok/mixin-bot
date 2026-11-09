@@ -340,8 +340,9 @@ async function archiveFixture(names: string[]) {
   const options = { root: groups, state: join(root, "state.sqlite"), archive: join(groups, "state/reclamation/backup/rm"), scope };
   const plan = await previewTmpArchive(options, 0);
   await applyTmpArchive(options, plan.id, plan.digest);
-  for (const path of [join(groups, "state/reclamation"), join(groups, "state/reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
+  for (const path of [join(groups, "state"), join(groups, "state/reclamation"), join(groups, "state/reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
   await chmod(options.archive, 0o750);
+  expect(writableByService(options.archive)).toBe(true);
   return { root, groups, journal, archive: options.archive, destinations: plan.items.map(item => item.destination) };
 }
 type ArchiveFixture = Awaited<ReturnType<typeof archiveFixture>>;

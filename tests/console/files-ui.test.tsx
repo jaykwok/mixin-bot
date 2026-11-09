@@ -1,6 +1,6 @@
 /** @jsxImportSource preact */
 import { afterAll, expect, test } from "bun:test";
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { GlobalRegistrator } from "../helpers/dom.tsx";
 import type { BrowseEntry, BrowsePurpose, BrowseResponse } from "../../console/ui/src/contract.ts";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });

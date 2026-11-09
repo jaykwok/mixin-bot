@@ -545,6 +545,36 @@ test("department and everyone pushes: grants, names and paths, duplicates and ne
   } finally { await h.close(); }
 });
 
+test("directory_lookup: pushers only; by part of the name, phone or department, together narrowing down; full phones and departments; capped", async () => {
+  const h = harness({ limits: { lookup: 2 }, people: [{ phone: "13800000004", name: "张 三丰", imUserId: im("13800000004") }] });
+  try {
+    // Before the tree is synced: names and phones work, departments wait.
+    expect(h.service.lookup(PUSHER, { name: "李" })).toBe("找到 1 人：\n- 李四，手机号 13800000002");
+    expect(h.service.lookup(PUSHER, { department: "技术部" })).toContain("还没有同步到部门信息");
+    h.tree({ "2": [PUSHER, ZHANG], "4": [LI, ZHANG], "3": [WANG] });
+    expect(() => h.service.lookup(PUSHER, {})).toThrow("至少一项");
+    expect(() => h.service.lookup(PUSHER, { name: "  " })).toThrow(PushRefused);
+    // By part of the name (white space does not count), each person with every department they are in.
+    expect(h.service.lookup(PUSHER, { name: "张三" })).toBe(["找到 2 人：", "- 张 三丰，手机号 13800000004", "- 张三，手机号 13800000001，部门：技术部；技术部/研发组"].join("\n"));
+    // By phone (spaces and dashes do not count); only the synced address book.
+    expect(h.service.lookup(PUSHER, { phone: "138-0000-0003" })).toBe("找到 1 人：\n- 王五，手机号 13800000003，部门：财务部");
+    expect(h.service.lookup(PUSHER, { phone: "13900000000" })).toBe("没有找到符合的人（只查机器人同步的通讯录范围）。");
+    // By department: sub-departments included and named; more people than the limit are cut off with a hint.
+    expect(h.service.lookup(PUSHER, { department: "技术部" })).toBe(["部门 技术部（含下级），下级部门：研发组", "找到 3 人，只列出前 2 人；可以加上姓名或改查下级部门缩小范围：",
+      "- 张三，手机号 13800000001，部门：技术部；技术部/研发组", "- 推送人，手机号 13800000009，部门：技术部"].join("\n"));
+    // Without sub-departments, by path, narrowed by name.
+    expect(h.service.lookup(PUSHER, { department: "技术部", children: false, name: "李" })).toBe("部门 技术部（不含下级），下级部门：研发组\n没有找到符合的人（只查机器人同步的通讯录范围）。");
+    expect(h.service.lookup(PUSHER, { department: "技术部 / 研发组", name: "李" })).toBe("部门 技术部/研发组（含下级），没有下级部门\n找到 1 人：\n- 李四，手机号 13800000002，部门：技术部/研发组");
+    // The same name twice, or no such department: the paths to choose from, or the near misses.
+    expect(h.service.lookup(PUSHER, { department: "研发组" })).toBe("有 2 个部门叫「研发组」，请用完整路径再查：技术部/研发组；财务部/研发组。");
+    expect(h.service.lookup(PUSHER, { department: "研发" })).toBe("找不到部门「研发」，是不是：技术部/研发组、财务部/研发组。");
+    // No department grant is needed (people are pushed to one by one); the pusher role is.
+    h.store.replaceRoles([], h.clock.now);
+    expect(() => h.service.lookup(PUSHER, { name: "李" })).toThrow("没有推送权限");
+    expect(h.sent).toEqual([]);
+  } finally { await h.close(); }
+});
+
 test("confirm expands the list again: joiners and leavers count; a lost grant or an empty list cancels with a message", async () => {
   const h = harness();
   try {

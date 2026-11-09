@@ -18,7 +18,7 @@
 2. 记下 AppID 和 AppSecret，部署向导会要求填写；环境默认“线上”，只有使用预发环境时才改。
 3. 权限按最小化授予：
    - 必需：`basic:appBasic`、`basic:chat:single`、`basic:chat:group`、`getAccess:addressBookRange`、`file:tempStorage`，以及通讯录的部门、成员列表读取权限。
-   - 建议移除：通讯录的增删改员工和部门（`addressbook:user`、`addressbook:dept`）、用户同步（`addressbook:sync`）和公众号推文。凭据保存在服务器上，Windows 原生部署时 `bash` 工具拥有运行账户的权限且能联网，出错的模型可能调用这些写接口；本项目只读通讯录。
+   - 建议移除：通讯录的增删改员工和部门（`addressbook:user`、`addressbook:dept`）、用户同步（`addressbook:sync`）和公众号推文。凭据保存在服务器上，Windows 和 macOS 原生部署时 `bash` 工具拥有运行账户的权限且能联网，出错的模型可能调用这些写接口；本项目只读通讯录。
 4. 通讯录可见范围（`getAccess:addressBookRange`）要覆盖所有会使用机器人的成员。机器人按通讯录把平台 ID 对应到手机号，统计和会话都按手机号归属；不在范围内的成员会因“无法确认身份”被拒收。
 
 事件订阅要等服务运行后才能验证，见[接入开发者后台](#接入开发者后台)。一个应用同一时间只能有一个服务实例连接 Stream：不要让两套部署、测试实例或调试工具共用同一个应用，否则事件会被分走。
@@ -64,7 +64,7 @@ cd /opt/mixin-bot
 
 部署按服务账户实际检查每个工具的版本和路径，并把找到的路径写进服务定义；以后升级 Homebrew 后若工具位置变化，重新部署即可。服务的 `PATH` 只包含这些工具和系统目录，语言环境为 `C.UTF-8`，不读取任何登录 shell 的配置。
 
-与 Linux 相比的限制：成员的工具进程脱离自己的会话后，停止时不一定能找全；临时文件的物理删除只在停机维护中、确认服务账户没有残留进程后进行，否则保留现场。项目目录须在 APFS 卷上（系统盘默认如此）：其他文件系统上无法确认删除结果，这类删除会被拒绝，不删除任何内容。卸载（`sudo bash scripts/ops.sh uninstall`）删除服务定义并归档数据，但保留服务账户，并打印删除它的命令。
+与 Linux 相比的限制：成员的工具进程脱离自己的会话后，停止时不一定能找全；临时文件的物理删除只在停机维护中、确认服务账户没有残留进程且部署锁仍被持有后按删除日志进行，否则保留现场。项目目录须在 APFS 卷上（系统盘默认如此）：其他文件系统上无法确认删除结果，这类删除会被拒绝，不删除任何内容。卸载（`sudo bash scripts/ops.sh uninstall`）删除服务定义并归档数据，但保留服务账户，并打印删除它的命令。
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
@@ -210,11 +210,11 @@ $env:BOT_PORT='12011'; powershell -NoProfile -ExecutionPolicy Bypass -File scrip
 
 Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原生预算、上下文缓存和可选辅助模型、MCP 的配置方式见[运行设置与可选工具](runtime-tools.md)。数据格式与升级规则见[版本、数据格式与从旧版切换](data-migrations.md)。
 
-部署脚本保存支持的设置，未显式指定的值沿用已存配置。Windows 上仅在前台启动时设置的环境变量不会自动落盘；停机后可运行 `bun run configure-runtime` 保存当前支持项；有未完成的部署、升级、运维任务或配置事务时它会拒绝。Linux 的 Docker 部署由部署入口写入运行参数，这条命令在 Linux 上拒绝执行。配置文件中的未知键、无效类型及越界值会阻止启动。
+部署脚本保存支持的设置，未显式指定的值沿用已存配置。Windows 上仅在前台启动时设置的环境变量不会自动落盘；停机后可运行 `bun run configure-runtime` 保存当前支持项；有未完成的部署、升级、运维任务或配置事务时它会拒绝。Linux 的 Docker 部署由部署入口写入运行参数，这条命令在 Linux 上拒绝执行。macOS 上请在控制台「设置 → 高级运行参数」中调整：`data/config` 属于服务账户，普通用户运行 `bun run configure-runtime` 通常没有写权限（它写入时保留原文件的属主）。配置文件中的未知键、无效类型及越界值会阻止启动。
 
 日常调整在控制台 **设置 → 高级运行参数** 中进行，按“并发与附件、收到提示、超时与退出、缓存与索引、文档处理”分组；留空表示恢复默认值，默认值与机器人运行时共用定义。点“校验并预览”核对后确认，执行时短暂停机应用并恢复原运行状态。本机端口、监听地址和共享资料目录属于部署设置，不在这里修改，见[本机管理端口](#本机管理端口)。
 
-确认后才短暂停止运行中的机器人，保存并通过健康检查后恢复；原本停止的实例保持停止。应用或健康检查失败时尝试恢复原配置；并发修改不会被覆盖。界面显示的是保存值与默认值，环境变量仍有更高优先级：保存前检查 Windows 当前环境或 Linux 容器的相关覆盖，发生冲突时拒绝写入；自定义计划任务还需检查其启动环境。
+确认后才短暂停止运行中的机器人，保存并通过健康检查后恢复；原本停止的实例保持停止。应用或健康检查失败时尝试恢复原配置；并发修改不会被覆盖。界面显示的是保存值与默认值，环境变量仍有更高优先级：保存前检查 Windows 和 macOS 当前环境或 Linux 容器的相关覆盖，发生冲突时拒绝写入；自定义计划任务还需检查其启动环境。
 
 | 设置 | 默认值 | 范围 / 说明 |
 | --- | --- | --- |
@@ -237,14 +237,14 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 | `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、六个文档编辑、生成与预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 | `BOT_DOCUMENT_PPTX_TEMPLATE` | 未设置（内置版式） | `.pptx`/`.potx`；生成 PPT 未指定模板时套用，见下文 |
 | `BOT_DOCUMENT_DOCX_TEMPLATE` | 未设置（内置版式） | `.docx`/`.dotx`；生成 Word 未指定模板时套用，见下文 |
-| `BOT_DOCUMENT_OFFICE_PATH` | 未设置（自动查找） | LibreOffice 程序的绝对路径；Windows/Linux 均支持，隔离任务填写任务容器内路径，重启生效 |
+| `BOT_DOCUMENT_OFFICE_PATH` | 未设置（自动查找） | LibreOffice 程序的绝对路径；各平台均支持，隔离任务填写任务容器内路径，重启生效 |
 
 ### 默认文档模板
 
 `BOT_DOCUMENT_PPTX_TEMPLATE`、`BOT_DOCUMENT_DOCX_TEMPLATE` 在控制台「设置 → 高级运行参数 → 文档处理」中分别为「默认 PPT 模板」「默认 Word 模板」，应用后重启生效。机器人用 `document_build` 生成文档且没有指定模板时套用它们；用户或机器人指定了其他文件时以指定的为准。
 
 - 相对路径（如 `模板/公司.potx`）在共享资料目录中查找，不能含 `..`，也不能经链接指向资料目录之外。找不到这个文件时照常使用内置版式，并在工具结果中提示，不报错。
-- 绝对路径按服务看到的路径填写。Windows 直接填文件路径；Linux Docker 填容器内路径，例如放在宿主机 `data/templates/公司.potx`，填写 `/app/data/templates/公司.potx`。
+- 绝对路径按服务看到的路径填写。Windows 和 macOS 直接填文件路径；Linux Docker 填容器内路径，例如放在宿主机 `data/templates/公司.potx`，填写 `/app/data/templates/公司.potx`。
 - 支持普通文档（`.pptx`/`.docx`）和 Office 模板（`.potx`/`.dotx`）。Office 模板在本次生成的临时副本中转换后使用，原文件不变。PPT 模板中有封面、封底等样例页时，可在对话中要求保留（`keepSlides`）；只含母版和版式的 `.potx` 仍能生成，标题样式按版式推断，首次使用建议看一下渲染效果。
 
 ### 数据目录
@@ -295,9 +295,9 @@ tmp/                           报告、测试隔离 cwd、诊断产物、一次
 logs/                          应用日志与操作日志
 ```
 
-群和成员标识会编码为安全目录段；映射到已有目录的大小写别名会被拒绝，避免 Windows 串会话。单聊空间在 `conversations/direct`、`tmp/direct` 下，群在 `groups/` 下，二者不会冲突。资料同步到共享资料目录，所有单聊和群都能读到；生成物写入各成员 tmp 的任务目录。通讯录映射是一份内部通讯录副本，与平台凭据同等敏感，不进日志和诊断包。
+群和成员标识会编码为安全目录段；映射到已有目录的大小写别名会被拒绝，避免在不区分大小写的文件系统（Windows、macOS 默认的 APFS）上串会话。单聊空间在 `conversations/direct`、`tmp/direct` 下，群在 `groups/` 下，二者不会冲突。资料同步到共享资料目录，所有单聊和群都能读到；生成物写入各成员 tmp 的任务目录。通讯录映射是一份内部通讯录副本，与平台凭据同等敏感，不进日志和诊断包。
 
-外置共享资料：部署时设 `WORKSPACE_ROOT=<已存在的目录>`（Windows 写入 `runtime.json`，Linux 保存在 `data/state/workspace-root`，Docker 只读挂到容器 `/app/workspace`）；设为空恢复默认的项目目录下 `workspace/`。部署不创建、不改属主，服务身份需能读取其中的资料；卸载不会删除外置目录。外置目录不能包含 `data/` 或位于受管目录（`data/` 下的 `config`、`state`、`conversations`、`tmp`、`index`、`runtime`，以及 `backup/`、`logs/`）内；受管目录也不能经链接或 junction 落在外置目录里，否则其中的配置和会话会被成员工具读到。部署在停机前、服务在启动时按解析链接后的位置检查，不符合即拒绝。
+外置共享资料：部署时设 `WORKSPACE_ROOT=<已存在的目录>`（Windows 和 macOS 写入 `runtime.json`，Linux 保存在 `data/state/workspace-root`，Docker 只读挂到容器 `/app/workspace`）；设为空恢复默认的项目目录下 `workspace/`。部署不创建、不改属主，服务身份需能读取其中的资料；卸载不会删除外置目录。外置目录不能包含 `data/` 或位于受管目录（`data/` 下的 `config`、`state`、`conversations`、`tmp`、`index`、`runtime`，以及 `backup/`、`logs/`）内；受管目录也不能经链接或 junction 落在外置目录里，否则其中的配置和会话会被成员工具读到。部署在停机前、服务在启动时按解析链接后的位置检查，不符合即拒绝。
 
 历史、统计和临时文件命令按会话空间选择：群用群号，配合 `--group-id`（原始群号）或 `--storage-segment`（已编码目录段），两者互斥；单聊空间用 `--direct`（`stat`、`tmp-*` 的 `--group` 写 `direct`）。PowerShell 包装器对应 `-GroupId` / `-StorageSegment` / `-Direct`。未指定时自动判断，遇到两个不同群同时匹配则拒绝操作。控制台会传入明确的目录段。
 
@@ -372,6 +372,6 @@ Linux Docker 的新部署和升级需要与服务宿主 UID 匹配的本机 root
 
 独立任务 daemon 上的旧镜像在部署提交、正式实例就绪并完成事务收尾后清理；原本停止的实例保持停止。清理只针对当前项目标识下、无标签及摘要引用的旧镜像，保留当前镜像和被运行中或已停止容器引用的镜像，不强制删除，也不清理其他项目或父镜像。取消预览、回滚和异常退出留下的副本，在下一次成功部署或升级时回收；事务未完成时不会清理。清理失败会告警，下次成功提交重试，不撤销已成功的部署。服务与任务共用同一个 daemon 时沿用服务镜像的标签生命周期。项目目录移动后标识变化，旧目录标识下的镜像不会被新目录自动认领或删除。
 
-每次 bash 的 `PI_USER_TMP` 是新任务目录。要读之前的临时产物，在 `input_paths` 中显式列出；共享资料和资料索引仍只读可见。Windows 原生部署不隔离 bash，工具说明里也不出现隔离提示和 `input_paths` 参数。输入受单文件 128 MiB、总计 256 MiB 和 20000 条目限制。隔离文档使用镜像内 `/app/.venv`；每个工作容器的 Office profile 位于自身 `/tmp`，工作容器退出并撤销后释放，不在服务容器的 64 MiB `/tmp` 中累积。
+每次 bash 的 `PI_USER_TMP` 是新任务目录。要读之前的临时产物，在 `input_paths` 中显式列出；共享资料和资料索引仍只读可见。Windows 和 macOS 原生部署不隔离 bash，工具说明里也不出现隔离提示和 `input_paths` 参数。输入受单文件 128 MiB、总计 256 MiB 和 20000 条目限制。隔离文档使用镜像内 `/app/.venv`；每个工作容器的 Office profile 位于自身 `/tmp`，工作容器退出并撤销后释放，不在服务容器的 64 MiB `/tmp` 中累积。
 
 隔离模式下 `send_image`、`send_file` 只下载公网 HTTP(S) 地址：拒绝私网、回环、链路本地、特殊用途地址、带凭据的 URL 和所有重定向；DNS 全部结果通过后固定连接地址。需要下载跳转后的资源时应提供最终公网地址。管理端模型、MCP 与已配置的外链后端仍属于可信控制面。

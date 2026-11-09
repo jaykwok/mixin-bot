@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { adminPost } from "../../ops/tools/directory-admin.ts";
 import { maskUser } from "../../ops/lib/format.ts";
+import { ROLE_LIMITS } from "../../src/push/role-limits.ts";
 import type { AuditLog } from "./audit.ts";
 import { fields } from "../../ops/core/operations.ts";
 import { ApiProblem, problemOf, type Route } from "./routes.ts";
@@ -21,6 +22,12 @@ interface View {
 }
 
 const VIEW_MS = 30 * 60_000;
+/**
+ * A save sends the whole list, so its request may be as large as the largest list the service accepts: every person with
+ * the most departments, each department a key of this view (a UUID in quotes and a comma, 39 bytes), and the rest of a
+ * person (key or typed number, roles, cap, other grants) within 512 bytes. About 8.3 MB.
+ */
+const SETTINGS_BODY = ROLE_LIMITS.people * (512 + ROLE_LIMITS.departments * 39) + 1024;
 const SETTINGS_TIMEOUT_MS = 10_000;
 
 export interface PushSettingsSource {
@@ -113,11 +120,11 @@ export class PushRoutes {
     } });
     return {
       "GET /api/push/settings": wrap(async ({ session, signal }) => this.#display(session.label, await this.source.read(signal))),
-      "POST /api/push/settings": wrap(async ({ session, body }) => {
+      "POST /api/push/settings": { maxBody: SETTINGS_BODY, ...wrap(async ({ session, body }) => {
         const params = body as Record<string, unknown>; fields(params, ["view", "roles"]);
         const view = this.#views.get(String(params.view));
         if (!view || view.session !== session.label || view.expires <= Date.now()) throw new ApiProblem(410, "view-gone", "名单已过期，请重新读取");
-        if (!Array.isArray(params.roles) || params.roles.length > 1000) throw new Error("名单无效");
+        if (!Array.isArray(params.roles) || params.roles.length > ROLE_LIMITS.people) throw new Error("名单无效");
         const roles = params.roles.map((raw, index) => {
           const item = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
           fields(item, ["key", "phone", "admin", "pusher", "dailyLimit", "grants"]);
@@ -135,7 +142,7 @@ export class PushRoutes {
         const saved = await this.source.save(roles);
         this.#views.delete(String(params.view));
         return this.#display(session.label, saved);
-      }),
+      }) },
     };
   }
 }

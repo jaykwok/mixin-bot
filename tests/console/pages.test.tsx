@@ -4,7 +4,7 @@
 // expired views, run records that never claim a message was read, search, the member list refresh, exports (including
 // late answers after a login change) and the stats page.
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { GlobalRegistrator } from "../helpers/dom.tsx";
 import type {
   EntryView, ExportStatus, MemberRow, MembersResponse, Overview, RequestsResponse, SessionResponse, SpacesResponse, SpaceViewResponse, StatsResponse,
 } from "../../console/ui/src/contract.ts";

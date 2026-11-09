@@ -180,11 +180,9 @@ export class DeploymentGit {
     try {
       if (!kind(join(this.project, "node_modules"))?.isDirectory()) return false;
       const manifest = JSON.parse(readFileSync(join(this.project, "package.json"), "utf8"));
-      if (manifest.workspaces) return false;
-      const inputs = ["package.json", "bun.lock", "bun.lockb", "bunfig.toml", ".npmrc", "patches"];
-      for (const path of Object.values(manifest.patchedDependencies ?? {})) {
-        if (typeof path !== "string") return false; this.safePath(path); inputs.push(path);
-      }
+      // Dependency patches are not used: a manifest with them always reinstalls.
+      if (manifest.workspaces || manifest.patchedDependencies) return false;
+      const inputs = ["package.json", "bun.lock", "bun.lockb", "bunfig.toml", ".npmrc"];
       if ((await this.git(["--literal-pathspecs", "diff", "--quiet", original, target, "--", ...inputs], signal)).code !== 0) return false;
       for (const section of ["dependencies", "devDependencies", "optionalDependencies"]) {
         for (const [name, version] of Object.entries(manifest[section] ?? {})) {

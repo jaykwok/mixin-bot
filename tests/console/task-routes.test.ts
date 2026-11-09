@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AuditLog } from "../../console/server/audit.ts";
 import { Auth } from "../../console/server/auth.ts";
@@ -127,5 +127,30 @@ test("SSE 续读、跨端口来源拒绝；断开和登录失效不改变已接�
     expect(h.tasks.request(id).operation).toBe("stop");
     h.tasks.finish(id, { outcome: "success", exitCode: 0, finalState: "stopped", message: "completed after disconnect" });
     expect(h.time.launches).toBe(1);
+  } finally { await h.fixture.cleanup(); }
+}, 10_000);
+
+test("SSE 积压一次发出：游标之后超过 2000 条时只发最近 2000 条，之后只发新追加的", async () => {
+  const h = await setup();
+  try {
+    const plan = await h.plan(), submitted = await h.request("/api/tasks", { plan: plan.id, key: "sse-backlog" });
+    const { id } = await submitted.json() as { id: string };
+    const path = join(h.tasks.dir(id), "events.jsonl"), line = (seq: number) => JSON.stringify({ seq, at: 1, kind: "output", text: `line ${seq}` }) + "\n";
+    writeFileSync(path, Array.from({ length: 5000 }, (_, index) => line(index + 1)).join(""));
+    const controller = new AbortController();
+    const stream = await h.request(`/api/tasks/${id}/events`, undefined, { "Last-Event-ID": "10" }, controller.signal);
+    const reader = stream.body!.getReader(), decoder = new TextDecoder();
+    const until = async (seq: number) => {
+      let text = "";
+      while (!text.includes(`id: ${seq}\n`)) text += decoder.decode((await reader.read()).value, { stream: true });
+      return { text, ids: [...text.matchAll(/^id: (\d+)$/gm)].map(match => Number(match[1])) };
+    };
+    // All of the window in the first send, before any keepalive.
+    const first = await until(5000);
+    expect(first.ids).toEqual(Array.from({ length: 2000 }, (_, index) => 3001 + index));
+    expect(first.text).not.toContain("keepalive");
+    appendFileSync(path, line(5001) + line(5002));
+    expect((await until(5002)).ids).toEqual([5001, 5002]);
+    controller.abort();
   } finally { await h.fixture.cleanup(); }
 }, 10_000);
