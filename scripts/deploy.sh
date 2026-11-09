@@ -109,10 +109,10 @@ ask_yes_no() {
     done
 }
 
-# 共享资料默认在 data/workspace（随 data 挂载）；外置资料目录只读挂到 /app/workspace，从不改属主。
+# 共享资料目录（默认项目根的 workspace/，或外置目录）只读挂到 /app/workspace，从不改属主。
 workspace_mount() {
     WORKSPACE_ARGS=()
-    if [ -n "$1" ]; then WORKSPACE_ARGS+=(-v "$1:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace); fi
+    WORKSPACE_ARGS+=(-v "${1:-$PROJECT_DIR/workspace}:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace)
 }
 
 # 新部署的服务身份，在任何改动之前确定：有原容器就沿用它的数值 UID:GID（不因改由 root 部署而迁移到 1001，也不改已有数据的
@@ -363,7 +363,7 @@ if [ "$BOT_PORT" != "$SAVED_PORT" ] && local_port_in_use "$BOT_PORT"; then
 fi
 print_success "本机管理端口：127.0.0.1:$BOT_PORT${PORT_SOURCE:+（来自 ${PORT_SOURCE}）}"
 
-# ---- 共享资料目录（WORKSPACE_ROOT；默认 data/workspace）----
+# ---- 共享资料目录（WORKSPACE_ROOT；默认 workspace）----
 # 取 WORKSPACE_ROOT 环境变量（设为空恢复默认），未设置时沿用已保存设置。
 # 外置目录必须已存在：只读挂到容器 /app/workspace，部署不创建、不改属主；服务身份需能读取其中的资料。
 HOST_WORKSPACE_ROOT="$(trim_input "${WORKSPACE_ROOT-$ORIGINAL_WORKSPACE_ROOT}")"
@@ -374,7 +374,7 @@ if [ -n "$HOST_WORKSPACE_ROOT" ]; then
     fi
 fi
 workspace_mount "$HOST_WORKSPACE_ROOT"
-print_status "共享资料目录：${HOST_WORKSPACE_ROOT:-$DATA_DIR/workspace}${HOST_WORKSPACE_ROOT:+（只读挂到容器 /app/workspace）}"
+print_status "共享资料目录：${HOST_WORKSPACE_ROOT:-$PROJECT_DIR/workspace}（只读挂到容器 /app/workspace）"
 echo ""
 
 # ---- 目录 ----
@@ -440,7 +440,7 @@ echo "  应用凭据:  $(pwd)/data/config/app-bot.json（改凭据：$(ops_comma
 echo "  AI 配置:   $(pwd)/data/config/models.json"
 echo "  日志:      $(pwd)/logs/"
 echo "  数据:      $(pwd)/data/"
-echo "  共享资料:  ${HOST_WORKSPACE_ROOT:-$(pwd)/data/workspace}"
+echo "  共享资料:  ${HOST_WORKSPACE_ROOT:-$(pwd)/workspace}"
 echo "  可选外链:  $(ops_command_hint relay-configure)"
 echo "  本机管理:  $LOOPBACK_HOST:$BOT_PORT"
 echo ""

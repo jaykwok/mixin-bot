@@ -36,7 +36,7 @@ try {
         $plan = Join-Path $Project ('tmp\data-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
         Set-OperationStage 'data-preparation-preview'
         $preview = Join-Path $releaseRoot 'ops\tools\data-current.ts'
-        & $bun --no-env-file run $preview preview --project $Project --plan $plan --upgrade --workspace $(if ($workspace) { $workspace } else { Join-Path $Project 'data\workspace' })
+        & $bun --no-env-file run $preview preview --project $Project --plan $plan --upgrade --workspace $(if ($workspace) { $workspace } else { Join-Path $Project 'workspace' })
         if ($LASTEXITCODE -ne 0) { throw '数据版本或配置校验未通过；旧服务尚未停止。' }
         # The core repeats these rules under deploy.lock; checking first means nothing is asked when main, the task or the switch refuse.
         Set-OperationStage 'upgrade-preflight'

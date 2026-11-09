@@ -6,7 +6,7 @@ import { publishJson } from "../../src/lib/atomic-file.ts";
 const { values, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true,
   options: { image: { type: "string" }, data: { type: "string" }, workspace: { type: "string" } } });
 if (positionals.length !== 1 || !["check", "write"].includes(positionals[0]!) || !values.image || !values.data) {
-  throw new Error("用法：task-deployment.ts check|write --image <sha256> --data <宿主 data> [--workspace <宿主外置资料目录>]");
+  throw new Error("用法：task-deployment.ts check|write --image <sha256> --data <宿主 data> [--workspace <宿主共享资料目录>]");
 }
 const launch: TaskLaunch = { version: 1, image: values.image, controlRoot: "/app/data/runtime/task-control",
   mounts: [{ manager: "/app/data", daemon: values.data }, ...(values.workspace ? [{ manager: "/app/workspace", daemon: values.workspace }] : [])],

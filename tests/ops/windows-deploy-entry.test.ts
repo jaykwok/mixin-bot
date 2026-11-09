@@ -118,14 +118,14 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     const lines = existsSync(events) ? (await readFile(events, "utf8")).trim().split(/\r?\n/) : [];
     const own = `own=${first ? port : ""}|${mode === "reconfigure" ? shared : mode === "workspace-missing" ? join(f.root, "missing") : ""}|`;
-    const stage = "<project>\\tmp\\deploy-stage-<id>", workspace = mode === "reconfigure" ? shared : "<project>\\data\\workspace";
+    const stage = "<project>\\tmp\\deploy-stage-<id>", workspace = mode === "reconfigure" ? shared : "<project>\\workspace";
     const preflight = `core deployment deploy --project <project> --preflight --git-path fixture-git ${own}`;
     const runtime = `runtime --prepare-values ${stage}\\runtime-values.json --deployment native child=BOT_HOST=127.0.0.1,BOT_PORT=${port},WORKSPACE_ROOT=${workspace} ${own}`;
     const core = `core deployment deploy --project <project> --stage ${stage} --command deploy --git-path fixture-git ${own}`;
     const preview = `data preview --project <project> --plan ${stage}\\data-plan.json --workspace ${workspace}`;
     const before = ["lifecycle deploy", preflight];
     const expected: Record<Mode, { code: number; events: string[]; files?: string[] }> = {
-      first: { code: 0, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\data\\workspace",
+      first: { code: 0, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
         "wizard configure.ts", `scope? app=${stage}\\configuration-app.json`, runtime, core],
         files: ["configuration-app.json", "configuration-models.json", "deployment.json", "directory-scope-plan.json", "runtime-values.json", "windows-tools"] },
       redeploy: { code: 0, events: [...before, `protect ${stage}`, preview, "reconfigure?", runtime, core],
@@ -138,7 +138,7 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
       preview: { code: 1, events: [...before, `protect ${stage}`, preview] },
       "workspace-missing": { code: 1, events: before },
       "port-in-use": { code: 1, events: [...before, "install install --frozen-lockfile"] },
-      "wizard-cancel": { code: 1, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\data\\workspace",
+      "wizard-cancel": { code: 1, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
         "wizard configure.ts"] },
       "core-failed": { code: 1, events: [...before, `protect ${stage}`, preview, "reconfigure?", runtime, core] },
       "not-admin": { code: 1, events: [] },

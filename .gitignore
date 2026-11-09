@@ -17,6 +17,8 @@ backup/
 tmp/
 logs/
 data/
+workspace/*
+!workspace/.gitkeep
 node_modules/
 
 # Chromium/crashpad diagnostics may be emitted beside a previewed document.

@@ -36,7 +36,7 @@ RUN mkdir -p \
       /app/data/config \
       /app/data/state \
       /app/data/runtime/pi \
-      /app/data/workspace \
+      /app/workspace \
       /app/data/runtime/tmp \
       /app/backup/snapshots \
       /app/backup/rm \

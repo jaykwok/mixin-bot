@@ -18,7 +18,7 @@ export interface DeployChoices {
   /** HEAD when the entry staged; empty without a Git checkout (an unpacked release). */
   target: string;
   port: number;
-  /** Shared-files root on the host; empty for the default data/workspace. */
+  /** Shared-files root on the host; empty for the default workspace. */
   workspace: string;
 }
 export interface DeployStage {

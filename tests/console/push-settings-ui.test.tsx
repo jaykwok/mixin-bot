@@ -29,8 +29,8 @@ test("推送设置的授权：全员勾选，部门可选不能/任意/指定，
     return Response.json(SETTINGS);
   }) as typeof fetch;
   try {
+    // The list is read when the form opens.
     render(<PushSettingsForm />, root);
-    button(root, "读取名单").click();
     await until(() => root.textContent!.includes("张三"));
     const chips = () => [...root.querySelectorAll(".push-grant .chip")].map(chip => [chip.textContent!.replace("×", ""), chip.classList.contains("warn")]);
     expect(chips()).toEqual([["技术部", false], ["已不在同步范围的部门", true]]);

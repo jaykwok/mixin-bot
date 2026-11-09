@@ -3,7 +3,7 @@
 import type { Overview, ServiceView } from "./contract.ts";
 import { ago, clock, dateTime, duration, platformName } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
-import { Banner, Card, Rows, type Tone } from "./ui.tsx";
+import { Banner, Card, PageHeader, Rows, type Tone } from "./ui.tsx";
 
 export function serviceSummary(service: ServiceView): { tone: Tone; label: string; icon: IconName } {
   switch (service.state) {
@@ -22,7 +22,7 @@ const SCOPE_STATES: Record<NonNullable<ServiceView["directory"]>["state"], [Tone
 export function StatusPill({ service, loading }: { service: ServiceView | undefined; loading: boolean }) {
   if (!service) return <span class="pill neutral"><span class="dot" />{loading ? "正在检查" : "状态未知"}</span>;
   const summary = serviceSummary(service);
-  return <span class={`pill ${summary.tone}`} title="机器人状态"><span class={`dot${service.state === "ready" ? " pulse" : ""}`} />机器人{summary.label}</span>;
+  return <span class={`pill ${summary.tone}`} data-tip="机器人状态"><span class={`dot${service.state === "ready" ? " pulse" : ""}`} />机器人{summary.label}</span>;
 }
 
 function Hero({ data }: { data: Overview }) {
@@ -55,11 +55,13 @@ function Hero({ data }: { data: Overview }) {
           )}
         </div>
       </div>
-      <div class="hero-stats">
-        <Stat label="事件 Stream" value={service.stream ? (service.stream.connected ? "已连接" : "已断开") : "—"}
-          tone={service.stream ? (service.stream.connected ? "ok" : "danger") : "neutral"} />
-        <Stat label="通讯录映射" value={service.directory ? service.directory.mappings.toLocaleString("zh-CN") : "—"} />
-        <Stat label="待留意" value={service.state === "ready" ? String(attention) : "—"} tone={attention > 0 ? "warn" : "neutral"} />
+      <div class="hero-side">
+        <div class="hero-stats">
+          <Stat label="事件 Stream" value={service.stream ? (service.stream.connected ? "已连接" : "已断开") : "—"}
+            tone={service.stream ? (service.stream.connected ? "ok" : "danger") : "neutral"} />
+          <Stat label="通讯录映射" value={service.directory ? service.directory.mappings.toLocaleString("zh-CN") : "—"} />
+          <Stat label="待留意" value={service.state === "ready" ? String(attention) : "—"} tone={attention > 0 ? "warn" : "neutral"} />
+        </div>
       </div>
     </section>
   );
@@ -74,16 +76,8 @@ export function OverviewPage({ data, error, refreshing, onRefresh, sessionLeft }
 }) {
   return (
     <>
-      <div class="page-header">
-        <div>
-          <h1 class="page-title">总览</h1>
-          <p class="page-desc">{data ? <>主机 <strong>{data.console.hostname}</strong> 上的部署状态，每 15 秒自动刷新</> : "正在读取部署状态…"}</p>
-        </div>
-        <button class="btn" onClick={onRefresh} disabled={refreshing}>
-          <Icon name="refresh" class={refreshing ? "spin" : undefined} />刷新
-        </button>
-      </div>
-
+      <PageHeader title="总览" description={data ? <>主机 <strong>{data.console.hostname}</strong> 上的部署状态，每 15 秒自动刷新</> : "正在读取部署状态…"}
+        actions={<button class="btn" onClick={onRefresh} disabled={refreshing}><Icon name="refresh" class={refreshing ? "spin" : undefined} />刷新</button>} />
       {error && <Banner tone="danger" icon="alert" title="刷新失败">{error}{data && "（下面是上一次读取的结果）"}</Banner>}
       {!data && !error && <Skeleton />}
       {data && <OverviewBody data={data} sessionLeft={sessionLeft} />}
@@ -98,7 +92,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
   return (
     <>
       {data.recovery && (
-        <Banner tone="danger" icon="alert" title="需要先处理部署">
+        <Banner tone="danger" icon="alert" title="需要先处理部署" action={<a class="btn small-btn" href="#/maintain">前往维护</a>}>
           {data.recovery}。到“维护”页的“部署恢复”继续或回滚上次操作，或重新部署；记录无法读取时，在终端运行 <code>ops doctor</code>（scripts 下的 ops.ps1 或 ops.sh）按提示处理。
         </Banner>
       )}
@@ -112,26 +106,26 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
       <div class="grid">
         <Hero data={data} />
 
-        <Card title="部署" icon="server" span={6}>
+        <Card title="部署" icon="server" tint="graphite" span={6}>
           {deployment ? (
             <Rows rows={[
               ["运行方式", `${platformName(deployment.platform)} · ${deployment.mode}`],
               ["主机", data.console.hostname],
               ["管理端口", <span class="mono">127.0.0.1:{deployment.port}</span>],
               ["数据目录", <span class="mono path">{deployment.dataRoot}</span>],
-              ["共享资料", <span class="mono path">{deployment.workspaceRoot || "data/workspace（默认）"}</span>],
+              ["共享资料", <span class="mono path">{deployment.workspaceRoot || "workspace（默认）"}</span>],
             ]} />
           ) : <p class="muted">没有可用的部署设置。</p>}
         </Card>
 
-        <Card title="版本" icon="tag" span={6}>
+        <Card title="版本" icon="tag" tint="purple" span={6}>
           <Rows rows={[
             ...data.versions.map(([key, value]): [string, string] => [key, value]),
             ["控制台", `v${data.console.version}${data.console.build ? ` · ${data.console.build.slice(0, 7)}${data.console.build.endsWith("-dirty") ? "-dirty" : ""}` : ""}`],
           ]} />
         </Card>
 
-        <Card title="事件 Stream" icon="radio" aside={stream && <span class={`pill small ${stream.connected ? "ok" : "danger"}`}><span class="dot" />{stream.connected ? "已连接" : "已断开"}</span>}>
+        <Card title="事件 Stream" icon="radio" tint="indigo" aside={stream && <span class={`pill small ${stream.connected ? "ok" : "danger"}`}><span class="dot" />{stream.connected ? "已连接" : "已断开"}</span>}>
           {stream ? (
             <Rows rows={[
               ["重连次数", String(stream.reconnects)],
@@ -141,7 +135,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
           ) : <p class="muted">{service.state === "ready" ? "此实例没有事件 Stream。" : "机器人运行时显示。"}</p>}
         </Card>
 
-        <Card title="通讯录" icon="users" aside={directory && (directory.running
+        <Card title="通讯录" icon="users" tint="mint" aside={directory && (directory.running
           ? <span class="pill small warn"><Icon name="loader" size={12} class="spin" />同步中</span>
           : <span class={`pill small ${SCOPE_STATES[directory.state][0]}`}><span class="dot" />{SCOPE_STATES[directory.state][1]}</span>)}>
           {directory ? (
@@ -157,7 +151,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
           ) : <p class="muted">机器人运行时显示。</p>}
         </Card>
 
-        <Card title="控制台" icon="terminal">
+        <Card title="控制台" icon="terminal" tint="gray">
           <Rows rows={[
             ["地址", <span class="mono">127.0.0.1:{data.console.port}</span>],
             ["启动于", dateTime(data.console.startedAt)],
@@ -167,7 +161,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
           <p class="card-note">在运行控制台的终端按 Ctrl+C 退出，端口随即关闭。</p>
         </Card>
 
-        <Card title="待留意事件" icon="alert" span={12} aside={<span class="muted small">自机器人本次启动以来</span>}>
+        <Card title="待留意事件" icon="alert" tint="orange" span={12} aside={<span class="muted small">自机器人本次启动以来</span>}>
           {attention.length === 0 ? (
             <div class="empty-inline"><Icon name="check" />{service.state === "ready" ? "没有需要留意的事件。" : "机器人运行时显示。"}</div>
           ) : (

@@ -8,7 +8,7 @@ import { DATA_DIR } from "./storage.ts";
  * 应用数据布局的唯一解析入口。一个部署实例对应一个应用机器人：全部单聊和群聊读取同一份 workspace，
  * 会话库按空间（单聊共用一个库、每群一个库）隔离，临时文件按空间、用户和请求隔离。
  *
- *   <data>/workspace                         默认共享资料（WORKSPACE_ROOT 可指向外置目录），模型只读
+ *   <project>/workspace                      默认共享资料（data 的同级目录；WORKSPACE_ROOT 可指向外置目录），模型只读
  *   <data>/index/                            公共资料索引、manifest 与公共解析缓存（可重建）
  *   <data>/config/materials-ignore.txt       管理员维护的索引排除规则
  *   <data>/runtime/document-env              原生部署共享的文档解析环境
@@ -108,7 +108,7 @@ export function requestSegment(requestId: string): string {
 }
 
 export function appLayout(data: string = DATA_DIR, workspaceRoot?: string): Layout {
-  const fallback = join(data, "workspace");
+  const fallback = defaultWorkspace(data);
   const configured = workspaceRoot?.trim() ? resolve(workspaceRoot.trim()) : undefined;
   return {
     data,
@@ -124,6 +124,11 @@ export function appLayout(data: string = DATA_DIR, workspaceRoot?: string): Layo
     conversations: join(data, "conversations"),
     tmp: join(data, "tmp"),
   };
+}
+
+/** The default workspace: `workspace` beside the data directory, at the project root. */
+export function defaultWorkspace(data: string): string {
+  return join(dirname(resolve(data)), "workspace");
 }
 
 export function spaceDatabase(layout: Pick<Layout, "conversations">, scope: Scope): string {
@@ -168,23 +173,35 @@ export function checkWorkspace(layout: Layout, project: string = process.cwd(),
     if (layout.externalWorkspace) throw new Error(`WORKSPACE_ROOT 不存在：${workspace}；外置资料目录必须先挂载或创建`);
   }
   if (stat && !stat.isDirectory()) throw new Error(`资料目录不是目录：${workspace}`);
-  const target = real(workspace), data = real(layout.data);
-  if (isPathInside(data, target)) throw new Error(`资料目录 ${workspace} 包含数据目录 ${layout.data}，会暴露会话、临时文件和配置`);
+  const problem = workspaceBoundary(layout, project, roots)(real(workspace), workspace);
+  if (problem) throw new Error(problem);
+}
+
+/**
+ * The boundary part of `checkWorkspace` for several candidates in a row (the console's directory picker): why the
+ * directory at `target` (links already resolved) cannot be the workspace, or null. The data and managed directories
+ * are resolved once, on first use; `shown` names the candidate in the answer.
+ */
+export function workspaceBoundary(layout: Layout, project: string = process.cwd(),
+  roots: { readonly backup?: string; readonly logs?: string } = {}): (target: string, shown?: string) => string | null {
+  let data: string | undefined;
   const managed = [layout.index, layout.state, layout.tmp, layout.conversations, join(layout.data, "config"), join(layout.data, "runtime"),
-    roots.backup ?? join(project, "backup"), roots.logs ?? join(project, "logs")];
-  for (const path of managed) {
-    const resolved = real(path);
-    if (isPathInside(target, resolved)) throw new Error(`资料目录 ${workspace} 位于受管目录 ${path} 内`);
-    // The other way round: a managed directory linked into the workspace while data itself stays outside.
-    if (isPathInside(resolved, target)) {
-      throw new Error(`受管目录 ${path} 实际位于资料目录 ${workspace} 内（${resolved}），会把其中的文件暴露给成员工具`);
+    roots.backup ?? join(project, "backup"), roots.logs ?? join(project, "logs")].map(path => ({ path, resolved: undefined as string | undefined }));
+  return (target, shown = target) => {
+    if (isPathInside(data ??= real(layout.data), target)) return `资料目录 ${shown} 包含数据目录 ${layout.data}，会暴露会话、临时文件和配置`;
+    for (const item of managed) {
+      const resolved = item.resolved ??= real(item.path);
+      if (isPathInside(target, resolved)) return `资料目录 ${shown} 位于受管目录 ${item.path} 内`;
+      // The other way round: a managed directory linked into the workspace while data itself stays outside.
+      if (isPathInside(resolved, target)) return `受管目录 ${item.path} 实际位于资料目录 ${shown} 内（${resolved}），会把其中的文件暴露给成员工具`;
     }
-  }
+    return null;
+  };
 }
 
 /**
  * The layout boundary of a deployment of `project` (preflight, verification instance and service start alike), with its
- * final workspace (absolute, or relative to the project; blank = data/workspace). Read-only.
+ * final workspace (absolute, or relative to the project; blank = <project>/workspace). Read-only.
  */
 export function checkProjectLayout(project: string, workspace: string | undefined,
   roots: { readonly data?: string; readonly backup?: string; readonly logs?: string } = {}): void {

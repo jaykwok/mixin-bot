@@ -78,7 +78,7 @@ export async function doctorReport(options: DoctorOptions): Promise<DoctorReport
   const rows: DoctorRow[] = [];
   let workspace = "";
   try { workspace = readFileSync(join(project, "data/state/workspace-root"), "utf8").trim(); } catch { workspace = ""; }
-  if (!workspace) rows.push(row("共享资料目录", "pass", `${join(project, "data/workspace")}（默认）`));
+  if (!workspace) rows.push(row("共享资料目录", "pass", `${join(project, "workspace")}（默认）`));
   else if (existsSync(workspace)) rows.push(row("共享资料目录", "pass", `${workspace}（外置，只读）`));
   else rows.push(row("共享资料目录", "fail", `外置目录不存在：${workspace}`, `恢复该目录或挂载；改用其他目录请用 sudo WORKSPACE_ROOT=<目录> bash scripts/ops.sh deploy。`));
 

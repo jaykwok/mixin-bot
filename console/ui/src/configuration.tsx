@@ -1,7 +1,15 @@
 /** @jsxImportSource preact */
+// The settings page: what is configured now, and an editor per configuration. An edit is a private draft on the host:
+// saved and checked first, then previewed and applied as a task; cancelling or leaving the page discards it.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "./api.ts";
-import { TaskAction } from "./tasks.tsx";
+import type { ReadPage } from "./contract.ts";
+import { clock } from "./format.ts";
+import { Icon, type IconName } from "./icons.tsx";
+import type { Tint } from "./nav.ts";
+import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
+import { Banner, Field, PageHeader, Row, Section, Segmented, Skeleton, Spinner, Toggle } from "./ui.tsx";
+import { RuntimeForm } from "./write-forms.tsx";
 
 type Kind = "models" | "app" | "relay";
 type Secret = { mode: "keep" | "set" | "clear"; value?: string };
@@ -16,6 +24,11 @@ interface Draft { id: string; revision: number; expiresAt: number; validated: bo
 interface Catalog { providers: { id: string; name: string }[]; apis: string[]; models: (Model & { provider: string })[] }
 type Patch = Record<string, unknown>;
 const titles = { models: "模型配置", app: "应用机器人凭据", relay: "外链配置" };
+const SECTIONS: Record<Kind, { title: string; icon: IconName; tint: Tint; detail: string }> = {
+  models: { title: "模型", icon: "sparkles", tint: "purple", detail: "机器人使用的服务商、模型和推理级别。" },
+  app: { title: "应用机器人", icon: "bot", tint: "blue", detail: "量子密信应用机器人的 AppID、环境和密钥。" },
+  relay: { title: "外链", icon: "link", tint: "indigo", detail: "大文件改用 S3 兼容存储的下载链接发送。" },
+};
 const errorText = (value: unknown) => value instanceof Error ? value.message : String(value);
 const retained = (has?: boolean, optional = false): Secret => ({ mode: has ? "keep" : optional ? "clear" : "set" });
 
@@ -34,13 +47,17 @@ function initial(form: Form, catalog?: Catalog): Patch {
     accessKey: retained(form.hasAccessKey), secret: retained(form.hasSecret), token: retained(form.hasToken, true) };
 }
 function SecretField({ label, value, optional, change }: { label: string; value: Secret; optional?: boolean; change: (value: Secret) => void }) {
-  return <fieldset><legend>{label}</legend><select aria-label={`${label}处理方式`} value={value.mode} onChange={event => change({ mode: event.currentTarget.value as Secret["mode"] })}>
-    <option value="keep">保留已设置的值</option><option value="set">填写新值</option>{optional && <option value="clear">清除（可选）</option>}</select>
-    {value.mode === "set" && <input aria-label={label} type="password" autoComplete="new-password" value={value.value ?? ""} onInput={event => change({ mode: "set", value: event.currentTarget.value })} />}
-    <small>原值不回显。改端点或账户时需要重新填写凭据。</small></fieldset>;
+  return <Field label={label} note="原值不回显。改端点或账户时需要重新填写凭据。">
+    <span class="inline-control">
+      <select aria-label={`${label}处理方式`} value={value.mode} onChange={event => change({ mode: event.currentTarget.value as Secret["mode"] })}>
+        <option value="keep">保留已设置的值</option><option value="set">填写新值</option>{optional && <option value="clear">清除（可选）</option>}</select>
+      {value.mode === "set" && <input aria-label={label} type="password" autoComplete="new-password" value={value.value ?? ""} onInput={event => change({ mode: "set", value: event.currentTarget.value })} />}
+    </span>
+  </Field>;
 }
 
-export function ConfigurationForm({ kind }: { kind: Kind }) {
+/** One configuration: its saved summary (`summary`, from the settings read) and its draft editor. */
+export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: string[][] }) {
   const [draft, setDraft] = useState<Draft | null>(null), [patch, setPatch] = useState<Patch>({}), [catalog, setCatalog] = useState<Catalog>(),
     [busy, setBusy] = useState(false), [error, setError] = useState(""), [valid, setValid] = useState(false), [network, setNetwork] = useState(false), [refresh, setRefresh] = useState(false);
   const current = useRef<string | null>(null), generation = useRef(0);
@@ -73,51 +90,75 @@ export function ConfigurationForm({ kind }: { kind: Kind }) {
     finally { if (request === generation.current) setBusy(false); }
   };
   const close = () => { generation.current++; if (current.current) void discard(current.current); current.current = null; setDraft(null); setPatch({}); setBusy(false); setError(""); setValid(false); };
-  const text = (key: string, label: string, number = false) => <label>{label}{number
+  const text = (key: string, label: string, number = false) => <Field label={label}>{number
     ? <input type="number" value={String(patch[key] ?? "")} onInput={event => change(key, Number(event.currentTarget.value))} />
-    : <input type="text" value={String(patch[key] ?? "")} onInput={event => change(key, event.currentTarget.value)} />}</label>;
+    : <input type="text" value={String(patch[key] ?? "")} onInput={event => change(key, event.currentTarget.value)} />}</Field>;
   const secret = (key: string, label: string, optional = false) => <SecretField label={label} optional={optional} value={(patch[key] as Secret) ?? retained(false, optional)} change={value => change(key, value)} />;
   const custom = patch.mode === "custom", model = typeof patch.model === "object" ? patch.model as Model : { id: String(patch.model ?? "") };
   const changeModel = (key: keyof Model, value: unknown) => change("model", { ...model, [key]: value });
   const models = [...new Map([...(catalog?.models ?? []), ...(draft?.form.catalogModels ?? [])].filter(value => value.provider === patch.provider).map(value => [value.id, value])).values()];
   const thinking = models.find(value => value.id === model.id)?.thinking ?? ["off", "minimal", "low", "medium", "high", "xhigh"];
-  return <section class="card write-form"><h2>{titles[kind]}</h2><p>先编辑草稿并校验，再预览应用。取消或关闭页面不会修改正式配置。</p>
-    <button class="btn" disabled={busy} onClick={() => void open()}>{draft ? "放弃并重新读取" : "编辑配置"}</button>
-    {error && <p role="alert">{error}</p>}
-    {draft && <><fieldset disabled={busy}><legend>配置草稿</legend>
-      {kind === "app" && <>{text("appId", "应用 AppID")}<label>环境<select value={String(patch.environment)} onChange={event => change("environment", event.currentTarget.value)}><option value="production">生产环境</option><option value="staging">预发布环境</option></select></label>{secret("secret", "应用密钥")}
-        {draft.form.bound && <p>现有数据已绑定应用；这里只能修改同一应用的凭据。切换应用请全新部署。</p>}</>}
-      {kind === "relay" && <><label class="check-label"><input type="checkbox" checked={!!patch.enabled} onChange={event => change("enabled", event.currentTarget.checked)} />启用外链</label>
-        {!!patch.enabled && <>{text("endpoint", "S3 端点")}{text("region", "区域")}{text("bucket", "存储桶")}{text("prefix", "路径前缀（可为空）")}
-          <label class="check-label"><input type="checkbox" checked={!!patch.forcePathStyle} onChange={event => change("forcePathStyle", event.currentTarget.checked)} />使用路径式寻址</label>
-          {text("maxBytes", "文件上限（字节）", true)}{text("expireHours", "链接有效期（小时）", true)}{text("cleanupGraceMinutes", "清理宽限（分钟）", true)}
-          {secret("accessKey", "访问密钥 ID")}{secret("secret", "访问密钥")}{secret("token", "临时会话令牌", true)}</>}</>}
-      {kind === "models" && <><label>服务商 ID<input list={`providers-${draft.id}`} value={String(patch.provider ?? "")} onInput={event => { setPatch(modelPatch(draft.form, event.currentTarget.value, catalog)); setValid(false); }} /></label>
-        <datalist id={`providers-${draft.id}`}>{[...new Set([...(draft.form.providers ?? []).map(value => value.id), ...(catalog?.providers ?? []).map(value => value.id)])].map(id => <option value={id} />)}</datalist>
-        <label>模型来源<select value={String(patch.mode)} onChange={event => { change("mode", event.currentTarget.value); change("model", event.currentTarget.value === "custom" ? { id: model.id, contextWindow: 128000, maxTokens: 8192, input: ["text"], reasoning: false } : model.id); }}><option value="builtin">内置服务商目录</option><option value="custom">自定义模型</option></select></label>
-        {custom && <><p>更改已有服务商的端点或协议，请使用新的服务商 ID。</p>{text("baseUrl", "API 端点")}<label>协议<select value={String(patch.api)} onChange={event => change("api", event.currentTarget.value)}>{(catalog?.apis ?? ["openai-completions"]).map(api => <option value={api}>{api}</option>)}</select></label></>}
-        {secret("key", "模型 API 密钥")}
-        {custom ? <><label>模型 ID<input value={model.id} onInput={event => changeModel("id", event.currentTarget.value)} /></label>
-          <label>显示名称<input value={model.name ?? ""} onInput={event => changeModel("name", event.currentTarget.value)} /></label>
-          <label>上下文上限<input type="number" min="1" value={model.contextWindow} onInput={event => changeModel("contextWindow", Number(event.currentTarget.value))} /></label>
-          <label>输出上限<input type="number" min="1" value={model.maxTokens} onInput={event => changeModel("maxTokens", Number(event.currentTarget.value))} /></label>
-          <label class="check-label"><input type="checkbox" checked={model.reasoning ?? false} onChange={event => changeModel("reasoning", event.currentTarget.checked)} />支持推理</label>
-          <label class="check-label"><input type="checkbox" checked={model.input?.includes("image") ?? false} onChange={event => changeModel("input", event.currentTarget.checked ? ["text", "image"] : ["text"])} />支持图片输入</label>
-          <fieldset><legend>每百万 token 单价</legend>{[["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]].map(([key, label]) => <label>{label}<input type="number" min="0" step="any" value={model.cost?.[key!] ?? 0} onInput={event => changeModel("cost", { ...model.cost, [key!]: Number(event.currentTarget.value) })} /></label>)}</fieldset></>
-          : <label>模型<select value={model.id} onChange={event => change("model", event.currentTarget.value)}><option value="">请选择模型</option>{model.id && !models.some(value => value.id === model.id) && <option value={model.id}>{model.id}</option>}{models.map(value => <option value={value.id}>{value.name ?? value.id}（{value.contextWindow} / {value.maxTokens}）</option>)}</select></label>}
-        <label>推理级别<select value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>{[...new Set([String(patch.thinking), ...thinking])].map(value => <option value={value}>{value}</option>)}</select></label></>}
-      {kind !== "relay" && <label class="check-label"><input type="checkbox" checked={network} onChange={event => { setNetwork(event.currentTarget.checked); if (!event.currentTarget.checked) setRefresh(false); setValid(false); }} />{kind === "app" ? "联网验证应用凭据（仅获取 token）" : "允许刷新所选服务商的模型目录（不发起推理）"}</label>}
-      {kind === "models" && network && <label class="check-label"><input type="checkbox" checked={refresh} onChange={event => { setRefresh(event.currentTarget.checked); setValid(false); }} />本次刷新模型目录</label>}
-      <button class="btn" onClick={() => void check()}>{busy ? "正在校验…" : "保存草稿并校验"}</button>
-    </fieldset><button class="btn" onClick={close}>取消草稿</button>
-      {valid && <><ul>{draft.summary.map(line => <li>{line}</li>)}</ul><TaskAction key={`${draft.id}-${draft.revision}`} operation="configuration-apply" params={{ draft: draft.id }} onStarted={() => { current.current = null; setDraft(null); setPatch({}); }}>预览应用配置</TaskAction></>}
+  const section = SECTIONS[kind];
+  return <Section title={section.title}
+    aside={<button type="button" class={`btn small-btn${draft ? " ghost" : ""}`} disabled={busy && !draft} onClick={() => void open()}>
+      {draft ? "放弃并重新读取" : <><Icon name="pencil" size={13} />编辑配置</>}</button>}
+    footer={draft ? "先保存草稿并校验，再预览应用。取消或关闭页面不会修改正式配置。" : undefined}>
+    {!draft && (summary?.length ? summary.map(([name, value]) => <Row key={name} class="value" title={name}>{value}</Row>)
+      : <Row icon={section.icon} tint={section.tint} title={titles[kind]} detail={section.detail} />)}
+    {error && <div class="group-note form-error" role="alert">{error}</div>}
+    {draft && <>
+      <fieldset class="draft-fields" disabled={busy}><legend class="sr-only">配置草稿</legend>
+        {kind === "app" && <>{text("appId", "应用 AppID")}
+          <Field label="环境"><select value={String(patch.environment)} onChange={event => change("environment", event.currentTarget.value)}><option value="production">生产环境</option><option value="staging">预发布环境</option></select></Field>
+          {secret("secret", "应用密钥")}
+          {draft.form.bound && <div class="group-note">现有数据已绑定应用；这里只能修改同一应用的凭据。切换应用请全新部署。</div>}</>}
+        {kind === "relay" && <><div class="row"><Toggle label="启用外链" detail="关闭后大文件仍按平台限制直接发送。" checked={!!patch.enabled} onChange={value => change("enabled", value)} /></div>
+          {!!patch.enabled && <>{text("endpoint", "S3 端点")}{text("region", "区域")}{text("bucket", "存储桶")}{text("prefix", "路径前缀（可为空）")}
+            <div class="row"><Toggle label="使用路径式寻址" checked={!!patch.forcePathStyle} onChange={value => change("forcePathStyle", value)} /></div>
+            {text("maxBytes", "文件上限（字节）", true)}{text("expireHours", "链接有效期（小时）", true)}{text("cleanupGraceMinutes", "清理宽限（分钟）", true)}
+            {secret("accessKey", "访问密钥 ID")}{secret("secret", "访问密钥")}{secret("token", "临时会话令牌", true)}</>}</>}
+        {kind === "models" && <><Field label="服务商 ID"><input list={`providers-${draft.id}`} value={String(patch.provider ?? "")} onInput={event => { setPatch(modelPatch(draft.form, event.currentTarget.value, catalog)); setValid(false); }} /></Field>
+          <datalist id={`providers-${draft.id}`}>{[...new Set([...(draft.form.providers ?? []).map(value => value.id), ...(catalog?.providers ?? []).map(value => value.id)])].map(id => <option key={id} value={id} />)}</datalist>
+          <Field group label="模型来源">
+            <Segmented label="模型来源" size="small" value={patch.mode === "custom" ? "custom" : "builtin"}
+              onChange={value => { change("mode", value); change("model", value === "custom" ? { id: model.id, contextWindow: 128000, maxTokens: 8192, input: ["text"], reasoning: false } : model.id); }}
+              options={[{ value: "builtin", label: "内置服务商目录" }, { value: "custom", label: "自定义模型" }]} /></Field>
+          {custom && <><div class="group-note">更改已有服务商的端点或协议，请使用新的服务商 ID。</div>{text("baseUrl", "API 端点")}
+            <Field label="协议"><select value={String(patch.api)} onChange={event => change("api", event.currentTarget.value)}>{(catalog?.apis ?? ["openai-completions"]).map(api => <option key={api} value={api}>{api}</option>)}</select></Field></>}
+          {secret("key", "模型 API 密钥")}
+          {custom ? <><Field label="模型 ID"><input value={model.id} onInput={event => changeModel("id", event.currentTarget.value)} /></Field>
+            <Field label="显示名称"><input value={model.name ?? ""} onInput={event => changeModel("name", event.currentTarget.value)} /></Field>
+            <Field label="上下文上限"><input type="number" min="1" value={model.contextWindow} onInput={event => changeModel("contextWindow", Number(event.currentTarget.value))} /></Field>
+            <Field label="输出上限"><input type="number" min="1" value={model.maxTokens} onInput={event => changeModel("maxTokens", Number(event.currentTarget.value))} /></Field>
+            <div class="row"><Toggle label="支持推理" checked={model.reasoning ?? false} onChange={value => changeModel("reasoning", value)} /></div>
+            <div class="row"><Toggle label="支持图片输入" checked={model.input?.includes("image") ?? false} onChange={value => changeModel("input", value ? ["text", "image"] : ["text"])} /></div>
+            <Field label="每百万 token 单价"><span class="cost-grid">{[["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]].map(([key, label]) =>
+              <span class="cost-item" key={key}><span>{label}</span><input type="number" min="0" step="any" aria-label={`${label}单价`} value={model.cost?.[key!] ?? 0}
+                onInput={event => changeModel("cost", { ...model.cost, [key!]: Number(event.currentTarget.value) })} /></span>)}</span></Field></>
+            : <Field label="模型"><select value={model.id} onChange={event => change("model", event.currentTarget.value)}><option value="">请选择模型</option>{model.id && !models.some(value => value.id === model.id) && <option value={model.id}>{model.id}</option>}{models.map(value => <option key={value.id} value={value.id}>{value.name ?? value.id}（{value.contextWindow} / {value.maxTokens}）</option>)}</select></Field>}
+          <Field label="推理级别"><select value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>{[...new Set([String(patch.thinking), ...thinking])].map(value => <option key={value} value={value}>{value}</option>)}</select></Field></>}
+        {kind !== "relay" && <div class="row"><Toggle label={kind === "app" ? "联网验证应用凭据" : "允许刷新模型目录"} detail={kind === "app" ? "仅获取 token。" : "刷新所选服务商的模型目录，不发起推理。"}
+          checked={network} onChange={value => { setNetwork(value); if (!value) setRefresh(false); setValid(false); }} /></div>}
+        {kind === "models" && network && <div class="row"><Toggle label="本次刷新模型目录" checked={refresh} onChange={value => { setRefresh(value); setValid(false); }} /></div>}
+      </fieldset>
+      <div class="row"><span class="row-text" />
+        <button class="btn" onClick={close}>取消草稿</button>
+        <button class="btn" disabled={busy} onClick={() => void check()}>{busy ? "正在校验…" : "保存草稿并校验"}</button>
+      </div>
+      {valid && <div class="row-body draft-checked">
+        <ul class="plan-summary">{draft.summary.map(line => <li key={line}>{line}</li>)}</ul>
+        <div class="action-row"><TaskAction key={`${draft.id}-${draft.revision}`} operation="configuration-apply" params={{ draft: draft.id }} primary
+          onStarted={() => { current.current = null; setDraft(null); setPatch({}); }}>预览应用配置</TaskAction></div>
+      </div>}
     </>}
-  </section>;
+  </Section>;
 }
 
-export function ConfigurationSettings() { return <>{(["models", "app", "relay"] as const).map(kind => <ConfigurationForm key={kind} kind={kind} />)}</>; }
-
-export function ConfigurationRecovery() {
+/**
+ * A configuration change or maintenance left unfinished. `quiet`: show nothing while there is nothing to recover (the
+ * settings page checks on opening; a failed check still shows).
+ */
+export function ConfigurationRecovery({ quiet = false }: { quiet?: boolean }) {
   type RecoveryState = { transaction: { id: string; phase: string; kind: Kind | "runtime" } | null; maintenancePending: boolean };
   const [state, setState] = useState<RecoveryState | null>(null), [error, setError] = useState(""), [version, setVersion] = useState(0);
   useEffect(() => {
@@ -128,13 +169,66 @@ export function ConfigurationRecovery() {
     return () => controller.abort();
   }, [version]);
   const transaction = state?.transaction;
-  return <section class="card plain"><h2>配置恢复</h2><button class="btn" onClick={() => setVersion(value => value + 1)}>检查配置事务</button>
-    {error && <p role="alert">{error}</p>}{!error && state && <>
-      {transaction && <p>{transaction.kind === "runtime" ? "高级运行参数" : titles[transaction.kind]}留下了待处理记录。</p>}
-      {state.maintenancePending ? <><p>上次维护尚未收尾。如任务仍在运行，请等待完成；中断后从这里恢复。</p>
-        <TaskAction operation="maintenance-recover" params={{}} onStarted={() => setState(null)}>预览恢复中断的维护</TaskAction></>
-        : transaction ? <TaskAction operation="configuration-restore" params={{ draft: transaction.id }} onStarted={() => setState(null)}>
-          {["committed", "rolled-back"].includes(transaction.phase) ? "预览完成配置收尾" : "预览恢复原配置"}</TaskAction>
-          : <p>没有未结束的配置事务。</p>}
-    </>}</section>;
+  if (quiet && !error && (!state || !transaction && !state.maintenancePending)) return null;
+  return <Section title="配置恢复" aside={<button type="button" class="btn ghost small-btn" onClick={() => setVersion(value => value + 1)}>检查配置事务</button>}>
+    {error && <div class="group-note form-error" role="alert">{error}</div>}
+    {!error && !state && <div class="row"><Spinner label="正在检查配置事务…" /></div>}
+    {!error && state && <>
+      {transaction && <Row icon="alert" tint="orange" title={<>{transaction.kind === "runtime" ? "高级运行参数" : titles[transaction.kind]}留下了待处理记录。</>} />}
+      {state.maintenancePending ? <Row icon="wrench" tint="orange" title="上次维护尚未收尾" detail="如任务仍在运行，请等待完成；中断后从这里恢复。">
+          <TaskAction operation="maintenance-recover" params={{}} onStarted={() => setState(null)} primary>预览恢复中断的维护</TaskAction></Row>
+        : transaction ? <Row title={["committed", "rolled-back"].includes(transaction.phase) ? "完成收尾" : "恢复原配置"}
+          detail={["committed", "rolled-back"].includes(transaction.phase) ? "配置已经提交或回滚，只差收尾。" : "按事务记录恢复修改前的配置。"}>
+          <TaskAction operation="configuration-restore" params={{ draft: transaction.id }} onStarted={() => setState(null)} primary>
+            {["committed", "rolled-back"].includes(transaction.phase) ? "预览完成配置收尾" : "预览恢复原配置"}</TaskAction></Row>
+          : <Row icon="check" tint="green" title="没有未结束的配置事务。" />}
+    </>}
+  </Section>;
+}
+
+/** Settings rows are named "模型", "模型 · 推理级别", "外链 · 端点"…: each section takes the rows of its names. */
+const rowsOf = (rows: string[][], names: string[]) => rows.filter(([name]) => names.some(prefix => name === prefix || name!.startsWith(`${prefix} · `)));
+/** Tasks after which this page reads the saved settings again. */
+const SETTINGS_TASKS = new Set(["configuration-apply", "configuration-restore", "runtime-configure", "maintenance-recover"]);
+
+export function SettingsPage() {
+  const [data, setData] = useState<ReadPage | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [version, setVersion] = useState(0);
+  // A settings task confirmed on this page has ended since it opened: what is saved has changed, or a recovery is now due.
+  // The runtime form starts over only after a runtime task (its unapplied changes would go too).
+  const { followed } = useFollowed();
+  const seen = useRef<Set<string> | null>(null), [ended, setEnded] = useState(0), [runtimeEnded, setRuntimeEnded] = useState(0);
+  useEffect(() => {
+    const done = followed.filter(item => SETTINGS_TASKS.has(item.operation) && taskEnded(item.task?.state));
+    if (!seen.current) { seen.current = new Set(done.map(item => item.id)); return; }
+    const fresh = done.filter(item => !seen.current!.has(item.id));
+    if (!fresh.length) return;
+    for (const item of fresh) seen.current.add(item.id);
+    setEnded(value => value + 1);
+    if (fresh.some(item => item.operation !== "configuration-apply" && item.operation !== "configuration-restore")) setRuntimeEnded(value => value + 1);
+  }, [followed]);
+  useEffect(() => {
+    const controller = new AbortController(); setBusy(true); setError("");
+    void api<ReadPage>("/api/read/settings", { method: "POST", body: {}, signal: controller.signal, intent: version > 0, timeoutMs: 95_000 }).then(value => {
+      if (!controller.signal.aborted) { setData(value); setBusy(false); }
+    }, error => { if (!controller.signal.aborted) { setError(errorText(error)); setBusy(false); } });
+    return () => controller.abort();
+  }, [version, ended]);
+  const rows = data?.rows ?? [];
+  const mcp = rowsOf(rows, ["MCP"]);
+  return <>
+    <PageHeader title="设置" description="模型、机器人凭据、外链与运行参数。修改先保存为草稿并校验，再预览应用。"
+      actions={<button class="btn" disabled={busy} onClick={() => setVersion(value => value + 1)}><Icon name="refresh" size={14} class={busy ? "spin" : undefined} />刷新</button>} />
+    {error && <Banner tone="danger" icon="alert" title="当前配置读取失败" action={<button class="btn small-btn" onClick={() => setVersion(value => value + 1)}>重试</button>}>{error}</Banner>}
+    <ConfigurationRecovery key={ended} quiet />
+    {!data && busy ? <Section><Skeleton lines={4} /></Section> : <>
+      <ConfigurationForm kind="models" summary={rowsOf(rows, ["模型", "辅助模型"])} />
+      <ConfigurationForm kind="app" summary={rowsOf(rows, ["应用机器人"])} />
+      <ConfigurationForm kind="relay" summary={rowsOf(rows, ["外链", "外链配置"])} />
+      {mcp.length > 0 && <Section title="MCP" footer="MCP 服务器在配置文件中设置，这里只显示摘要。">
+        {mcp.map(([name, value]) => <Row key={name} class="value" icon="layers" tint="gray" title={name === "MCP" ? "MCP" : name!.slice("MCP · ".length)}>{value}</Row>)}
+      </Section>}
+    </>}
+    <RuntimeForm key={runtimeEnded} />
+    {data && <p class="footnote">读取于 {clock(data.checkedAt)} · {data.note}</p>}
+  </>;
 }

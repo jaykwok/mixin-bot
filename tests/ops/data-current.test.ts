@@ -39,7 +39,7 @@ test("an empty directory is a fresh install; the record names the deployed progr
   try {
     await writeCurrentConfig(f.root);
     // Operator materials in the default workspace are not data: a fresh install keeps them.
-    await mkdir(join(f.root, "data/workspace"), { recursive: true }); await writeFile(join(f.root, "data/workspace/reference.txt"), "keep");
+    await mkdir(join(f.root, "workspace"), { recursive: true }); await writeFile(join(f.root, "workspace/reference.txt"), "keep");
     const preview = await run(f.root, "preview");
     expect(preview.code, preview.text).toBe(0);
     expect(preview.text).toContain(`程序 v${APP_VERSION}（构建 abc1234），数据格式 ${DATA_VERSION}：全新安装`);
@@ -56,7 +56,7 @@ test("an empty directory is a fresh install; the record names the deployed progr
     expect((await run(f.root, "rollback")).code).toBe(42);
     // The old committed probe is gone: an unknown action.
     expect((await run(f.root, "committed")).code).toBe(1);
-    expect(await readFile(join(f.root, "data/workspace/reference.txt"), "utf8")).toBe("keep");
+    expect(await readFile(join(f.root, "workspace/reference.txt"), "utf8")).toBe("keep");
   } finally { await f.cleanup(); }
   // Eleven sequential runner processes: 8 s alone, 28 s seen with a parallel group (Windows process start costs).
 }, 60000);
@@ -280,7 +280,7 @@ test("--workspace names the final workspace for check, preview and commit, whate
       const result = await run(f.root, action, deployment, BUILD, ["--workspace", outside]);
       expect(result.code, `${action}: ${result.text}`).toBe(0);
     }
-    expect(existsSync(join(f.root, "data/workspace"))).toBe(false);
+    expect(existsSync(join(f.root, "workspace"))).toBe(false);
   } finally { await f.cleanup(); }
 }, 60000);
 

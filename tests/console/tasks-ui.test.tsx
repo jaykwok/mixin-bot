@@ -44,7 +44,7 @@ test("升级缺少范围时可直接选部门；取消不提交，预览只传�
   }) as typeof fetch;
   const choose = (label: string, value: string) => { const select = root.querySelector<HTMLSelectElement>(`[aria-label="${label}"]`)!; select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
   try {
-    render(<UpgradeForm />, root); find(root, "检查可升级版本").click(); await until(() => !!find(root, "预览升级"));
+    render(<UpgradeForm />, root); find(root, "检查更新").click(); await until(() => !!find(root, "预览升级"));
     choose("升级通讯录范围", "departments"); await until(() => !!find(root, "读取部署部门树"));
     expect(find(root, "预览升级").disabled).toBe(true); find(root, "读取部署部门树").click(); await until(() => root.textContent!.includes("研发部"));
     root.querySelector<HTMLInputElement>('.department-tree input[type="checkbox"]')!.click(); await until(() => !find(root, "预览升级").disabled);
@@ -66,15 +66,17 @@ test("重部署表单保留显式端口和目录选择，Linux 重建修复与 W
     requests.push(JSON.parse(String(options?.body))); return Response.json({ id: "plan-deploy", summary: ["重新部署后启动"], expiresAt: Date.now() + 60000 });
   }) as typeof fetch;
   try {
-    render(<DeployForm />, root); find(root, "读取部署设置").click(); await until(() => !!find(root, "预览重新部署"));
+    // Opening the section reads the saved settings; the Linux operation is a segmented choice.
+    render(<DeployForm />, root); root.querySelector<HTMLButtonElement>(".disclosure-head")!.click(); await until(() => !!find(root, "预览重新部署"));
     expect(find(root, "预览重新部署").disabled).toBe(true);
     const choose = (label: string, value: string) => { const input = root.querySelector<HTMLInputElement | HTMLSelectElement>(`[aria-label="${label}"]`)!; input.value = value;
       input.dispatchEvent(new Event(input.tagName === "SELECT" ? "change" : "input", { bubbles: true })); };
-    choose("部署操作", "repair"); choose("机器人端口", "2022"); choose("共享资料目录", ""); choose("重部署通讯录范围", "saved");
+    root.querySelector<HTMLButtonElement>('[aria-label="部署操作"] [role="radio"][data-value="repair"]')!.click();
+    choose("机器人端口", "2022"); choose("共享资料目录", ""); choose("重部署通讯录范围", "saved");
     await until(() => !!find(root, "预览重建修复") && !find(root, "预览重建修复").disabled); find(root, "预览重建修复").click();
     await until(() => !!root.querySelector('[role="dialog"]'));
     expect(requests[0]).toEqual({ operation: "repair", params: { port: 2022, workspace: "", directory: "saved" } });
-    find(root, "返回").click(); platform = "windows"; find(root, "读取部署设置").click(); await until(() => !!find(root, "预览本机修复"));
+    find(root, "返回").click(); platform = "windows"; find(root, "重新读取部署设置").click(); await until(() => !!find(root, "预览本机修复"));
     expect(root.querySelector('[aria-label="部署操作"]')).toBeNull(); find(root, "预览本机修复").click(); await until(() => requests.length === 2);
     expect(requests[1]).toEqual({ operation: "repair", params: {} });
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
@@ -89,7 +91,7 @@ test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检�
     requests.push(JSON.parse(String(options?.body))); return Response.json({ id: "plan-upgrade", summary: [target], expiresAt: Date.now() + 60000 });
   }) as typeof fetch;
   try {
-    render(<UpgradeForm />, root); expect(requests).toEqual([]); find(root, "检查可升级版本").click();
+    render(<UpgradeForm />, root); expect(requests).toEqual([]); find(root, "检查更新").click();
     await until(() => !!find(root, "预览升级")); expect(find(root, "预览升级").disabled).toBe(true);
     const choose = (selector: string, value: string) => { const select = root.querySelector<HTMLSelectElement>(selector)!; select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
     choose('[aria-label="升级通讯录范围"]', "saved");
@@ -97,7 +99,7 @@ test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检�
     root.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     await until(() => !find(root, "预览升级").disabled); find(root, "预览升级").click(); await until(() => !!root.querySelector('[role="dialog"]'));
     expect(requests).toEqual([{ operation: "update", params: { target, switchMain: true, directory: "saved" } }]);
-    find(root, "返回").click(); offline = true; find(root, "检查可升级版本").click(); await until(() => root.textContent!.includes("网络失败"));
+    find(root, "返回").click(); offline = true; find(root, "检查更新").click(); await until(() => root.textContent!.includes("网络失败"));
     expect(find(root, "预览升级")).toBeUndefined(); expect(root.textContent).not.toContain(target);
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });

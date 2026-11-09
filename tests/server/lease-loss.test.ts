@@ -13,7 +13,7 @@ import { tempFixture } from "../helpers/temp.ts";
 import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const harness = fileURLToPath(new URL("../helpers/service-harness.ts", import.meta.url));
-const HEARTBEAT = "data/workspace/tool-heartbeat.txt";
+const HEARTBEAT = "workspace/tool-heartbeat.txt";
 // Lease directories and logs are not data; the tool's heartbeat is checked on its own.
 const NOT_DATA = ["logs", "gate.open", HEARTBEAT, "data/state/service.lock"];
 const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");

@@ -39,7 +39,7 @@ function deploymentSettings(values: RuntimeConfig, env: NodeJS.ProcessEnv, deplo
     if (env[name]?.trim()) settings[name] = env[name]!.trim();
   }
   // The default workspace is not a setting: naming it (a native deployment does, to return from an external one) drops the key.
-  if (settings.WORKSPACE_ROOT && resolve(settings.WORKSPACE_ROOT) === resolve(DATA_DIR, "workspace")) delete settings.WORKSPACE_ROOT;
+  if (settings.WORKSPACE_ROOT && resolve(settings.WORKSPACE_ROOT) === resolve(DATA_DIR, "..", "workspace")) delete settings.WORKSPACE_ROOT;
   return validateRuntimeConfig(settings);
 }
 

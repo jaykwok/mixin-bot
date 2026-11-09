@@ -2,8 +2,11 @@
 // Ctrl+K / ⌘K command palette: jump to a section or run a console action.
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Icon, type IconName } from "./icons.tsx";
+import type { Tint } from "./nav.ts";
+import { Tile } from "./ui.tsx";
 
-export interface Command { id: string; label: string; hint?: string; icon: IconName; keywords?: string; run: () => void }
+/** `tint`: a section's coloured tile, as the sidebar shows it; actions keep a plain icon. */
+export interface Command { id: string; label: string; hint?: string; icon: IconName; tint?: Tint; keywords?: string; run: () => void }
 
 export function CommandPalette({ commands, onClose }: { commands: Command[]; onClose: () => void }) {
   const [query, setQuery] = useState("");
@@ -53,7 +56,7 @@ export function CommandPalette({ commands, onClose }: { commands: Command[]; onC
           {matches.map((command, position) => (
             <div key={command.id} id={`palette-${command.id}`} data-index={position} role="option" aria-selected={position === index}
               class="palette-item" onMouseMove={() => setIndex(position)} onClick={() => choose(command)}>
-              <Icon name={command.icon} />
+              {command.tint ? <Tile icon={command.icon} tint={command.tint} size="small" /> : <span class="palette-icon"><Icon name={command.icon} /></span>}
               <span class="palette-label">{command.label}</span>
               {command.hint && <span class="palette-hint">{command.hint}</span>}
               {position === index && <Icon name="enter" size={14} class="palette-enter" />}

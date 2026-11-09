@@ -133,8 +133,8 @@ function Lines({ text }: { text: string }) {
 
 function Anchor({ href, children }: { href: string; children: ComponentChildren }) {
   const safe = safeHref(href);
-  if (!safe) return <span class="md-unsafe" title="不是 http(s) 链接，未生成链接">{children}</span>;
-  return <a href={safe} target="_blank" rel="noreferrer noopener" title={safe}>{children}</a>;
+  if (!safe) return <span class="md-unsafe" data-tip="不是 http(s) 链接，未生成链接">{children}</span>;
+  return <a href={safe} target="_blank" rel="noreferrer noopener" data-tip={safe}>{children}</a>;
 }
 
 export function inline(text: string, depth = 0): ComponentChildren[] {
@@ -172,7 +172,7 @@ export function inline(text: string, depth = 0): ComponentChildren[] {
       }
       if ((c === "[" || c === "!") && (match = at(LINK, i))) {
         flush();
-        if (match[1]) out.push(<span key={out.length} class="md-image" title={match[3]}><Icon name="file" size={13} />图片：{match[2] || "无说明"}（未加载）</span>);
+        if (match[1]) out.push(<span key={out.length} class="md-image" data-tip={match[3]}><Icon name="file" size={13} />图片：{match[2] || "无说明"}（未加载）</span>);
         else out.push(<Anchor key={out.length} href={match[3]!}>{inline(match[2]!, depth + 1)}</Anchor>);
         i += match[0].length;
         continue;

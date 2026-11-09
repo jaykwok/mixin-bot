@@ -35,7 +35,7 @@ async function until(check: () => boolean, state: () => unknown, timeoutMs = 20_
 await mkdir("data/config", { recursive: true });
 await mkdir("data/runtime/pi", { recursive: true });
 await mkdir("data/state", { recursive: true });
-await mkdir("data/workspace", { recursive: true });
+await mkdir("workspace", { recursive: true });
 // The configured model only passes the startup data check (src/core/data-validation.ts); it is never contacted, the
 // service gets the faux model below.
 await writeFile("data/config/models.json", JSON.stringify({ providers: { fake: {
@@ -121,7 +121,7 @@ projectionGated = true;
 message("im-archive", "/clear");
 message("im-blocked", "block");
 
-const heartbeat = resolve("data/workspace/tool-heartbeat.txt");
+const heartbeat = resolve("workspace/tool-heartbeat.txt");
 const pidFile = resolve("tool.pid");
 await writeFile("tool.ts", [
   'import { appendFileSync, writeFileSync } from "node:fs";',
@@ -129,7 +129,7 @@ await writeFile("tool.ts", [
   "writeFileSync(pidFile, String(process.pid));",
   'setInterval(() => appendFileSync(file, Date.now() + "\\n"), 20);',
 ].join("\n"));
-void runProcess({ command: process.execPath, args: [resolve("tool.ts"), heartbeat, pidFile], cwd: resolve("data/workspace"), timeoutMs: 120_000 })
+void runProcess({ command: process.execPath, args: [resolve("tool.ts"), heartbeat, pidFile], cwd: resolve("workspace"), timeoutMs: 120_000 })
   .catch(() => {});
 
 const beats = () => existsSync(heartbeat) ? readFileSync(heartbeat, "utf8").split("\n").filter(Boolean).length : 0;

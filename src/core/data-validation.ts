@@ -18,7 +18,7 @@ import { assertMaintenanceAction } from "./maintenance-state.ts";
 export interface ValidationOptions {
   /**
    * The final workspace of the deployment being validated (absolute, or relative to the project). Default: the
-   * WORKSPACE_ROOT the service will read (environment, then data/config/runtime.json), else data/workspace.
+   * WORKSPACE_ROOT the service will read (environment, then data/config/runtime.json), else workspace.
    */
   readonly workspace?: string;
   /** Who asks, for the maintenance state (maintenance-state.ts): the service (default), the verification instance or a release commit. */

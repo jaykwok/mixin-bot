@@ -1,13 +1,14 @@
 /** @jsxImportSource preact */
 // 推送页的推送记录：列表（按状态筛选、翻页），打开一条推送看每个接收人的发送、确认、选择和回复，补推送、修改抄送、
 // 下载汇总包（汇总表和回复附件，号码打码）、删除已结束的推送。都经运行中的机器人；没有运行时只提示。
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "./api.ts";
 import type {
   PushDetailResponse, PushGroupKey, PushListCursor, PushListItemView, PushListResponse, PushRecipientView, PushState, PushTicket, PushTotalsView,
 } from "./contract.ts";
 import { dateTime } from "./format.ts";
-import { Chip, Segmented, type Tone } from "./ui.tsx";
+import { Icon } from "./icons.tsx";
+import { Chip, Section, Segmented, Skeleton, type Tone } from "./ui.tsx";
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -66,29 +67,30 @@ export function PushRecords() {
   };
   useEffect(() => { void load(); }, [group]);
   return <>
-    <section class="card write-form push-records"><h2>推送记录</h2>
-      <p>推送人在单聊里让机器人准备推送，点预览卡片上的「确认推送」后发出。这里看每条推送的情况，补推送、修改抄送、下载汇总包。机器人必须正在运行。</p>
-      <div class="action-row">
+    <Section title="推送记录"
+      aside={<>
         <Segmented label="推送状态" options={GROUPS} value={group} onChange={value => { setOpen(null); setGroup(value); }} disabled={busy} size="small" />
-        <button class="btn" disabled={busy} onClick={() => void load()}>{busy ? "正在读取…" : "刷新"}</button>
-      </div>
-      {totals && <p>{totalsText(totals)}</p>}
-      {error && <p role="alert">{error}</p>}
-      {!error && !busy && !pushes.length && <p>没有推送。</p>}
-      {pushes.length > 0 && <div class="table-wrap"><table class="data-table"><thead><tr>
+        <button class="btn ghost small-btn" disabled={busy} onClick={() => void load()}><Icon name="refresh" size={13} class={busy ? "spin" : undefined} />{busy ? "正在读取…" : "刷新"}</button>
+      </>}
+      footer="推送人点预览卡片上的「确认推送」后发出。打开一条推送可以补推送、修改抄送和下载汇总包。">
+      {totals && <div class="group-note push-totals">{totalsText(totals)}</div>}
+      {error && <div class="group-note form-error" role="alert">{error}</div>}
+      {!pushes.length && busy && <Skeleton lines={3} />}
+      {!error && !busy && !pushes.length && <div class="group-note">没有推送。</div>}
+      {pushes.length > 0 && <div class="table-wrap"><table class="data-table push-records"><thead><tr>
         <th>主题</th><th>推送人</th><th>状态</th><th>要求</th><th>发出</th><th>截止</th><th>答复</th><th /></tr></thead>
         <tbody>{pushes.map(push => <tr key={push.id} class={open === push.id ? "selected" : undefined}>
-          <td>{push.subject}{push.of && <> <Chip tone="info" title={`补推送：推送编号 ${push.of}`}>补推送</Chip></>}<div class="muted mono">{push.id}</div></td>
-          <td>{push.pusher}</td>
+          <td class="wrap">{push.subject}{push.of && <> <Chip tone="info" tip={`补推送：推送编号 ${push.of}`}>补推送</Chip></>}<div class="muted mono">{push.id}</div></td>
+          <td class="wrap">{push.pusher}</td>
           <td>{stateChip(push)}</td>
           <td>{MODE[push.mode]}</td>
-          <td>{push.confirmedAt ? dateTime(push.confirmedAt) : <span class="muted">{dateTime(push.createdAt)} 准备</span>}</td>
+          <td>{push.confirmedAt ? dateTime(push.confirmedAt) : <><span class="muted">{dateTime(push.createdAt)}</span><div class="muted">准备，未发出</div></>}</td>
           <td>{dateTime(push.deadline)}</td>
-          <td>{push.counts.answered}/{push.counts.delivered}{push.counts.failed ? <span class="muted">（失败 {push.counts.failed}）</span> : null}</td>
-          <td><button class="btn ghost" onClick={() => setOpen(open === push.id ? null : push.id)}>{open === push.id ? "收起" : "查看"}</button></td>
+          <td>{push.counts.answered}/{push.counts.delivered}{push.counts.failed ? <div class="muted">失败 {push.counts.failed}</div> : null}</td>
+          <td><button class={`btn small-btn${open === push.id ? " active" : " ghost"}`} onClick={() => setOpen(open === push.id ? null : push.id)}>{open === push.id ? "收起" : "查看"}</button></td>
         </tr>)}</tbody></table></div>}
-      {more && <button class="btn" disabled={busy} onClick={() => { const last = pushes.at(-1)!; void load({ createdAt: last.createdAt, id: last.id }); }}>更早的推送</button>}
-    </section>
+      {more && <div class="row"><span class="row-text" /><button class="btn small-btn" disabled={busy} onClick={() => { const last = pushes.at(-1)!; void load({ createdAt: last.createdAt, id: last.id }); }}>更早的推送</button></div>}
+    </Section>
     {open && <PushDetailCard key={open} id={open} onChanged={() => void load()} onDeleted={() => { setOpen(null); void load(); }} />}
   </>;
 }
@@ -127,10 +129,13 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
   const [chosen, setChosen] = useState<Set<string>>(new Set()), [error, setError] = useState(""), [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false), [deleting, setDeleting] = useState(false);
   const [cc, setCc] = useState<{ key?: string; name: string; phone: string }[] | null>(null), [ccPhone, setCcPhone] = useState(""), [ccName, setCcName] = useState("");
+  const box = useRef<HTMLDivElement>(null);
   const run = async (work: () => Promise<void>) => { setBusy(true); setError(""); setNotice(""); try { await work(); } catch (error) { setError(message(error)); } finally { setBusy(false); } };
   const reload = () => run(async () => { setDetail(await api<PushDetailResponse>("/api/push/detail", { method: "POST", body: { id }, intent: true, timeoutMs: 30_000 })); setChosen(new Set()); });
   useEffect(() => { void reload(); }, [id]);
-  if (!detail) return <section class="card write-form"><h2>推送 {id}</h2>{error ? <p role="alert">{error}</p> : <p>正在读取…</p>}</section>;
+  // The detail opens under the list: bring it into view.
+  useEffect(() => { box.current?.scrollIntoView?.({ behavior: "smooth", block: "nearest" }); }, [detail !== null]);
+  if (!detail) return <div ref={box} class="push-detail"><Section title={`推送 ${id}`}>{error ? <div class="group-note form-error" role="alert">{error}</div> : <Skeleton lines={4} />}</Section></div>;
   const { push, recipients, view } = detail;
   const shown = recipients.filter(recipient => matches(filter, recipient));
   const waiting = recipients.filter(recipient => !recipient.answered && recipient.sendState !== "pending" && recipient.sendState !== "sending");
@@ -165,58 +170,64 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
   const remove = () => run(async () => { await api("/api/push/delete", { method: "POST", body: { id }, intent: true, timeoutMs: 30_000 }); onDeleted(); });
   const toggle = (key: string) => setChosen(previous => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next; });
   const selectable = (recipient: PushRecipientView) => !recipient.answered && recipient.sendState !== "pending" && recipient.sendState !== "sending";
-  return <section class="card write-form push-detail"><h2>{push.subject} <span class="muted mono">{push.id}</span> {stateChip(push)}</h2>
-    <dl class="kv">
-      <dt>推送人</dt><dd>{push.pusher}</dd>
-      <dt>对象</dt><dd>{push.target.map(line => <div key={line}>{line}</div>)}</dd>
-      <dt>要求</dt><dd>{MODE[push.mode]}{push.options.length ? `：${push.options.join(" / ")}` : ""}</dd>
-      <dt>时间</dt><dd>{dateTime(push.createdAt)} 准备{push.confirmedAt ? `，${dateTime(push.confirmedAt)} 发出` : ""}，截止 {dateTime(push.deadline)}{push.defaultDeadline ? "（未指定，默认 3 天）" : ""}
-        {push.closedAt ? `，${dateTime(push.closedAt)} ${push.closeReason === "complete" ? "全部答复" : "结束"}` : ""}</dd>
-      <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}
-        {push.counts.replying ? `，回复中 ${push.counts.replying}` : ""}</dd>
-      <dt>汇总</dt><dd>{push.summaryState === "sent" ? `已发出${push.summaryAt ? `（${dateTime(push.summaryAt)}）` : ""}` : push.summaryState === "failed" ? `没有发出：${push.summaryError ?? "原因未知"}`
-        : push.summaryState === "pending" ? "待发" : "截止或全部答复后发给推送人和抄送人"}</dd>
-      {push.of && <><dt>补推送</dt><dd>推送编号 {push.of} 中没有答复的人</dd></>}
-      {push.followUp && <><dt>已补推送</dt><dd>推送编号 {push.followUp}</dd></>}
-      <dt>抄送</dt><dd>{cc === null ? <>{push.cc.length ? push.cc.map(person => `${person.name} · ${person.phone}`).join("、") : "无"}
-        {canCc && <> <button class="btn ghost" disabled={busy} onClick={() => setCc(push.cc.map(person => ({ key: person.key, name: person.name, phone: person.phone })))}>修改</button></>}</>
-        : <div class="push-cc">
-          {cc.map((person, index) => <span class="chip neutral" key={person.key ?? `new-${person.phone}`}>{person.name || "（保存时核对姓名）"} · {person.phone}
-            <button class="btn ghost" aria-label="移除抄送人" disabled={busy} onClick={() => setCc(cc.filter((_, at) => at !== index))}>×</button></span>)}
-          <div class="action-row">
-            <input aria-label="抄送人手机号" inputMode="tel" placeholder="完整手机号" value={ccPhone} disabled={busy || cc.length >= 10} onInput={event => setCcPhone(event.currentTarget.value)} />
-            <input aria-label="抄送人姓名" placeholder="姓名（可不填）" value={ccName} disabled={busy || cc.length >= 10} onInput={event => setCcName(event.currentTarget.value)} />
-            <button class="btn" disabled={busy || !ccPhone.trim()} onClick={addCc}>加入</button>
-            <button class="btn primary" disabled={busy} onClick={() => void saveCc()}>保存抄送</button>
-            <button class="btn ghost" disabled={busy} onClick={() => setCc(null)}>不改了</button>
-          </div>
-        </div>}</dd>
-    </dl>
-    <details><summary>正文</summary><pre class="push-body">{push.body}</pre></details>
-    {error && <p role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
-    <div class="action-row">
-      <Segmented label="接收人筛选" options={FILTERS} value={filter} onChange={setFilter} size="small" />
-      {canRemind && <button class="btn" disabled={busy} onClick={() => void remind()}>{`给没有答复的 ${reach(waiting.length, waitingGroups)}${push.state === "closed" ? "补推送" : "重发卡片"}`}</button>}
-      {canRemind && chosen.size > 0 && <button class="btn" disabled={busy} onClick={() => void remind([...chosen])}>只给选中的 {reach(chosen.size, chosenGroups)}</button>}
-      {push.state !== "preview" && push.state !== "cancelled" && push.state !== "expired" && <button class="btn" disabled={busy} onClick={() => void pack()}>下载汇总包</button>}
-      <button class="btn ghost" disabled={busy} onClick={() => void reload()}>刷新</button>
-      {canDelete && (deleting
-        ? <><button class="btn danger" disabled={busy} onClick={() => void remove()}>确认删除</button><button class="btn ghost" disabled={busy} onClick={() => setDeleting(false)}>不删除</button></>
-        : <button class="btn ghost" disabled={busy} onClick={() => setDeleting(true)}>删除推送</button>)}
-    </div>
-    {push.state === "closed" && push.followUp && <p><small>这条推送已经准备过补推送（推送编号 {push.followUp}）；补推送取消或失效后才能再补。</small></p>}
-    {deleting && <p role="alert">删除后推送记录、接收情况和回复都从机器人里删掉，接收人的卡片不再更新；会话里的推送备注保留。</p>}
-    <div class="table-wrap"><table class="data-table push-recipients"><thead><tr><th />
-      <th>{push.counts.groups ? "姓名或群" : "姓名"}</th><th>手机号</th><th>发送</th><th>{push.mode === "reply" ? "回复" : push.mode === "options" ? "选择" : "确认"}</th><th /></tr></thead>
-      <tbody>{shown.map(recipient => <tr key={recipient.key}>
-        <td>{canRemind && selectable(recipient) && <input type="checkbox" aria-label={`选择 ${recipient.name}`} checked={chosen.has(recipient.key)} disabled={busy}
-          onChange={() => toggle(recipient.key)} />}</td>
-        <td>{recipient.name}</td>
-        <td class="mono">{recipient.phone}</td>
-        <td>{SEND[recipient.sendState]}{recipient.sentAt ? <div class="muted">{dateTime(recipient.sentAt)}</div> : null}</td>
-        <td class="push-answer">{answerOf(push, recipient)}{recipient.submittedAt ? <div class="muted">{dateTime(recipient.submittedAt)} 提交</div> : null}</td>
-        <td>{push.mode === "reply" && recipient.reply && <button class="btn ghost" disabled={busy} onClick={() => void pack(recipient.key)}>下载</button>}</td>
-      </tr>)}</tbody></table></div>
-    {!shown.length && <p>没有符合筛选的接收人。</p>}
-  </section>;
+  return <div ref={box} class="push-detail">
+    <Section title={<span class="push-detail-head">{push.subject}<span class="muted mono">{push.id}</span>{stateChip(push)}</span>}
+      aside={<button class="btn ghost small-btn" disabled={busy} onClick={() => void reload()}><Icon name="refresh" size={13} class={busy ? "spin" : undefined} />刷新</button>}>
+      <div class="group-content">
+        <dl class="kv">
+          <dt>推送人</dt><dd>{push.pusher}</dd>
+          <dt>对象</dt><dd>{push.target.map(line => <div key={line}>{line}</div>)}</dd>
+          <dt>要求</dt><dd>{MODE[push.mode]}{push.options.length ? `：${push.options.join(" / ")}` : ""}</dd>
+          <dt>时间</dt><dd>{dateTime(push.createdAt)} 准备{push.confirmedAt ? `，${dateTime(push.confirmedAt)} 发出` : ""}，截止 {dateTime(push.deadline)}{push.defaultDeadline ? "（未指定，默认 3 天）" : ""}
+            {push.closedAt ? `，${dateTime(push.closedAt)} ${push.closeReason === "complete" ? "全部答复" : "结束"}` : ""}</dd>
+          <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}
+            {push.counts.replying ? `，回复中 ${push.counts.replying}` : ""}</dd>
+          <dt>汇总</dt><dd>{push.summaryState === "sent" ? `已发出${push.summaryAt ? `（${dateTime(push.summaryAt)}）` : ""}` : push.summaryState === "failed" ? `没有发出：${push.summaryError ?? "原因未知"}`
+            : push.summaryState === "pending" ? "待发" : "截止或全部答复后发给推送人和抄送人"}</dd>
+          {push.of && <><dt>补推送</dt><dd>推送编号 {push.of} 中没有答复的人</dd></>}
+          {push.followUp && <><dt>已补推送</dt><dd>推送编号 {push.followUp}</dd></>}
+          <dt>抄送</dt><dd>{cc === null ? <>{push.cc.length ? push.cc.map(person => `${person.name} · ${person.phone}`).join("、") : "无"}
+            {canCc && <> <button class="link-btn" disabled={busy} onClick={() => setCc(push.cc.map(person => ({ key: person.key, name: person.name, phone: person.phone })))}>修改</button></>}</>
+            : <div class="push-cc">
+              {cc.map((person, index) => <span class="chip neutral" key={person.key ?? `new-${person.phone}`}>{person.name || "（保存时核对姓名）"} · {person.phone}
+                <button class="chip-remove" aria-label="移除抄送人" disabled={busy} onClick={() => setCc(cc.filter((_, at) => at !== index))}><Icon name="x" size={11} /></button></span>)}
+              <div class="action-row">
+                <input aria-label="抄送人手机号" inputMode="tel" placeholder="完整手机号" value={ccPhone} disabled={busy || cc.length >= 10} onInput={event => setCcPhone(event.currentTarget.value)} />
+                <input aria-label="抄送人姓名" placeholder="姓名（可不填）" value={ccName} disabled={busy || cc.length >= 10} onInput={event => setCcName(event.currentTarget.value)} />
+                <button class="btn small-btn" disabled={busy || !ccPhone.trim()} onClick={addCc}>加入</button>
+                <button class="btn primary small-btn" disabled={busy} onClick={() => void saveCc()}>保存抄送</button>
+                <button class="btn ghost small-btn" disabled={busy} onClick={() => setCc(null)}>不改了</button>
+              </div>
+            </div>}</dd>
+        </dl>
+        <details class="push-body-details"><summary><Icon name="chevronRight" size={13} />正文</summary><pre class="push-body">{push.body}</pre></details>
+      </div>
+      {error && <div class="group-note form-error" role="alert">{error}</div>}
+      {notice && <div class="group-note ok-note" role="status"><Icon name="checkmark" size={13} />{notice}</div>}
+      <div class="row push-actions">
+        <Segmented label="接收人筛选" options={FILTERS} value={filter} onChange={setFilter} size="small" />
+        <span class="row-text" />
+        {canRemind && <button class="btn small-btn" disabled={busy} onClick={() => void remind()}>{`给没有答复的 ${reach(waiting.length, waitingGroups)}${push.state === "closed" ? "补推送" : "重发卡片"}`}</button>}
+        {canRemind && chosen.size > 0 && <button class="btn small-btn" disabled={busy} onClick={() => void remind([...chosen])}>只给选中的 {reach(chosen.size, chosenGroups)}</button>}
+        {push.state !== "preview" && push.state !== "cancelled" && push.state !== "expired" && <button class="btn small-btn" disabled={busy} onClick={() => void pack()}><Icon name="download" size={13} />下载汇总包</button>}
+        {canDelete && (deleting
+          ? <><button class="btn danger small-btn" disabled={busy} onClick={() => void remove()}>确认删除</button><button class="btn ghost small-btn" disabled={busy} onClick={() => setDeleting(false)}>不删除</button></>
+          : <button class="btn destructive small-btn" disabled={busy} onClick={() => setDeleting(true)}>删除推送</button>)}
+      </div>
+      {push.state === "closed" && push.followUp && <div class="group-note">这条推送已经准备过补推送（推送编号 {push.followUp}）；补推送取消或失效后才能再补。</div>}
+      {deleting && <div class="group-note form-error" role="alert">删除后推送记录、接收情况和回复都从机器人里删掉，接收人的卡片不再更新；会话里的推送备注保留。</div>}
+      <div class="table-wrap"><table class="data-table push-recipients"><thead><tr><th />
+        <th>{push.counts.groups ? "姓名或群" : "姓名"}</th><th>手机号</th><th>发送</th><th>{push.mode === "reply" ? "回复" : push.mode === "options" ? "选择" : "确认"}</th><th /></tr></thead>
+        <tbody>{shown.map(recipient => <tr key={recipient.key}>
+          <td>{canRemind && selectable(recipient) && <input type="checkbox" aria-label={`选择 ${recipient.name}`} checked={chosen.has(recipient.key)} disabled={busy}
+            onChange={() => toggle(recipient.key)} />}</td>
+          <td>{recipient.name}</td>
+          <td class="mono">{recipient.phone}</td>
+          <td>{SEND[recipient.sendState]}{recipient.sentAt ? <div class="muted">{dateTime(recipient.sentAt)}</div> : null}</td>
+          <td class="push-answer">{answerOf(push, recipient)}{recipient.submittedAt ? <div class="muted">{dateTime(recipient.submittedAt)} 提交</div> : null}</td>
+          <td>{push.mode === "reply" && recipient.reply && <button class="btn ghost small-btn" disabled={busy} onClick={() => void pack(recipient.key)}>下载</button>}</td>
+        </tr>)}</tbody></table></div>
+      {!shown.length && <div class="group-note">没有符合筛选的接收人。</div>}
+    </Section>
+  </div>;
 }

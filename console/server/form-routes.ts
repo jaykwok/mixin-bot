@@ -9,6 +9,7 @@ import { ApiProblem, type Route } from "./routes.ts";
 import { fields, textParam } from "../../ops/core/operations.ts";
 import { scanTmp } from "../../src/lib/tmp-scan.ts";
 import { maskUser, spaceLabel } from "../../ops/lib/format.ts";
+import { browseUnavailable, RUNTIME_BROWSE } from "./files.ts";
 
 const DIRECTORY = { status: readServiceStatus, describe: describeDepartments, list: listDepartments, apply: changeScope };
 /**
@@ -71,8 +72,11 @@ export class FormRoutes {
         }) };
       }),
       "GET /api/forms/runtime": wrap(async () => ({ ...await readRuntimeSettings(join(this.project, "data/config/runtime.json")),
-        groups: RUNTIME_GROUPS.map(group => ({ ...group, options: group.options.map(option => ({ ...option, default: RUNTIME_DEFAULTS[option.key],
-          range: RUNTIME_RANGES[option.key as keyof typeof RUNTIME_RANGES] })) })) })),
+        groups: RUNTIME_GROUPS.map(group => ({ ...group, options: group.options.map(option => {
+          const purpose = RUNTIME_BROWSE[option.key], unavailable = purpose && browseUnavailable(purpose);
+          return { ...option, default: RUNTIME_DEFAULTS[option.key], range: RUNTIME_RANGES[option.key as keyof typeof RUNTIME_RANGES],
+            ...(purpose ? { browse: { purpose, ...(unavailable ? { unavailable } : {}) } } : {}) };
+        }) })) })),
       "GET /api/directory/selection": wrap(async ({ session, signal }) => {
         const status = await this.directory.status(undefined, file, signal);
         if (!status.directory || status.verificationOnly) throw new Error("机器人未运行或通讯录不可用");

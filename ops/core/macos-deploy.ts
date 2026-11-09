@@ -204,9 +204,9 @@ async function choosePort(project: string, env: NodeJS.ProcessEnv): Promise<numb
   return port;
 }
 
-/** Default data/workspace, or an existing external directory the service account can read (WORKSPACE_ROOT, else the saved one). */
+/** Default workspace, or an existing external directory the service account can read (WORKSPACE_ROOT, else the saved one). */
 async function chooseWorkspace(project: string, account: Identity, env: NodeJS.ProcessEnv): Promise<{ external: string; final: string }> {
-  const fallback = join(project, "data/workspace"), request = env.WORKSPACE_ROOT?.trim() || readState(project, "workspace-root") || "";
+  const fallback = join(project, "workspace"), request = env.WORKSPACE_ROOT?.trim() || readState(project, "workspace-root") || "";
   let external = "";
   if (request) {
     const candidate = resolve(project, request);
@@ -393,7 +393,7 @@ export async function upgradeEntry(argv: string[], env: NodeJS.ProcessEnv = proc
       plans = accountStage(project, "upgrade-plan-", account);
       const plan = join(plans, "data-plan.json");
       setStage("data-preparation-preview");
-      if (await projectTool(project, bun, account, join(SOURCE, "ops/tools/data-current.ts"), ["preview", "--project", project, "--plan", plan, "--upgrade", "--workspace", saved || join(project, "data/workspace")],
+      if (await projectTool(project, bun, account, join(SOURCE, "ops/tools/data-current.ts"), ["preview", "--project", project, "--plan", plan, "--upgrade", "--workspace", saved || join(project, "workspace")],
         { BOT_OPERATION_LOG: log.name ?? "" }) !== 0) throw new EntryError("数据版本或配置校验未通过；旧服务尚未停止。");
       // The core repeats these rules under deploy.lock; checking first means nothing is asked when main, the service or the switch refuse.
       setStage("upgrade-preflight");

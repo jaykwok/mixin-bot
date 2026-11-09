@@ -83,7 +83,7 @@ const READ_ROUTES: ReadonlySet<string> = new Set([
   "POST /api/conversation/activity", "POST /api/conversation/boundaries", "POST /api/conversation/entries", "POST /api/conversation/entry", "POST /api/conversation/requests",
   "POST /api/conversation/search", "POST /api/views/close", "POST /api/views/search", "POST /api/views/space", "POST /api/views/stats", "POST /api/search", "POST /api/stats",
   "POST /api/exports/status", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/groups", "POST /api/directory/children",
-  "POST /api/lifecycle/directory/open", "POST /api/lifecycle/directory/children",
+  "POST /api/lifecycle/directory/open", "POST /api/lifecycle/directory/children", "POST /api/files/list",
 ]);
 
 export function createHandler(options: ConsoleServerOptions): (request: Request, server?: RequestTimeouts) => Promise<Response> {

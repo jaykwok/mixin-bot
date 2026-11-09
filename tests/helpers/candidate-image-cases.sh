@@ -639,7 +639,7 @@ snapshot_cases() {
     . "$here/../../scripts/lib/deployment.sh"
     PROJECT_DIR="$fixture/project"
     local conversation="$fixture/project/data/conversations/groups/g1" size
-    mkdir -p "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/state" "$PROJECT_DIR/data/runtime/pi" "$PROJECT_DIR/data/workspace" "$conversation"
+    mkdir -p "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/state" "$PROJECT_DIR/data/runtime/pi" "$PROJECT_DIR/workspace" "$conversation"
     sized() { head -c "$2" /dev/zero > "$1"; }
     # Counted: configuration, the deployment record and the state databases (the statistics ledger among them).
     sized "$PROJECT_DIR/data/config/models.json" 100000
@@ -652,7 +652,7 @@ snapshot_cases() {
     # Not in the snapshot: conversation databases, which a release of the same data format leaves alone, the shared
     # workspace and other state.
     sized "$conversation/durable.sqlite" 5000000
-    sized "$PROJECT_DIR/data/workspace/big" 5000000
+    sized "$PROJECT_DIR/workspace/big" 5000000
     sized "$PROJECT_DIR/data/state/other.log" 5000000
     size="$(snapshot_size_estimate)"
     result estimate-at-least "$([ "$size" -ge 1500000 ] && echo yes || echo "no:$size")"

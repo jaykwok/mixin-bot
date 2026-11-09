@@ -45,7 +45,8 @@ const scenarios = [
   const below = userTmp(appLayout(""), groupScope(scenario.groupId), scenario.phone).length + 1;
   const padding = USER_TMP_LENGTH - below - root.length - 1 - scenario.name.length - 1;
   if (padding < 1) throw new Error(`run directory too deep for a ${USER_TMP_LENGTH}-character member tmp; pass a shorter --root`);
-  const dataRoot = join(root, scenario.name + "-" + "d".repeat(padding));
+  // The default workspace sits beside the data directory: each scenario gets its own parent, so its own workspace.
+  const dataRoot = join(root, scenario.name, "d".repeat(padding));
   const layout = appLayout(dataRoot), tempDir = userTmp(layout, groupScope(scenario.groupId), scenario.phone);
   assert.equal(tempDir.length, USER_TMP_LENGTH);
   return { ...scenario, dataRoot, tempDir, workspace: layout.workspace, indexPath: layout.materialsIndex };

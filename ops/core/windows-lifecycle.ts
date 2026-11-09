@@ -58,7 +58,7 @@ function windowsSession(context: DeploymentContext): DeploymentSession {
   };
   return {
     writer,
-    tools: { project, file: file => join(context.snapshot, file), workspace: record => record.target_workspace_root || join(project, "data/workspace") },
+    tools: { project, file: file => join(context.snapshot, file), workspace: record => record.target_workspace_root || join(project, "workspace") },
     async recover(previous) {
       if (previous.kind !== "windows-job") throw new Error("此事务需要原平台恢复写入者");
       const store = context.store();

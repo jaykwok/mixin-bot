@@ -53,9 +53,12 @@ test("页面代码只能引用 console/ui/src 内的文件和内置 Preact", asy
     await expect(attempt(`import "bun:sqlite";`)).rejects.toThrow("不能引用 bun:sqlite");
     await expect(attempt(`import { Hono } from "hono"; console.log(Hono);`)).rejects.toThrow("不能引用 hono");
     await expect(attempt(`import { x } from "../outside.ts"; console.log(x);`)).rejects.toThrow("只能引用 console/ui/src 内的文件");
-    await writeFile(join(fixture.root, "src", "styles.css"), "body { color: red; }");
+    // Inline data is a stylesheet's glyph only: script cannot import it.
+    await expect(attempt(`import "data:text/javascript,console.log(1)";`)).rejects.toThrow("不能引用 data:");
+    await writeFile(join(fixture.root, "src", "styles.css"), `body { color: red; background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E"); }`);
     const ok = await attempt(`import { render } from "preact"; import { useState } from "preact/hooks"; import "./styles.css";
       function App() { const [n] = useState(1); return <p>{n}</p>; } render(<App />, document.body);`);
     expect([...ok.assets.keys()]).toHaveLength(3);
+    expect(new TextDecoder().decode([...ok.assets.values()].find(asset => asset.path.endsWith(".css"))!.body)).toContain("data:image/svg+xml");
   } finally { await fixture.cleanup(); }
 });

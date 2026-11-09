@@ -115,16 +115,17 @@ test("只读接口接受几秒内的代码核对；其余接口和 /api/runtime 
   const handle = createHandler({ port: PORT, guard: guardConfig(PORT), bundle, auth, instanceId: "frozen",
     current: read => { asked.push(read); return true; }, overview: async () => ({} as Overview), download: () => new Response("file"),
     routes: Object.fromEntries(["GET /api/lifecycle", "POST /api/conversation/entries", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/delete", "POST /api/plans", "POST /api/exports", "POST /api/directory/apply",
+      "POST /api/files/list",
       // New routes under the paths of read routes: not named, so they check in full.
-      "GET /api/lifecycle/new", "GET /api/new", "POST /api/conversation/new", "POST /api/views/new", "POST /api/lifecycle/directory/new", "GET /api/tasks"].map(route => [route, { run: async () => ({}) }])) });
+      "GET /api/lifecycle/new", "GET /api/new", "POST /api/conversation/new", "POST /api/views/new", "POST /api/lifecycle/directory/new", "POST /api/files/new", "GET /api/tasks"].map(route => [route, { run: async () => ({}) }])) });
   const headers = { cookie: auth.cookieName + "=" + login.sessionId };
   const post = { method: "POST", body: "{}", headers };
   for (const [path, init, expected] of [
     ["/api/lifecycle", { headers }, [true, true]], ["/api/overview", { headers }, [true, true]], ["/api/runtime", { headers }, [false]],
-    ["/api/conversation/entries", post, [true, true]], ["/api/push/list", post, [true, true]], ["/api/push/detail", post, [true, true]],
+    ["/api/conversation/entries", post, [true, true]], ["/api/push/list", post, [true, true]], ["/api/push/detail", post, [true, true]], ["/api/files/list", post, [true, true]],
     ["/api/push/delete", post, [false, false]], ["/api/plans", post, [false, false]], ["/api/exports", post, [false, false]], ["/api/directory/apply", post, [false, false]],
     ["/api/lifecycle/new", { headers }, [false, false]], ["/api/new", { headers }, [false, false]], ["/api/conversation/new", post, [false, false]], ["/api/views/new", post, [false, false]],
-    ["/api/lifecycle/directory/new", post, [false, false]], ["/download/ticket", { headers }, [true]],
+    ["/api/lifecycle/directory/new", post, [false, false]], ["/api/files/new", post, [false, false]], ["/download/ticket", { headers }, [true]],
     // Login and task records are served whatever the code: no check at all.
     ["/api/session", { headers }, []], ["/api/tasks", { headers }, []],
   ] as const) {

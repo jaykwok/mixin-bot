@@ -142,7 +142,7 @@ test.skipIf(process.platform !== "linux")("Docker mount order is not a deploymen
   try {
     const mount = (source: string, destination: string) => ({ Type: "bind", Source: source, Destination: destination, RW: true, Propagation: "rprivate" });
     const original = [mount(realpathSync(join(f.root, "data")), "/app/data"), mount("/run/user/1001/docker.sock", "/run/mixin-task/docker.sock"),
-      mount(join(f.root, "data/workspace"), "/app/workspace")];
+      mount(join(f.root, "workspace"), "/app/workspace")];
     let mounts = structuredClone(original), user = "1001:1001", id = "same-container";
     const run: Runner = async (argv, env) => argv[0] === "docker"
       ? { code: 0, stderr: "", stdout: JSON.stringify([{ Id: id, Image: "same-image", Config: { User: user }, Mounts: mounts }]) }

@@ -7,7 +7,7 @@
 // the real one: the exported working tree's platform endpoints are replaced by the fixture, the production code keeps its
 // fixed hosts. Rootful containers use the host network (127.0.0.1); rootless ones reach the host at the source address of
 // its default route (or MIXIN_REAL_DOCKER_PLATFORM_HOST). MIXIN_REAL_DOCKER_LAYOUTS=external (comma list) limits the
-// shared workspace layouts that run (default data/workspace, or an external WORKSPACE_ROOT mounted read-only).
+// shared workspace layouts that run (default workspace, or an external WORKSPACE_ROOT mounted read-only).
 // With the default workspace both operators also check the preparation before the stop: a slowed build while the original
 // service keeps answering (host load recorded), a single build with every container on the candidate's ID, work-tree files
 // kept out of the image, and tags moved while the preview waits.
@@ -526,7 +526,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         const base = join(root, layout);
         ({ work, upstream } = repository(base, exportWithFakePlatform));
         projects.push(projectId(work));
-        shared = layout === "default" ? join(work, "data/workspace") : join(base, "shared-files");
+        shared = layout === "default" ? join(work, "workspace") : join(base, "shared-files");
         port = await freePort();
         fixture = syntheticData(work, shared);
         if (layout === "external") sharedBaseline = sharedEntries();
@@ -543,9 +543,9 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         expect(await until("the deployed service", () => healthy(), 60_000)).toBe(true);
         await converses("the deployed service");
         expect(pending()).toBe(false);
-        // An external workspace is mounted read-only at /app/workspace; the default one is part of data/.
+        // The workspace, default or external, is mounted read-only at /app/workspace.
         const mounts = JSON.parse(docker("inspect", "--format", "{{json .Mounts}}", "mixin-bot").out) as { Destination: string; RW: boolean }[];
-        expect(mounts.find(mount => mount.Destination === "/app/workspace")?.RW).toBe(layout === "external" ? false : undefined);
+        expect(mounts.find(mount => mount.Destination === "/app/workspace")?.RW).toBe(false);
         externalUnchanged();
         baseline = digest(fixture);
         accepted = head();

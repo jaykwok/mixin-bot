@@ -50,7 +50,7 @@ function Invoke-ConsoleProcess([string]$FilePath, [string[]]$Arguments, [switch]
 `.replace(/\r?\n/g, "\r\n");
 
 const core = `deployment upgrade --project <project> --original ${original} --target ${target} --branch main --git-path fixture-git`;
-const preview = "data-preparation-preview:preview --project <project> --plan <project>\\tmp\\data-plan-<id>.json --upgrade --workspace <project>\\data\\workspace";
+const preview = "data-preparation-preview:preview --project <project> --plan <project>\\tmp\\data-plan-<id>.json --upgrade --workspace <project>\\workspace";
 const preflight = `upgrade-preflight:${core} --preflight`, scope = "directory-scope:scope-choice";
 const handoff = `shared-deployment-core:${core}`, plan = " --plan <project>\\tmp\\data-plan-<id>.json";
 const full = [preview, preflight, scope, `${handoff}${plan} --directory-plan <project>\\tmp\\directory-scope-plan-<id>.json`];

@@ -1,5 +1,6 @@
 // Builds the console page in memory at startup. Linux Docker hosts have no node_modules, so the only bare imports the
-// page may use are the vendored Preact files; everything else must stay inside console/ui/src.
+// page may use are the vendored Preact files; everything else must stay inside console/ui/src. The stylesheet may draw
+// small glyphs as data: URLs, which load nothing (the CSP allows data: images).
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { SOURCE_DIR } from "../../ops/core/platform.ts";
 
@@ -41,6 +42,7 @@ export async function buildBundle(root = UI_DIR): Promise<Bundle> {
         setup(build) {
           build.onResolve({ filter: /.*/ }, args => {
             if (args.kind === "entry-point-build" || args.kind === "entry-point-run") return undefined;
+            if (args.path.startsWith("data:") && args.importer.endsWith(".css")) return undefined;
             const vendored = VENDORED[args.path];
             if (vendored) return { path: join(vendor, vendored) };
             if (args.path.startsWith("./") || args.path.startsWith("../")) {

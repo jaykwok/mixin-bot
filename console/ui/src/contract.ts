@@ -382,3 +382,51 @@ export interface ExportTicket { id: string; url: string; filename: string; expir
 export type ExportState = "ready" | "running" | "sent" | "interrupted" | "failed" | "expired";
 
 export interface ExportStatus { id: string; state: ExportState; filename: string; rows: number; bytes: number; error?: string }
+
+// ─── Host files ────────────────────────────────────────────────────────────
+
+/** What a path field holds; it decides what can be chosen and the value written into the field. */
+export type BrowsePurpose = "workspace" | "stats" | "document-env" | "pptx-template" | "docx-template" | "office";
+
+export interface BrowseRequest {
+  purpose: BrowsePurpose;
+  /** A host directory to open (absolute); a file opens its directory with it selected. */
+  path?: string;
+  /** The field's present value: its directory opens with it selected. */
+  from?: string;
+  hidden?: boolean;
+}
+
+export interface BrowseEntry {
+  name: string;
+  /** Host path; a directory opens on it. */
+  path: string;
+  /** `app`: a macOS application bundle, chosen as a whole. */
+  kind: "directory" | "file" | "app";
+  size: number | null;
+  modified: number | null;
+  /** The field's value when this entry is chosen, null when it cannot be (`reason` says why when it is not obvious). */
+  value: string | null;
+  reason?: string;
+  link?: boolean;
+  hidden?: boolean;
+}
+
+export interface BrowsePlace { label: string; path: string; kind: "project" | "data" | "workspace" | "home" | "drive" | "apps" | "office" | "root" }
+
+export interface BrowseResponse {
+  purpose: BrowsePurpose;
+  select: "directory" | "file";
+  path: string;
+  parent: string | null;
+  crumbs: { name: string; path: string }[];
+  places: BrowsePlace[];
+  entries: BrowseEntry[];
+  /** Choosing the directory shown (directory fields only). */
+  current: { value: string | null; reason?: string } | null;
+  /** Name of the entry the field's value names, when it is in this directory. */
+  selected: string | null;
+  /** More entries than are listed, or metadata cut short by the time limit. */
+  truncated: boolean;
+  note: string;
+}

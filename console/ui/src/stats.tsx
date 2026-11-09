@@ -52,7 +52,7 @@ function Tile({ label, value, sub }: { label: string; value: string; sub?: strin
   );
 }
 
-const tokenTitle = (tokens: StatsTokens) =>
+const tokenTip = (tokens: StatsTokens) =>
   `输入 ${count(tokens.input)} · 输出 ${count(tokens.output)} · 缓存读 ${count(tokens.cacheRead)} · 缓存写 ${count(tokens.cacheWrite)}`;
 
 export function StatsPage() {
@@ -176,7 +176,7 @@ export function StatsPage() {
           <ModeSwitch mode={view?.mode ?? mode.mode} disabled={loading} what="统计页面"
             onChange={(next, confirm) => { reopened.current = false; setNotice(null); setError(null); setMode({ mode: next, confirm }); }} />
           <button type="button" class="btn" disabled={!data || loading || !!error || !!rangeError} onClick={() => setExporting(true)}><Icon name="download" />导出</button>
-          <button type="button" class="btn ghost icon-btn" aria-label="刷新统计" title="刷新" disabled={!view} onClick={reload}>
+          <button type="button" class="btn ghost icon-btn" aria-label="刷新统计" data-tip="刷新" disabled={!view} onClick={reload}>
             <Icon name="refresh" class={loading && data ? "spin" : undefined} />
           </button>
         </div>
@@ -203,7 +203,7 @@ export function StatsPage() {
           {[...groups].sort((a, b) => Number(b[0] === "direct") - Number(a[0] === "direct") || a[1].localeCompare(b[1], "zh-CN"))
             .map(([key, title]) => <option key={key} value={key}>{title}</option>)}
         </select>
-        <select class="select" aria-label="成员筛选" title="名单来自已查看的统计范围；找不到成员时可调整空间或时间。" value={filters.member ?? ""} disabled={!view || !members.size}
+        <select class="select" aria-label="成员筛选" data-tip="名单来自已查看的统计范围；找不到成员时可调整空间或时间。" value={filters.member ?? ""} disabled={!view || !members.size}
           onChange={event => set({ member: event.currentTarget.value || null })}>
           <option value="">全部成员</option>
           {[...members].map(([key, label]) => <option key={key} value={key}>{label}</option>)}
@@ -265,7 +265,7 @@ export function StatsPage() {
                     options={[{ value: "asks", label: "提问次数" }, { value: "people", label: "提问人数" }, { value: "tokens", label: "Token" }]} />
                   <Segmented label="趋势粒度" size="small" value={filters.grain} onChange={grain => set({ grain })}
                     options={[{ value: "day", label: "日" }, { value: "week", label: "周" }, { value: "month", label: "月" }]} />
-                  <button type="button" class={`btn ghost icon-btn${table ? " active" : ""}`} aria-pressed={table} aria-label="以表格显示" title="以表格显示"
+                  <button type="button" class={`btn ghost icon-btn${table ? " active" : ""}`} aria-pressed={table} aria-label="以表格显示" data-tip="以表格显示"
                     onClick={() => setTable(value => !value)}><Icon name="table" /></button>
                 </div>}>
                 {points.length === 0 ? <p class="muted">没有可画的日期。</p>
@@ -286,7 +286,7 @@ export function StatsPage() {
                 ) : (
                   <BarList rows={ranking.slice(0, 10).map((row, index) => ({
                     key: row.identity.key, label: <><span class="rank">{index + 1}</span><IdentityText identity={row.identity} compact /></>,
-                    value: row.asks, text: `${count(row.asks)} 次`, title: `${row.identity.label} · 活跃 ${row.activeDays} 天 · ${row.groups} 个群`,
+                    value: row.asks, text: `${count(row.asks)} 次`, tip: `${row.identity.label} · 活跃 ${row.activeDays} 天 · ${row.groups} 个群`,
                   }))} />
                 )}
                 {ranking.length >= 1_000 && <p class="card-note">只列出前 1,000 名；合计仍按全部成员计算。</p>}
@@ -296,7 +296,7 @@ export function StatsPage() {
                 <Card title="群与单聊" icon="messages" span={6}>
                   <BarList rows={[...data.groups].sort((a, b) => b.asks - a.asks).slice(0, 12).map(group => ({
                     key: group.group, label: group.title, value: group.asks, text: `${count(group.asks)} 次 · ${count(group.people)} 人`,
-                    title: `${group.title} · 活跃 ${group.activeDays} 天 · Token ${count(group.tokens.totalTokens)}${group.lastAt ? ` · 最近 ${dateTime(group.lastAt)}` : ""}；点击只看这个群`,
+                    tip: `${group.title} · 活跃 ${group.activeDays} 天 · Token ${count(group.tokens.totalTokens)}${group.lastAt ? ` · 最近 ${dateTime(group.lastAt)}` : ""}；点击只看这个群`,
                     onClick: () => set({ group: group.group }),
                   }))} />
                   {data.groups.length > 12 && <p class="card-note">另有 {data.groups.length - 12} 个群，见下方表格。</p>}
@@ -330,7 +330,7 @@ export function StatsPage() {
                         {[...data.groups].sort((a, b) => b.asks - a.asks || b.tokens.totalTokens - a.tokens.totalTokens).map(group => (
                           <tr key={group.group}>
                             <td>{group.title}</td><td class="num">{count(group.asks)}</td><td class="num">{count(group.people)}</td>
-                            <td class="num">{count(group.activeDays)}</td><td class="num" title={tokenTitle(group.tokens)}>{compact(group.tokens.totalTokens)}</td>
+                            <td class="num">{count(group.activeDays)}</td><td class="num" data-tip={tokenTip(group.tokens)}>{compact(group.tokens.totalTokens)}</td>
                             <td class="muted">{group.lastAt ? dateTime(group.lastAt) : "—"}</td>
                             <td><button type="button" class="btn ghost small-btn" onClick={() => set({ group: group.group })}>只看此群</button></td>
                           </tr>
@@ -343,12 +343,12 @@ export function StatsPage() {
 
               <Card title="模型 Token" icon="sparkles" span={6}>
                 <BarList empty="区间内没有模型用量" rows={data.models.slice(0, 10).map(row => ({
-                  key: row.key, label: <span class="mono">{row.key}</span>, value: row.tokens.totalTokens, text: compact(row.tokens.totalTokens), title: tokenTitle(row.tokens),
+                  key: row.key, label: <span class="mono">{row.key}</span>, value: row.tokens.totalTokens, text: compact(row.tokens.totalTokens), tip: tokenTip(row.tokens),
                 }))} />
               </Card>
               <Card title="工具 Token" icon="wrench" span={6}>
                 <BarList empty="区间内没有工具自身的模型用量" rows={data.tools.slice(0, 10).map(row => ({
-                  key: row.key, label: <span class="mono">{row.key}</span>, value: row.tokens.totalTokens, text: compact(row.tokens.totalTokens), title: tokenTitle(row.tokens),
+                  key: row.key, label: <span class="mono">{row.key}</span>, value: row.tokens.totalTokens, text: compact(row.tokens.totalTokens), tip: tokenTip(row.tokens),
                 }))} />
               </Card>
             </div>

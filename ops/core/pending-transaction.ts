@@ -12,7 +12,7 @@ export function loadPendingTransaction(project = PROJECT_DIR): PendingTransactio
 }
 
 const shortSha = (sha: string | null) => sha ? sha.slice(0, 7) : "（非 git 部署）";
-const workspace = (root: string) => root || "data/workspace";
+const workspace = (root: string) => root || "workspace";
 
 /** 概览和部署恢复预览共用的摘要：标题一行，记录内容逐行。 */
 export function describePendingTransaction(pending: PendingTransaction): { subject: string; record: string[] } {

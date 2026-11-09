@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tempFixture } from "../helpers/temp.ts";
 
 const library = fileURLToPath(new URL("../../scripts/lib/task-runtime.sh", import.meta.url));
@@ -74,6 +74,7 @@ test.skipIf(process.platform !== "linux")("ops one-off containers check the task
     expect(admin).toBeDefined();
     await Bun.write(join(project, "data/config/task-deployment.json"), "{}");
     await Bun.write(join(project, "data/state/task-runtime"), `endpoint=unix://${socket}\ndaemon=daemon-one\n`);
+    await mkdir(join(project, "workspace"));
     const script = join(f.root, "admin.sh");
     // ops.sh runs with set -u: every variable the check reads must be assigned before it.
     await writeFile(script, `set -uo pipefail
@@ -104,6 +105,7 @@ data_admin ops/tools/tmp-admin.ts preview --all
     expect(good.code, good.output).toBe(0);
     expect(good.output).toContain(`--user ${process.getuid!()}:${process.getgid!()}`);
     expect(good.output).toContain("DOCKER_HOST=unix:///run/mixin-task/docker.sock");
+    expect(good.output).toContain(`-v ${join(project, "workspace")}:/app/workspace:ro -e WORKSPACE_ROOT=/app/workspace`);
     const other = await run("999999:999999");
     expect(other.code).not.toBe(0);
     expect(other.output).toContain("需要属于宿主 UID 999999");

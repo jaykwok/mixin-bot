@@ -1,8 +1,9 @@
 // The demo deployment behind console-screenshots.ts, which starts this file in its scratch directory: modules read data/
 // relative to the working directory when they load. The data directory gets 90 days of synthetic statistics; the real
 // service writes a few synthetic chats with a faux model; the bot's HTTP app serves /health and the read channel; the
-// console runs its real handler and page bundle. Only the task list of the maintain page is a fixed demo, because real
-// maintenance needs a deployment. A headless Chrome or Edge renders each page through the DevTools protocol.
+// console runs its real handler and page bundle. The maintain page's task list, its restart plan and the path picker's
+// listing are fixed demos: real maintenance needs a deployment, and the picker would show this host's own directories.
+// A headless Chrome or Edge renders each page through the DevTools protocol.
 import { Database } from "bun:sqlite";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
@@ -27,7 +28,7 @@ import { serviceView } from "../../console/server/status.ts";
 import { conversationRoutes, Views } from "../../console/server/views.ts";
 import { probeService } from "../../console/server/data.ts";
 import { versionRows } from "../../ops/tools/version-info.ts";
-import type { Overview } from "../../console/ui/src/contract.ts";
+import type { BrowseResponse, Overview } from "../../console/ui/src/contract.ts";
 import { PROJECT_PROGRESS } from "./durable.ts";
 import { recordingOutbound, replyTexts } from "./recording-outbound.ts";
 import { writeTestData } from "./stats-fixture.ts";
@@ -159,8 +160,8 @@ class Page {
   async shoot(path: string, height?: number | "full") {
     const base = this.height;
     if (height !== undefined) await this.viewport(height === "full" ? Number(await this.evaluate("document.documentElement.scrollHeight")) : height);
-    // Let charts and the layout settle at the new size, then drop the focus ring of the last click.
-    await this.evaluate("document.activeElement instanceof HTMLElement && document.activeElement.blur()");
+    // Let charts and the layout settle at the new size, then drop the focus ring of the last click (a dialog keeps its focus).
+    await this.evaluate("document.activeElement instanceof HTMLElement && !document.activeElement.closest('[role=dialog]') && document.activeElement.blur()");
     await Bun.sleep(800);
     const shot = await this.send("Page.captureScreenshot", { format: "png" });
     await mkdir(resolve(path, ".."), { recursive: true });
@@ -265,13 +266,13 @@ try {
   const overview = async (): Promise<Overview> => ({
     checkedAt: Date.now(),
     console: { version: VERSION, build: BUILD, hostname: "mixin-bot", platform: "linux", port: 10001, pid: process.pid, startedAt: consoleStarted },
-    deployment: { platform: "linux", runtime: "docker", mode: "Docker", port: 3000, dataRoot: "/opt/mixin-bot/data", workspaceRoot: "/opt/mixin-bot/data/workspace" },
+    deployment: { platform: "linux", runtime: "docker", mode: "Docker", port: 3000, dataRoot: "/opt/mixin-bot/data", workspaceRoot: "/opt/mixin-bot/workspace" },
     deploymentError: null, recovery: null, pending: null,
     service: serviceView(await probeService(bot.port!, instanceFile)),
     versions: versionRows({ source: "running", program, dataVersion: DATA_VERSION, local: program }),
   });
   const server = startServer({ port, guard: guardConfig(port), bundle: await buildBundle(), auth, instanceId: crypto.randomUUID(), overview,
-    routes: { ...conversationRoutes({ bot: linked, audit, views }), ...statsRoutes({ bot: linked, audit, views, root }), ...exporter.routes(), ...demoTasks() },
+    routes: { ...conversationRoutes({ bot: linked, audit, views }), ...statsRoutes({ bot: linked, audit, views, root }), ...exporter.routes(), ...demoTasks(), ...demoSheets() },
     download: (ticket, context) => exporter.download(ticket, context) });
   cleanups.push(() => server.stop(true));
 
@@ -298,6 +299,15 @@ try {
   await page.until("document.body.innerText.includes('张三') && document.querySelectorAll('svg').length > 2", "统计");
   await page.shoot(join(outDir, "console-stats.png"), 1440);
 
+  // A host path is pasted, or chosen in the picker that browses the host's file system.
+  await page.click(".disclosure-head", "导入统计");
+  await page.until("document.querySelector('.path-field button') !== null", "导入统计表单");
+  await page.click(".path-field button", "选取");
+  await page.until("document.querySelectorAll('.entry').length > 3", "选择框");
+  await page.click(".entry", "stats-20261001.sqlite");
+  await page.shoot(join(outDir, "console-picker.png"));
+  await page.evaluate("document.querySelector('.dialog-close').click()");
+
   await page.go(`http://127.0.0.1:${port}/#/conversations`);
   await page.until("[...document.querySelectorAll('.space-card')].some(card => !card.disabled && card.innerText.includes('单聊'))", "会话空间");
   await page.click(".space-card", "单聊");
@@ -311,8 +321,37 @@ try {
   await page.click(".task-list button", "重启");
   await page.until("document.body.innerText.includes('机器人运行中（实例身份与就绪检查通过）')", "任务详情");
   await page.shoot(join(outDir, "console-maintain.png"), "full");
+
+  // Every operation is previewed first: the confirm sheet with its steps and the plan's time limit.
+  await page.evaluate("scrollTo(0, 0)");
+  await page.click("button", "重启");
+  await page.until("document.querySelector('.plan-summary') !== null", "确认重启");
+  await page.shoot(join(outDir, "console-confirm.png"));
 } finally {
   for (const cleanup of cleanups.reverse()) { try { await cleanup(); } catch (error) { console.error(`清理失败：${String(error)}`); } }
+}
+
+/** The restart plan behind the confirm sheet, and the path picker's listing of a demo host's stats backups. */
+function demoSheets(): Record<string, Route> {
+  const at = (back: number) => now - back, folder = "/opt/mixin-bot/backup/stats";
+  const file = (name: string, size: number, back: number) => ({ name, path: `${folder}/${name}`, kind: "file" as const, size, modified: at(back), value: `${folder}/${name}` });
+  const listing: BrowseResponse = {
+    purpose: "stats", select: "file", path: folder, parent: "/opt/mixin-bot/backup",
+    crumbs: [{ name: "/", path: "/" }, { name: "opt", path: "/opt" }, { name: "mixin-bot", path: "/opt/mixin-bot" }, { name: "backup", path: "/opt/mixin-bot/backup" },
+      { name: "stats", path: folder }],
+    places: [{ label: "项目目录", path: "/opt/mixin-bot", kind: "project" }, { label: "数据目录", path: "/opt/mixin-bot/data", kind: "data" },
+      { label: "共享资料", path: "/opt/mixin-bot/workspace", kind: "workspace" }, { label: "主目录", path: "/home/ops", kind: "home" }, { label: "根目录", path: "/", kind: "root" }],
+    entries: [
+      { name: "archive", path: `${folder}/archive`, kind: "directory", size: null, modified: at(40 * DAY), value: null },
+      file("stats-20260901.sqlite", 18_350_080, 69 * DAY), file("stats-20261001.sqlite", 21_495_808, 39 * DAY), file("stats-20261001.sqlite-wal", 65_536, 39 * DAY),
+    ],
+    current: null, selected: null, truncated: false, note: "选择以前保存的统计账本（通常名为 stats.sqlite），导入前会校验格式。",
+  };
+  return {
+    "POST /api/files/list": { run: async () => listing },
+    "POST /api/plans": { run: async ({ body }) => ({ id: `plan-${crypto.randomUUID()}`, operation: (body as { operation: string }).operation, expiresAt: Date.now() + 5 * 60_000,
+      summary: ["停止机器人：等待进行中的回答结束（最多 60 秒）", `启动同一版本 v${VERSION}，核对实例身份与就绪检查`, "完成后恢复事件 Stream 连接"] }) },
+  };
 }
 
 /** The maintain page's task list: a fixed demo of finished tasks; the restart's lines are what the executor and the service core print. */

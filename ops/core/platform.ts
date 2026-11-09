@@ -24,7 +24,7 @@ export interface Deployment {
   port: number;
   /** 数据目录（data/）的绝对路径：会话、tmp、统计账本和索引都在它下面。 */
   dataRoot: string;
-  /** 外置共享资料目录（WORKSPACE_ROOT）；空为默认的 data/workspace。 */
+  /** 外置共享资料目录（WORKSPACE_ROOT）；空为默认的 workspace。 */
   workspaceRoot: string;
 }
 

@@ -164,7 +164,7 @@ export class DockerDeployment {
       // A rootless host network is its own namespace: publish on the host's loopback and bind every interface inside.
       ...(this.docker.rootless ? ["--publish", `127.0.0.1:${options.port}:${options.port}`, "--env", "BOT_CONTAINER_BIND_ALL=1"] : ["--network", "host"]),
       "--env", "HOME=/app/data/runtime/home", "--env", `BOT_PORT=${options.port}`, "--env", "BOT_HOST=127.0.0.1",
-      ...(options.workspace ? ["--mount", `type=bind,src=${options.workspace},dst=/app/workspace,readonly`, "--env", "WORKSPACE_ROOT=/app/workspace"] : []),
+      "--mount", `type=bind,src=${options.workspace},dst=/app/workspace,readonly`, "--env", "WORKSPACE_ROOT=/app/workspace",
       "--mount", `type=bind,src=${logs},dst=/app/logs`, "--mount", `type=bind,src=${this.data},dst=/app/data`, "--mount", `type=bind,src=${backup},dst=/app/backup`,
       "--restart", "unless-stopped", "--stop-timeout", "30", "--name", SERVICE_CONTAINER, "--memory", "512m", "--memory-swap", "768m", "--cpus", "1.0",
       "--pids-limit", "256", "--read-only", "--tmpfs", "/tmp:size=64m", "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
@@ -175,7 +175,7 @@ export class DockerDeployment {
   /** Same boundary rule as the service start, in host path space: the service only sees /app/workspace. Read-only, no network. */
   async layoutCheck(image: string, user: string, hostWorkspace: string): Promise<void> {
     const project = realpathSync(this.project), backup = resolvedPath(join(this.project, "backup")), logs = resolvedPath(join(this.project, "logs"));
-    const workspace = hostWorkspace ? realpathSync(hostWorkspace) : join(this.data, "workspace");
+    const workspace = hostWorkspace ? realpathSync(hostWorkspace) : join(project, "workspace");
     const mounts = [...new Set([this.data, backup, logs, workspace])].filter(path => existsSync(path)).flatMap(path => ["--mount", `type=bind,source=${path},target=${path},readonly`]);
     const result = await this.docker.probe(["run", "--rm", "--network", "none", "--user", user, "--read-only", "--tmpfs", "/tmp:size=8m", "--env", "HOME=/tmp", "--workdir", "/app",
       "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", ...mounts, image, "bun", "ops/tools/layout-check.ts",

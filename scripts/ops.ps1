@@ -429,7 +429,7 @@ function Read-StateText([string]$Name) {
     return $null
 }
 if (-not $recovering) {
-    # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错；共享资料目录为空表示默认 data\workspace。
+    # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错；共享资料目录为空表示默认 workspace。
     $savedPort = Read-StateText 'bot-port'
     $Port = if ($env:BOT_PORT) { $env:BOT_PORT } elseif ($null -ne $savedPort) { $savedPort } else { '10000' }
     $DeployedWorkspaceRoot = Get-SavedWorkspaceRoot $Project
@@ -470,7 +470,7 @@ function Show-Doctor {
 
     # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
     if (-not $DeployedWorkspaceRoot) {
-        $rows += New-DoctorRow "共享资料目录" "pass" "$(Join-Path $DataDir 'workspace')（默认）"
+        $rows += New-DoctorRow "共享资料目录" "pass" "$(Join-Path $Project 'workspace')（默认）"
     } elseif (Test-Path -LiteralPath $DeployedWorkspaceRoot -PathType Container) {
         $rows += New-DoctorRow "共享资料目录" "pass" "$DeployedWorkspaceRoot（外置，只读）"
     } else {

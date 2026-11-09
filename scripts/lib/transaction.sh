@@ -39,7 +39,7 @@ read_transaction_record() {
     done
 }
 
-# 已提交部署保存的外置共享资料目录（宿主绝对路径）；为空表示默认的 data/workspace。
+# 已提交部署保存的外置共享资料目录（宿主绝对路径）；为空表示默认的 workspace。
 saved_workspace_root() {
     local file="$PROJECT_DIR/data/state/workspace-root"
     [ ! -s "$file" ] || tr -d '\r\n' < "$file"
@@ -65,6 +65,6 @@ describe_pending_transaction() {
     [ "${TRANSACTION[was_running]}" = 0 ] || state='运行'
     [ -n "$target" ] || target='（非 git 部署）'
     printf '未完成的%s：目标提交 %s；共享资料目录 %s（原 %s）；本机端口 %s；原运行状态：%s' "$kind" \
-        "$target" "${TRANSACTION[target_workspace_root]:-data/workspace}" "${TRANSACTION[original_workspace_root]:-data/workspace}" \
+        "$target" "${TRANSACTION[target_workspace_root]:-workspace}" "${TRANSACTION[original_workspace_root]:-workspace}" \
         "${TRANSACTION[bot_port]}" "$state"
 }

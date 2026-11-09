@@ -26,7 +26,7 @@ MODELS_FILE="${CONFIG_DIR}/models.json"
 APP_BOT_FILE="${CONFIG_DIR}/app-bot.json"
 RELAY_CONFIG_FILE="${CONFIG_DIR}/relay.json"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
-# 已保存的本机端口和外置共享资料目录（空为默认 data/workspace）。普通操作再叠加 BOT_PORT 环境变量（见文件末尾的入口判断）；
+# 已保存的本机端口和外置共享资料目录（空为默认 workspace）。普通操作再叠加 BOT_PORT 环境变量（见文件末尾的入口判断）；
 # 升级、继续和回滚只用已保存设置或事务记录，升级结束后的体检也重新读取这里。
 load_saved_settings() {
     PORT="10000"
@@ -156,7 +156,7 @@ doctor() {
     PASS=0; FAIL=0; CHECK_WARN=0; JSON_ROWS=""
 
     # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
-    local workspace_ok="1" workspace_detail="${DATA_DIR}/workspace（默认）"
+    local workspace_ok="1" workspace_detail="${PROJECT_DIR}/workspace（默认）"
     if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
         workspace_detail="$DEPLOYED_WORKSPACE_ROOT（只读挂载）"
         [ -d "$DEPLOYED_WORKSPACE_ROOT" ] || { workspace_ok="0"; workspace_detail="外置目录不存在：$DEPLOYED_WORKSPACE_ROOT"; }
@@ -392,10 +392,9 @@ data_admin() {
         if docker_rootless; then task_rootless=1; fi
         task_runtime_read "$PROJECT_DIR/data/state/task-runtime" && task_runtime_check_endpoint "$user" "$task_rootless" || return 1
     fi
-    if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
-        [ -d "$DEPLOYED_WORKSPACE_ROOT" ] || { ER "共享资料目录不存在：$DEPLOYED_WORKSPACE_ROOT"; return 1; }
-        workspace_args=(-v "$DEPLOYED_WORKSPACE_ROOT:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace)
-    fi
+    local workspace="${DEPLOYED_WORKSPACE_ROOT:-$PROJECT_DIR/workspace}"
+    [ -d "$workspace" ] || { ER "共享资料目录不存在：$workspace"; return 1; }
+    workspace_args=(-v "$workspace:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace)
     docker run --rm \
         --user "$user" \
         -e HOME=/app/data/runtime/home \

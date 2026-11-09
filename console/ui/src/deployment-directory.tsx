@@ -36,10 +36,13 @@ export function DeploymentDirectoryPicker({ onChange }: { onChange(value: Deploy
     <button class="btn ghost" disabled={busy} onClick={() => void read(item.key)}>下级部门</button>
     {tree[item.key] && (tree[item.key]!.length ? nodes(tree[item.key]!, new Set([...ancestors, item.key])) : <small>无下级部门</small>)}
   </li>)}</ul>;
-  return <fieldset><legend>部署时的部门范围</legend><p>直接向平台查询，不要求机器人运行。这里只选择草稿；预览时重新核对，停机部署时才保存。最多选择 200 个部门，包含其全部子部门。</p>
-    <button class="btn" disabled={busy} onClick={() => void read()}>{busy ? "正在查询部门…" : data ? "重新读取部署部门树" : "读取部署部门树"}</button>
-    {(data || busy) && <button class="btn" onClick={cancel}>取消部门选择</button>}
-    {error && <p role="alert">{error}</p>}
-    {data && <><p>已选择：{selected.map(item => item.name).join("、") || "无"}</p>{nodes(data.children)}</>}
-  </fieldset>;
+  return <div class="dept-picker">
+    <p class="muted small">直接向平台查询，不要求机器人运行。这里只选择草稿；预览时重新核对，停机部署时才保存。最多选择 200 个部门，包含其全部子部门。</p>
+    <div class="action-row">
+      <button class="btn small-btn" disabled={busy} onClick={() => void read()}>{busy ? "正在查询部门…" : data ? "重新读取部署部门树" : "读取部署部门树"}</button>
+      {(data || busy) && <button class="btn ghost small-btn" onClick={cancel}>取消部门选择</button>}
+    </div>
+    {error && <p role="alert" class="form-error">{error}</p>}
+    {data && <><p class="selected-line">已选择：{selected.map(item => item.name).join("、") || "无"}</p>{nodes(data.children)}</>}
+  </div>;
 }

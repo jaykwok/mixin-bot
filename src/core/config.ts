@@ -23,7 +23,7 @@ function integerEnv(name: keyof typeof RUNTIME_RANGES): number {
 }
 
 /**
- * 应用数据布局：全部单聊和群聊共用的资料 workspace（默认 data/workspace，WORKSPACE_ROOT 可指向外置目录，相对路径
+ * 应用数据布局：全部单聊和群聊共用的资料 workspace（默认 workspace，WORKSPACE_ROOT 可指向外置目录，相对路径
  * 以项目根解析），以及固定在 data 下的索引、会话库、临时文件和统计。启动后固定，改资料路径需重启。
  */
 export const LAYOUT = appLayout(DATA_DIR, runtimeSetting("WORKSPACE_ROOT"));

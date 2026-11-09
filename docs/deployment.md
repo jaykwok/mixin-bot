@@ -173,7 +173,7 @@ $env:BOT_PORT='12011'; powershell -NoProfile -ExecutionPolicy Bypass -File scrip
 
 1. 运行 `doctor`，检查配置、服务、事件 Stream 和通讯录同步。首次部署后通讯录按选定的范围在后台完整同步一次（全量通讯录可能需要几十分钟），完成前未同步到的成员会收到“正在同步通讯录”的提示；进度见 `directory` 命令或控制台「通讯录」。
 2. 在测试群 @ 机器人，发送“只回复 OK”，确认收到回答；再在单聊中发一条消息验证。
-3. 将资料同步到共享资料目录（默认 `data/workspace/`），再请求查找资料、发送文件，并验证 `/status` 和 `/stop`。目录位置见[数据目录](#数据目录)。
+3. 将资料同步到共享资料目录（默认 `workspace/`），再请求查找资料、发送文件，并验证 `/status` 和 `/stop`。目录位置见[数据目录](#数据目录)。
 
 本地 `/health` 只能确认应用就绪；收到群内回复和文件后，才完成实际交付验证。
 
@@ -220,7 +220,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 | --- | --- | --- |
 | `BOT_PORT` | 10000 | 1–65535；部署时用环境变量指定，保存在 `data/state/bot-port`，见[本机管理端口](#本机管理端口) |
 | `BOT_HOST` | 127.0.0.1 | 只接受回环地址 `127.0.0.1`、`::1` 或 `localhost`；HTTP 只供本机管理 |
-| `WORKSPACE_ROOT` | data/workspace | 共享资料目录；可指向已存在的外置目录，服务只读，部署不创建、不改属主。部署时用环境变量指定（设为空恢复默认），见[数据目录](#数据目录) |
+| `WORKSPACE_ROOT` | workspace | 共享资料目录；可指向已存在的外置目录，服务只读，部署不创建、不改属主。部署时用环境变量指定（设为空恢复默认），见[数据目录](#数据目录) |
 | `BOT_MAX_ACTIVE_REQUESTS` | 32 | 1–1000，普通请求总量 |
 | `BOT_ACKNOWLEDGE_IDLE_MINUTES` | 30 分钟 | 0–1440 分钟，0 关闭。单聊：成员第一次提问或超过这段时间没有对话后的第一条提问，先回“收到，正在处理”；群聊：回过这句后，这段时间内群里任何人的提问都不再回 |
 | `BOT_BASH_TIMEOUT` | 600 秒 | 10–3600 秒；工具可声明其他时限，最高 3600 秒 |
@@ -263,7 +263,6 @@ data/
 │   ├── directory.json         通讯录同步范围（整个通讯录或选定的部门，部署时选择）
 │   ├── task-deployment.json   Linux 任务隔离部署清单（私有，部署脚本维护）
 │   └── materials-ignore.txt   资料索引排除规则（自动生成模板，手工维护）
-├── workspace/                 默认共享资料目录（WORKSPACE_ROOT 可指向外置目录），模型只读
 ├── index/                     资料索引 materials.md、扫描 manifest 与 parsed/ 解析缓存，可重建
 ├── conversations/
 │   ├── direct/durable.sqlite  单聊空间库（Pi Durable）：全部单聊成员的会话、排队消息、控制命令、待交付内容与附件登记
@@ -287,6 +286,7 @@ data/
     ├── models-store.json      模型目录缓存，动态目录服务商离线启动时需要
     ├── document-env/          共享文档解析环境，按需准备，可重建
     └── ...                    其余 Pi 资源与启动脚本，可重建
+workspace/                     默认共享资料目录（随代码提供；WORKSPACE_ROOT 可指向外置目录），模型只读
 backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
 ├── snapshots/                 部署与升级的回滚现场（macOS 只放设置副本，事务记录在 .console/deployments/）
 └── rm/                        部署期间被替换的旧文件；操作期间的归档在 rm/<快照名>/
@@ -297,13 +297,13 @@ logs/                          应用日志与操作日志
 
 群和成员标识会编码为安全目录段；映射到已有目录的大小写别名会被拒绝，避免 Windows 串会话。单聊空间在 `conversations/direct`、`tmp/direct` 下，群在 `groups/` 下，二者不会冲突。资料同步到共享资料目录，所有单聊和群都能读到；生成物写入各成员 tmp 的任务目录。通讯录映射是一份内部通讯录副本，与平台凭据同等敏感，不进日志和诊断包。
 
-外置共享资料：部署时设 `WORKSPACE_ROOT=<已存在的目录>`（Windows 写入 `runtime.json`，Linux 保存在 `data/state/workspace-root`，Docker 只读挂到容器 `/app/workspace`）；设为空恢复默认 `data/workspace`。部署不创建、不改属主，服务身份需能读取其中的资料；卸载不会删除外置目录。外置目录不能包含 `data/` 或位于受管目录（`data/` 下的 `config`、`state`、`conversations`、`tmp`、`index`、`runtime`，以及 `backup/`、`logs/`）内；受管目录也不能经链接或 junction 落在外置目录里，否则其中的配置和会话会被成员工具读到。部署在停机前、服务在启动时按解析链接后的位置检查，不符合即拒绝。
+外置共享资料：部署时设 `WORKSPACE_ROOT=<已存在的目录>`（Windows 写入 `runtime.json`，Linux 保存在 `data/state/workspace-root`，Docker 只读挂到容器 `/app/workspace`）；设为空恢复默认的项目目录下 `workspace/`。部署不创建、不改属主，服务身份需能读取其中的资料；卸载不会删除外置目录。外置目录不能包含 `data/` 或位于受管目录（`data/` 下的 `config`、`state`、`conversations`、`tmp`、`index`、`runtime`，以及 `backup/`、`logs/`）内；受管目录也不能经链接或 junction 落在外置目录里，否则其中的配置和会话会被成员工具读到。部署在停机前、服务在启动时按解析链接后的位置检查，不符合即拒绝。
 
 历史、统计和临时文件命令按会话空间选择：群用群号，配合 `--group-id`（原始群号）或 `--storage-segment`（已编码目录段），两者互斥；单聊空间用 `--direct`（`stat`、`tmp-*` 的 `--group` 写 `direct`）。PowerShell 包装器对应 `-GroupId` / `-StorageSegment` / `-Direct`。未指定时自动判断，遇到两个不同群同时匹配则拒绝操作。控制台会传入明确的目录段。
 
-建议正常停机后备份整个 `data/`，并单独备份外置的共享资料目录。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
+建议正常停机后备份整个 `data/`，并单独备份共享资料目录（默认 `workspace/`，或外置目录）。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
-空间库和 tmp 里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun ops/tools/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制 `state`、`conversations`、`tmp`、`index` 和默认的 `workspace`（外置资料目录不在内，tmp 归档和诊断快照跳过），写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun ops/tools/data-backup.ts restore <备份目录> <空暂存项目>` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun ops/tools/data-current.ts validate --project <暂存项目>`，验收通过再切换。恢复工具不会覆盖正在使用的数据。
+空间库和 tmp 里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun ops/tools/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制 `state`、`conversations`、`tmp`、`index`（共享资料目录不在内，tmp 归档和诊断快照跳过），写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun ops/tools/data-backup.ts restore <备份目录> <空暂存项目>` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun ops/tools/data-current.ts validate --project <暂存项目>`，验收通过再切换。恢复工具不会覆盖正在使用的数据。
 
 Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 999 次，正常退出不重试；停止机器人也会停止启动器。此退避让旧服务租约有时间过期。修改代码后需按正常部署流程更新启动器；运行中的服务不会自动切换到这份代码。
 

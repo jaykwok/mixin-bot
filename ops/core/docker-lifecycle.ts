@@ -1,7 +1,7 @@
 // Docker platform of the shared lifecycle host. The entry built and previewed the candidate image while the old service kept
 // running; this session rechecks those facts under deploy.lock and performs the container, snapshot and task-daemon effects.
 // No rollback/startup policy here: runDeployment owns that order and deployment-host.ts the transaction around it.
-import { chmodSync, chownSync, lstatSync, mkdirSync } from "node:fs";
+import { chmodSync, chownSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { publish } from "../../src/lib/atomic-file.ts";
 import { openOperationLog } from "../../src/lib/operation-log.ts";
@@ -229,9 +229,9 @@ async function dockerSession(context: DeploymentContext<DockerInput>): Promise<D
         }
         case "prepare-dependencies": return; // The image carries its own dependencies.
         case "install-candidate": {
-          const record = context.record(), workspace = record.target_workspace_root;
-          const manifest = await dataTask("ops/tools/task-deployment.ts", ["write", "--image", candidate!.image_id, "--data", effects.data, ...(workspace ? ["--workspace", workspace] : [])],
-            undefined, { ...(workspace ? { workspace } : {}), tasks: { endpoint: runtime!.endpoint, daemon: runtime!.daemon, uid: taskUid() } });
+          const record = context.record(), workspace = record.target_workspace_root || join(realpathSync(project), "workspace");
+          const manifest = await dataTask("ops/tools/task-deployment.ts", ["write", "--image", candidate!.image_id, "--data", effects.data, "--workspace", workspace],
+            undefined, { workspace, tasks: { endpoint: runtime!.endpoint, daemon: runtime!.daemon, uid: taskUid() } });
           if (manifest.code !== 0) throw new Error("任务清单写入失败");
           await publish(join(project, "data/state/task-runtime"), serializeTaskRuntime(runtime!), { owner: owner() });
           const current = await effects.container(SERVICE_CONTAINER);

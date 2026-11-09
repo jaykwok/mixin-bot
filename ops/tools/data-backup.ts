@@ -10,8 +10,8 @@ import { hashFile } from "../../src/core/file-hash.ts";
 import { openReadable, openWritable } from "../../src/lib/sqlite-open.ts";
 
 /** The data directories a backup holds (below data/); configuration, secrets and runtime/ are backed up separately.
- * The default workspace is included; an external WORKSPACE_ROOT belongs to its operator and is not. */
-const AREAS = ["state", "conversations", "tmp", "index", "workspace"] as const;
+ * The shared workspace lies outside data/ and belongs to its operator. */
+const AREAS = ["state", "conversations", "tmp", "index"] as const;
 type Area = typeof AREAS[number];
 type FileRecord = { area: Area; path: string; bytes: number; sha256: string };
 type Manifest = { format: 2; at: string; files: FileRecord[] };
@@ -44,11 +44,10 @@ async function ordinaryAncestors(path: string): Promise<void> {
   }
 }
 async function syncFile(path: string) { const file = await open(path, "r+"); try { await file.sync(); } finally { await file.close(); } }
-/** The areas below a data directory that exist; the workspace only when it is the default one. */
-async function areaRoots(data: string, externalWorkspace: boolean): Promise<{ area: Area; root: string }[]> {
+/** The areas below a data directory that exist. */
+async function areaRoots(data: string): Promise<{ area: Area; root: string }[]> {
   const found: { area: Area; root: string }[] = [];
   for (const area of AREAS) {
-    if (area === "workspace" && externalWorkspace) continue;
     const root = resolve(data, area);
     try { await lstat(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
     found.push({ area, root });
@@ -58,11 +57,11 @@ async function areaRoots(data: string, externalWorkspace: boolean): Promise<{ ar
 /** Caller holds the maintenance lease. Includes every conversation database, member tmp, index, attachment and their
  * ownership journals, but not the tmp archive under state/reclamation (`tmp discard` frees it; backing it up would
  * double its space). */
-export async function createDataBackup(data: string, destination: string, externalWorkspace = false): Promise<Manifest> {
+export async function createDataBackup(data: string, destination: string): Promise<Manifest> {
   destination = resolve(destination);
   await ordinaryAncestors(destination);
   if (isPathInside(destination, resolve(data)) || isPathInside(resolve(data), destination)) throw new Error("备份目录与数据目录不能包含彼此");
-  const roots = await areaRoots(data, externalWorkspace);
+  const roots = await areaRoots(data);
   for (const { root } of roots) await checkedRoot(root);
   const entries = await Promise.all(roots.map(async ({ area, root }) => ({ area, root, names: await files(root, "", area === "state") })));
   for (const { root, names } of entries) for (const name of names.filter(name => name.endsWith(".sqlite"))) {
@@ -126,8 +125,8 @@ if (import.meta.main) {
   const [command, path, project] = process.argv.slice(2);
   if (!path || !["backup", "restore"].includes(command!)) throw new Error("用法：bun ops/tools/data-backup.ts backup <新备份目录> | restore <备份目录> <空暂存项目>");
   if (command === "backup") {
-    await withMaintenance(() => createDataBackup(DATA_DIR, path, LAYOUT.externalWorkspace));
-    if (LAYOUT.externalWorkspace) console.log(`外置共享资料目录 ${LAYOUT.workspace} 不在备份内，请另行备份。`);
+    await withMaintenance(() => createDataBackup(DATA_DIR, path));
+    console.log(`共享资料目录 ${LAYOUT.workspace} 不在备份内，请另行备份。`);
   } else {
     if (!project) throw new Error("restore 需要空暂存项目路径");
     await withMaintenance(() => restoreDataBackup(path, join(project, "data")));

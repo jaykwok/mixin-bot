@@ -1,28 +1,28 @@
 /** @jsxImportSource preact */
 // Exports from the page: a dialog chooses what to export, the console hands out a one-time link, and the browser
-// downloads it as an ordinary file (the page never holds the content). A tray follows each export until the console
-// reports it sent, interrupted or failed; "sent" means the console finished sending, not that the file was saved.
+// downloads it as an ordinary file (the page never holds the content). The activity tray follows each export until the
+// console reports it sent, interrupted or failed; "sent" means the console finished sending, not that the file was saved.
 import { useEffect, useState } from "preact/hooks";
 import { api, ApiFailure } from "./api.ts";
 import type { ExportRequest, ExportState, ExportStatus, ExportTicket, IdentityMode, StatsPeriodKey } from "./contract.ts";
 import { bytes, count } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
 import { ModeChoice, SCOPE_NOTE } from "./identity.tsx";
-import { Banner, Dialog, Segmented, type Tone } from "./ui.tsx";
+import { Banner, Dialog, ProgressBar, Segmented, type Tone } from "./ui.tsx";
 
 const POLL_MS = 1_000;
 const MAX_SHOWN = 4;
 
 type JobState = ExportState | "unknown";
-interface Job { id: string; filename: string; state: JobState; rows: number; bytes: number; error?: string }
+export interface ExportJob { id: string; filename: string; state: JobState; rows: number; bytes: number; error?: string }
 
-let jobs: Job[] = [];
+let jobs: ExportJob[] = [];
 // Bumped by resetExports: an answer to a request sent before the reset (the page of an earlier login) changes nothing.
 let epoch = 0;
 const listeners = new Set<() => void>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const emit = () => { for (const listener of listeners) listener(); };
-const update = (id: string, patch: Partial<Job>) => { jobs = jobs.map(job => job.id === id ? { ...job, ...patch } : job); emit(); };
+const update = (id: string, patch: Partial<ExportJob>) => { jobs = jobs.map(job => job.id === id ? { ...job, ...patch } : job); emit(); };
 
 /** Starts the browser download of a one-time link. A same-origin `download` link keeps the page where it is. */
 function download(url: string) {
@@ -73,7 +73,7 @@ export function resetExports(): void {
   emit();
 }
 
-const STATE: Record<JobState, { tone: Tone; icon: IconName; text: (job: Job) => string }> = {
+const STATE: Record<JobState, { tone: Tone; icon: IconName; text: (job: ExportJob) => string }> = {
   ready: { tone: "info", icon: "loader", text: () => "等待浏览器开始下载…" },
   running: { tone: "info", icon: "loader", text: job => `正在下载 · ${count(job.rows)} 行 · ${bytes(job.bytes)}` },
   sent: { tone: "ok", icon: "check", text: job => `已发送完毕 · ${count(job.rows)} 行 · ${bytes(job.bytes)}；是否保存成功以浏览器下载记录为准` },
@@ -83,31 +83,31 @@ const STATE: Record<JobState, { tone: Tone; icon: IconName; text: (job: Job) => 
   unknown: { tone: "warn", icon: "alert", text: job => `无法读取导出状态：${job.error ?? "原因未知"}` },
 };
 
-export function ExportTray() {
+/** The exports the tray shows, newest first. */
+export function useExportJobs(): ExportJob[] {
   const [, setTick] = useState(0);
   useEffect(() => {
     const listener = () => setTick(value => value + 1);
     listeners.add(listener);
     return () => { listeners.delete(listener); };
   }, []);
-  if (!jobs.length) return null;
-  const dismiss = (id: string) => { clearTimeout(timers.get(id)); timers.delete(id); jobs = jobs.filter(job => job.id !== id); emit(); };
+  return jobs.slice(0, MAX_SHOWN);
+}
+
+function dismiss(id: string) { clearTimeout(timers.get(id)); timers.delete(id); jobs = jobs.filter(job => job.id !== id); emit(); }
+
+export function ExportItem({ job }: { job: ExportJob }) {
+  const state = STATE[job.state];
+  const active = job.state === "ready" || job.state === "running";
   return (
-    <div class="export-tray" aria-label="导出" role="region">
-      {jobs.slice(0, MAX_SHOWN).map(job => {
-        const state = STATE[job.state];
-        const active = job.state === "ready" || job.state === "running";
-        return (
-          <div key={job.id} class={`export-item tone-${state.tone}`} role="status">
-            <span class="export-icon"><Icon name={active ? "download" : state.icon} size={16} /></span>
-            <div class="export-text">
-              <div class="export-name" title={job.filename}>{job.filename}</div>
-              <div class="export-state">{active && <Icon name="loader" size={12} class="spin" />}{state.text(job)}</div>
-            </div>
-            {!active && <button type="button" class="btn ghost icon-btn" aria-label="关闭这条导出提示" onClick={() => dismiss(job.id)}><Icon name="x" size={14} /></button>}
-          </div>
-        );
-      })}
+    <div class={`activity-item tone-${state.tone}`} role="status">
+      <span class="activity-icon"><Icon name={active ? "download" : state.icon} size={16} /></span>
+      <div class="activity-text">
+        <div class="activity-name" data-tip={job.filename}>{job.filename}</div>
+        <div class="activity-state">{active && <Icon name="loader" size={12} class="spin" />}{state.text(job)}</div>
+        {active && <ProgressBar label="下载进度" />}
+      </div>
+      {!active && <button type="button" class="btn ghost icon-btn" aria-label="关闭这条导出提示" onClick={() => dismiss(job.id)}><Icon name="x" size={14} /></button>}
     </div>
   );
 }
@@ -180,7 +180,7 @@ export function ConversationExportDialog({ view, viewMode, spaceTitle, members, 
         <div class="field">
           <span class="field-label">格式</span>
           <Segmented label="导出格式" value={format} onChange={setFormat}
-            options={[{ value: "markdown", label: "Markdown", title: "便于阅读" }, { value: "json", label: "JSON", title: "结构化，便于程序处理" }]} />
+            options={[{ value: "markdown", label: "Markdown", tip: "便于阅读" }, { value: "json", label: "JSON", tip: "结构化，便于程序处理" }]} />
         </div>
         <div class="field">
           <span class="field-label">时间</span>
@@ -225,7 +225,7 @@ export function StatsExportDialog({ viewMode, period, since, until, group, view,
         <div class="field">
           <span class="field-label">格式</span>
           <Segmented label="导出格式" value={format} onChange={setFormat}
-            options={[{ value: "html", label: "HTML 报表", title: "单文件，可离线打开" }, { value: "csv", label: "CSV 表格", title: "每行一个群 × 成员" }]} />
+            options={[{ value: "html", label: "HTML 报表", tip: "单文件，可离线打开" }, { value: "csv", label: "CSV 表格", tip: "每行一个群 × 成员" }]} />
         </div>
         <ModeChoice mode={mode} confirmed={confirmed} onChange={(next, ok) => { setMode(next); setConfirmed(ok); }} />
         {error && <Banner tone="danger" icon="alert" title="无法开始导出">{error}</Banner>}

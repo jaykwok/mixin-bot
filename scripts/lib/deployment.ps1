@@ -48,7 +48,7 @@ function Read-DeploymentTransaction([string]$Directory) {
     return $record
 }
 
-# 已提交部署保存的外置共享资料目录（绝对路径）；为空表示默认的 data\workspace。
+# 已提交部署保存的外置共享资料目录（绝对路径）；为空表示默认的 workspace。
 function Get-SavedWorkspaceRoot([string]$ProjectRoot) {
     $file = Join-Path $ProjectRoot 'data\state\workspace-root'
     if (Test-Path -LiteralPath $file -PathType Leaf) { return "$(Get-Content -LiteralPath $file -Raw)".Trim() }
@@ -59,7 +59,7 @@ function Format-DeploymentTransaction($Record) {
     $kind = if ($Record.operation -eq 'upgrade') { '升级' } else { '部署' }
     $state = if ($Record.was_running -eq '1') { '运行' } else { '停止' }
     $sha = if ($Record.target_sha) { $Record.target_sha.Substring(0, 7) } else { '（非 git 部署）' }
-    return "未完成的$($kind)：目标提交 $($sha)；共享资料目录 $(if ($Record.target_workspace_root) { $Record.target_workspace_root } else { 'data\workspace' })（原 $(if ($Record.original_workspace_root) { $Record.original_workspace_root } else { 'data\workspace' })）；本机端口 $($Record.bot_port)；原运行状态：$($state)"
+    return "未完成的$($kind)：目标提交 $($sha)；共享资料目录 $(if ($Record.target_workspace_root) { $Record.target_workspace_root } else { 'workspace' })（原 $(if ($Record.original_workspace_root) { $Record.original_workspace_root } else { 'workspace' })）；本机端口 $($Record.bot_port)；原运行状态：$($state)"
 }
 
 function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {

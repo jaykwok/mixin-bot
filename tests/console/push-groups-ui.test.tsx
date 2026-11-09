@@ -28,8 +28,8 @@ test("群名单：读取后按群名登记、改名、停用和重新启用，�
     return Response.json({ view: "v2", groups, steps: "登记方法：在群里发送“@机器人 /登记群 群名”" });
   }) as typeof fetch;
   try {
+    // The list is read when the page opens.
     render(<PushGroups />, root);
-    button(root, "读取群名单")!.click();
     const names = () => [...root.querySelectorAll<HTMLInputElement>('input[aria-label="群名"]')];
     await until(() => names().length === 3);
     expect(names().map(input => input.value)).toEqual(["销售一部", "", "旧群"]);

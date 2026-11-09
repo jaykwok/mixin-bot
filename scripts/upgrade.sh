@@ -319,7 +319,7 @@ fresh_upgrade() {
     check_upgrade_environment
     determine_service_user
     read_saved_settings
-    print_status "升级沿用现有设置：本机管理端口 ${BOT_PORT}；共享资料目录 ${WORKSPACE_ROOT_SAVED:-$DATA_DIR/workspace}"
+    print_status "升级沿用现有设置：本机管理端口 ${BOT_PORT}；共享资料目录 ${WORKSPACE_ROOT_SAVED:-$PROJECT_DIR/workspace}"
     # rootless Docker 要到停机后启动容器时才拒绝发布低端口：沿用的端口发布不了就在这里停止。
     if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
         print_error "$(rootless_port_hint "$BOT_PORT")"
@@ -337,8 +337,7 @@ fresh_upgrade() {
         { print_error "升级预检未通过（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     build_candidate
     HOST_WORKSPACE_ROOT="$WORKSPACE_ROOT_SAVED"
-    WORKSPACE_ARGS=()
-    if [ -n "$HOST_WORKSPACE_ROOT" ]; then WORKSPACE_ARGS=(-v "$HOST_WORKSPACE_ROOT:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace); fi
+    WORKSPACE_ARGS=(-v "${HOST_WORKSPACE_ROOT:-$PROJECT_DIR/workspace}:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace)
     task_runtime_prepare || { print_error "任务隔离预检失败，原服务保持运行状态"; exit 1; }
     check_workspace_layout || { print_error "共享资料目录不能使用（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     PREPARED_INPUTS="$(prepared_inputs)"

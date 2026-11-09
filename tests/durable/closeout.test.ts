@@ -260,7 +260,6 @@ test("closed DB and external-result hash manifest restores exactly; tampered fil
   const db = new Database(database);
   db.exec("PRAGMA journal_mode=WAL; CREATE TABLE proof(value TEXT); INSERT INTO proof VALUES ('persisted')"); db.close();
   await writeFile(join(output, "output.txt"), "exact bytes");
-  await mkdir(join(data, "workspace"), { recursive: true }); await writeFile(join(data, "workspace", "手册.md"), "shared");
   // Archived tmp entries are not copied again (a link inside one would even refuse the whole backup); their plans are.
   const archive = join(data, "state", "reclamation", "backup", "rm");
   await mkdir(join(archive, "tmp-plan-0"), { recursive: true }); await mkdir(join(archive, ".tmp-plans"));
@@ -270,10 +269,7 @@ test("closed DB and external-result hash manifest restores exactly; tampered fil
   await writeFile(join(data, "state", "reclamation", "snapshots", "snapshot-x", "group.sqlite"), "copy");
   const manifest = await createDataBackup(data, snapshot);
   expect(manifest.files.some(file => file.area === "tmp" && file.path.endsWith("output.txt") && file.bytes === 11)).toBe(true);
-  expect(manifest.files.some(file => file.area === "workspace" && file.path === "手册.md")).toBe(true);
   expect(manifest.files.filter(file => file.area === "state").map(file => file.path)).toEqual(["reclamation/backup/rm/.tmp-plans/plan.json"]);
-  // An external workspace belongs to its operator and is left out.
-  expect((await createDataBackup(data, join(root, "snapshot-external"), true)).files.some(file => file.area === "workspace")).toBe(false);
   const restored = join(root, "restored", "data"); await restoreDataBackup(snapshot, restored);
   const read = openReadable(databaseOf(restored, group));
   try { expect(read.query("SELECT value FROM proof").get()).toEqual({ value: "persisted" }); } finally { read.close(); }

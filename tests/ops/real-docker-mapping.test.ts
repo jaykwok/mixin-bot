@@ -1,7 +1,7 @@
 // Opt-in short check of the task-daemon mapping proof against real Docker: the deployment preflight
-// (task_runtime_manifest from scripts/lib/task-runtime.sh) on the default layout and on an external workspace mounted
-// read-only, refusals for a twin directory and a missing one, and one real task that reads the materials, cannot write
-// them and writes its own work directory in the request tmp. It builds a small image from the working tree on the
+// (task_runtime_manifest from scripts/lib/task-runtime.sh) on the default workspace beside data/ and on an external one,
+// both mounted read-only, refusals for a twin directory and a missing one, and one real task that reads the materials,
+// cannot write them and writes its own work directory in the request tmp. It builds a small image from the working tree on the
 // oven/bun base (the service code, Bun and the Docker CLI; no document toolchain), labels it with this run and removes it
 // by ID afterwards. It never touches containers it did not create or a container named mixin-bot.
 //
@@ -175,14 +175,15 @@ describe.skipIf(!enabled || operator === "group")(`real Docker task mapping proo
     else rmSync(root, { recursive: true, force: true });
   }, 120_000);
 
-  // A deployment directory: data/ owned by the service identity, an external workspace readable by it.
+  // A deployment directory: data/ owned by the service identity; the default workspace beside it and an external one, both
+  // readable by it.
   function layout(name: string) {
-    const base = join(root, name), data = join(base, "work/data"), shared = join(base, "shared-files");
-    for (const dir of ["config", "state", "runtime", "workspace", "tmp"]) mkdirSync(join(data, dir), { recursive: true });
-    mkdirSync(shared, { recursive: true });
-    if (operator === "root") for (const path of [data, ...["config", "state", "runtime", "workspace", "tmp"].map(dir => join(data, dir))]) chownSync(path, 1001, 1001);
-    for (const path of [base, join(base, "work")]) chmodSync(path, 0o755);
-    return { work: join(base, "work"), data: realpathSync(data), shared: realpathSync(shared) };
+    const base = join(root, name), data = join(base, "work/data"), workspace = join(base, "work/workspace"), shared = join(base, "shared-files");
+    for (const dir of ["config", "state", "runtime", "tmp"]) mkdirSync(join(data, dir), { recursive: true });
+    for (const dir of [workspace, shared]) mkdirSync(dir, { recursive: true });
+    if (operator === "root") for (const path of [data, ...["config", "state", "runtime", "tmp"].map(dir => join(data, dir))]) chownSync(path, 1001, 1001);
+    for (const path of [base, join(base, "work"), workspace]) chmodSync(path, 0o755);
+    return { work: join(base, "work"), data: realpathSync(data), workspace: realpathSync(workspace), shared: realpathSync(shared) };
   }
   const preflight = (work: string, mounted: string, claimed: string) =>
     run("bash", ["-c", PREFLIGHT, "preflight", join(project, "scripts/lib/task-runtime.sh"), taskEndpoint, mounted],
@@ -198,13 +199,14 @@ describe.skipIf(!enabled || operator === "group")(`real Docker task mapping proo
     return { helpers, tasks };
   };
 
-  step("default layout: the preflight proves the data mapping", () => {
-    const { work, data } = layout("default");
-    const before = tree(join(data, "workspace"));
-    const result = preflight(work, "", "");
+  step("default layout: the preflight proves the data and default workspace mappings", () => {
+    const { work, data, workspace } = layout("default");
+    const before = tree(workspace);
+    // As deploy.sh mounts it: the project's workspace/ at /app/workspace, with no WORKSPACE_ROOT saved.
+    const result = preflight(work, workspace, "");
     expect(result.code, result.out + "\n" + result.err).toBe(0);
     expect(result.out).toContain("任务隔离预检通过");
-    expect(tree(join(data, "workspace"))).toEqual(before);
+    expect(tree(workspace)).toEqual(before);
     expect(readdirSync(data).filter(name => name.startsWith(".task-mapping-"))).toEqual([]);
     expect(noHelpers()).toEqual({ helpers: "", tasks: "" });
   });

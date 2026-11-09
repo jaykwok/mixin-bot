@@ -109,7 +109,7 @@ sudo bash scripts/deploy.sh
 ```
 脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
 
-- 共享资料默认放在 `data/workspace/`；部署时可用 `WORKSPACE_ROOT` 指向已有的外置目录，服务只读。
+- 共享资料默认放在 `workspace/`；部署时可用 `WORKSPACE_ROOT` 指向已有的外置目录，服务只读。
 - 本机管理端口自动使用 `10000`，不需要填写；大文件外链可稍后配置。
 - 各项配置说明见[部署与配置](docs/deployment.md)。
 

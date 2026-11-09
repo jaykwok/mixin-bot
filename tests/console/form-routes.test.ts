@@ -64,5 +64,13 @@ test("通讯录未运行时拒绝；运行参数表单读取默认值和已有�
     expect(options.map(option => option.key).sort())
       .toEqual(ADVANCED_RUNTIME_KEYS.filter(key => key !== "BOT_TASK_IMAGE" && key !== "BOT_TASK_CONTROL_ROOT").sort());
     expect(options.find(option => option.key === "BOT_ACKNOWLEDGE_IDLE_MINUTES")).toMatchObject({ default: "30" });
+    // Path settings open the host file picker; on Linux the LibreOffice path is the task container's, so it cannot be picked.
+    const browse = Object.fromEntries(options.flatMap(option => {
+      const value = (option as { browse?: { purpose: string; unavailable?: string } }).browse;
+      return value ? [[option.key, value]] : [];
+    }));
+    expect(Object.fromEntries(Object.entries(browse).map(([key, value]) => [key, value.purpose]))).toEqual({ BOT_DOCUMENT_ENV: "document-env",
+      BOT_DOCUMENT_PPTX_TEMPLATE: "pptx-template", BOT_DOCUMENT_DOCX_TEMPLATE: "docx-template", BOT_DOCUMENT_OFFICE_PATH: "office" });
+    expect(Object.entries(browse).filter(([, value]) => value.unavailable).map(([key]) => key)).toEqual(process.platform === "linux" ? ["BOT_DOCUMENT_OFFICE_PATH"] : []);
   } finally { await f.cleanup(); }
 });

@@ -46,7 +46,7 @@ test.skipIf(!linux)("首次部署：停机前暂存的运行参数、应用凭�
       expect([read(f, "data/state/bot-port"), read(f, "data/state/workspace-root")]).toEqual(["1011", checkout ? "" : shared]);
       expect(parseTaskRuntime(read(f, "data/state/task-runtime")!)).toEqual({ endpoint: f.taskEndpoint, daemon: f.task.id });
       const service = f.main.container("mixin-bot")!;
-      expect(service.Mounts.filter(mount => mount.Destination === "/app/workspace")).toEqual(checkout ? [] : [{ Type: "bind", Source: shared, Destination: "/app/workspace", RW: false }]);
+      expect(service.Mounts.filter(mount => mount.Destination === "/app/workspace")).toEqual([{ Type: "bind", Source: checkout ? join(f.project, "workspace") : shared, Destination: "/app/workspace", RW: false }]);
       for (const relative of ["data/state/verify-only", "backup/snapshots", "backup/rm"]) expect(existsSync(join(f.project, relative)), relative).toBe(false);
       // The stage is the entry's to remove; nothing of it is needed after the snapshot.
       expect(existsSync(stage)).toBe(true);

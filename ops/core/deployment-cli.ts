@@ -179,7 +179,7 @@ async function runDeployCli(args: DeployArgs, dependencies: Dependencies, signal
     if (!value) return "";
     try {
       const path = realpathSync(String(value));
-      try { if (path === realpathSync(join(project, "data/workspace"))) return ""; } catch { /* No default directory yet. */ }
+      try { if (path === realpathSync(join(project, "workspace"))) return ""; } catch { /* No default directory yet. */ }
       return path;
     } catch { return null; }
   };

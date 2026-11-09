@@ -134,7 +134,7 @@ export function ColumnTable({ points, columns }: { points: ColumnPoint[]; column
   );
 }
 
-export interface BarRow { key: string; label: ComponentChildren; value: number; text: string; title?: string; onClick?: () => void }
+export interface BarRow { key: string; label: ComponentChildren; value: number; text: string; tip?: string; onClick?: () => void }
 
 /** Ranked horizontal bars with the value written beside each (direct labels; the bars only carry the proportion). */
 export function BarList({ rows, empty = "没有数据" }: { rows: BarRow[]; empty?: string }) {
@@ -151,7 +151,7 @@ export function BarList({ rows, empty = "没有数据" }: { rows: BarRow[]; empt
           </>
         );
         return (
-          <li key={row.key} title={row.title}>
+          <li key={row.key} data-tip={row.tip}>
             {row.onClick ? <button type="button" class="bar-row" onClick={row.onClick}>{body}</button> : <div class="bar-row">{body}</div>}
           </li>
         );

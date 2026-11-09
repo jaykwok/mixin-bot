@@ -48,7 +48,7 @@ export function ModeSwitch({ mode, onChange, disabled, what = "查看" }: {
   return (
     <>
       <Segmented label="身份显示模式" size="small" value={mode} disabled={disabled}
-        options={(["default", "full", "anonymous"] as const).map(value => ({ value, label: MODE_LABEL[value], title: MODE_HINT[value] }))}
+        options={(["default", "full", "anonymous"] as const).map(value => ({ value, label: MODE_LABEL[value], tip: MODE_HINT[value] }))}
         onChange={value => value === "full" ? setAsking(true) : onChange(value, false)} />
       {asking && <FullConfirm what={what} onCancel={() => setAsking(false)} onConfirm={() => { setAsking(false); onChange("full", true); }} />}
     </>
@@ -78,7 +78,7 @@ export function ModeChoice({ mode, confirmed, onChange }: {
 }
 
 export function ModeBadge({ mode }: { mode: IdentityMode }) {
-  return <span class={`mode-badge ${mode}`} title={MODE_HINT[mode]}><Icon name={mode === "anonymous" ? "eye" : "shield"} size={12} />{MODE_LABEL[mode]}</span>;
+  return <span class={`mode-badge ${mode}`} data-tip={MODE_HINT[mode]}><Icon name={mode === "anonymous" ? "eye" : "shield"} size={12} />{MODE_LABEL[mode]}</span>;
 }
 
 /** Name and number as the mode sent them; a member without a name says why, without guessing. */
@@ -89,7 +89,7 @@ export function IdentityText({ identity, compact }: { identity: Identity; compac
       {identity.name !== undefined && <span class="id-name">{identity.name}</span>}
       <span class="id-phone">{identity.phone}</span>
       {identity.nameState && identity.nameState !== "named" && !compact && (
-        <Chip title={identity.nameNote}>{NAME_SHORT[identity.nameState]}</Chip>
+        <Chip tip={identity.nameNote}>{NAME_SHORT[identity.nameState]}</Chip>
       )}
     </span>
   );
@@ -120,5 +120,5 @@ export function NamesNotice({ names }: { names: NamesStatus }) {
 /** "姓名读取于 …": names are the directory's at that time, not at the time of the conversation. */
 export function NamesObserved({ names }: { names: NamesStatus }) {
   if (names.observedAt === undefined) return null;
-  return <span class="muted small" title="姓名是读取时的通讯录姓名，不代表对话发生时的名字">姓名读取于 {clock(names.observedAt)}</span>;
+  return <span class="muted small" data-tip="姓名是读取时的通讯录姓名，不代表对话发生时的名字">姓名读取于 {clock(names.observedAt)}</span>;
 }

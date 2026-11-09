@@ -64,7 +64,7 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
 }
 
 /** Default document templates: a path relative to the application workspace, or an absolute path. */
-const TEMPLATE_EXTENSIONS = { BOT_DOCUMENT_PPTX_TEMPLATE: [".pptx", ".potx"], BOT_DOCUMENT_DOCX_TEMPLATE: [".docx", ".dotx"] } as const;
+export const TEMPLATE_EXTENSIONS = { BOT_DOCUMENT_PPTX_TEMPLATE: [".pptx", ".potx"], BOT_DOCUMENT_DOCX_TEMPLATE: [".docx", ".dotx"] } as const;
 
 function validateTemplatePath(key: keyof typeof TEMPLATE_EXTENSIONS, text: string) {
   const extensions = TEMPLATE_EXTENSIONS[key];

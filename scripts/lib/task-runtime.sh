@@ -67,8 +67,7 @@ task_runtime_prepare() {
 }
 
 task_runtime_manifest() {
-    local command="$1" extra=()
-    if [ -n "${HOST_WORKSPACE_ROOT:-}" ]; then extra=(--workspace "$HOST_WORKSPACE_ROOT"); fi
+    local command="$1" extra=(--workspace "${HOST_WORKSPACE_ROOT:-$(realpath -- "$PROJECT_DIR/workspace")}")
     # check does not change the active manifest or take the old controller's lock.
     docker run --rm --user "$SERVICE_USER" --read-only --network none --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs /tmp:rw,nosuid,nodev,size=16m -e HOME=/tmp \

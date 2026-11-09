@@ -50,7 +50,7 @@ export function deploymentEnvironment(operation: DeploymentOperation, input: Rec
     MIXIN_OPS_DIRECTORY_APP: typeof value.directory === "string" ? "" : value.directory.appHash,
     MIXIN_OPS_SWITCH_MAIN: "switchMain" in value && value.switchMain ? "1" : "0",
     BOT_PORT: "port" in value ? String(value.port) : "",
-    WORKSPACE_ROOT: "workspace" in value ? value.workspace || (nativeService() ? join(project, "data/workspace") : "") : "" };
+    WORKSPACE_ROOT: "workspace" in value ? value.workspace || (nativeService() ? join(project, "workspace") : "") : "" };
 }
 
 export function assertDeploymentEnvironment(operation: string, input: Record<string, unknown>, project: string, env = process.env): void {
@@ -123,7 +123,7 @@ export async function deploymentScope(project: string, operation: DeploymentOper
   if (planDigest(before) !== planDigest(INPUTS.map(path => [path, fileHash(join(project, path))]))) throw new Error("预览期间部署设置已变化，请重试");
   return { scope: planDigest([before, options, branch.stdout.trim(), workspaceIdentity, identity]), summary: [
     "target" in options ? `目标提交：${options.target}；当前分支：${branch.stdout.trim()}；${options.switchMain ? "允许切换到 main" : "不允许切换分支"}。`
-      : `重新部署当前代码；端口 ${options.port}；共享资料：${options.workspace || "data/workspace（默认）"}。`,
+      : `重新部署当前代码；端口 ${options.port}；共享资料：${options.workspace || "workspace（默认）"}。`,
     options.directory === "saved" ? "沿用已保存的通讯录范围。" : options.directory === "all" ? "首次设置通讯录范围：整个通讯录。"
       : `首次设置通讯录范围：${options.directory.names.join("、")}（含全部子部门）。`,
     "target" in options ? "原来运行的实例升级后恢复运行；原来停止的实例保持停止。" : "重新部署完成后启动机器人，包括当前处于停止状态的实例。",

@@ -1,32 +1,36 @@
 /** @jsxImportSource preact */
-// Login gate and the console shell (sidebar, top bar, command palette). When the session ends or the console goes
-// away, the shell unmounts so no page content stays on screen.
+// Login gate and the console shell (sidebar, top bar, command palette, the task sheet and the activity tray). When the
+// session ends or the console goes away, the shell unmounts so no page content stays on screen.
 import type { ComponentChildren } from "preact";
-import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { ActivityTray, TaskSheet } from "./activity.tsx";
 import { api, ApiFailure, newLoginGeneration, onConnectionLost } from "./api.ts";
 import type { Overview, SessionResponse, SessionView } from "./contract.ts";
 import { duration, platformName } from "./format.ts";
 import { BrandMark, Icon, type IconName } from "./icons.tsx";
 import { available, NAV, routeFromHash, type NavItem } from "./nav.ts";
 import { ConversationsPage } from "./conversations.tsx";
-import { ExportTray, resetExports } from "./exports.tsx";
+import { resetExports } from "./exports.tsx";
 import { OverviewPage, StatusPill } from "./overview.tsx";
 import { CommandPalette, type Command } from "./palette.tsx";
 import { takeLoginToken } from "./login.ts";
 import { StatsPage } from "./stats.tsx";
-import { PushSettingsForm } from "./push.tsx";
-import { PushGroups } from "./push-groups.tsx";
-import { PushRecords } from "./push-records.tsx";
+import { PushPage } from "./push.tsx";
 import { ReadOnlyPage } from "./read-pages.tsx";
 import { TasksPage, resetTasks } from "./tasks.tsx";
-import { DirectoryForm, RelayActions, RuntimeForm, StatsImportForm, StorageActions } from "./write-forms.tsx";
-import { ConfigurationSettings, ConfigurationRecovery } from "./configuration.tsx";
+import { TooltipLayer } from "./tooltip.tsx";
+import { DirectoryForm, RelayActions, StatsImportForm, StorageActions } from "./write-forms.tsx";
+import { SettingsPage } from "./configuration.tsx";
 import { applyTheme, nextTheme, storedTheme, themeLabel, type Theme } from "./theme.ts";
+import { Banner, EmptyState, Tile } from "./ui.tsx";
 
 const OVERVIEW_POLL_MS = 15_000;
 const SESSION_POLL_MS = 60_000;
 /** User activity renews the idle timer at most this often. */
 const TOUCH_INTERVAL_MS = 60_000;
+/** Pages of tables and conversations use the full width; settings-like pages read best narrower. */
+const WIDE = new Set(["conversations", "stats", "push", "logs"]);
+const NARROW = new Set(["maintain", "settings", "directory", "storage", "relay", "health"]);
 
 /** A logout that gets no answer within this time is reported as unconfirmed (a half-open SSH tunnel may never answer). */
 const LOGOUT_TIMEOUT_MS = 10_000;
@@ -226,11 +230,14 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
     return () => { window.removeEventListener("hashchange", onHash); window.removeEventListener("keydown", onKey); };
   }, []);
 
+  // A new page starts at its top, before it is painted.
+  useLayoutEffect(() => { window.scrollTo(0, 0); }, [route]);
+
   const changeTheme = (value: Theme) => { applyTheme(value); setTheme(value); };
 
   const commands = useMemo<Command[]>(() => [
     ...NAV.filter(item => available(item) && (!resultsOnly || item.id === "maintain")).map(item => ({ id: `go-${item.id}`, label: `前往${item.label}`, hint: item.description, icon: item.icon,
-      keywords: item.id, run: () => { location.hash = `#/${item.id}`; } })),
+      tint: item.tint, keywords: item.id, run: () => { location.hash = `#/${item.id}`; } })),
     { id: "refresh", label: "刷新数据", icon: "refresh", keywords: "reload refresh", run: () => void loadOverview(true) },
     ...(["system", "light", "dark"] as const).filter(value => value !== theme).map(value => ({
       id: `theme-${value}`, label: `外观：${themeLabel[value]}`, icon: (value === "dark" ? "moon" : value === "light" ? "sun" : "monitor") as IconName,
@@ -240,6 +247,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
 
   const current = NAV.find(item => item.id === route)!;
   const themeIcon: IconName = theme === "dark" ? "moon" : theme === "light" ? "sun" : "monitor";
+  const width = resultsOnly || NARROW.has(route) ? " narrow" : WIDE.has(route) ? " wide" : "";
 
   return (
     <div class={`layout${drawer ? " drawer-open" : ""}`}>
@@ -250,40 +258,52 @@ function Shell({ initial, onEnd, onLogout }: { initial: { view: SessionView; off
           <button class="btn ghost icon-btn menu-btn" aria-label="打开导航" onClick={() => setDrawer(true)}><Icon name="menu" /></button>
           <nav class="crumbs" aria-label="位置">
             <span class="crumb-host">{overview?.console.hostname ?? "控制台"}</span>
-            <Icon name="arrow" size={12} />
+            <Icon name="chevronRight" size={12} />
             <span class="crumb-page">{resultsOnly ? "任务结果" : current.label}</span>
           </nav>
           <div class="topbar-right">
-            {resultsOnly ? <span class="pill neutral" title="代码已变化，控制台不再读取部署"><span class="dot" />只看任务结果</span>
+            {resultsOnly ? <span class="pill neutral" data-tip="代码已变化，控制台不再读取部署"><span class="dot" />只看任务结果</span>
               : <StatusPill service={overview?.service} loading={!overview} />}
-            <span class={`session-chip${idleLeft < 5 * 60_000 ? " warn" : ""}`} title={`闲置 ${duration(idleLeft)}后失效；登录 ${duration(absoluteLeft)}后到期`}>
+            <span class={`session-chip${idleLeft < 5 * 60_000 ? " warn" : ""}`} data-tip={`闲置 ${duration(idleLeft)}后失效；登录 ${duration(absoluteLeft)}后到期`}>
               <Icon name="clock" size={14} />{duration(Math.min(idleLeft, absoluteLeft))}
             </span>
-            <button class="btn ghost icon-btn" aria-label={`外观：${themeLabel[theme]}，点击切换`} title={`外观：${themeLabel[theme]}`}
+            <button class="btn ghost icon-btn" aria-label={`外观：${themeLabel[theme]}，点击切换`} data-tip={`外观：${themeLabel[theme]}`}
               onClick={() => changeTheme(nextTheme(theme))}><Icon name={themeIcon} /></button>
-            <button class="btn ghost icon-btn" aria-label="退出登录" title="退出登录" onClick={onLogout}><Icon name="logout" /></button>
+            <button class="btn ghost icon-btn" aria-label="退出登录" data-tip="退出登录" onClick={onLogout}><Icon name="logout" /></button>
           </div>
         </header>
-        <main class={`content${route === "conversations" ? " wide" : ""}`} id="content">
-          {resultsOnly ? <><section class="card plain" role="status"><h1>代码已变化</h1><p>当前控制台只能查看任务结果。请退出当前控制台并重新运行 <code>bun run console</code>，再使用终端里的新链接登录。</p></section><TasksPage resultsOnly /></> : !runtimeChecked ? <section class="card plain" role="status"><p>{overviewError ?? "正在检查控制台版本…"}</p>{overviewError && <button class="btn" onClick={() => void loadOverview(true)}>重试</button>}</section> : <>
-          {route === "overview" && <OverviewPage data={overview} error={overviewError} refreshing={refreshing}
-            onRefresh={() => void loadOverview(true)} sessionLeft={Math.min(idleLeft, absoluteLeft)} />}
-          {route === "conversations" && <ConversationsPage />}
-          {route === "stats" && <StatsPage />}
-          {route === "stats" && <StatsImportForm />}
-          {route === "maintain" && <TasksPage />}
-          {["health", "logs", "storage", "relay", "directory", "settings"].includes(route) && <ReadOnlyPage key={route} page={route}
-            refresh={route === "directory" ? directorySettled : 0} />}
-          {route === "storage" && <StorageActions />}
-          {route === "relay" && <RelayActions />}
-          {route === "directory" && <DirectoryForm onSettled={() => { setDirectorySettled(count => count + 1); void loadOverview(false); }} />}
-          {route === "push" && <><PushRecords /><PushSettingsForm /><PushGroups /></>}
-          {route === "settings" && <><ConfigurationRecovery /><ConfigurationSettings /><RuntimeForm /></>}
-          </>}
+        <main class={`content${width}`} id="content">
+          {resultsOnly ? <div class="view">
+            <Banner tone="warn" icon="alert" title="代码已变化">
+              当前控制台只能查看任务结果。请退出当前控制台并重新运行 <code>bun run console</code>，再使用终端里的新链接登录。
+            </Banner>
+            <TasksPage resultsOnly />
+          </div> : !runtimeChecked ? (overviewError
+            ? <EmptyState icon="alert" tone="danger" title="无法确认控制台版本" action={<button class="btn" onClick={() => void loadOverview(true)}>重试</button>}>{overviewError}</EmptyState>
+            : <EmptyState icon="loader" title="正在检查控制台版本…" />) : (
+            // Keyed by page: each page enters with its own animation.
+            <div class="view" key={route}>
+              {route === "overview" && <OverviewPage data={overview} error={overviewError} refreshing={refreshing}
+                onRefresh={() => void loadOverview(true)} sessionLeft={Math.min(idleLeft, absoluteLeft)} />}
+              {route === "conversations" && <ConversationsPage />}
+              {route === "stats" && <><StatsPage /><StatsImportForm /></>}
+              {route === "maintain" && <TasksPage />}
+              {route === "health" && <ReadOnlyPage page="health" />}
+              {route === "logs" && <ReadOnlyPage page="logs" />}
+              {route === "storage" && <ReadOnlyPage page="storage"><StorageActions /></ReadOnlyPage>}
+              {route === "relay" && <ReadOnlyPage page="relay"><RelayActions /></ReadOnlyPage>}
+              {route === "directory" && <ReadOnlyPage page="directory" refresh={directorySettled}>
+                <DirectoryForm onSettled={() => { setDirectorySettled(count => count + 1); void loadOverview(false); }} />
+              </ReadOnlyPage>}
+              {route === "push" && <PushPage />}
+              {route === "settings" && <SettingsPage />}
+            </div>
+          )}
         </main>
       </div>
-      {!resultsOnly && <ExportTray />}
+      {!resultsOnly && <><TaskSheet /><ActivityTray /></>}
       {palette && <CommandPalette commands={commands} onClose={() => setPalette(false)} />}
+      <TooltipLayer />
     </div>
   );
 }
@@ -300,31 +320,35 @@ function Sidebar({ route, overview, resultsOnly = false, onSearch, onClose }: { 
       <div class="brand">
         <BrandMark />
         <div class="brand-text"><div class="brand-name">量子密信应用机器人</div><div class="brand-sub">管理控制台</div></div>
-        <button class="btn ghost icon-btn drawer-close" aria-label="关闭导航" onClick={onClose}><Icon name="arrow" /></button>
+        <button class="btn ghost icon-btn drawer-close" aria-label="关闭导航" onClick={onClose}><Icon name="x" /></button>
       </div>
       <button class="search-trigger" onClick={onSearch}>
         <Icon name="search" /><span>搜索或跳转…</span><kbd>Ctrl K</kbd>
       </button>
       <nav class="nav">
-        {groups.map(([group, items]) => (
-          <div class="nav-group" key={group || "top"}>
-            {group && <div class="nav-group-label">{group}</div>}
-            {items.filter(item => !resultsOnly || item.id === "maintain").map(item => available(item) ? (
-              <a key={item.id} class="nav-item" href={`#/${item.id}`} aria-current={route === item.id ? "page" : undefined}>
-                <Icon name={item.icon} /><span>{item.label}</span>
-              </a>
-            ) : (
-              <span key={item.id} class="nav-item disabled" aria-disabled="true" title={`${item.description}（计划在 ${item.stage} 阶段提供）`}>
-                <Icon name={item.icon} /><span>{item.label}</span><span class="nav-badge">规划中</span>
-              </span>
-            ))}
-          </div>
-        ))}
+        {groups.map(([group, items]) => {
+          const shown = items.filter(item => !resultsOnly || item.id === "maintain");
+          if (!shown.length) return null;
+          return (
+            <div class="nav-group" key={group || "top"}>
+              {group && <div class="nav-group-label">{group}</div>}
+              {shown.map(item => available(item) ? (
+                <a key={item.id} class="nav-item" href={`#/${item.id}`} aria-current={route === item.id ? "page" : undefined}>
+                  <Tile icon={item.icon} tint={item.tint} /><span>{item.label}</span>
+                </a>
+              ) : (
+                <span key={item.id} class="nav-item disabled" aria-disabled="true" data-tip={`${item.description}（计划在 ${item.stage} 阶段提供）`}>
+                  <Tile icon={item.icon} tint={item.tint} /><span>{item.label}</span><span class="nav-badge">规划中</span>
+                </span>
+              ))}
+            </div>
+          );
+        })}
       </nav>
       <div class="sidebar-footer">
         <div class="host-card">
-          <Icon name="server" />
-          <div>
+          <Tile icon="server" tint="graphite" />
+          <div class="host-text">
             <div class="host-name">{overview?.console.hostname ?? "—"}</div>
             <div class="host-sub">{resultsOnly ? "代码已变化，不再读取部署" : deployment ? `${platformName(deployment.platform)} · ${deployment.mode}` : "读取部署中…"}</div>
           </div>

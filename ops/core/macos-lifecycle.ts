@@ -83,7 +83,7 @@ async function macosSession(context: DeploymentContext): Promise<DeploymentSessi
   };
   return {
     writer,
-    tools: { project, file: file => join(context.snapshot, file), workspace: record => record.target_workspace_root || join(project, "data/workspace") },
+    tools: { project, file: file => join(context.snapshot, file), workspace: record => record.target_workspace_root || join(project, "workspace") },
     owner: account,
     async recover(previous) {
       if (previous.kind !== "macos-session") throw new Error("此事务需要原平台恢复写入者");

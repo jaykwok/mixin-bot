@@ -50,7 +50,7 @@ describe("app layout", () => {
   test("one data directory: shared workspace, per-space databases, per-member tmp", () => {
     const data = join("deploy", "data");
     const layout = appLayout(data);
-    expect(layout.workspace).toBe(join(data, "workspace"));
+    expect(layout.workspace).toBe(resolve("deploy", "workspace"));
     expect(layout.externalWorkspace).toBe(false);
     expect(layout.stats).toBe(join(data, "state", "stats.sqlite"));
     expect(layout.materialsIndex).toBe(join(data, "index", "materials.md"));
@@ -67,17 +67,17 @@ describe("app layout", () => {
 
   test("WORKSPACE_ROOT replaces the shared workspace; blank keeps the default", () => {
     const data = join("deploy", "data");
-    expect(appLayout(data, "  ").workspace).toBe(join(data, "workspace"));
+    expect(appLayout(data, "  ").workspace).toBe(resolve("deploy", "workspace"));
     const external = appLayout(data, join("mnt", "materials"));
     expect(external.workspace).toBe(resolve("mnt", "materials"));
     expect(external.externalWorkspace).toBe(true);
-    expect(appLayout(data, join(data, "workspace")).externalWorkspace).toBe(false);
+    expect(appLayout(data, join("deploy", "workspace")).externalWorkspace).toBe(false);
   });
 
   test("the workspace check refuses a missing mount, a file, a workspace holding the data, and one inside managed state", () => {
     const project = join(fixture.root, "project");
     const data = join(project, "data");
-    mkdirSync(join(data, "workspace"), { recursive: true });
+    mkdirSync(join(project, "workspace"), { recursive: true });
     checkWorkspace(appLayout(data), project);
     expect(() => checkWorkspace(appLayout(data, join(fixture.root, "missing")), project)).toThrow("WORKSPACE_ROOT 不存在");
     writeFileSync(join(fixture.root, "file"), "");
@@ -100,13 +100,13 @@ describe("app layout", () => {
       mkdirSync(hidden, { recursive: true });
       symlinkSync(hidden, join(project, managed), "junction");
       expect(() => checkWorkspace(appLayout(data, workspace), project), managed).toThrow("实际位于资料目录");
-      // The same link outside the workspace is fine; the default data/workspace stays allowed.
+      // The same link outside the workspace is fine; the default workspace stays allowed.
       const elsewhere = join(root, "elsewhere");
       mkdirSync(elsewhere);
       checkWorkspace(appLayout(data, elsewhere), project);
     }
     const project = join(fixture.root, "reverse-default", "project"), data = join(project, "data");
-    mkdirSync(join(data, "workspace"), { recursive: true });
+    mkdirSync(join(project, "workspace"), { recursive: true });
     checkWorkspace(appLayout(data), project);
   });
 });

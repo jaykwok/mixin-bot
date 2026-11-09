@@ -40,7 +40,7 @@ check_stop_disk_space() {
 # 共享资料目录的边界在宿主路径空间核对：服务容器把外置资料目录改名挂到 /app/workspace，容器内看不出它在宿主上是否
 # 包含 data/ 或位于 state、tmp、会话、配置、备份、日志之内。宿主上解析后的 data、backup、logs 和资料目录按原路径
 # 只读挂进候选镜像（无网络、无权限提升），用与服务启动相同的规则（ops/tools/layout-check.ts）判断；只读，
-# 不创建任何目录。依赖 IMAGE_ID、SERVICE_USER、PROJECT_DIR 和 HOST_WORKSPACE_ROOT（空 = data/workspace）。
+# 不创建任何目录。依赖 IMAGE_ID、SERVICE_USER、PROJECT_DIR 和 HOST_WORKSPACE_ROOT（空 = workspace）。
 check_workspace_layout() {
     local project data backup logs workspace path mounts=()
     project="$(realpath -e -- "$PROJECT_DIR")" && data="$(realpath -e -- "$PROJECT_DIR/data")" || {
@@ -50,9 +50,9 @@ check_workspace_layout() {
         workspace="$(realpath -e -- "$HOST_WORKSPACE_ROOT" 2>/dev/null)" && [ -d "$workspace" ] || {
             echo "WORKSPACE_ROOT 不存在或不是目录：$HOST_WORKSPACE_ROOT" >&2; return 1; }
     else
-        workspace="$data/workspace"
+        workspace="$project/workspace"
     fi
-    # 同一路径只挂一次（默认资料目录随 data/ 挂入；资料目录与 data/ 相同时也只挂一次）。
+    # 同一路径只挂一次（资料目录与 data/ 相同时）。
     local seen=$'\n'
     for path in "$data" "$backup" "$logs" "$workspace"; do
         [ -e "$path" ] && [[ "$seen" != *$'\n'"$path"$'\n'* ]] || continue

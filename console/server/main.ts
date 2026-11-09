@@ -24,6 +24,7 @@ import { BackupForms } from "./backup-forms.ts";
 import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
 import { configurationRoutes } from "./configuration-routes.ts";
 import { DeploymentDirectory } from "./deployment-directory.ts";
+import { fileRoutes } from "./files.ts";
 import { lifecycleRoutes } from "./lifecycle-routes.ts";
 import { upgradeRoutes } from "./upgrade-routes.ts";
 import { buildExecutor, launchTask, pruneUnusedRuntimes, reconcileTasks, taskObservers } from "./task-host.ts";
@@ -139,7 +140,7 @@ async function main(argv: string[]): Promise<number | undefined> {
   const server = startServer({
     port: choice.port, guard: guardConfig(choice.port, forwarded === undefined ? [] : [forwarded]),
     bundle, auth, instanceId, current: read => fence.current(read ? CODE_CHECK_MS : 0), dataSignal: dataReads.signal, overview: () => loadOverview(info),
-    routes: { ...conversationRoutes({ bot, audit, views }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(),
+    routes: { ...conversationRoutes({ bot, audit, views }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...fileRoutes(PROJECT_DIR),
       ...taskRoutes({ tasks, plans, observers, audit, hosting: hostingCheck, current: () => fence.current(), prepare: operationPreparer(PROJECT_DIR, views, undefined, uploads, backups, forms, configurations, deploymentDirectory),
         created: request => { uploads.bind(request); backups.bind(request); if (request.operation === "configuration-apply") configurations.bind(String(request.params.draft), String(request.params.digest), request.id); },
         launch: id => launchTask(tasks, id, executorBundle) }) },

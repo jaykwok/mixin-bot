@@ -33,7 +33,7 @@ async function execute(args: string[], cwd: string, env: Record<string, string |
 test("事务记录逐键校验：重复、未知、缺失或非法的值拒绝整份记录", () => {
   expect(parseTransactionRecord(serialize(record))).toEqual(record);
   expect(parseTransactionRecord(serialize({ ...record, target_workspace_root: "D:\\shared", original_branch: "feature/x" })).target_workspace_root).toBe("D:\\shared");
-  // An empty root is the default data/workspace.
+  // An empty root is the default workspace.
   expect(parseTransactionRecord(serialize({ ...record, target_workspace_root: "", original_workspace_root: "" })).target_workspace_root).toBe("");
   const invalid: Record<string, string>[] = [
     { ...record, bot_port: "70000" }, { ...record, bot_port: "0080" }, { ...record, target_sha: "abc" },

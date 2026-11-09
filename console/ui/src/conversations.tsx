@@ -347,7 +347,7 @@ function MemberPane({ rows, selected, onSelect, names, busy, onRefresh }: {
             <input type="search" placeholder={names.view.mode === "anonymous" ? "按成员编号筛选" : "按姓名或号码筛选"} aria-label="筛选成员" value={filter}
               onInput={event => setFilter((event.target as HTMLInputElement).value)} />
           </div>
-          <button type="button" class="btn ghost icon-btn" aria-label="刷新成员列表" title="刷新成员列表（最近活动与新成员）" disabled={busy} onClick={onRefresh}>
+          <button type="button" class="btn ghost icon-btn" aria-label="刷新成员列表" data-tip="刷新成员列表（最近活动与新成员）" disabled={busy} onClick={onRefresh}>
             <Icon name="refresh" class={busy ? "spin" : undefined} />
           </button>
         </div>
@@ -361,7 +361,7 @@ function MemberPane({ rows, selected, onSelect, names, busy, onRefresh }: {
               <span class="member-text">
                 <span class="member-name"><IdentityText identity={row.identity} compact /></span>
                 <span class="member-sub">{row.lastAt ? stamp(row.lastAt, names.observedAt) : "还没有对话"}
-                  {row.identity.nameState && row.identity.nameState !== "named" && <span title={row.identity.nameNote}> · {row.identity.nameNote}</span>}
+                  {row.identity.nameState && row.identity.nameState !== "named" && <span data-tip={row.identity.nameNote}> · {row.identity.nameNote}</span>}
                 </span>
               </span>
             </button>
@@ -396,15 +396,15 @@ function MemberReader({ view, row, onProblem, jump, onBack, onRefresh }: {
         <div class="reader-title">
           <div class="reader-name"><IdentityText identity={row.identity} /></div>
           <div class="reader-sub">
-            {row.createdAt ? `首次对话 ${dateTime(row.createdAt)}` : "首次对话时间未知"}
-            {row.lastAt ? ` · 最近 ${dateTime(row.lastAt)}` : ""}
+            <span>{row.createdAt ? `首次对话 ${dateTime(row.createdAt)}` : "首次对话时间未知"}</span>
+            {row.lastAt ? <span> · 最近 {dateTime(row.lastAt)}</span> : null}
           </div>
         </div>
         <div class="reader-tools">
           <Segmented label="内容" size="small" value={tab} onChange={setTab}
             options={[{ value: "chat", label: "对话", icon: "messages" }, { value: "runs", label: "运行记录", icon: "activity" }]} />
           {tab === "chat" && <BoundaryMenu view={view} member={row.identity.key} onJump={goTo} onProblem={onProblem} />}
-          <button type="button" class="btn ghost icon-btn" aria-label={tab === "chat" ? "回到最新" : "刷新运行记录"} title={tab === "chat" ? "回到最新" : "刷新"}
+          <button type="button" class="btn ghost icon-btn" aria-label={tab === "chat" ? "回到最新" : "刷新运行记录"} data-tip={tab === "chat" ? "回到最新" : "刷新"}
             onClick={() => { setTarget(null); setReload(value => value + 1); onRefresh(); }}><Icon name="refresh" /></button>
         </div>
       </header>
@@ -522,7 +522,7 @@ function Transcript({ view, identity, target, onProblem }: { view: string; ident
 function When({ entry }: { entry: EntryView }) {
   return (
     <span class="entry-when">
-      {entry.at !== null && <time title={dateTime(entry.at)}>{stamp(entry.at)}</time>}
+      {entry.at !== null && <time data-tip={dateTime(entry.at)}>{stamp(entry.at)}</time>}
       <span class="entry-id">#{entry.id}</span>
     </span>
   );
@@ -542,7 +542,7 @@ function ToolCall({ part, onLoad }: { part: Extract<EntryPart, { type: "toolCall
   return (
     <details class="tool-call">
       <summary><Icon name="terminal" size={14} /><span class="tool-name">{part.name}</span><span class="muted">调用参数</span>
-        {part.invalid && <Chip tone="danger" title={part.invalid}>参数无效</Chip>}</summary>
+        {part.invalid && <Chip tone="danger" tip={part.invalid}>参数无效</Chip>}</summary>
       <pre class="code-block">{part.arguments}</pre>
       <Truncated part={part} onLoad={onLoad} />
     </details>
@@ -592,7 +592,7 @@ function Usage({ entry }: { entry: EntryView }) {
   return (
     <div class="entry-meta">
       <span class="mono">{info.provider}/{info.model}</span>
-      {usage && <span title={`输入 ${count(usage.input)} · 输出 ${count(usage.output)} · 缓存读 ${count(usage.cacheRead)} · 缓存写 ${count(usage.cacheWrite)}`}>
+      {usage && <span data-tip={`输入 ${count(usage.input)} · 输出 ${count(usage.output)} · 缓存读 ${count(usage.cacheRead)} · 缓存写 ${count(usage.cacheWrite)}`}>
         {count(usage.total)} token</span>}
       {info.durationMs !== undefined && <span>{seconds(info.durationMs)}</span>}
       {STOP_NOTES[info.stopReason] && <Chip tone={info.stopReason === "length" ? "warn" : "danger"}>{STOP_NOTES[info.stopReason]}</Chip>}
@@ -804,7 +804,7 @@ function SearchFilterBar({ state, onChange, disabled }: {
   const set = (patch: Partial<FilterState>) => onChange(state => ({ ...state, ...patch }));
   return (
     <div class="search-filters">
-      <div class="kind-toggles" role="group" aria-label="只搜这些内容（不选即全部）" title="只搜选中的内容；都不选即全部">
+      <div class="kind-toggles" role="group" aria-label="只搜这些内容（不选即全部）" data-tip="只搜选中的内容；都不选即全部">
         {SEARCH_KINDS.map(([kind, label]) => {
           const on = state.kinds.includes(kind);
           return <button key={kind} type="button" class={`btn small-btn${on ? " active" : ""}`} aria-pressed={on} disabled={disabled} onClick={() => toggle(kind)}>{label}</button>;
@@ -915,7 +915,7 @@ function SearchPanel({ view, member, byKey, onOpen, onProblem, onClose }: {
           const row = hit.member ? byKey.get(hit.member) : undefined;
           return (
             <button key={hit.id} type="button" class="hit" disabled={!hit.member} onClick={() => hit.member && onOpen(hit.member, hit.id)}
-              title={hit.member ? "在会话中打开" : "这位成员不在本视图载入的名单里"}>
+              data-tip={hit.member ? "在会话中打开" : "这位成员不在本视图载入的名单里"}>
               <span class="hit-head">
                 <span class="hit-who">{row ? row.identity.label : "未载入的成员"}</span>
                 <span class="muted small">{KIND_LABEL[hit.kind] ?? hit.kind}{hit.at ? ` · ${stamp(hit.at)}` : ""}</span>
@@ -1020,7 +1020,7 @@ function GlobalSearch({ hidden, onOpen }: { hidden: boolean; onOpen: (hit: Globa
             onInput={event => setText((event.target as HTMLInputElement).value)} />
         </div>
         <Segmented label="搜索结果的身份显示" size="small" value={mode} onChange={setMode} disabled={busy}
-          options={[{ value: "default", label: "默认身份", title: "姓名和打码号码" }, { value: "anonymous", label: "匿名", title: "只显示本次编号" }]} />
+          options={[{ value: "default", label: "默认身份", tip: "姓名和打码号码" }, { value: "anonymous", label: "匿名", tip: "只显示本次编号" }]} />
         <button type="submit" class="btn primary" disabled={busy || !text.trim() || !!chosen.error}>搜索</button>
         {search && <button type="button" class="btn ghost" onClick={clear}>清除结果</button>}
       </form>
@@ -1042,7 +1042,7 @@ function GlobalSearch({ hidden, onOpen }: { hidden: boolean; onOpen: (hit: Globa
           )}
           {hits.map(hit => (
             <button key={`${hit.space}:${hit.id}`} type="button" class="hit" disabled={!hit.member} onClick={() => onOpen(hit, search)}
-              title={hit.member ? "在会话中打开" : "这位成员不在本次搜索载入的成员中"}>
+              data-tip={hit.member ? "在会话中打开" : "这位成员不在本次搜索载入的成员中"}>
               <span class="hit-head">
                 <span class="hit-who">{hit.member?.label ?? "未载入的成员"}<span class="muted"> · {hit.title}</span></span>
                 <span class="muted small">{KIND_LABEL[hit.kind] ?? hit.kind}{hit.at ? ` · ${stamp(hit.at)}` : ""}</span>
@@ -1069,9 +1069,9 @@ const PART_KIND: Record<string, string> = { markdown: "回复", links: "外链�
 const DELIVERABLE: Record<string, [string, Tone]> = { checked: ["已检查", "ok"], draft: ["草稿", "warn"], rejected: ["未通过检查", "danger"] };
 const ABANDONED: Record<string, string> = { withdrawn: "被 /stop 或 /clear 撤回", expired: "超出发送时限" };
 
-function StateChip({ table, state, title }: { table: Record<string, [string, Tone]>; state: string; title?: string }) {
+function StateChip({ table, state }: { table: Record<string, [string, Tone]>; state: string }) {
   const [label, tone] = table[state] ?? [state || "未知", "neutral"];
-  return <Chip tone={tone} title={title}>{label}</Chip>;
+  return <Chip tone={tone}>{label}</Chip>;
 }
 
 function RunCard({ item, onJump }: { item: RequestView; onJump: (id: number) => void }) {

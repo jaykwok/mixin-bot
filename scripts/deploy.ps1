@@ -32,7 +32,7 @@ $ModelsFile = Join-Path $ConfigDir 'models.json'
 $SettingsFile = Join-Path $DataDir 'runtime\pi\settings.json'
 $AppBotFile = Join-Path $ConfigDir 'app-bot.json'
 $PortFile = Join-Path $StateDir 'bot-port'
-$DefaultWorkspace = Join-Path $DataDir 'workspace'
+$DefaultWorkspace = Join-Path $Project 'workspace'
 
 function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan; Set-OperationStage $m }
 function Done($m) { Write-Host "[+] $m" -ForegroundColor Green; Write-OperationEvent 'info' $m }
@@ -102,8 +102,8 @@ if ($Port -ne $savedPort) {
 }
 Done "本机管理端口：127.0.0.1:$Port$(if ($portSource) { "（来自 $portSource）" })"
 
-# ---- 4. 共享资料目录（默认 data\workspace；WORKSPACE_ROOT 可指向已存在的外置目录，服务只读）----
-# 取 WORKSPACE_ROOT，未设置时沿用已保存设置；设为 data\workspace 即恢复默认。外置目录不创建。
+# ---- 4. 共享资料目录（默认项目下的 workspace；WORKSPACE_ROOT 可指向已存在的外置目录，服务只读）----
+# 取 WORKSPACE_ROOT，未设置时沿用已保存设置；设为项目下的 workspace 即恢复默认。外置目录不创建。
 $workspaceRequest = if (-not [string]::IsNullOrWhiteSpace($env:WORKSPACE_ROOT)) { $env:WORKSPACE_ROOT.Trim() } else { Get-SavedWorkspaceRoot $Project }
 $WorkspaceRoot = ''
 if ($workspaceRequest) {
