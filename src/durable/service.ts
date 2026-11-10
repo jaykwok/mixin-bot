@@ -49,7 +49,7 @@ import { clearRunning, markRunning } from "./running-requests.ts";
 import { deleteSnapshots, fileDigest, releasableSnapshots, slotVersions } from "../agent/deliverables.ts";
 import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming, type RecordWriter } from "./closeout.ts";
-import { describeRequestFailure, modelRequestError } from "../agent/failure.ts";
+import { describeRequestFailure, modelRequestError, RequestStopped } from "../agent/failure.ts";
 import { ensureMaterialsIndex } from "../agent/materials-index.ts";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
 import { ensureStorageIdentities, ensureStorageIdentity } from "../agent/storage-identity.ts";
@@ -179,7 +179,7 @@ export type InboundAttachment = Omit<Inbound, "content"> & { attachment: Attachm
 /** A registered attachment carries its ID. */
 export type AttachResult = { status: "accepted"; attachment: string } | { status: "duplicate" } | { status: "full"; message: string };
 
-type AbortReason = { kind: "task_timeout" | "model_idle" | "model_response_timeout"; error: Error };
+type AbortReason = { kind: "task_timeout" | "model_idle" | "model_response_timeout"; error: RequestStopped };
 
 /** Log labels of the watchdog's aborts, as the task log extraction (scripts/task-logs.*) looks for them. */
 const ABORT_LABELS: Record<AbortReason["kind"], string> = {
@@ -1021,9 +1021,9 @@ export class DurableService {
         if (attempt?.key !== model.key) attempt = { key: model.key, since: now, progress: model.progress, changed: now };
         else if (attempt.progress !== model.progress) { attempt.progress = model.progress; attempt.changed = now; }
         if (now - attempt.since > this.#limits.modelResponseMs) {
-          reason = { kind: "model_response_timeout", error: new Error(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`) };
+          reason = { kind: "model_response_timeout", error: new RequestStopped(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`, "model_response_timeout") };
         } else if (now - attempt.changed > this.#limits.modelIdleMs) {
-          reason = { kind: "model_idle", error: new Error(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`) };
+          reason = { kind: "model_idle", error: new RequestStopped(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`, "model_idle") };
         }
       }
       if (reason !== undefined) {
@@ -1035,7 +1035,7 @@ export class DurableService {
 
   #totalTimeout(requestId: string, startedAt: number | undefined): AbortReason | undefined {
     if (startedAt === undefined || Date.now() - startedAt < this.#limits.runTimeoutMs) return;
-    return { kind: "task_timeout", error: new Error(`任务总时限 ${this.#limits.runTimeoutMs / 1000} 秒已到（任务：${taskNumber(requestId)}）`) };
+    return { kind: "task_timeout", error: new RequestStopped(`任务总时限 ${this.#limits.runTimeoutMs / 1000} 秒已到（任务：${taskNumber(requestId)}）`, "task_timeout") };
   }
 
   #markAborted(member: MemberState, id: string, reason: AbortReason, startedAt: number): void {
@@ -1069,13 +1069,13 @@ export class DurableService {
         ? await harness.commit(async (tx) => (await tx.entry(AssistantEntry, settled.answer!))?.model?.[0] as AssistantMessage | undefined, this.#context)
         : undefined;
       const text = textOf(answer), sent = record.files.some(file => fileSendOutcome(file) !== undefined);
-      if (!text && !record.notes.length && !sent) failure = describeRequestFailure(new Error("Pi 未返回回复"));
+      if (!text && !record.notes.length && !sent) failure = describeRequestFailure(new RequestStopped("Pi 未返回回复", "no_reply"));
       else delivery = replyDelivery(record.reply, text || (record.notes.length ? "文件链接已生成。" : "文件已发出，没有收到的话请再说一声。"), record.notes, now);
     } else if (settled.status === "unanswered") {
       // Only the watchdog aborts an item that is not cancelled (a control commits the cancellation first). Its reason
       // does not survive a restart, when only the total deadline can still tell it.
       failure = describeRequestFailure(settled.reason !== "aborted" ? await this.#failure(harness, conversation, settled)
-        : this.#totalTimeout(item.requestId, item.startedAt)?.error ?? new Error(`时限检查已中止本次运行，服务随后重启（任务：${taskNumber(item.requestId)}）`));
+        : this.#totalTimeout(item.requestId, item.startedAt)?.error ?? new RequestStopped(`时限检查已中止本次运行，服务随后重启（任务：${taskNumber(item.requestId)}）`, "watchdog_restart"));
     }
     if (failure !== undefined) {
       if (this.#options.closeout && !this.#closing.signal.aborted) {
@@ -1167,7 +1167,8 @@ export class DurableService {
     }
     // Any other reason says what ended the run (`interrupted`: the host stopped while the model answered, more often than
     // the retries; `restart_limit`: the run was cut off restartLimit times; `no_model`, `faulted`, `orphaned`, …).
-    return new Error(detail === undefined ? `模型未能回答（${reason}）` : detail);
+    const text = detail === undefined ? `模型未能回答（${reason}）` : detail;
+    return reason === "interrupted" || reason === "restart_limit" ? new RequestStopped(text, reason) : new Error(text);
   }
 
   /**

@@ -33,6 +33,32 @@ export function modelRequestError(errorMessage: string, messages: readonly unkno
   return new ModelRequestError(errorMessage, source && isContextOverflow(source, contextWindow) ? "context_overflow" : undefined);
 }
 
+/**
+ * 不是模型报错、而是这次运行被结束的几种情况：本服务的时限检查（三种时限，以及重启后只知道“被时限检查中止”）、
+ * 运行正常结束却没有任何回复、Durable 结束运行的两种原因（`pi.live.runFailure` 的 `interrupted` 与 `restart_limit`）。
+ */
+export type StopKind = "model_response_timeout" | "model_idle" | "task_timeout" | "watchdog_restart" | "no_reply" | "interrupted" | "restart_limit";
+
+/** 运行被结束。结论按 `kind` 给出，不从报错文字里猜：文字是写给管理员看的原文，改了措辞也不影响结论。 */
+export class RequestStopped extends Error {
+  constructor(message: string, readonly kind: StopKind) {
+    super(message);
+    this.name = "RequestStopped";
+  }
+}
+
+const STOP_HINTS: Record<StopKind, string> = {
+  model_idle: "模型长时间没有产生新的有效内容，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
+  model_response_timeout: "模型未能在规定时间内完成本次响应，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
+  task_timeout: "这次处理超过了最长等待时间，已停止。请联系管理员，并提供下方的任务编号以便排查。",
+  watchdog_restart: "这次处理超过时限已被停止，服务随后重启。请重新发送一次问题；持续出现请联系管理员，并提供下方的任务编号以便排查。",
+  // 模型回答途中服务意外停止（崩溃、断电、被强行结束），次数超过了重试次数。
+  interrupted: "机器人服务在模型回答途中意外停止，这次回答没有完成。请重新发送一次问题；持续出现请联系管理员。",
+  // 生成任务连续 restartLimit 次被异常中断。
+  restart_limit: "这个任务连续多次被异常中断，已经结束。请重新发送一次问题；持续出现请联系管理员。",
+  no_reply: "模型没有返回回复。请重新发送一次问题；如果仍然没有回复，请联系管理员。",
+};
+
 // pi-ai 的 formatProviderError 会把状态码拼成 `429: <body>` 或 `<provider> (429): <body>`；
 // 各家 SDK 自己的 message 则多是 `HTTP 401` / `403 status code (no body)` 这类写法。
 const STATUS_PATTERNS: readonly RegExp[] = [
@@ -63,24 +89,8 @@ interface FailureRule {
 
 // 顺序即优先级：特征更具体的排前面。窗口用尽和额度耗尽都必须排在限流之前——它们的响应
 // 同样是 429、原文里同样带 rate_limit_exceeded，但「稍等片刻再发一次」对要等几小时才重置
-// 的窗口纯属误导；空回复排最后，它只是「没别的线索」时的兜底描述。
+// 的窗口纯属误导。运行被结束的几种情况（时限、服务中断、空回复）不在这里：它们按 RequestStopped 的 kind 给结论。
 const FAILURE_RULES: readonly FailureRule[] = [
-  {
-    pattern: /模型连续\s+\d+\s+秒无有效进展/,
-    hint: "模型长时间没有产生新的有效内容，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  },
-  {
-    pattern: /单次模型响应时限/,
-    hint: "模型未能在规定时间内完成本次响应，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  },
-  {
-    pattern: /任务总时限/,
-    hint: "这次处理超过了最长等待时间，已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  },
-  {
-    pattern: /时限检查已中止本次运行/,
-    hint: "这次处理超过时限已被停止，服务随后重启。请重新发送一次问题；持续出现请联系管理员，并提供下方的任务编号以便排查。",
-  },
   {
     // settings.json 是 Pi 存选型的地方，读坏了和 models.json 坏了一样属于配置问题。
     pattern: /models\.json|settings\.json|configure|未配置可用凭证/i,
@@ -132,20 +142,6 @@ const FAILURE_RULES: readonly FailureRule[] = [
     statuses: [500, 502, 503, 504, 529],
     hint: "模型服务暂时故障或过载，请过几分钟再发送一次问题；持续出现请联系管理员。",
   },
-  {
-    // Durable 结束了这次运行：模型回答途中服务意外停止（崩溃、断电、被强行结束），次数超过了重试次数。
-    pattern: /The host stopped while the (?:model was answering|deferred answer was fetched)/,
-    hint: "机器人服务在模型回答途中意外停止，这次回答没有完成。请重新发送一次问题；持续出现请联系管理员。",
-  },
-  {
-    // 生成任务连续 restartLimit 次被异常中断，Durable 结束了它。
-    pattern: /The generation was interrupted (?:once|\d+ times in a row) in its/,
-    hint: "这个任务连续多次被异常中断，已经结束。请重新发送一次问题；持续出现请联系管理员。",
-  },
-  {
-    pattern: /未返回回复/,
-    hint: "模型没有返回回复。请重新发送一次问题；如果仍然没有回复，请联系管理员。",
-  },
 ];
 
 const FALLBACK_HINT = "暂时无法确定原因，请把这条提示连同下方的错误信息发给管理员排查。";
@@ -195,8 +191,8 @@ function formatDetail(raw: string): string {
 /** 群里那条失败回执的正文：一句能照着动手的结论 + 报错原文。 */
 export function describeRequestFailure(error: unknown): string {
   const raw = errorText(error);
-  const hint = error instanceof ModelRequestError && error.reason === "context_overflow"
-    ? CONTEXT_OVERFLOW_HINT : classifyFailure(raw, extractHttpStatus(raw));
+  const hint = error instanceof RequestStopped ? STOP_HINTS[error.kind]
+    : error instanceof ModelRequestError && error.reason === "context_overflow" ? CONTEXT_OVERFLOW_HINT : classifyFailure(raw, extractHttpStatus(raw));
   const reset = extractResetMoment(raw);
   const detail = formatDetail(raw);
   const lines = ["⚠️ 抱歉，处理您的请求时出错了。", hint];
