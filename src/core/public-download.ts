@@ -44,26 +44,33 @@ function sameAddress(actual: string, expected: string): boolean {
   return a.bits === b.bits && a.value === b.value;
 }
 
-async function readResponse(response: IncomingMessage, maxBytes: number): Promise<Uint8Array> {
+/** The file is larger than the caller takes: `size` as declared, or as received when the limit was passed. */
+export class DownloadTooLarge extends Error {
+  constructor(readonly size: number) { super("远程文件超过附件大小上限"); }
+}
+
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+async function readResponse(response: IncomingMessage, maxBytes: number): Promise<Uint8Array | { location: string }> {
   try {
-    const status = response.statusCode ?? 0;
-    if (status >= 300 && status < 400) throw new Error("隔离模式不允许下载重定向，请提供文件的最终公网 URL");
+    const status = response.statusCode ?? 0, location = response.headers.location;
+    if (REDIRECTS.has(status) && location) return { location };
     if (status < 200 || status >= 300) throw new Error("下载失败 HTTP " + status);
     const declared = Number(response.headers["content-length"]);
-    if (Number.isFinite(declared) && declared > maxBytes) throw new Error("远程文件超过附件大小上限");
+    if (Number.isFinite(declared) && declared > maxBytes) throw new DownloadTooLarge(declared);
     const chunks: Buffer[] = []; let total = 0;
     for await (const chunk of response) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buffer.length;
-      if (total > maxBytes) throw new Error("远程文件超过附件大小上限");
+      if (total > maxBytes) throw new DownloadTooLarge(total);
       chunks.push(buffer);
     }
     return Buffer.concat(chunks, total);
   } finally { response.destroy(); }
 }
 
-/** One DNS lookup, checked in full, pinned to one connection; no proxy, redirects or shared sockets. */
-export async function downloadPublicBytes(source: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
+/** One request: one DNS lookup, checked in full, pinned to one connection; no proxy or shared sockets. */
+async function requestPublic(source: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array | { location: string }> {
   signal.throwIfAborted();
   const url = new URL(source);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("下载仅支持不含凭据的公网 HTTP(S) URL");
@@ -71,11 +78,11 @@ export async function downloadPublicBytes(source: string, maxBytes: number, sign
   const addresses = isIP(hostname) ? [{ address: hostname, family: isIP(hostname) }]
     : await waitFor(dns.lookup(hostname, { all: true, verbatim: true }), signal);
   if (!addresses.length || addresses.length > 64 || addresses.some(item => !isPublicAddress(item.address))) {
-    throw new Error("隔离模式禁止访问非公网地址");
+    throw new Error("禁止访问非公网地址：只能下载公网 HTTP(S) 地址上的文件");
   }
   signal.throwIfAborted();
   const pinned = addresses[0]!;
-  return new Promise<Uint8Array>((resolve, reject) => {
+  return new Promise<Uint8Array | { location: string }>((resolve, reject) => {
     const request = (url.protocol === "https:" ? https.request : http.request)(url, {
       agent: false, signal, family: pinned.family,
       headers: { "Accept-Encoding": "identity" },
@@ -94,4 +101,20 @@ export async function downloadPublicBytes(source: string, maxBytes: number, sign
       });
     });
   });
+}
+
+/**
+ * Download from a public address. `redirects`: how many redirects are followed; every one is a new request, checked and
+ * pinned like the first, so a public address cannot pass the download on to a private one. With 0 a redirect is refused.
+ */
+export async function downloadPublicBytes(source: string, maxBytes: number, signal: AbortSignal, redirects = 0): Promise<Uint8Array> {
+  let url = source;
+  for (let followed = 0; ; followed++) {
+    const result = await requestPublic(url, maxBytes, signal);
+    if (!("location" in result)) return result;
+    if (!redirects) throw new Error("不允许下载重定向，请提供文件的最终公网 URL");
+    if (followed >= redirects) throw new Error(`下载重定向超过 ${redirects} 次`);
+    try { url = new URL(result.location, url).href; }
+    catch { throw new Error("下载重定向的地址无效"); }
+  }
 }

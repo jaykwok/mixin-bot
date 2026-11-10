@@ -62,6 +62,23 @@ describe("attachment send tools", () => {
     }
   });
 
+  test("a remote source is only fetched from a public address: loopback, private and metadata addresses are refused without a request", async () => {
+    let hits = 0;
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { hits++; return new Response("internal"); } });
+    const recording = recordingChannel();
+    try {
+      for (const name of ["send_image", "send_file"] as const) {
+        const tool = sendTool(name, { channel: recording.channel, workspaceDir: ".", tempDir: ".", notes: createOutboundNotes() });
+        for (const source of [`http://127.0.0.1:${server.port}/report.png`, `http://localhost:${server.port}/report.png`, "http://169.254.169.254/latest/meta-data/",
+          "http://192.168.1.10/share/report.png", `http://[::1]:${server.port}/report.png`]) {
+          await expect(runMemberTool(tool, { source }), source).rejects.toThrow("非公网");
+        }
+        await expect(runMemberTool(tool, { source: `http://user:secret@127.0.0.1:${server.port}/report.png` })).rejects.toThrow("不含凭据");
+      }
+      expect(hits).toBe(0);
+    } finally { await server.stop(true); }
+  });
+
   test("relays an oversized local file and posts the link to the group", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-bot-relay-"));
     const workspace = join(root, "workspace");

@@ -23,7 +23,7 @@ import { application } from "../core/lifecycle.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks } from "../core/task-backend.ts";
-import { downloadPublicBytes } from "../core/public-download.ts";
+import { downloadPublicBytes, DownloadTooLarge } from "../core/public-download.ts";
 
 const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? RUNTIME_DEFAULTS.BOT_ATTACHMENT_CONCURRENCY));
 
@@ -86,53 +86,24 @@ function oversizeError(kind: string, size: number): Error {
   );
 }
 
-/** 下载远程内容，边收边卡上限，避免声明的 content-length 说谎。 */
+/** Redirects followed where tasks are not isolated; the isolated mode takes the final URL only. */
+const REMOTE_REDIRECTS = 5;
+
+/**
+ * 下载远程内容。地址是成员或模型给的：两种模式都只连公网地址（DNS 全部结果校验后固定连接），
+ * 不会替人去取内网、回环或云元数据地址上的内容；边收边卡上限，避免声明的 content-length 说谎。
+ */
 async function fetchRemoteBytes(
   url: string,
   signal?: AbortSignal
 ): Promise<Uint8Array> {
-  if (configuredRootlessTasks()) {
-    const budget = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT), ...(signal ? [signal] : [])]);
-    return downloadPublicBytes(url, NATIVE_FILE_MAX_BYTES, budget);
-  }
-  const r = await fetch(url, {
-    signal: signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT)])
-      : AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT),
-  });
-  if (!r.ok) {
-    await r.body?.cancel().catch(() => {});
-    throw new Error(`下载失败 HTTP ${r.status}: ${url}`);
-  }
-  const declared = Number(r.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > NATIVE_FILE_MAX_BYTES) {
-    await r.body?.cancel().catch(() => {});
-    throw oversizeError("远程文件", declared);
-  }
-  if (!r.body) throw new Error(`下载响应没有内容: ${url}`);
-
-  const reader = r.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+  const budget = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT), ...(signal ? [signal] : [])]);
   try {
-    while (true) {
-      signal?.throwIfAborted();
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > NATIVE_FILE_MAX_BYTES) {
-        throw oversizeError("远程文件", total);
-      }
-      chunks.push(value);
-    }
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
-  const data = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    data.set(chunk, offset);
-    offset += chunk.byteLength;
+    return await downloadPublicBytes(url, NATIVE_FILE_MAX_BYTES, budget, configuredRootlessTasks() ? 0 : REMOTE_REDIRECTS);
+  } catch (error) {
+    if (error instanceof DownloadTooLarge) throw oversizeError("远程文件", error.size);
+    throw error;
   }
-  return data;
 }
 
 /** 读进内存供 IM 直传；只在确认不超过单条附件上限后调用。 */
