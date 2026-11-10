@@ -634,13 +634,15 @@ function EntryRow({ entry, identity, target, onFull }: { entry: EntryView; ident
   if (entry.role === "toolResult" && entry.tool) {
     const tool = entry.tool;
     const text = entry.parts.map(part => part.type === "text" ? part.text : "").join("\n");
+    // A command that ran and exited non-zero (diff found differences, grep found nothing) is not a tool that failed.
+    const exited = tool.isError && tool.exitCode !== undefined;
     return (
-      <div class={`tool-result${tool.isError ? " failed" : ""}${mark}`} data-entry={entry.id}>
+      <div class={`tool-result${exited ? " exited" : tool.isError ? " failed" : ""}${mark}`} data-entry={entry.id}>
         <details open={text.length <= LONG_TOOL_OUTPUT && text.split("\n").length <= 12}>
           <summary>
             <Icon name={tool.isError ? "alert" : "check"} size={14} />
             <span class="tool-name">{tool.name || "工具"}</span>
-            <span class="muted">{tool.isError ? "失败" : "结果"}</span>
+            <span class="muted">{exited ? `退出码 ${tool.exitCode}` : tool.isError ? "失败" : "结果"}</span>
             {tool.durationMs !== undefined && <span class="muted">{seconds(tool.durationMs)}</span>}
             {tool.nested !== undefined && <Chip>嵌套调用 {tool.nested}</Chip>}
             <span class="muted small">{count(text.length)} 字</span>

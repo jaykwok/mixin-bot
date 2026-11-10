@@ -50,6 +50,10 @@ test("Markdown fences outgrow any backtick run in the text, and inline text cann
   expect(text).toContain("````text\n```\n# 标题\n<b>x</b>\n````");
   expect(text).toContain("/clear：此后开始新的上下文");
   expect(text).toContain("<!-- mixin-console-export: complete; members=1; entries=2 -->");
+  const tool = (extra: object): EntryView => ({ id: 6, kind: "pi.tool-result", at: AT, chars: 3, role: "toolResult", parts: [{ type: "text", text: "out" }],
+    tool: { callId: "c", name: "bash", isError: false, ...extra } });
+  expect([{}, { isError: true, exitCode: 1 }, { isError: true }].map(extra => w.entry(tool(extra)).match(/`bash`(（[^）]*）)?/)![1] ?? ""))
+    .toEqual(["", "（退出码 1）", "（失败）"]);
   const stopped = markdownWriter().end({ complete: false, endedAt: AT, members: 0, entries: 0, error: "机器人<停了>" });
   expect(stopped).toContain("机器人&lt;停了&gt;");
   expect(stopped).toContain("<!-- mixin-console-export: incomplete -->");

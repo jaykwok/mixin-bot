@@ -328,6 +328,18 @@ describe("queries", () => {
     expect(view.at).toBe(5);
   });
 
+  test("a command's non-zero exit is told apart from a tool that failed", () => {
+    const result = (isError: boolean, data: unknown) => q.entryView({ id: 1, head: null, record: JSON.stringify({ kind: "pi.tool-result", data,
+      model: [{ role: "toolResult", toolCallId: "c1", toolName: "bash", isError, timestamp: 5, content: [{ type: "text", text: "out" }] }] }) }, q.PAGE_TEXT_CHARS).tool;
+    const exit = (code: number) => ({ diagnostics: [{ severity: "error", code: "exit_code", message: `Command exited with code ${code}` }] });
+    expect(result(true, exit(1))).toEqual({ callId: "c1", name: "bash", isError: true, exitCode: 1 });
+    expect(result(true, exit(127))?.exitCode).toBe(127);
+    // A timeout or a refused call has no exit code; a result that is not an error never gets one.
+    expect(result(true, { diagnostics: [{ severity: "error", code: "timeout", message: "Command timed out after 5 seconds" }] })).toEqual({ callId: "c1", name: "bash", isError: true });
+    expect(result(true, undefined)).toEqual({ callId: "c1", name: "bash", isError: true });
+    expect(result(false, exit(1))).toEqual({ callId: "c1", name: "bash", isError: false });
+  });
+
   test("search blocks end where the scan ends", () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE entries (id INTEGER PRIMARY KEY, conversation_id INTEGER, head INTEGER, commit_seq INTEGER, record TEXT)");

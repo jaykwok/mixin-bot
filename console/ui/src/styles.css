@@ -1117,6 +1117,8 @@ input[type="file"]::file-selector-button:hover { background: var(--fill-hover); 
 .tool-result summary .icon { color: var(--ok-dot); }
 .tool-result.failed { background: var(--danger-soft); }
 .tool-result.failed summary .icon { color: var(--danger-dot); }
+.tool-result.exited { background: var(--warn-soft); }
+.tool-result.exited summary .icon { color: var(--warn-dot); }
 .tool-result .entry-when, .other-row .entry-when, .system-row .entry-when { margin-left: auto; }
 .tool-result .plain-text { margin-top: 8px; max-height: 420px; overflow: auto; padding: 8px 10px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-2); background: var(--surface); border-radius: 8px; }
 .system-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }

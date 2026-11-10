@@ -185,7 +185,7 @@ function entryMarkdown(entry: EntryView): string {
   let title = ROLE[entry.role ?? ""] ?? inline(entry.kind);
   if (entry.kind === "pi.compaction") title = `压缩摘要（此后上下文从 #${entry.head} 起保留）`;
   if (entry.assistant) title += `（${inline(entry.assistant.provider)}/${inline(entry.assistant.model)}）`;
-  if (entry.tool) title += ` \`${inline(entry.tool.name)}\`${entry.tool.isError ? "（失败）" : ""}`;
+  if (entry.tool) title += ` \`${inline(entry.tool.name)}\`${entry.tool.exitCode !== undefined ? `（退出码 ${entry.tool.exitCode}）` : entry.tool.isError ? "（失败）" : ""}`;
   lines.push(`\n#### ${when}${title} · #${entry.id}\n`);
   for (const part of entry.parts) lines.push(partText(part), "");
   if (entry.assistant?.error) lines.push(`> 错误：${inline(entry.assistant.error)}`, "");

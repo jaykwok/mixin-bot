@@ -135,7 +135,12 @@ export type EntryView = {
   role?: "user" | "assistant" | "toolResult" | "system";
   parts: Part[];
   assistant?: { provider: string; model: string; stopReason: string; error?: string; durationMs?: number; usage: Usage | null };
-  tool?: { callId: string; name: string; isError: boolean; durationMs?: number; nested?: number };
+  /**
+   * `exitCode`: the command ran to its end and exited with this non-zero code (Durable's `exit_code` diagnostic). Such a
+   * result is an error to the model, but for diff, grep or test it is an ordinary answer, so it is told apart from a tool
+   * that failed.
+   */
+  tool?: { callId: string; name: string; isError: boolean; exitCode?: number; durationMs?: number; nested?: number };
   /** System entries: section names and size; the text is only in the single-entry view. */
   system?: { chars: number; sections: string[]; toolsAdded: string[]; toolsRemoved: string[] };
   data?: unknown;
@@ -175,6 +180,17 @@ function usage(value: unknown): Usage | null {
     total: num(u.totalTokens) ?? 0, cost: num((u.cost as Record<string, unknown> | undefined)?.total) ?? null };
 }
 
+/** The exit code in a tool result's diagnostics: `{ code: "exit_code", message: "Command exited with code 1" }`. */
+function exitCodeOf(data: unknown): number | undefined {
+  const diagnostics = (data as { diagnostics?: unknown } | undefined)?.diagnostics;
+  if (!Array.isArray(diagnostics)) return undefined;
+  for (const item of diagnostics as { code?: unknown; message?: unknown }[]) {
+    const match = item?.code === "exit_code" && typeof item.message === "string" ? item.message.match(/(-?\d+)\s*$/) : null;
+    if (match) return Number(match[1]);
+  }
+  return undefined;
+}
+
 /** A display view of one stored entry; `max` caps each text part. */
 export function entryView(row: Pick<EntryRow, "id" | "head" | "record">, max: number): EntryView {
   const record = JSON.parse(row.record) as { kind?: unknown; model?: unknown; data?: unknown };
@@ -201,8 +217,9 @@ export function entryView(row: Pick<EntryRow, "id" | "head" | "record">, max: nu
   }
   if (role === "toolResult") {
     const nested = (message!.nestedCalls as { calls?: unknown[] } | undefined)?.calls?.length;
+    const exitCode = message!.isError === true ? exitCodeOf(record.data) : undefined;
     view.tool = { callId: String(message!.toolCallId ?? ""), name: String(message!.toolName ?? ""), isError: message!.isError === true,
-      ...(num(message!.durationMs) !== undefined ? { durationMs: num(message!.durationMs) } : {}), ...(nested ? { nested } : {}) };
+      ...(exitCode !== undefined ? { exitCode } : {}), ...(num(message!.durationMs) !== undefined ? { durationMs: num(message!.durationMs) } : {}), ...(nested ? { nested } : {}) };
   }
   if (record.data !== undefined && kind !== "pi.tool-result") view.data = record.data;
   return view;

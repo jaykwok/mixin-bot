@@ -182,7 +182,7 @@ export interface EntryView {
   role?: "user" | "assistant" | "toolResult" | "system";
   parts: EntryPart[];
   assistant?: { provider: string; model: string; stopReason: string; error?: string; durationMs?: number; usage: EntryUsage | null };
-  tool?: { callId: string; name: string; isError: boolean; durationMs?: number; nested?: number };
+  tool?: { callId: string; name: string; isError: boolean; exitCode?: number; durationMs?: number; nested?: number };
   system?: { chars: number; sections: string[]; toolsAdded: string[]; toolsRemoved: string[] };
   data?: unknown;
 }

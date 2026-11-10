@@ -182,6 +182,27 @@ test("会话：选择空间与成员后按页阅读；用户正文不当 Markdow
   await shows("已到这段会话的开头");
 });
 
+test("会话：命令以非零退出码结束标“退出码 N”，工具本身出错才标“失败”", async () => {
+  const result = (id: number, tool: Partial<NonNullable<EntryView["tool"]>>): EntryView => ({ id, kind: "pi.tool-result", at: T, chars: 1, role: "toolResult",
+    parts: [{ type: "text", text: "output " + id }], tool: { callId: "c" + id, name: "bash", isError: false, ...tool } });
+  routes = {
+    ...base(),
+    "GET /api/spaces": () => ({ status: 200, body: spaces }),
+    "POST /api/views/space": () => ({ status: 200, body: viewOf("v1", "default") }),
+    "POST /api/conversation/entries": () => ({ status: 200, body: { items: [
+      result(23, { name: "codemode", isError: true }), result(22, { isError: true, exitCode: 1 }), result(21, {})], next: null } }),
+  };
+  mount("conversations");
+  await until(() => container.querySelector(".space-card") !== null, "空间卡片");
+  container.querySelector<HTMLButtonElement>(".space-card")!.click();
+  await shows("张三");
+  container.querySelector<HTMLButtonElement>(".member-row")!.click();
+  await shows("output 23");
+  const rows = [...container.querySelectorAll(".tool-result")].map(row => [row.getAttribute("data-entry"), row.className.replace("tool-result", "").trim(),
+    row.querySelector("summary .muted")!.textContent]);
+  expect(rows).toEqual([["21", "", "结果"], ["22", "exited", "退出码 1"], ["23", "failed", "失败"]]);
+});
+
 test("完整身份需要本次确认；切换模式保留当前成员并重新读取，返回列表后回到默认", async () => {
   let opened = 0;
   routes = {
