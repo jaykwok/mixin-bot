@@ -289,7 +289,7 @@ async function uninstall(context: Context): Promise<number> {
     else warn("没有可删除的 LaunchDaemon");
     // A console task does not ask: its confirmed choice, checked with the task and plan above.
     const archive = context.env.MIXIN_OPS_CONSOLE === "1" ? context.env.MIXIN_OPS_UNINSTALL_DATA === "1"
-      : askYesNo("是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N] ", false, context.env);
+      : askYesNo("是否把 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/ 移入 backup/rm 归档？[y/N] ", false, context.env);
     if (archive) {
       archiveServiceData(project);
       ok("data/ 和 logs/ 已移入 backup/rm");

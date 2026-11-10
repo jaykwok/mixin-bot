@@ -769,7 +769,7 @@ uninstall() {
         if docker rmi mixin-bot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; UNINSTALL_NOTE='；镜像未完全删除（见任务输出）'; fi
     fi
 
-    if uninstall_choice MIXIN_OPS_UNINSTALL_DATA "是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N] "; then
+    if uninstall_choice MIXIN_OPS_UNINSTALL_DATA "是否把 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/ 移入 backup/rm 归档？[y/N] "; then
         # logs/ 先移：任何一步失败时 data/ 都还在，控制台仍按已部署处理，可以再次卸载。
         if archive_project_path "${PROJECT_DIR}/logs" && archive_project_path "${PROJECT_DIR}/data" &&
             [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then

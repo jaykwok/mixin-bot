@@ -927,7 +927,7 @@ function Remove-BotInstallation {
     }
     # 控制台任务不提问：用网页确认的选择（核心在锁内随任务和计划一起核对过，uninstall-check）。
     $archiveData = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { $env:MIXIN_OPS_UNINSTALL_DATA -ceq '1' }
-        else { Read-YesNo "是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N]" $false }
+        else { Read-YesNo "是否把 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/ 移入 backup/rm 归档？[y/N]" $false }
     if ($archiveData) {
         $logsDir = Join-Path $Project "logs"
         $script:UninstallLock.Dispose(); $script:UninstallLock = $null
