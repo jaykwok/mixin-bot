@@ -899,7 +899,9 @@ export class PushService {
     const chosen = this.#unanswered(push).filter(recipient => (!members || members.includes(recipient.member))
       && recipient.sendState !== "pending" && recipient.sendState !== "sending");
     // A new card message each (`card: null`); the old card keeps working, a click on it makes it the one updated again.
-    for (const recipient of chosen) this.#store.updateRecipient(pushId, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null });
+    this.#store.transaction(() => {
+      for (const recipient of chosen) this.#store.updateRecipient(pushId, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null });
+    });
     if (chosen.length) { log.info(`推送 ${pushId}：补推送 ${chosen.length} 张卡片`); this.#pump(); }
     return { resent: chosen.length };
   }
@@ -1293,7 +1295,7 @@ export class PushService {
     const waiting = this.#store.awaitingReply(phone).filter(recipient => (recipient.hintedAt === null || now - recipient.hintedAt >= this.#limits.hintMs)
       && now < this.#store.push(recipient.pushId)!.deadline);
     if (!waiting.length) return;
-    for (const recipient of waiting) this.#store.updateRecipient(recipient.pushId, phone, { hintedAt: now });
+    this.#store.transaction(() => { for (const recipient of waiting) this.#store.updateRecipient(recipient.pushId, phone, { hintedAt: now }); });
     const subjects = waiting.map(recipient => `「${this.#store.push(recipient.pushId)!.subject}」`).join("、");
     this.#notice(reply, `你有 ${waiting.length} 条推送待回复：${subjects}。回复请先点卡片上的「回复」，再发送内容；这条消息按普通提问处理。`);
   }
@@ -1314,11 +1316,13 @@ export class PushService {
       for (const push of this.#store.pushesIn(LIVE_STATES)) {
         if (now >= push.deadline) { this.#close(push.id, "deadline"); continue; }
         // Groups get no reminder: their reply stays open until someone ends it or the deadline.
-        for (const recipient of this.#store.unreminded(push.id)) {
-          if (now - recipient.activityAt! < this.#limits.idleReminderMs || !this.#store.items(push.id, recipient.member, recipient.draft).length) continue;
-          this.#store.updateRecipient(push.id, recipient.member, { remindedAt: now });
-          this.#text(this.#memberTarget(recipient), `「${push.subject}」的回复还没有提交。发完了请点卡片上的「已回复」或发送 /完成；提交前发来的消息都会记入这次回复，截止时已发送的内容也会按已回复提交。`);
-        }
+        this.#atomic(() => {
+          for (const recipient of this.#store.unreminded(push.id)) {
+            if (now - recipient.activityAt! < this.#limits.idleReminderMs || !this.#store.items(push.id, recipient.member, recipient.draft).length) continue;
+            this.#store.updateRecipient(push.id, recipient.member, { remindedAt: now });
+            this.#text(this.#memberTarget(recipient), `「${push.subject}」的回复还没有提交。发完了请点卡片上的「已回复」或发送 /完成；提交前发来的消息都会记入这次回复，截止时已发送的内容也会按已回复提交。`);
+          }
+        });
       }
       this.#pump();
       this.#track(this.#drainNotes());
@@ -1434,24 +1438,50 @@ export class PushService {
 
   /** Close a live push: open drafts with content are submitted, the cards show the end, the summary is due. */
   #close(pushId: string, reason: "deadline" | "complete"): void {
-    const push = this.#store.push(pushId);
-    if (!push || !LIVE_STATES.includes(push.state)) return;
-    for (const recipient of this.#store.recipients(pushId)) {
-      if (recipient.replyState === "replying" && !this.#submit(push, recipient, "deadline")) {
-        this.#store.updateRecipient(pushId, recipient.member, { replyState: recipient.submitted > 0 ? "submitted" : "none", draft: 0 });
+    // One transaction for the whole list (5000 rows at most): a commit per row is a disk sync each, on the thread that
+    // answers messages. What it sends starts after the commit.
+    this.#atomic(() => {
+      const push = this.#store.push(pushId);
+      if (!push || !LIVE_STATES.includes(push.state)) return;
+      for (const recipient of this.#store.recipients(pushId)) {
+        if (recipient.replyState === "replying" && !this.#submit(push, recipient, "deadline")) {
+          this.#store.updateRecipient(pushId, recipient.member, { replyState: recipient.submitted > 0 ? "submitted" : "none", draft: 0 });
+        }
+        if (recipient.sendState === "pending" || (recipient.sendState === "failed" && recipient.retryAt !== null)) {
+          this.#store.updateRecipient(pushId, recipient.member, { sendState: "failed", retryAt: null, sendError: recipient.sendError ?? "截止前没有发出" });
+        }
       }
-      if (recipient.sendState === "pending" || (recipient.sendState === "failed" && recipient.retryAt !== null)) {
-        this.#store.updateRecipient(pushId, recipient.member, { sendState: "failed", retryAt: null, sendError: recipient.sendError ?? "截止前没有发出" });
-      }
-    }
-    if (!this.#store.movePush(pushId, LIVE_STATES, { state: "closed", closedAt: this.#now(), closeReason: reason, summaryState: "pending" })) return;
-    log.info(`推送 ${pushId} 已${reason === "deadline" ? "截止" : "全部答复，提前结束"}`);
-    for (const recipient of this.#store.recipients(pushId)) {
-      this.#store.updateRecipient(pushId, recipient.member, { version: recipient.version + 1 });
-      this.#refreshCard(pushId, recipient.member);
-    }
-    this.#refreshPreview(pushId);
-    this.#track(this.#summarize(pushId));
+      if (!this.#store.movePush(pushId, LIVE_STATES, { state: "closed", closedAt: this.#now(), closeReason: reason, summaryState: "pending" })) return;
+      log.info(`推送 ${pushId} 已${reason === "deadline" ? "截止" : "全部答复，提前结束"}`);
+      this.#store.bumpVersions(pushId);
+      // Only a card someone clicked has a known ID to update.
+      for (const recipient of this.#store.recipients(pushId)) if (recipient.card) this.#refreshCard(pushId, recipient.member);
+      this.#refreshPreview(pushId);
+      this.#effect(() => this.#track(this.#summarize(pushId)));
+    });
+  }
+
+  /** While `#atomic` runs: what its work sends, to start once the transaction has committed. */
+  #after: (() => void)[] | null = null;
+
+  /**
+   * Run `work` in one transaction. The texts, notices, card updates, attachment releases and note deliveries it asks for
+   * start after the commit, and not at all when it fails: nothing goes out for a change that was rolled back.
+   */
+  #atomic<T>(work: () => T): T {
+    if (this.#after) return work();
+    const after: (() => void)[] = [];
+    this.#after = after;
+    let result: T;
+    try { result = this.#store.transaction(work); }
+    finally { this.#after = null; }
+    for (const run of after) run();
+    return result;
+  }
+
+  #effect(run: () => void): void {
+    if (this.#after) this.#after.push(run);
+    else run();
   }
 
   /**
@@ -1475,7 +1505,9 @@ export class PushService {
       if (this.#now() - (push.closedAt ?? 0) < this.#limits.settleWaitMs
         && current.some(recipient => recipient.sendState === "sending" || effectiveItems(recipient, items).some(item => unsettled(item, files)))) return;
       // A card still without a result is unknown for good (#send leaves it so), then the counts below cannot change.
-      for (const recipient of current) if (recipient.sendState === "sending") this.#store.updateRecipient(pushId, recipient.member, { sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
+      this.#store.transaction(() => {
+        for (const recipient of current) if (recipient.sendState === "sending") this.#store.updateRecipient(pushId, recipient.member, { sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
+      });
       const recipients = this.#store.recipients(pushId);
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -1616,7 +1648,8 @@ export class PushService {
   #release(pushId: string, member: string, items: readonly ReplyItem[]): void {
     const ids = items.flatMap(item => item.attachment ? [item.attachment] : []);
     if (!ids.length || !this.#host) return;
-    this.#track(this.#host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids).catch(error => { if (!this.#signal.aborted) this.#report(error); }));
+    const host = this.#host;
+    this.#effect(() => this.#track(host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids).catch(error => { if (!this.#signal.aborted) this.#report(error); })));
   }
 
   /** Attachment items a process left half registered: find the registration by the message, or mark it failed. */
@@ -1635,7 +1668,7 @@ export class PushService {
   /** A note for the member's conversation in `scope` (their direct chat, or a group). */
   #note(scope: Scope, phone: string, requestId: string, text: string, data: Record<string, string | number>): void {
     this.#store.addNote({ scope: scopeKey(scope), requestId: `push-note:${requestId}`, phone, text, data: JSON.stringify(data) }, this.#now());
-    this.#track(this.#drainNotes());
+    this.#effect(() => this.#track(this.#drainNotes()));
   }
 
   #draining = false;
@@ -1718,6 +1751,7 @@ export class PushService {
 
   /** Update a card in place with its state at send time; updates asked for meanwhile coalesce into one more. */
   #refresh(key: string, build: () => { target: Target; card: CardContent } | undefined): void {
+    if (this.#after) { this.#after.push(() => this.#refresh(key, build)); return; }
     const running = this.#refreshing.get(key);
     if (running) { running.again = true; return; }
     const state = { again: false };
@@ -1741,13 +1775,13 @@ export class PushService {
   }
 
   #text(target: Target, text: string): void {
-    this.#track(this.#outbound.send(target, textMessage(text), { signal: this.#signal }).then(outcome => {
+    this.#effect(() => this.#track(this.#outbound.send(target, textMessage(text), { signal: this.#signal }).then(outcome => {
       if (outcome.status === "failed" && !this.#signal.aborted) log.warn(`推送提示没有发出：${outcome.reason}`);
-    }));
+    })));
   }
 
   #notice(reply: ReplyContext, text: string): void {
-    this.#track(sendNotice(this.#outbound, reply, text, { signal: this.#signal }));
+    this.#effect(() => this.#track(sendNotice(this.#outbound, reply, text, { signal: this.#signal })));
   }
 
   #track(work: Promise<unknown>): void {

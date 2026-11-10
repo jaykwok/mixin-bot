@@ -172,7 +172,7 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   });
   const groupText = (groupId: string, phone: string, value: string, context = groupReply(groupId, phone)) => service.groupText(groupId, byPhone.get(phone)!, context, value);
   return {
-    root, store, sent, uploads, reports, clock, failing, gate, records, notes, attached, released, registering, finishDownload, abort, reply, identity, cards, texts,
+    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, attached, released, registering, finishDownload, abort, reply, identity, cards, texts,
     files, card, buttonOf, click,
     settle, prepare, pushId, tree, grant, groupReply, groupCards, groupTexts, groupClick, groupText, get service() { return service; },
     async restart() { await service.close(); service = make(); },
@@ -435,6 +435,64 @@ test("deadline: an open draft with content counts as replied, one without conten
     await h.settle();
     expect(h.card(LI).status.name).toBe("未回复");
     expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("deadline, reminders and 补推送 write the whole list in one transaction; a close that fails half way changes nothing and sends nothing", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
+    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    h.click(LI, h.card(LI), "回复", "card-li");
+    await h.settle();
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
+    expect(h.service.directText(h.identity(LI), h.reply(LI), "李四的回复")).toBe(true);
+    await h.settle();
+    // Every row write from here on: whether a transaction was open, and a failure on demand.
+    const writes: boolean[] = [], update = h.store.updateRecipient.bind(h.store);
+    let failAt = 0;
+    h.store.updateRecipient = (...args) => {
+      writes.push(h.db.inTransaction);
+      if (writes.length === failAt) throw new Error("disk full");
+      update(...args);
+    };
+    const outside = () => writes.filter(inside => !inside).length;
+    // Two idle drafts are reminded in one transaction.
+    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
+    h.service.tick();
+    await h.settle();
+    expect([writes.length, outside()]).toEqual([2, 0]);
+    expect([ZHANG, LI].map(phone => h.texts(phone).filter(text => text.includes("还没有提交")).length)).toEqual([1, 1]);
+    // 补推送 to the one without an answer or a draft.
+    writes.length = 0;
+    expect(await h.service.remind(id, [WANG])).toEqual({ resent: 1 });
+    expect(writes[0]).toBe(true);
+    await h.settle();
+    // The deadline: the second row's write fails. The first row's submission is rolled back and its messages are not sent.
+    const before = { sent: h.sent.length, notes: h.notes.length, rows: h.store.recipients(id) };
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    writes.length = 0;
+    failAt = 2;
+    h.service.tick();
+    await h.settle();
+    expect(h.reports.map(String)).toEqual(["Error: disk full"]);
+    expect(h.store.push(id)!.state).toBe("open");
+    expect(h.store.recipients(id)).toEqual(before.rows);
+    expect([h.sent.length, h.notes.length]).toEqual([before.sent, before.notes]);
+    // The next pass closes it: both drafts submitted, each told once, every write inside the one transaction.
+    failAt = 0;
+    writes.length = 0;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.state).toBe("closed");
+    expect(outside()).toBe(0);
+    expect(h.store.recipients(id).map(recipient => [recipient.submitted, recipient.replyState, recipient.version > before.rows.find(row => row.member === recipient.member)!.version]))
+      .toEqual([[1, "submitted", true], [1, "submitted", true], [0, "none", true]]);
+    expect([ZHANG, LI].map(phone => h.texts(phone).filter(text => text.includes("已到截止时间")).length)).toEqual([1, 1]);
+    expect(h.notes.filter(note => note.requestId.includes(`reply:${id}`)).map(note => note.phone).toSorted()).toEqual([ZHANG, LI].toSorted());
+    // The cards someone clicked show the end.
+    expect([h.card(ZHANG).status.name, h.card(LI).status.name]).toEqual(["已回复", "已回复"]);
+    expect(h.store.push(id)!.summaryState).toBe("sent");
   } finally { await h.close(); }
 });
 

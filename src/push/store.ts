@@ -469,6 +469,11 @@ export class PushStore {
       .run(...keys.map(key => change[key] as SQLQueryBindings), pushId, member);
   }
 
+  /** Every card of the push is out of date (the push ended): clicks on the buttons as sent no longer count. */
+  bumpVersions(pushId: string): void {
+    this.db.query("UPDATE push_recipients SET version = version + 1 WHERE push_id = ?").run(pushId);
+  }
+
   /** A push's people replying with activity and not reminded yet (the idle reminder; groups get none). */
   unreminded(pushId: string): Recipient[] {
     return (this.db.query(`SELECT * FROM push_recipients WHERE push_id = ? AND reply_state = 'replying' AND reminded_at IS NULL
