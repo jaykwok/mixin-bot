@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, realpathSync, rmSync, statSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { assertDeploymentEnvironment, deploymentOptions, deploymentEnvironment, deploymentScope, uninstallScope } from "../../ops/core/deployment-options.ts";
+import { assertDeploymentEnvironment, deploymentOptions, deploymentEnvironment, deploymentScope, sameWindowsPath, uninstallScope } from "../../ops/core/deployment-options.ts";
 import { operationArgs, operationCommand } from "../../ops/core/operations.ts";
 import { codeDigest } from "../../ops/core/source-runtime.ts";
 import { checkTaskPlan } from "../../ops/core/check-plan.ts";
@@ -241,5 +241,22 @@ test("卸载只接收两项明确选择并逐项传给入口；预览绑定本�
     await expect(uninstallScope(f.root, keep, f.run, f.launchd)).rejects.toThrow();
     rmSync(join(f.root, "data"), { recursive: true });
     await expect(uninstallScope(f.root, archive, f.run, f.launchd)).rejects.toThrow("没有可卸载");
+  } finally { await f.cleanup(); }
+});
+
+test("the scheduled task's directory is compared as Windows compares paths: case and a trailing separator do not make another deployment", async () => {
+  expect(sameWindowsPath("d:\\projects\\Mixin-Bot\\", "D:\\Projects\\mixin-bot")).toBe(true);
+  expect(sameWindowsPath("D:/Projects/mixin-bot", "D:\\Projects\\mixin-bot")).toBe(true);
+  expect(sameWindowsPath("D:\\Projects\\mixin-bot2", "D:\\Projects\\mixin-bot")).toBe(false);
+  expect(sameWindowsPath("", "D:\\Projects\\mixin-bot")).toBe(false);
+  if (process.platform !== "win32") return;
+  // The task keeps the directory as typed at deployment; the console has it as the file system spells it.
+  const f = await fixture();
+  try {
+    const typed: Runner = async (argv, environment) => argv[0] === "powershell"
+      ? { code: 0, stderr: "", stdout: JSON.stringify({ Principal: { UserId: "first" }, Actions: [{ WorkingDirectory: `${f.root.toUpperCase()}\\`, Execute: "fixture" }] }) }
+      : f.run(argv, environment);
+    expect((await uninstallScope(f.root, { data: false, image: false }, typed, f.launchd)).summary.join("\n")).toContain("注销计划任务 mixin-bot");
+    expect((await deploymentScope(f.root, "update", choice, typed, f.launchd)).scope).toBeString();
   } finally { await f.cleanup(); }
 });

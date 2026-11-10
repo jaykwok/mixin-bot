@@ -1,7 +1,7 @@
 // Explicit choices for new lifecycle operations. No stdin defaults and no arbitrary environment/argv from the browser.
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, win32 } from "node:path";
 import { readDirectoryScope } from "../../src/integrations/open-platform/directory-scope.ts";
 import { assertMaintenanceAction } from "../../src/core/maintenance-state.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
@@ -110,7 +110,7 @@ export async function uninstallScope(project: string, params: Record<string, unk
   let identity: unknown, installed: boolean;
   if (process.platform === "win32") {
     const task = await scheduledTask(run), actions = task?.Actions;
-    if (task && (actions?.length !== 1 || resolve(actions[0]!.WorkingDirectory ?? "") !== resolve(project))) throw new Error("本机的计划任务 mixin-bot 属于另一个目录：请在那个目录卸载");
+    if (task && (actions?.length !== 1 || !sameWindowsPath(actions[0]!.WorkingDirectory ?? "", project))) throw new Error("本机的计划任务 mixin-bot 属于另一个目录：请在那个目录卸载");
     identity = task; installed = task !== null;
     summary.push(task ? "停止机器人并注销计划任务 mixin-bot；launcher 移入 backup/rm。" : "计划任务 mixin-bot 不存在；结束本项目残留的机器人进程（如有）。");
   } else if (process.platform === "darwin") {
@@ -259,6 +259,16 @@ export async function installScope(project: string, params: Record<string, unkno
   ] };
 }
 
+/**
+ * Two Windows paths naming the same directory, as the PowerShell entries compare the task's directory with theirs (`-eq`:
+ * without case). The task keeps the directory as it was typed when the bot was deployed, this process has it as the
+ * file system spells it: `d:\projects\Mixin-Bot` and `D:\Projects\mixin-bot` are one deployment.
+ */
+export function sameWindowsPath(a: string, b: string): boolean {
+  const normal = (path: string) => win32.resolve(path).replace(/\\+$/, "").toLowerCase();
+  return normal(a) === normal(b);
+}
+
 /** The scheduled task mixin-bot as the plan binds it, or null when there is none. A listing that fails is not "none". */
 async function scheduledTask(run: Runner): Promise<{ Actions?: { WorkingDirectory?: string }[] } | null> {
   const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -302,7 +312,7 @@ async function deploymentIdentity(project: string, run: Runner, launchd: Partial
     }
     identity = task;
     const actions = task.Actions;
-    if (actions?.length !== 1 || resolve(actions[0]!.WorkingDirectory ?? "") !== resolve(project)) throw new Error("机器人计划任务不属于此部署");
+    if (actions?.length !== 1 || !sameWindowsPath(actions[0]!.WorkingDirectory ?? "", project)) throw new Error("机器人计划任务不属于此部署");
   } else if (process.platform === "darwin") {
     const service = await new LaunchdPlatform(project, { ...launchd, run }).inspect();
     if (service.state === "absent") {
