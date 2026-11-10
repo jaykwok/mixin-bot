@@ -263,7 +263,7 @@ export function createDocumentTextLookup(options: DocumentOptions, signal: Abort
 const extractOutput = obj({
   source: str({ description: "原件的实际路径" }),
   format: oneOf(["pdf", "docx", "pptx", "xlsx"]),
-  path: str({ description: "提取出的文本文件，用 read/bash 按需读取" }),
+  path: str({ description: "提取出的文本文件，用 read/bash 按需读取；按关键词检索这份文档时把 source 传给 materials_grep 的 paths" }),
   digest: str({ description: "原件内容的 SHA-256 摘要" }),
   units: int({ minimum: 0, description: "已提取的页（PDF）、正文块（DOCX）、幻灯片（PPTX）或工作表（XLSX）数" }),
   characters: int({ minimum: 0 }),

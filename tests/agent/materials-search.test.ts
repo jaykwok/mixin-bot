@@ -36,6 +36,34 @@ test("filename/body searches respect ignore, hidden paths and group boundaries; 
   await expect(f.call("materials_grep", { keywords: ["策略"], paths: ["../other/secret.txt"] })).rejects.toThrow("只能检索共享资料索引中的路径");
 });
 
+test("paths name documents or directories; a path that matches nothing is reported instead of reading as nothing found", async () => {
+  const f = await setup(), inside = join(f.options.workspaceDir, "产品-安全", "安全大脑（网关型）");
+  await mkdir(inside, { recursive: true }); await mkdir(join(f.options.workspaceDir, "产品-安全大脑"));
+  await Promise.all([join(inside, "参数.txt"), join(f.options.workspaceDir, "产品-安全", "概述.md"), join(f.options.workspaceDir, "产品-安全大脑", "别的.txt"),
+    join(f.options.workspaceDir, "根.txt")].map(path => writeFile(path, "认证方式")));
+  await f.call("materials_find", {});
+  const search = async (paths: string[]) => { const r = await f.call("materials_grep", { keywords: ["认证"], paths });
+    return [r.hits.map((hit: any) => hit.path).sort(), r.scanned, r.unmatchedPaths, r.incomplete]; };
+  // A directory covers everything below it, and only that: a sibling whose name starts the same is not inside.
+  expect(await search(["产品-安全"])).toEqual([["产品-安全/安全大脑（网关型）/参数.txt", "产品-安全/概述.md"].sort(), 2, undefined, false]);
+  expect(await search(["产品-安全/安全大脑（网关型）/", "根.txt"])).toEqual([["产品-安全/安全大脑（网关型）/参数.txt", "根.txt"].sort(), 2, undefined, false]);
+  expect(await search([join(inside, "参数.txt")])).toEqual([["产品-安全/安全大脑（网关型）/参数.txt"], 1, undefined, false]);
+  // Nothing in the index under that path: said so, and the search is not complete.
+  expect(await search(["产品-安全/不存在的目录"])).toEqual([[], 0, ["产品-安全/不存在的目录"], true]);
+  expect(await search(["根.txt", "没有.txt"])).toEqual([["根.txt"], 1, ["没有.txt"], true]);
+});
+
+test("formats no extraction can make searchable are counted, not listed among the documents to extract", async () => {
+  const f = await setup();
+  await Promise.all(["public.txt", "manual.docx", "a-sync.py", "a-logo.png"].map(x => writeFile(join(f.options.workspaceDir, x), "安全网关 策略")));
+  await f.call("materials_find", {});
+  const mixed = await f.call("materials_grep", { keywords: ["安全网关"] });
+  expect([mixed.unsupported, mixed.notIndexedCount, mixed.notIndexed.map((x: any) => x.path), mixed.scanned]).toEqual([2, 1, ["manual.docx"], 4]);
+  // Alone they do not make a search incomplete.
+  const plainOnly = await f.call("materials_grep", { keywords: ["安全网关"], paths: ["public.txt", "a-sync.py"] });
+  expect([plainOnly.hits.length, plainOnly.unsupported, plainOnly.notIndexed, plainOnly.incomplete]).toEqual([1, 1, [], false]);
+});
+
 test("a cache entry without source fields needs one explicit extraction; a cache hit registers a pointer without parsing and source edits invalidate it", async () => {
   const f = await setup(), source = join(f.options.workspaceDir, "manual.docx");
   const digest = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
@@ -83,6 +111,36 @@ test.each([false, true])("300 large unpointed documents read the cache catalogue
       console.log(JSON.stringify({ unpointedLargeFiles: 300, cacheDirs: 128, legacy, round, ms: performance.now() - started }));
     }
   } finally { listing.mockRestore(); reading.mockRestore(); hashing.mockRestore(); }
+});
+
+test("the text path document_extract returned stands for its document in paths; other paths outside the materials are refused with what to pass", async () => {
+  const f = await setup(), digest = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
+  const source = join(f.options.workspaceDir, "产品", "手册.docx"), other = join(f.options.workspaceDir, "其他.docx");
+  await mkdir(join(f.options.workspaceDir, "产品"));
+  await writeFile(source, "original"); await writeFile(other, "another");
+  const cacheOf = async (name: string, document: string | undefined, body: string) => {
+    const cache = join(f.root, "index/parsed", digest(name)); await mkdir(cache, { recursive: true });
+    const s = await stat(document ?? source);
+    await writeFile(join(cache, "text.txt"), body);
+    await writeFile(join(cache, "metadata.json"), JSON.stringify({ textHash: digest(body), truncated: false,
+      ...(document ? { sourcePath: document, sourceStamp: JSON.stringify([s.size, s.mtimeMs, s.ctimeMs, s.ino, s.birthtimeMs]) } : {}) }));
+    return join(cache, "text.txt");
+  };
+  const text = await cacheOf("a", source, "第一行\n认证方式：账号\n");
+  await cacheOf("b", other, "认证：其他文档\n");
+  await f.call("materials_find", {});
+  expect((await f.call("materials_grep", { keywords: ["认证"] })).hits.map((hit: any) => hit.path).sort()).toEqual(["产品/手册.docx", "其他.docx"].sort());
+  // Both ways the model writes the path: only that document is searched, and the hit names the document.
+  for (const path of [text, text.replaceAll("\\", "/")]) {
+    const result = await f.call("materials_grep", { keywords: ["认证"], paths: [path] });
+    expect([result.scanned, result.notIndexed, result.hits.map((hit: any) => [hit.path, hit.line, hit.extracted])]).toEqual([1, [], [["产品/手册.docx", 2, true]]]);
+  }
+  // A cache without its source, a text elsewhere in the index, and a member's own file: refused, with what to pass instead.
+  const orphan = await cacheOf("c", undefined, "认证\n");
+  await writeFile(join(f.options.tempDir, "notes.txt"), "认证");
+  for (const path of [orphan, join(f.root, "index/materials.md"), join(f.options.tempDir, "notes.txt")]) {
+    await expect(f.call("materials_grep", { keywords: ["认证"], paths: [path] })).rejects.toThrow(/只能检索共享资料索引中的路径：paths 传资料原件的路径.*read 读取/);
+  }
 });
 
 test("current source metadata without a pointer uses stat identity, and a later source edit is not reused", async () => {

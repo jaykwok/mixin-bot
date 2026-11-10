@@ -1,5 +1,5 @@
-import { lstat, open, realpath, stat } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { lstat, open, readFile, realpath, stat } from "node:fs/promises";
+import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { arr, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { MemberToolSpec } from "../durable/tools.ts";
 import { materialsRecords, loadIgnorePrefixes, isIgnored } from "./materials-index.ts";
@@ -41,6 +41,23 @@ async function boundedText(path: string, signal: AbortSignal): Promise<string> {
 }
 
 /**
+ * The document a path in `paths` stands for. document_extract returns the text it extracted (`<index>/parsed/<key>/text.txt`),
+ * and the model has passed that path here to search "in this document": the cache records the document it came from, and
+ * searching that document reads the same text. Any other path is returned as given.
+ */
+async function documentOfExtract(path: string, indexPath: string): Promise<string> {
+  const parsed = join(await realpath(dirname(indexPath)).catch(() => resolve(dirname(indexPath))), "parsed");
+  const parts = isPathInside(path, parsed) ? relative(parsed, path).split(sep) : [];
+  if (parts.length !== 2 || !/^[a-f0-9]{64}$/.test(parts[0]!) || parts[1] !== "text.txt") return path;
+  try {
+    const info = await lstat(join(parsed, parts[0]!, "metadata.json"));
+    if (!info.isFile() || info.size > 64 * 1024) return path;
+    const metadata = JSON.parse(await readFile(join(parsed, parts[0]!, "metadata.json"), "utf8")) as { sourcePath?: unknown };
+    return typeof metadata.sourcePath === "string" ? resolve(metadata.sourcePath) : path;
+  } catch { return path; }
+}
+
+/**
  * materials_find and materials_grep over the calling member's workspace and index; `ignorePath` is the administrator's
  * ignore list. All work stays in this process. Cache misses are returned, never silently turned into parser jobs.
  */
@@ -64,18 +81,29 @@ export function materialsTools(ignorePath: string): MemberToolSpec[] {
   };
   const grep: MemberToolSpec<typeof grepParams> = {
     name: "materials_grep", parameters: grepParams,
-    description: "在共享资料的纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索。最多 15 秒、12 KB 结果，每文件最多 5 个命中。",
+    description: "在共享资料的纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。paths 限定只查其中几份资料或几个目录，传原件或目录的路径；索引里找不到的路径列在 unmatchedPaths（先用 materials_find 核对路径）。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索；图片、压缩包、脚本等不支持正文检索的文件只计入 unsupported。最多 15 秒、12 KB 结果，每文件最多 5 个命中。",
     async run(params, { places: options }, { signal: callerSignal }) {
       const started = performance.now();
       const budget = AbortSignal.timeout(15_000), signal = AbortSignal.any([budget, ...(callerSignal ? [callerSignal] : [])]);
       const data = await index(options), root = await realpath(options.workspaceDir);
-      const wanted = params.paths?.map(x => resolve(root, x));
-      if (wanted?.some(x => !isPathInside(x, root))) throw new Error("只能检索共享资料索引中的路径");
-      const entries = data.entries.filter(x => !wanted || wanted.includes(resolve(root, x.path)));
+      const wanted = params.paths && await Promise.all(params.paths.map(x => documentOfExtract(resolve(root, x), options.indexPath)));
+      if (wanted?.some(x => !isPathInside(x, root))) {
+        throw new Error("只能检索共享资料索引中的路径：paths 传资料原件的路径（materials_find 返回的路径，或 document_extract 结果里的 source）；检索原件时自动使用它的解析文本。其他位置的文本文件用 read 读取");
+      }
+      // A path names one document or a directory of them. One that matches nothing in the index is reported: a search
+      // of no files would otherwise read as "searched, nothing found".
+      const matched = new Set<number>();
+      const entries = !wanted ? data.entries : data.entries.filter(x => {
+        const full = resolve(root, x.path);
+        let found = false;
+        wanted.forEach((path, n) => { if (isPathInside(full, path)) { matched.add(n); found = true; } });
+        return found;
+      });
+      const unmatchedPaths = (params.paths ?? []).filter((_, n) => !matched.has(n));
       const cachedText = createDocumentTextLookup(options, signal);
       const hits: { path: string; line: number; snippet: string; extracted: boolean; truncated: boolean }[] = [];
       const notIndexed: { path: string; reason: string }[] = [];
-      let scanned = 0, bytes = 0, incomplete = data.summary.truncated, missingCount = 0;
+      let scanned = 0, bytes = 0, incomplete = data.summary.truncated || unmatchedPaths.length > 0, missingCount = 0, unsupported = 0;
       try {
         for (const entry of entries) {
           signal.throwIfAborted();
@@ -98,7 +126,7 @@ export function materialsTools(ignorePath: string): MemberToolSpec[] {
               if ("reason" in cached) { miss(cached.reason); continue; }
               path = cached.path; extracted = true; truncated = cached.truncated;
               if (truncated) incomplete = true;
-            } else { miss("未支持此文件格式的正文检索"); continue; }
+            } else { unsupported++; continue; } // No extraction can make it searchable: counted, and kept out of the list of documents to extract.
             const content = await boundedText(path, signal);
             if (Buffer.byteLength(content) > 8 * 1024 * 1024) { miss("文件读取期间超过上限"); continue; }
             const current = await stat(source);
@@ -119,7 +147,7 @@ export function materialsTools(ignorePath: string): MemberToolSpec[] {
           finally { scanned++; }
         }
       } catch (error) { callerSignal?.throwIfAborted(); if (!budget.aborted) throw error; incomplete = true; }
-      const value = { hits, notIndexed, notIndexedCount: missingCount, scanned, unscanned: Math.max(0, entries.length - scanned), incomplete,
+      const value = { hits, notIndexed, notIndexedCount: missingCount, unsupported, ...(unmatchedPaths.length ? { unmatchedPaths } : {}), scanned, unscanned: Math.max(0, entries.length - scanned), incomplete,
         stale: data.stale, generatedAt: data.summary.generatedAt };
       searchTiming(started, scanned, hits.length);
       return { output: [{ type: "text", text: JSON.stringify(value) }], details: value };
