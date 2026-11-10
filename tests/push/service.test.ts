@@ -1171,6 +1171,85 @@ test("summary card: 「提醒未回复」 prepares one follow-up for the people 
   } finally { await h.close(); }
 });
 
+test("previews: confirming a push deletes the pusher's earlier unconfirmed previews, not later ones, follow-ups or another pusher's; an old card's buttons are answered", async () => {
+  const h = harness();
+  try {
+    // A closed push with nobody answered: its summary card prepares follow-ups.
+    const closed = await confirmed(h, { deadline: "2026-11-04 18:00" });
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    h.store.replaceRoles([{ phone: PUSHER, admin: false, pusher: true, grants: {}, dailyLimit: null }, { phone: WANG, admin: false, pusher: true, grants: {}, dailyLimit: null }], h.clock.now);
+    // Three rounds of one push, with a follow-up preview and another pusher's preview between them, and another push prepared after.
+    const first = h.pushId(await h.prepare({ body: "第一版" }));
+    const firstCard = h.card(PUSHER, first);
+    h.clock.now += 60_000;
+    h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-1");
+    await h.settle();
+    const followUp = h.store.push(closed)!.followUp!;
+    h.clock.now += 1000;
+    const others = h.pushId(await h.service.prepare({ phone: WANG, reply: h.reply(WANG) }, { recipients: [{ name: "张三", phone: ZHANG }], subject: "王五的推送", body: "正文", mode: "ack" }));
+    h.clock.now += 60_000;
+    const second = h.pushId(await h.prepare({ body: "第二版" }));
+    h.clock.now += 60_000;
+    const answer = await h.prepare({ body: "第三版" }), third = h.pushId(answer);
+    expect(answer).toContain("之前准备、还没有确认的 2 条预览在确认这一条后清理，旧卡片不再有效。");
+    h.clock.now += 60_000;
+    const later = h.pushId(await h.prepare({ subject: "另一件事" }));
+    const texts = h.texts(PUSHER).length;
+    h.click(PUSHER, h.card(PUSHER, third), "确认推送", "preview-third");
+    await h.settle();
+    expect(h.store.push(third)!.state).toBe("open");
+    expect([h.store.push(first), h.store.push(second), h.store.recipients(first), h.store.recipients(second)]).toEqual([undefined, undefined, [], []]);
+    expect([followUp, others, later].map(id => h.store.push(id)!.state)).toEqual(["preview", "preview", "preview"]);
+    expect(h.service.list({ group: "preview", before: null, limit: 10 }).pushes.map(push => push.id)).toEqual([later, others, followUp]);
+    expect(h.texts(PUSHER).length).toBe(texts);
+    // The first round's card still shows its buttons: a click sends nothing and says so, once.
+    const firstClick = () => h.service.click({
+      payload: { eventType: "callback:card_interaction", userId: `im-${PUSHER}`, msgUid: "preview-first", groupId: "", type: "api",
+        content: { url: "", method: "POST", headers: {}, data: JSON.stringify(h.buttonOf(firstCard, "确认推送").value.data) } },
+      sentAt: 1, receivedAt: h.clock.now,
+    });
+    firstClick();
+    firstClick();
+    await h.settle();
+    expect(h.texts(PUSHER).slice(texts)).toEqual(["这张预览卡片对应的推送记录已清理，没有发出任何内容。确认发出一条推送后，在它之前准备、还没有确认的预览会一并清理；还需要的话请重新提出。"]);
+    expect(h.cards(ZHANG).filter(each => each.content.includes("第一版"))).toHaveLength(0);
+    h.click(PUSHER, firstCard, "取消", "preview-first");
+    await h.settle();
+    expect(h.texts(PUSHER).slice(texts)).toHaveLength(2);
+    // A confirmed follow-up clears nothing: the push prepared before it is another matter.
+    h.click(PUSHER, previewOf(h, followUp), "取消", "follow-1");
+    await h.settle();
+    h.clock.now += 60_000;
+    h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-1");
+    await h.settle();
+    const again = h.store.push(closed)!.followUp!;
+    expect(again).not.toBe(followUp);
+    h.click(PUSHER, previewOf(h, again), "确认推送", "follow-2");
+    await h.settle();
+    expect([h.store.push(again)!.state, h.store.push(later)!.state, h.store.push(others)!.state]).toEqual(["open", "preview", "preview"]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("previews: at startup the previews left before a confirmed push are deleted too", async () => {
+  const h = harness();
+  try {
+    const stale = h.pushId(await h.prepare({ body: "第一版" }));
+    h.clock.now += 60_000;
+    const sent = h.pushId(await h.prepare({ body: "第二版" }));
+    h.clock.now += 60_000;
+    const kept = h.pushId(await h.prepare({ subject: "另一件事" }));
+    // As a service without this rule left them: the second round went out and is over, the first is still waiting.
+    h.store.updatePush(sent, { state: "closed", confirmedAt: h.clock.now, closedAt: h.clock.now, closeReason: "deadline", summaryState: "sent", released: true });
+    await h.restart();
+    await h.settle();
+    expect([h.store.push(stale), h.store.push(sent)!.state, h.store.push(kept)!.state]).toEqual([undefined, "closed", "preview"]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
 test("console: the list pages newest first by state; one push shows every recipient's state and reply; only ended pushes are deleted", async () => {
   const h = harness();
   try {

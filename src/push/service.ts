@@ -206,6 +206,7 @@ const truncate = (text: string, max: number) => chars(text) > max ? [...text].sl
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 const NO_DEPARTMENT_GRANT = "你没有按部门推送的权限，请联系管理员在控制台授权";
 const NO_GROUP_GRANT = "你没有推送到群的权限，请联系管理员在控制台授权";
+const PREVIEW_GONE = "这张预览卡片对应的推送记录已清理，没有发出任何内容。确认发出一条推送后，在它之前准备、还没有确认的预览会一并清理；还需要的话请重新提出。";
 /** How a group gets registered (the bot's refusals and the console say so). */
 export const GROUP_STEPS = "登记方法：把机器人拉进群，推送管理员在群里发送“@机器人 /登记群 群名”；有人 @ 过机器人的群，也可以在控制台推送页的群名单里补群名";
 const GROUP_ID = /^[0-9]{1,64}$/;
@@ -310,6 +311,7 @@ export class PushService {
   start(): void {
     const settled = this.#store.settleInterruptedSends();
     if (settled) log.warn(`推送：${settled} 张卡片在上次服务中断时正在发送，结果未知，按已发出处理`);
+    this.#dropSuperseded();
     this.#sweepPackages();
     this.#track(this.#reconcileItems());
     this.#timer = setInterval(() => this.tick(), this.#limits.tickMs);
@@ -466,11 +468,13 @@ export class PushService {
     const pusher = this.#directory.byPhone(caller.phone);
     const push = this.#newPush({ pusher: caller.phone, pusherName: pusher?.name ?? caller.reply.name ?? caller.phone, pusherIm: pusher?.imUserId ?? caller.reply.receiveId,
       subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })) });
+    const earlier = this.#store.pushesOf(caller.phone, 50).filter(each => each.state === "preview" && !each.target.of).length;
     const outcome = await this.#createPreview(push, people);
     log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}，等待推送人确认`);
     return `已把推送预览卡片发给你（推送编号 ${push.id}，${reachText(reachOf(people))}${cc.length ? `，抄送 ${cc.length} 人` : ""}，截止 ${defaultDeadline ? "确认发出后 3 天（未指定截止时间）" : shortTime(deadline, now)}）。`
       + "请在卡片上核对，点「确认推送」才会发出；点之前不会发给任何人。"
       + (target.departments.length || target.everyone ? "部门和全员的名单在点「确认推送」时按当时的通讯录重新展开。" : "")
+      + (earlier ? `之前准备、还没有确认的 ${earlier} 条预览在确认这一条后清理，旧卡片不再有效。` : "")
       + (outcome === "uncertain" ? "（预览卡片的发送结果不确定，如果没有收到，请重新提出。）" : "");
   }
 
@@ -725,7 +729,12 @@ export class PushService {
     if (this.#clicks.size >= 20_000) this.#clicks.delete(this.#clicks.values().next().value!);
     this.#clicks.add(key);
     const found = this.#store.push(data.push);
-    if (!found) { log.info(`推送 ${data.push} 不存在，忽略点击`); return; }
+    if (!found) {
+      log.info(`推送 ${data.push} 不存在，忽略点击`);
+      // A preview's buttons: the record was cleared with a later confirmed push, or deleted in the console.
+      if (!groupId && (data.action === "confirm" || data.action === "cancel")) this.#text({ kind: "direct", receiveId: userId }, PREVIEW_GONE);
+      return;
+    }
     const click: Click = { event, data, userId, card };
     try {
       // Past the deadline the push ends first: the click only shows the end.
@@ -784,12 +793,27 @@ export class PushService {
       if (!this.#store.movePush(push.id, ["preview"], { state: "sending", confirmedAt: now, previewVersion: current.previewVersion + 1,
         ...(current.defaultDeadline ? { deadline: now + this.#limits.defaultDeadlineMs } : {}) })) return false;
       this.#store.replaceRecipients(push.id, people.map(person => this.#recipientRow(push.id, person)));
+      this.#dropSuperseded();
       return true;
     });
     if (!confirmed) return;
     log.info(`推送 ${push.id} 已确认，开始发送 ${people.length} 张卡片`);
     this.#previewSettled(push.id);
     this.#pump();
+  }
+
+  /**
+   * Delete the previews a pusher prepared before a push they confirmed: a push settled over several rounds leaves one
+   * record, the one that went out. Their cards cannot be updated (a card's ID is only known from a click on it): a
+   * click on one is answered in `click`.
+   */
+  #dropSuperseded(): void {
+    this.#store.transaction(() => {
+      for (const preview of this.#store.supersededPreviews()) {
+        this.#store.remove(preview.id);
+        log.info(`推送 ${preview.id} 的预览没有确认，推送人确认了之后准备的推送，已清理`);
+      }
+    });
   }
 
   /** The preview's state changed: its card, and for a follow-up the summary card of the push it reminds. */

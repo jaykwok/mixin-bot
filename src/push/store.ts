@@ -385,6 +385,16 @@ export class PushStore {
     });
   }
 
+  /**
+   * Previews the pusher prepared before a push they confirmed: the earlier rounds of a push that went out in a later
+   * one. A follow-up (「提醒未回复」) neither counts as that push nor is one of them.
+   */
+  supersededPreviews(): Push[] {
+    return (this.db.query(`SELECT p.* FROM pushes p WHERE p.state = 'preview' AND json_extract(p.target, '$.of') IS NULL AND EXISTS (
+      SELECT 1 FROM pushes c WHERE c.pusher = p.pusher AND c.created_at > p.created_at AND c.confirmed_at IS NOT NULL
+        AND json_extract(c.target, '$.of') IS NULL) ORDER BY p.created_at`).all() as Row[]).map(decodePush);
+  }
+
   /** Pushes with a summary still to send. */
   summariesDue(): Push[] {
     return (this.db.query("SELECT * FROM pushes WHERE state = 'closed' AND summary_state = 'pending' ORDER BY closed_at").all() as Row[]).map(decodePush);
