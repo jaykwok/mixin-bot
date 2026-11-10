@@ -25,6 +25,27 @@ function storageUrl(client: PlatformClient, raw: unknown, what: string): string 
   return raw;
 }
 
+const STORAGE_REDIRECTS = 3;
+
+/**
+ * A request to the platform's object storage that does not leave it: a redirect is followed only to an address that is
+ * storage too (checked like the first one), a few times at most. An upload follows only the redirects that keep the
+ * method and body (307, 308).
+ */
+async function storageFetch(client: PlatformClient, url: string, what: string, init: RequestInit): Promise<Response> {
+  for (let followed = 0; ; followed++) {
+    const response = await fetch(url, { ...init, redirect: "manual" });
+    const location = response.headers.get("location");
+    const redirect = location !== null && (init.method === "PUT" ? [307, 308] : [301, 302, 303, 307, 308]).includes(response.status);
+    if (!redirect) return response;
+    await response.body?.cancel().catch(() => undefined);
+    if (followed >= STORAGE_REDIRECTS) throw new PlatformRequestError(`${what}重定向超过 ${STORAGE_REDIRECTS} 次`, "rejected");
+    let next: string;
+    try { next = new URL(location, url).href; } catch { throw new PlatformRequestError(`${what}重定向的地址无效`, "rejected"); }
+    url = storageUrl(client, next, `${what}重定向`);
+  }
+}
+
 function abortReason(signal: AbortSignal | undefined, client: PlatformClient): unknown {
   return signal?.aborted ? signal.reason : client.closingSignal.aborted ? client.closingSignal.reason : undefined;
 }
@@ -117,7 +138,7 @@ export async function uploadFile(client: PlatformClient, source: UploadSource, s
 async function putPart(client: PlatformClient, url: string, bytes: Buffer, signal?: AbortSignal): Promise<string> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const response = await fetch(url, {
+      const response = await storageFetch(client, url, "上传分片", {
         method: "PUT",
         headers: { "Content-Type": "application/octet-stream" },
         body: bytes,
@@ -192,7 +213,7 @@ async function streamTo(client: PlatformClient, url: string, destination: string
 
 async function streamBody(client: PlatformClient, url: string, destination: string, options: DownloadOptions,
   stalled: AbortSignal, progress: () => void): Promise<{ size: number; sha256: string }> {
-  const response = await fetch(url, {
+  const response = await storageFetch(client, url, "下载", {
     signal: AbortSignal.any([client.closingSignal, stalled, ...(options.signal ? [options.signal] : [])]),
   });
   if (!response.ok || !response.body) {

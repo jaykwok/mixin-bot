@@ -494,6 +494,48 @@ describe("files", () => {
     } finally { await fixture.cleanup(); }
   });
 
+  test("a storage redirect is followed only to another storage address; an upload part only keeps its method", async () => {
+    const fixture = await tempFixture("open-platform-");
+    try {
+      const api = client({ retryDelaysMs: [] });
+      const target = join(fixture.root, "a.part");
+      const info = (id: string) => fake.route(`GET /open-apis/v1/files/${id}/download`, () => json({ code: 0, success: true, data: { fileName: "x", fileUrl: `${fake.origin}/storage/files/${id}` } }));
+      const to = (location: string, status = 302) => () => new Response(null, { status, headers: { location } });
+      const asked = (path: string) => fake.requests.filter(request => request.path === path).length;
+      // Within the storage: followed, relative or absolute.
+      info("moved");
+      fake.route("GET /storage/files/moved", to("/storage/files/final"));
+      fake.route("GET /storage/files/final", () => new Response("content"));
+      expect((await downloadFile(api, "moved", target)).size).toBe(7);
+      // Out of the storage (another path of the same host here, another host in production): refused before any request.
+      info("leaving");
+      fake.route("GET /storage/files/leaving", to(`${fake.origin}/internal/secret`));
+      await expect(downloadFile(api, "leaving", target)).rejects.toThrow("下载重定向地址不在平台对象存储");
+      info("abroad");
+      fake.route("GET /storage/files/abroad", to("https://elsewhere.example/f"));
+      await expect(downloadFile(api, "abroad", target)).rejects.toThrow("下载重定向地址不在平台对象存储");
+      expect([asked("/internal/secret"), await stat(target).catch(() => undefined)]).toEqual([0, undefined]);
+      // A loop ends.
+      info("loop");
+      fake.route("GET /storage/files/loop", to("/storage/files/loop"));
+      await expect(downloadFile(api, "loop", target)).rejects.toThrow("下载重定向超过 3 次");
+      expect(asked("/storage/files/loop")).toBe(4);
+      // An upload part: 307 within the storage keeps the PUT and its body; 302 would turn it into a GET and is a failure.
+      const path = join(fixture.root, "small.txt");
+      await writeFile(path, "hello");
+      const init = (id: string) => fake.route("POST /open-apis/v1/files/upload/init", () => json({ code: 0, success: true, data: { uploadId: id, chunkSize: 5 * 1024 * 1024,
+        parts: [{ partNumber: 1, uploadUrl: `${fake.origin}/storage/upload/${id}/1` }] } }));
+      init("up-302");
+      fake.route("PUT /storage/upload/up-302/1", to("/storage/upload/up-302/again"));
+      await expect(uploadFile(api, { path, fileName: "small.txt", size: 5, mimeType: "text/plain" })).rejects.toThrow("HTTP 302");
+      expect(asked("/storage/upload/up-302/again")).toBe(0);
+      init("up-307");
+      fake.route("PUT /storage/upload/up-307/1", to(`${fake.origin}/internal/upload`, 307));
+      await expect(uploadFile(api, { path, fileName: "small.txt", size: 5, mimeType: "text/plain" })).rejects.toThrow("上传分片重定向地址不在平台对象存储");
+      expect(asked("/internal/upload")).toBe(0);
+    } finally { await fixture.cleanup(); }
+  });
+
   test("partial reads and writes move every byte; a write error leaves no file and no result", async () => {
     const fixture = await tempFixture("open-platform-");
     const target = join(fixture.root, "a.part"), source = join(fixture.root, "upload.bin");
