@@ -893,6 +893,7 @@ test("summary: after the wait it goes out without a file still downloading; the 
     await h.settle();
     expect([h.store.push(id)!.summaryState, h.store.push(id)!.released]).toEqual(["sent", false]);
     expect(h.store.push(id)!.summaryText).toContain("有 1 个附件没能打包");
+    expect(h.store.push(id)!.summaryText).toContain("汇总表和回复内容见下面的压缩包。");
     expect((await summaryArchive(h)).files.get("回复/001-张三-0001/回复.txt")).toContain("盘点.xlsx：未打包，还在下载");
     h.service.tick();
     await h.settle();
@@ -1130,6 +1131,9 @@ test("summary card: 「提醒未回复」 prepares one follow-up for the people 
     let summary = summaryOf(h);
     expect(summary.content).toContain("推送「机房盘点」已截止");
     expect(summary.content).toContain("未确认：李四");
+    // Only a confirmation was asked for: the package is the workbook, and no reply is mentioned.
+    expect(summary.content).toContain("汇总表见下面的压缩包。");
+    expect(summary.content).not.toContain("回复内容");
     expect(summary.tailFields.map(button => button.name)).toEqual(["提醒未回复"]);
     expect(h.texts(WANG)[0]).toContain("推送人 推送的汇总抄送给你");
     expect(h.cards(WANG)).toHaveLength(0);

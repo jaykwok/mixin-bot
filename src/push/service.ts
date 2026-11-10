@@ -1489,7 +1489,8 @@ export class PushService {
         ...(unknown ? [`有 ${unknown} 张卡片发送结果未知，按已发出统计`] : []),
         ...(missing.length ? [`${push.mode === "reply" ? "未回复" : push.mode === "ack" ? "未确认" : "未选择"}：${missing.slice(0, 30).join("、")}${missing.length > 30 ? ` 等 ${missing.length} 个` : ""}`] : []),
         ...(pack.missingFiles ? [`有 ${pack.missingFiles} 个附件没能打包（原因见汇总表）`] : []),
-        pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : "汇总表和回复内容见下面的压缩包。"];
+        // Only a push asking for replies has anything but the workbook.
+        pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : `${push.mode === "reply" ? "汇总表和回复内容" : "汇总表"}见下面的压缩包。`];
       this.#store.updatePush(pushId, { summaryText: lines.join("\n") });
       const failures: { name: string; reason: string }[] = [];
       for (const person of [{ phone: push.pusher, name: push.pusherName, im: push.pusherIm }, ...push.cc.map(cc => ({ ...cc, im: this.#directory.byPhone(cc.phone)?.imUserId }))]) {
