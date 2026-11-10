@@ -26,10 +26,11 @@ export function DeploymentDirectoryPicker({ onChange, draft }: { onChange(value:
     } catch (error) { if (!current.signal.aborted) setError(error instanceof Error ? error.message : "部门查询失败"); }
     finally { locked.current = false; if (!current.signal.aborted) setBusy(false); }
   };
-  const select = (item: Department, checked: boolean) => {
-    const next = checked ? [...selected.filter(value => value.key !== item.key), item] : selected.filter(value => value.key !== item.key);
-    setSelected(next); onChange(data && next.length ? { view: data.view, selected: next.map(value => value.key) } : null);
-  };
+  const choose = (next: Department[]) => { setSelected(next); onChange(data && next.length ? { view: data.view, selected: next.map(value => value.key) } : null); };
+  const select = (item: Department, checked: boolean) =>
+    choose(checked ? [...selected.filter(value => value.key !== item.key), item] : selected.filter(value => value.key !== item.key));
+  // All: every top-level department (each includes its subdepartments); none: nothing at all.
+  const top = data?.children ?? [], allTop = top.length > 0 && top.every(item => selected.some(value => value.key === item.key));
   const cancel = () => { controller.current?.abort(); setData(null); setSelected([]); setTree({}); setBusy(false); setError(""); onChange(null); };
   const nodes = (items: Department[], ancestors = new Set<string>()): JSX.Element => <ul class="department-tree">{items.filter(item => !ancestors.has(item.key)).map(item => <li key={item.key}>
     <label class="check-label"><input type="checkbox" checked={selected.some(value => value.key === item.key)} disabled={busy || selected.length >= 200 && !selected.some(value => value.key === item.key)}
@@ -44,6 +45,9 @@ export function DeploymentDirectoryPicker({ onChange, draft }: { onChange(value:
       {(data || busy) && <button class="btn ghost small-btn" onClick={cancel}>取消部门选择</button>}
     </div>
     {error && <p role="alert" class="form-error">{error}</p>}
-    {data && <><p class="selected-line">已选择：{selected.map(item => item.name).join("、") || "无"}</p>{nodes(data.children)}</>}
+    {data && <><p class="selected-line">已选择：{selected.map(item => item.name).join("、") || "无"}</p>
+      <label class="check-label select-all"><input type="checkbox" checked={allTop} indeterminate={!allTop && selected.length > 0} disabled={busy || !top.length || top.length > 200}
+        onChange={event => choose(event.currentTarget.checked ? top : [])} />全选（{top.length} 个一级部门）</label>
+      {nodes(data.children)}</>}
   </div>;
 }

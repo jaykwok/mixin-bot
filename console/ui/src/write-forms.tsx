@@ -238,6 +238,10 @@ export function DirectoryForm({ onSettled }: { onSettled?: () => void }) {
     </li>;
   })}</ul>;
   const tooMany = mode === "departments" && selected.length > MAX_DEPARTMENTS;
+  // All: every top-level department (each includes its subdepartments, so nothing else stays selected); none: nothing at all.
+  const top = data?.children ?? [], allTop = top.length > 0 && top.every(item => selected.some(value => value.key === item.key));
+  // Selected departments without a box on screen (below a department not opened yet) can still be dropped.
+  const shown = new Set(top.flatMap(item => [item.key, ...below(item.key)])), hidden = selected.filter(item => !shown.has(item.key));
   return <Section title="同步范围" footer="选择范围后保存即开始应用，不需要再预览确认。机器人必须正在运行。重新读取部门树时，尚未保存的勾选会保留。">
     <Row icon="users" tint="mint" title="部门范围" detail={data ? "整个通讯录，或选定的部门（包含其全部下级部门）。" : "读取部门树后选择整个通讯录或部分部门。"}>
       <button class="btn" disabled={busy} onClick={() => void open()}>{busy ? "正在读取…" : data ? "重新读取部门树" : "选择同步范围"}</button>
@@ -252,8 +256,10 @@ export function DirectoryForm({ onSettled }: { onSettled?: () => void }) {
       {data.unavailable > 0 && <div class="group-note form-error" role="alert">有 {data.unavailable} 个原选部门已不可查询，保存时将移除。</div>}
       {mode === "departments" && <div class="row-body">
         <p class="selected-line">已选择：{selected.map(item => item.name).join("、") || "无"}</p>
-        {selected.length > 0 && <div class="selected-list">{selected.map(item => <button key={item.key} class="btn small-btn" disabled={busy}
-          onClick={() => setSelected(previous => previous.filter(value => value.key !== item.key))}>移除 {item.name}</button>)}</div>}
+        {hidden.length > 0 && <p class="selected-line">其中 {hidden.length} 个在尚未展开的下级部门里（{hidden.slice(0, 5).map(item => item.name).join("、")}{hidden.length > 5 ? " 等" : ""}），展开到它们可以取消勾选。
+          <button class="btn ghost small-btn" disabled={busy} onClick={() => setSelected(previous => previous.filter(value => shown.has(value.key)))}>取消这 {hidden.length} 个</button></p>}
+        <label class="check-label select-all"><input type="checkbox" checked={allTop} indeterminate={!allTop && selected.length > 0} disabled={busy || !top.length || top.length > MAX_DEPARTMENTS}
+          onChange={event => setSelected(event.currentTarget.checked ? top : [])} />全选（{top.length} 个一级部门）</label>
         {nodes(data.children)}
       </div>}
       {tooMany && <div class="group-note form-error" role="alert">最多选 {MAX_DEPARTMENTS} 个部门；可以改选它们的上级部门。</div>}

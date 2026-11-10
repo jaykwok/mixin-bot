@@ -1287,9 +1287,14 @@ button.bar-row:hover, div.bar-row:hover { background: var(--hover); }
 .department-tree > li > .check-label { padding: 4px 6px; border-radius: 8px; }
 .department-tree > li > .btn { margin-left: 8px; height: 24px; padding: 0 10px; font-size: 12px; }
 .department-tree small { display: inline-block; margin-left: 6px; color: var(--muted); }
-.selected-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .selected-line { font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
-.selected-line + .selected-list, .selected-line + .department-tree, .selected-list + .department-tree { margin-top: 10px; }
+.selected-line + .selected-line { margin-top: 6px; }
+.selected-line > .btn { margin-left: 6px; }
+.selected-line + .department-tree { margin-top: 10px; }
+.select-all { padding: 4px 6px; font-weight: 600; }
+.row-body > .select-all { margin: 10px 0 0 2px; }
+.select-all + .department-tree { margin-top: 2px; }
+.dept-picker > .select-all { margin: 0 0 -8px 2px; }
 .dept-picker { display: flex; flex-direction: column; gap: 10px; }
 .dept-picker > .department-tree { margin: 0; padding-left: 2px; border-left: 0; }
 
