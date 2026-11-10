@@ -14,6 +14,9 @@ import { tempFixture } from "../helpers/temp.ts";
 import { confirmTransaction, transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 import { TaskStore } from "../../ops/core/tasks.ts";
 import { consoleDir } from "../../ops/core/console-state.ts";
+import { serializeConfigurationStage, type ConfigurationStage } from "../../ops/config/configuration-stage.ts";
+import { configurationDigest } from "../../ops/config/configuration-draft.ts";
+import { readDeployStage } from "../../ops/core/deploy-stage.ts";
 
 const original = "a".repeat(40), target = "b".repeat(40);
 const args = (project: string) => ["upgrade", "--project", project, "--original", original, "--target", target, "--branch", "main"];
@@ -176,6 +179,46 @@ test("部署入口：新部署只接受暂存目录和命令，续做和回滚�
     const upgrading = join(f.root, "upgrading"); await pending(upgrading);
     await expect(runDeploymentCli(["deploy", "--project", upgrading], { host })).rejects.toThrow("未完成的是升级");
     expect(calls).toHaveLength(4);
+  } finally { await f.cleanup(); }
+});
+
+test("首次部署任务走 deploy 入口：暂存的配置必须正是确认过的两份草稿；网页重新部署不带配置暂存", async () => {
+  const f = await tempFixture("core-install-cli-");
+  try {
+    const project = join(f.root, "project"), stage = join(f.root, "stage"), calls: DockerInput[] = [];
+    const host: typeof runDockerLifecycle = async (input, options) => { await options.verify(); calls.push(input); return { ...done, command: input.command! }; };
+    await mkdir(project); await mkdir(stage);
+    await writeFile(join(stage, "deployment.json"), JSON.stringify({ format: 1, target: "", port: 1011, workspace: "" }));
+    await writeFile(join(stage, "runtime-values.json"), JSON.stringify({ format: 1, base: null, values: { BOT_PORT: "1011" } }));
+    const snapshot = <K extends "app" | "models">(kind: K, files: Record<string, string | null>) => ({ kind, files, binding: null });
+    const app: ConfigurationStage<"app"> = { version: 1, base: snapshot("app", { app: null }), next: snapshot("app", { app: '{"appId":"fixture"}' }) };
+    const models: ConfigurationStage<"models"> = { version: 1, base: snapshot("models", { models: null, settings: null, catalog: null }),
+      next: snapshot("models", { models: "{}", settings: "{}", catalog: null }) };
+    const ref = (value: ConfigurationStage, letter: string) => ({ draft: "config-" + letter.repeat(32), digest: configurationDigest(value) });
+    const store = new TaskStore(consoleDir(project)), task = (operation: string, params: Record<string, unknown>, key: string) => store.create({ planId: "plan-" + key,
+      operation, params: { directory: "all", port: 1011, workspace: "", ...params }, project, mechanism: "systemd-user" }, key).id;
+    const accepted = (id: string) => ({ host, checkPlan: async () => {}, env: { MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: id, MIXIN_OPS_EXPECT_CODE: "code" } });
+    const argv = ["deploy", "--project", project, "--stage", stage, "--command", "deploy"];
+    const install = task("install", { app: ref(app, "a"), models: ref(models, "b") }, "install");
+    await expect(runDeploymentCli(argv, accepted(install)), "nothing staged").rejects.toThrow("与已接单任务不一致");
+    await writeFile(join(stage, "configuration-app.json"), serializeConfigurationStage(app));
+    await expect(runDeploymentCli(argv, accepted(install)), "models missing").rejects.toThrow("与已接单任务不一致");
+    await writeFile(join(stage, "configuration-models.json"), serializeConfigurationStage(models));
+    expect((await runDeploymentCli(argv, accepted(install))).result.command).toBe("deploy");
+    const other = task("install", { app: { ...ref(app, "a"), digest: "0".repeat(64) }, models: ref(models, "b") }, "other");
+    await expect(runDeploymentCli(argv, accepted(other)), "another draft").rejects.toThrow("与已接单任务不一致");
+    await expect(runDeploymentCli(argv, accepted(task("deploy", { directory: "saved" }, "redeploy"))), "redeploy").rejects.toThrow("与已接单任务不一致");
+    await expect(runDeploymentCli([...argv.slice(0, -1), "repair"], accepted(install)), "repair").rejects.toThrow("与已接单任务不一致");
+    expect(calls).toEqual([{ operation: "deploy", command: "deploy", rollback: false, stage: resolve(stage) }]);
+    // The stage is read again to be installed: a configuration swapped after verify (the service identity owns the stage) is refused.
+    const swapped = { ...models, next: snapshot("models", { models: '{"swapped":true}', settings: "{}", catalog: null }) };
+    const swapping: typeof runDockerLifecycle = async (input, options) => {
+      await options.verify();
+      await writeFile(join(stage, "configuration-models.json"), serializeConfigurationStage(swapped));
+      await options.confirmStage!(readDeployStage((input as { stage: string }).stage));
+      return { ...done, command: input.command! };
+    };
+    await expect(runDeploymentCli(argv, { ...accepted(install), host: swapping }), "swapped after verify").rejects.toThrow("暂存的选择或配置与已接单任务不一致");
   } finally { await f.cleanup(); }
 });
 

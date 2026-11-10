@@ -1,24 +1,29 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { directoryAppHash, type DirectoryChoice } from "../../ops/lib/directory-choice.ts";
 import { parseScopeDepartments, readDirectoryScope, MAX_SCOPE_DEPARTMENTS, ROOT_DEPARTMENT } from "../../src/integrations/open-platform/directory-scope.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
+import type { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { textParam } from "../../ops/core/operations.ts";
+import { undeployed } from "./recovery.ts";
 import { runtimeQuery } from "./runtime-query.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 
 type Department = { id: string; name: string };
-export type DepartmentQuery = (action: "children" | "verify", ids: string[], signal?: AbortSignal) => Promise<{ appHash: string; departments: Department[] }>;
-interface Selection { session: string; expires: number; appHash: string; codes: Map<string, string>; ids: Map<string, string> }
+/** `app`: before the first deployment, the checked application draft that stands in for data/config/app-bot.json. */
+export type DepartmentQuery = (action: "children" | "verify", ids: string[], signal?: AbortSignal, app?: string) => Promise<{ appHash: string; departments: Department[] }>;
+/** draft: a first deployment's application draft, whose text the tree is read with instead of the installed configuration. */
+interface Selection { session: string; expires: number; appHash: string; draft?: string; codes: Map<string, string>; ids: Map<string, string> }
 const object = (value: unknown, fields: string[]) => {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== fields.length || Object.keys(value).some(key => !fields.includes(key))) throw new Error("部门选择参数无效");
   return value as Record<string, unknown>;
 };
 
 export function departmentQuery(project: string): DepartmentQuery {
-  return async (action, ids, signal) => {
-    const result = await runtimeQuery(project, "directory-query", action, { ids }, signal);
-    if (result.code !== 0 || result.timedOut) throw new Error("部门查询未完成，请检查已部署镜像、应用权限与网络");
+  return async (action, ids, signal, app) => {
+    const result = await runtimeQuery(project, "directory-query", action, app === undefined ? { ids } : { ids, app }, signal);
+    if (result.code !== 0 || result.timedOut) throw new Error("部门查询未完成，请检查应用权限、网络和运行环境");
     try {
       const value = JSON.parse(result.stdout);
       if (value?.protocol !== "mixin-directory-query" || value.version !== 1 || typeof value.appHash !== "string" || !/^[a-f0-9]{64}$/.test(value.appHash)) throw new Error();
@@ -40,19 +45,27 @@ function checkedDepartments(value: unknown): Department[] {
 /** Private in-memory trees. Only prepare() turns browser keys into a persisted, verified deployment choice. */
 export class DeploymentDirectory {
   private readonly views = new Map<string, Selection>();
-  constructor(readonly project: string, readonly query: DepartmentQuery = departmentQuery(project), readonly now = Date.now) {}
+  constructor(readonly project: string, readonly query: DepartmentQuery = departmentQuery(project), readonly now = Date.now,
+    readonly drafts?: Pick<ConfigurationDrafts, "appText">) {}
   end(session: string) { for (const [key, view] of this.views) if (view.session === session) this.views.delete(key); }
-  private base(): string {
+  /** The application the tree is read with: the installed one, or before the first deployment a checked application draft. */
+  private base(session: string, draft?: string): { appHash: string; app?: string } {
     if (loadPendingTransaction(this.project) || readConfigurationState(this.project)) throw new Error("请先处理未完成的维护事务");
+    if (draft !== undefined) {
+      if (!this.drafts || !undeployed(this.project)) throw new Error("应用草稿只用于首次部署；已有部署请使用通讯录设置");
+      const app = this.drafts.appText(draft, session);
+      return { appHash: createHash("sha256").update(app).digest("hex"), app };
+    }
     if (readDirectoryScope(join(this.project, "data/config/directory.json"))) throw new Error("已有同步范围，请沿用保存值；修改范围请使用通讯录设置");
-    return directoryAppHash(this.project);
+    return { appHash: directoryAppHash(this.project) };
   }
-  private view(session: string, key: unknown): Selection {
+  private view(session: string, key: unknown): { view: Selection; app?: string } {
     const at = this.now(); for (const [id, value] of this.views) if (value.expires <= at) this.views.delete(id);
     const value = typeof key === "string" ? this.views.get(key) : undefined;
     if (!value || value.session !== session) throw new Error("部门列表已过期，请重新打开");
-    if (this.base() !== value.appHash) throw new Error("应用配置已变化，请重新读取部门树");
-    return value;
+    const base = this.base(session, value.draft);
+    if (base.appHash !== value.appHash) throw new Error("应用配置已变化，请重新读取部门树");
+    return { view: value, app: base.app };
   }
   private display(view: Selection, items: Department[]) {
     return items.map(item => {
@@ -65,13 +78,13 @@ export class DeploymentDirectory {
     });
   }
   private async read(session: string, key: string, action: "children" | "verify", ids: string[], signal?: AbortSignal) {
-    const view = this.view(session, key), result = await this.query(action, ids, signal);
+    const { view, app } = this.view(session, key), result = await this.query(action, ids, signal, app);
     signal?.throwIfAborted();
-    if (this.view(session, key) !== view || result.appHash !== view.appHash) throw new Error("应用配置或登录已变化，请重新打开部门树");
+    if (this.view(session, key).view !== view || result.appHash !== view.appHash) throw new Error("应用配置或登录已变化，请重新打开部门树");
     return checkedDepartments(result.departments);
   }
   async prepare(input: unknown, session: string): Promise<DirectoryChoice> {
-    const params = object(input, ["view", "selected"]), view = this.view(session, params.view);
+    const params = object(input, ["view", "selected"]), { view } = this.view(session, params.view);
     if (!Array.isArray(params.selected) || !params.selected.length || params.selected.length > MAX_SCOPE_DEPARTMENTS) throw new Error(`请选择 1 至 ${MAX_SCOPE_DEPARTMENTS} 个部门`);
     const ids = parseScopeDepartments(params.selected.map(key => {
       const id = typeof key === "string" ? view.codes.get(key) : undefined;
@@ -88,17 +101,19 @@ export class DeploymentDirectory {
     } });
     return {
       "POST /api/lifecycle/directory/open": wrap(async ({ body, session, signal }) => {
-        object(body, []); const appHash = this.base(), at = this.now();
+        // A first deployment reads the tree with its application draft; otherwise with the installed configuration.
+        const draft = body && typeof body === "object" && "draft" in body ? textParam(object(body, ["draft"]).draft) : (object(body, []), undefined);
+        const { appHash } = this.base(session.label, draft), at = this.now();
         for (const [id, value] of this.views) if (value.expires <= at) this.views.delete(id);
         const prior = [...this.views].filter(([, value]) => value.session === session.label);
         while (prior.length >= 8) this.views.delete(prior.shift()![0]);
-        const key = randomUUID(), view: Selection = { session: session.label, expires: at + 600_000, appHash, codes: new Map(), ids: new Map() };
+        const key = randomUUID(), view: Selection = { session: session.label, expires: at + 600_000, appHash, ...draft === undefined ? {} : { draft }, codes: new Map(), ids: new Map() };
         this.views.set(key, view);
         try { return { view: key, children: this.display(view, await this.read(session.label, key, "children", [ROOT_DEPARTMENT], signal)) }; }
         catch (error) { this.views.delete(key); throw error; }
       }),
       "POST /api/lifecycle/directory/children": wrap(async ({ body, session, signal }) => {
-        const params = object(body, ["view", "parent"]), view = this.view(session.label, params.view);
+        const params = object(body, ["view", "parent"]), { view } = this.view(session.label, params.view);
         const id = typeof params.parent === "string" ? view.codes.get(params.parent) : undefined;
         if (!id) throw new Error("请从部门树中选择，不接受手填 ID");
         return { children: this.display(view, await this.read(session.label, String(params.view), "children", [id], signal)) };

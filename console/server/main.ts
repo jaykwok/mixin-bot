@@ -21,9 +21,13 @@ import { PushPage } from "./push-page.ts";
 import { PushRoutes } from "./push-routes.ts";
 import { UploadStore } from "./uploads.ts";
 import { BackupForms } from "./backup-forms.ts";
-import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { ConfigurationDrafts, taskDrafts } from "../../ops/core/configuration-drafts.ts";
 import { configurationRoutes } from "./configuration-routes.ts";
-import { DeploymentDirectory } from "./deployment-directory.ts";
+import { departmentQuery, DeploymentDirectory } from "./deployment-directory.ts";
+import { HostSetup } from "./setup-routes.ts";
+import { settleCreatedDependencies } from "./host-dependencies.ts";
+import { inspectDataVersion } from "../../src/core/data-version.ts";
+import { loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { fileRoutes } from "./files.ts";
 import { lifecycleRoutes } from "./lifecycle-routes.ts";
 import { upgradeRoutes } from "./upgrade-routes.ts";
@@ -106,7 +110,11 @@ async function main(argv: string[]): Promise<number | undefined> {
   const forms = new FormRoutes(PROJECT_DIR, audit);
   const pushes = new PushRoutes(PROJECT_DIR, audit); auth.onEnd(label => pushes.end(label));
   const pushPage = new PushPage(PROJECT_DIR, audit); auth.onEnd(label => pushPage.end(label));
-  const deploymentDirectory = new DeploymentDirectory(PROJECT_DIR); auth.onEnd(label => deploymentDirectory.end(label));
+  const deploymentDirectory = new DeploymentDirectory(PROJECT_DIR, departmentQuery(PROJECT_DIR), Date.now, configurations); auth.onEnd(label => deploymentDirectory.end(label));
+  const setup = new HostSetup(PROJECT_DIR, audit);
+  // A first deployment that succeeded while its task's cleanup could not settle the console's node_modules.
+  try { if (inspectDataVersion(PROJECT_DIR).current && !loadPendingTransaction(PROJECT_DIR)) settleCreatedDependencies(PROJECT_DIR); }
+  catch { console.error("控制台为首次部署安装的依赖未能收尾，已保留；下次启动控制台时重试。"); }
   const backups = new BackupForms(PROJECT_DIR); auth.onEnd(label => backups.end(label));
   let pruningConfigurations = false;
   const configurationTimer = setInterval(() => {
@@ -140,9 +148,9 @@ async function main(argv: string[]): Promise<number | undefined> {
   const server = startServer({
     port: choice.port, guard: guardConfig(choice.port, forwarded === undefined ? [] : [forwarded]),
     bundle, auth, instanceId, current: read => fence.current(read ? CODE_CHECK_MS : 0), dataSignal: dataReads.signal, overview: () => loadOverview(info),
-    routes: { ...conversationRoutes({ bot, audit, views }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...fileRoutes(PROJECT_DIR),
+    routes: { ...conversationRoutes({ bot, audit, views }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...setup.routes(), ...fileRoutes(PROJECT_DIR),
       ...taskRoutes({ tasks, plans, observers, audit, hosting: hostingCheck, current: () => fence.current(), prepare: operationPreparer(PROJECT_DIR, views, undefined, uploads, backups, forms, configurations, deploymentDirectory),
-        created: request => { uploads.bind(request); backups.bind(request); if (request.operation === "configuration-apply") configurations.bind(String(request.params.draft), String(request.params.digest), request.id); },
+        created: request => { uploads.bind(request); backups.bind(request); for (const { draft, digest } of taskDrafts(request)) configurations.bind(draft, digest, request.id); },
         launch: id => launchTask(tasks, id, executorBundle) }) },
     download: (ticket, context) => ticket.startsWith("push-") ? pushPage.download(ticket, context) : exporter.download(ticket, context),
   });

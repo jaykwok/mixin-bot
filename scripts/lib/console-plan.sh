@@ -20,10 +20,22 @@ assert_console_lifecycle() {
             echo '部门选择与确认不符；服务尚未停止' >&2; return 1; } ;;
         *) echo '必须明确选择通讯录范围；服务尚未停止' >&2; return 1 ;;
     esac
+    # 首次部署（install）的配置来自网页确认的草稿，由 console-stage.ts 暂存；重新部署和升级沿用已有配置。
+    if [ "$operation" = install ]; then
+        [ "${MIXIN_OPS_DIRECTORY}" != saved ] && [ -n "${MIXIN_OPS_APP_DRAFT:-}" ] && [ -n "${MIXIN_OPS_MODELS_DRAFT:-}" ] || {
+            echo '首次部署缺少已确认的配置草稿或通讯录范围；服务尚未停止' >&2; return 1; }
+        return 0
+    fi
+    [ -z "${MIXIN_OPS_APP_DRAFT:-}" ] && [ -z "${MIXIN_OPS_MODELS_DRAFT:-}" ] || { echo '只有首次部署使用网页配置草稿；服务尚未停止' >&2; return 1; }
     local required
     for required in data/config/models.json data/config/app-bot.json data/runtime/pi/settings.json; do
         [ -f "$PROJECT_DIR/$required" ] || { echo '缺少已有配置，请先完成首次部署；服务尚未停止' >&2; return 1; }
     done
+}
+
+# 控制台部署任务在入口里的操作：首次部署（install）还是重新部署（deploy）。只看控制台导出的选择，终端部署不受影响。
+console_lifecycle() {
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ] && [ "${MIXIN_OPS_LIFECYCLE:-}" = install ]; then echo install; else echo deploy; fi
 }
 
 check_console_plan() {

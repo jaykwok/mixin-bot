@@ -46,23 +46,45 @@ function initial(form: Form, catalog?: Catalog): Patch {
     forcePathStyle: form.forcePathStyle ?? false, maxBytes: form.maxBytes, expireHours: form.expireHours, cleanupGraceMinutes: form.cleanupGraceMinutes,
     accessKey: retained(form.hasAccessKey), secret: retained(form.hasSecret), token: retained(form.hasToken, true) };
 }
-function SecretField({ label, value, optional, change }: { label: string; value: Secret; optional?: boolean; change: (value: Secret) => void }) {
-  return <Field label={label} note="原值不回显。改端点或账户时需要重新填写凭据。">
+/** `stored`: a value exists (saved, or already in this draft) that "keep" can keep; without one there is only a new value to enter. */
+function SecretField({ label, value, optional, stored, change }: { label: string; value: Secret; optional?: boolean; stored: boolean; change: (value: Secret) => void }) {
+  const keep = stored || value.mode === "keep";
+  return <Field label={label} note={keep ? "原值不回显。改端点或账户时需要重新填写凭据。" : undefined}>
     <span class="inline-control">
       <select aria-label={`${label}处理方式`} value={value.mode} onChange={event => change({ mode: event.currentTarget.value as Secret["mode"] })}>
-        <option value="keep">保留已设置的值</option><option value="set">填写新值</option>{optional && <option value="clear">清除（可选）</option>}</select>
+        {keep && <option value="keep">保留已设置的值</option>}<option value="set">填写新值</option>{optional && <option value="clear">清除（可选）</option>}</select>
       {value.mode === "set" && <input aria-label={label} type="password" autoComplete="new-password" value={value.value ?? ""} onInput={event => change({ mode: "set", value: event.currentTarget.value })} />}
     </span>
   </Field>;
 }
 
+/**
+ * A first deployment's configuration step: the draft must be checked online, and instead of being applied it is handed to
+ * the deployment (`onReady` gets its id once checked, null once it is not). `round` changes when a deployment took the draft:
+ * the form lets it go (the task finishes it) and keeps the fields it showed, without secrets, for another attempt.
+ */
+export interface DeployDraft { title: string; onReady(draft: string | null): void; blocked?: string; round: number }
+
+/** What a released first-deployment draft leaves for the next one: the fields, with every secret to be entered again. */
+const withoutSecrets = (patch: Patch): Patch => Object.fromEntries(Object.entries(patch).map(([key, value]) =>
+  [key, value && typeof value === "object" && "mode" in value ? { mode: "set" } : value]));
+
 /** One configuration: its saved summary (`summary`, from the settings read) and its draft editor. */
-export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: string[][] }) {
+export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summary?: string[][]; deploy?: DeployDraft }) {
   const [draft, setDraft] = useState<Draft | null>(null), [patch, setPatch] = useState<Patch>({}), [catalog, setCatalog] = useState<Catalog>(),
-    [busy, setBusy] = useState(false), [error, setError] = useState(""), [valid, setValid] = useState(false), [network, setNetwork] = useState(false), [refresh, setRefresh] = useState(false);
-  const current = useRef<string | null>(null), generation = useRef(0);
+    [busy, setBusy] = useState(false), [error, setError] = useState(""), [valid, setValid] = useState(false), [network, setNetwork] = useState(!!deploy), [refresh, setRefresh] = useState(false);
+  const current = useRef<string | null>(null), generation = useRef(0), kept = useRef<Patch | null>(null), round = useRef(deploy?.round);
   const discard = (id: string) => api("/api/configuration/discard", { method: "POST", body: { id }, quiet: true }).catch(() => {});
   useEffect(() => () => { generation.current++; if (current.current) void discard(current.current); current.current = null; }, []);
+  // A first deployment hears whether its draft is ready.
+  const ready = valid && draft ? draft.id : null;
+  useEffect(() => { deploy?.onReady(ready); }, [ready]);
+  useEffect(() => {
+    if (!deploy || deploy.round === round.current) return;
+    round.current = deploy.round; generation.current++;
+    if (current.current) kept.current = withoutSecrets(patch);
+    current.current = null; setDraft(null); setPatch({}); setBusy(false); setValid(false);
+  }, [deploy?.round]);
   const change = (key: string, value: unknown) => { setPatch(previous => ({ ...previous, [key]: value })); setValid(false); };
   const open = async () => {
     const request = ++generation.current; setBusy(true); setError(""); setValid(false);
@@ -70,7 +92,7 @@ export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: str
       if (current.current) { await discard(current.current); current.current = null; }
       const next = await api<Draft>("/api/configuration/open", { method: "POST", body: { kind }, intent: true });
       if (request !== generation.current) { void discard(next.id); return; }
-      current.current = next.id; setDraft(next); setPatch(initial(next.form)); setNetwork(false); setRefresh(false);
+      current.current = next.id; setDraft(next); setPatch({ ...initial(next.form), ...kept.current }); kept.current = null; setNetwork(!!deploy); setRefresh(false);
       if (kind === "models") {
         const data = await api<Catalog>("/api/configuration/catalog", { intent: true, timeoutMs: 90_000 });
         if (request === generation.current) setCatalog(data);
@@ -93,18 +115,23 @@ export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: str
   const text = (key: string, label: string, number = false) => <Field label={label}>{number
     ? <input type="number" value={String(patch[key] ?? "")} onInput={event => change(key, Number(event.currentTarget.value))} />
     : <input type="text" value={String(patch[key] ?? "")} onInput={event => change(key, event.currentTarget.value)} />}</Field>;
-  const secret = (key: string, label: string, optional = false) => <SecretField label={label} optional={optional} value={(patch[key] as Secret) ?? retained(false, optional)} change={value => change(key, value)} />;
+  // A secret can be kept only when the draft's form says one is set (for models: on the provider chosen now).
+  const stored = (key: string) => !!draft && ((kind === "models" ? modelPatch(draft.form, String(patch.provider ?? ""), catalog)
+    : initial(draft.form, catalog))[key] as Secret | undefined)?.mode === "keep";
+  const secret = (key: string, label: string, optional = false) => <SecretField label={label} optional={optional} stored={stored(key)}
+    value={(patch[key] as Secret) ?? retained(false, optional)} change={value => change(key, value)} />;
   const custom = patch.mode === "custom", model = typeof patch.model === "object" ? patch.model as Model : { id: String(patch.model ?? "") };
   const changeModel = (key: keyof Model, value: unknown) => change("model", { ...model, [key]: value });
   const models = [...new Map([...(catalog?.models ?? []), ...(draft?.form.catalogModels ?? [])].filter(value => value.provider === patch.provider).map(value => [value.id, value])).values()];
   const thinking = models.find(value => value.id === model.id)?.thinking ?? ["off", "minimal", "low", "medium", "high", "xhigh"];
   const section = SECTIONS[kind];
-  return <Section title={section.title}
-    aside={<button type="button" class={`btn small-btn${draft ? " ghost" : ""}`} disabled={busy && !draft} onClick={() => void open()}>
-      {draft ? "放弃并重新读取" : <><Icon name="pencil" size={13} />编辑配置</>}</button>}
-    footer={draft ? "先保存草稿并校验，再预览应用。取消或关闭页面不会修改正式配置。" : undefined}>
+  return <Section title={deploy?.title ?? section.title}
+    aside={<button type="button" class={`btn small-btn${draft ? " ghost" : ""}`} disabled={busy && !draft || !draft && !!deploy?.blocked} onClick={() => void open()}>
+      {draft ? deploy ? "放弃并重新填写" : "放弃并重新读取" : <><Icon name="pencil" size={13} />{deploy ? "填写" : "编辑配置"}</>}</button>}
+    footer={draft ? deploy ? `保存草稿并${kind === "app" ? "在线校验（获取应用 token）" : "校验（Pi 核对服务商、模型和凭据引用，不发起模型推理）"}。草稿只保存在本机，确认首次部署后才写入正式配置。` : "先保存草稿并校验，再预览应用。取消或关闭页面不会修改正式配置。" : undefined}>
     {!draft && (summary?.length ? summary.map(([name, value]) => <Row key={name} class="value" title={name}>{value}</Row>)
-      : <Row icon={section.icon} tint={section.tint} title={titles[kind]} detail={section.detail} />)}
+      : <Row icon={section.icon} tint={section.tint} title={titles[kind]} detail={deploy?.blocked
+        ?? (deploy && kept.current ? "这份配置已交给首次部署。部署没有完成时，重新填写会带上次的内容，密钥需要重新填写。" : section.detail)} />)}
     {error && <div class="group-note form-error" role="alert">{error}</div>}
     {draft && <>
       <fieldset class="draft-fields" disabled={busy}><legend class="sr-only">配置草稿</legend>
@@ -137,7 +164,7 @@ export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: str
                 onInput={event => changeModel("cost", { ...model.cost, [key!]: Number(event.currentTarget.value) })} /></span>)}</span></Field></>
             : <Field label="模型"><select value={model.id} onChange={event => change("model", event.currentTarget.value)}><option value="">请选择模型</option>{model.id && !models.some(value => value.id === model.id) && <option value={model.id}>{model.id}</option>}{models.map(value => <option key={value.id} value={value.id}>{value.name ?? value.id}（{value.contextWindow} / {value.maxTokens}）</option>)}</select></Field>}
           <Field label="推理级别"><select value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>{[...new Set([String(patch.thinking), ...thinking])].map(value => <option key={value} value={value}>{value}</option>)}</select></Field></>}
-        {kind !== "relay" && <div class="row"><Toggle label={kind === "app" ? "联网验证应用凭据" : "允许刷新模型目录"} detail={kind === "app" ? "仅获取 token。" : "刷新所选服务商的模型目录，不发起推理。"}
+        {kind !== "relay" && !deploy && <div class="row"><Toggle label={kind === "app" ? "联网验证应用凭据" : "允许刷新模型目录"} detail={kind === "app" ? "仅获取 token。" : "刷新所选服务商的模型目录，不发起推理。"}
           checked={network} onChange={value => { setNetwork(value); if (!value) setRefresh(false); setValid(false); }} /></div>}
         {kind === "models" && network && <div class="row"><Toggle label="本次刷新模型目录" checked={refresh} onChange={value => { setRefresh(value); setValid(false); }} /></div>}
       </fieldset>
@@ -147,8 +174,9 @@ export function ConfigurationForm({ kind, summary }: { kind: Kind; summary?: str
       </div>
       {valid && <div class="row-body draft-checked">
         <ul class="plan-summary">{draft.summary.map(line => <li key={line}>{line}</li>)}</ul>
-        <div class="action-row"><TaskAction key={`${draft.id}-${draft.revision}`} operation="configuration-apply" params={{ draft: draft.id }} primary
-          onStarted={() => { current.current = null; setDraft(null); setPatch({}); }}>预览应用配置</TaskAction></div>
+        {deploy ? <p class="muted small"><Icon name="checkmark" size={13} />{kind === "app" ? "已在线校验" : "已校验"}，首次部署使用这份草稿。</p>
+          : <div class="action-row"><TaskAction key={`${draft.id}-${draft.revision}`} operation="configuration-apply" params={{ draft: draft.id }} primary
+            onStarted={() => { current.current = null; setDraft(null); setPatch({}); }}>预览应用配置</TaskAction></div>}
       </div>}
     </>}
   </Section>;

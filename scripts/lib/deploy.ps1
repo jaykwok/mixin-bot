@@ -6,20 +6,39 @@
 # 前失败自动回滚，首次部署的回滚不留计划任务。部署不移动代码。未完成的事务由 ops.ps1 resume / rollback 处理。
 # 消息经平台事件 Stream 主动连出接收（imtwo.zdxlz.com、imfl.zdxlz.com 的 443 端口）；HTTP 只监听 127.0.0.1，无需入站端口。
 #
-# 请在管理员 PowerShell 中运行：
-#   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
+# 内部入口：由网页控制台的部署任务和 ops.ps1 deploy 调用（管理员 PowerShell）；-Check 只做环境检查（控制台首次部署向导）。
+param([switch]$Check)
 $ErrorActionPreference = 'Stop'
-$Project = if ($env:MIXIN_OPS_PROJECT) { (Resolve-Path -LiteralPath $env:MIXIN_OPS_PROJECT).Path } else { (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
+$Project = if ($env:MIXIN_OPS_PROJECT) { (Resolve-Path -LiteralPath $env:MIXIN_OPS_PROJECT).Path } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 # 运维核心随本脚本的版本运行（控制台任务运行冻结的运行包）；数据工具和配置向导属于要部署的代码，取自项目。
-$ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 if ($env:MIXIN_OPS_CONSOLE -ceq '1') { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding }
 Set-Location $Project
-$CommonLib = Join-Path $PSScriptRoot 'lib\common.ps1'
+$CommonLib = Join-Path $PSScriptRoot 'common.ps1'
 if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
     Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
     exit 1
 }
 . $CommonLib
+# 控制台首次部署向导的环境检查：部署在停机前会核对的管理员权限和工具，只读地提前查一遍；不取部署锁、不写运维日志。
+# 每项一行“ok|fail<TAB>项目<TAB>说明”，有一项不通过就以 1 退出。
+if ($Check) {
+    $failed = $false
+    function Write-CheckLine([string]$State, [string]$Name, [string]$Text) {
+        [Console]::Out.WriteLine("$State`t$Name`t$(($Text -replace "`t", ' ') -replace "\s*[`r`n]+\s*", '；')")
+        if ($State -cne 'ok') { $script:failed = $true }
+    }
+    if (Test-Administrator) { Write-CheckLine 'ok' '管理员权限' '以管理员身份运行' }
+    else { Write-CheckLine 'fail' '管理员权限' '部署需要管理员权限：请在管理员 PowerShell 中启动控制台' }
+    try {
+        $tools = Find-DeployTools
+        Write-CheckLine 'ok' '工具' "git（$($tools.Git)）、bash（$($tools.Bash)）、bun $($tools.BunVersion)（$($tools.Bun)）、uv（$($tools.Uv)）"
+    } catch { Write-CheckLine 'fail' '工具' $_.Exception.Message }
+    foreach ($pointer in @('deploy-transaction', 'upgrade-transaction')) {
+        if (Test-Path -LiteralPath (Join-Path $Project "data\state\$pointer")) { Write-CheckLine 'fail' '未完成的操作' '有未完成的部署或升级事务；请在“维护”页继续或回滚' }
+    }
+    exit $(if ($failed) { 1 } else { 0 })
+}
 $operation = Start-OperationLog $Project 'deploy'
 $operationExit = 1
 $Stage = ''
@@ -57,7 +76,7 @@ foreach ($pointer in @('deploy-transaction', 'upgrade-transaction')) {
         exit 1
     }
 }
-Assert-ConsoleLifecycle 'deploy' $Project
+Assert-ConsoleLifecycle (Get-ConsoleLifecycle) $Project
 $core = Join-Path $ReleaseRoot 'ops\core\cli.ts'
 # 部署锁、运维任务和计划任务归属先由核心只读检查一次，提问之前就能拒绝；交接后它在锁内再查。
 Set-OperationStage 'deploy-preflight'
@@ -85,7 +104,8 @@ $portSource = ""
 $rawPort = if (-not [string]::IsNullOrWhiteSpace($env:BOT_PORT)) { $portSource = "BOT_PORT"; $env:BOT_PORT.Trim() }
     elseif ($null -ne $savedPort) { $portSource = "data\state\bot-port"; $savedPort }
     else { "10000" }
-$portFix = "改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(Get-OpsCommandHint deploy)）；服务尚未停止"
+$portFix = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { "改端口：在控制台重新预览并填写另一个端口；服务尚未停止" }
+    else { "改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(Get-OpsCommandHint deploy)）；服务尚未停止" }
 $portNumber = 0
 if (-not ([int]::TryParse($rawPort, [ref]$portNumber) -and $portNumber -ge 1 -and $portNumber -le 65535)) {
     throw "$portSource 中的端口无效（应为 1–65535 的整数）：$rawPort；$portFix"
@@ -138,9 +158,15 @@ if ((Test-Path -LiteralPath $ModelsFile -PathType Leaf) -and (Test-Path -Literal
     & $bunPath --no-env-file run $dataTool check --project $Project --workspace $finalWorkspace
     if ($LASTEXITCODE -ne 0) { throw "数据版本核对未通过（原因见上方）；$Unchanged" }
 }
-# 控制台部署沿用网页确认的配置，不运行向导（Assert-ConsoleLifecycle 已要求配置齐全）。
-if ($env:MIXIN_OPS_CONSOLE -ceq '1') {
-    Done '沿用网页确认的模型与机器人配置'
+# 控制台部署不运行向导：首次部署暂存网页确认的配置草稿（宿主工具 console-stage.ts）；重新部署沿用已有配置
+# （Assert-ConsoleLifecycle 已要求配置齐全）。
+if ((Get-ConsoleLifecycle) -ceq 'install') {
+    Step '暂存网页确认的应用机器人与模型配置（停止服务后写入）...'
+    if ((Invoke-ConsoleProcess $bunPath @('--no-env-file', (Join-Path $ReleaseRoot 'ops\core\console-stage.ts'), '--project', $Project, '--stage', $Stage)) -ne 0) {
+        throw "网页确认的配置无法暂存（原因见上方）；$Unchanged"
+    }
+} elseif ($env:MIXIN_OPS_CONSOLE -ceq '1') {
+    Done '沿用已有的模型与机器人配置'
 } elseif (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf) -or -not (Test-Path -LiteralPath $SettingsFile -PathType Leaf)) {
     # 没有应用机器人配置时，这个向导先问它。
     Invoke-StagedWizard $bunPath $Project $Stage '首次配置 AI（provider/key/model）' 'configure.ts' 'configuration-models.json'

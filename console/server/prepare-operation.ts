@@ -18,6 +18,18 @@ import type { DeploymentDirectory } from "./deployment-directory.ts";
 /** Converts form input to host-only immutable references. The browser cannot submit argv or its own saved manifest. */
 export function operationPreparer(project: string, views: Views, query = capture, uploads?: UploadStore, backups?: BackupForms, forms?: FormRoutes, configurations?: ConfigurationDrafts, directory?: DeploymentDirectory) {
   return async (operation: string, params: Record<string, unknown>, session: string): Promise<Record<string, unknown>> => {
+    if (operation === "install") {
+      // The browser names its two drafts; the plan carries each with the digest it was checked online with.
+      fields(params, ["app", "models", "directory", "port", "workspace"]); if (!configurations) throw new Error("配置草稿不可用");
+      const app = configurations.deploymentReference(textParam(params.app), session, "app"), models = configurations.deploymentReference(textParam(params.models), session, "models");
+      let chosen = params.directory;
+      if (chosen && typeof chosen === "object") {
+        if (!directory) throw new Error("部署部门选择器不可用");
+        chosen = await directory.prepare(chosen, session);
+      }
+      const normalized = { app, models, directory: chosen, port: params.port, workspace: params.workspace };
+      operationArgs(operation, normalized); return normalized;
+    }
     if (["update", "deploy", "repair"].includes(operation) && params.directory && typeof params.directory === "object") {
       if (!directory) throw new Error("部署部门选择器不可用");
       const normalized = { ...params, directory: await directory.prepare(params.directory, session) };

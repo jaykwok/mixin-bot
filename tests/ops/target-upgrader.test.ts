@@ -62,7 +62,7 @@ case "$cmd" in
         # Changes to the checkout while the image builds, which the check before the stop must notice.
         case "\${FIXTURE_DURING_BUILD:-}" in
             version) printf 'hotfix\\n' > "$FIXTURE_WORK/version.txt" ;;
-            deploy) printf '\\n# hotfix\\n' >> "$FIXTURE_WORK/scripts/deploy.sh" ;;
+            deploy) printf '\\n# hotfix\\n' >> "$FIXTURE_WORK/scripts/lib/deploy.sh" ;;
             branch) git -C "$FIXTURE_WORK" checkout --quiet -b hotfix ;;
             commit) git -C "$FIXTURE_WORK" commit --quiet --allow-empty -m hotfix ;;
             main) git -C "$FIXTURE_WORK" update-ref refs/heads/main "$(git -C "$FIXTURE_WORK" commit-tree 'HEAD^{tree}' -p HEAD -m hotfix)" ;;
@@ -257,7 +257,7 @@ async function buildTemplate() {
       await cp(join(project, path), join(work, path), { recursive: true });
     }
     await mkdir(join(work, "ops/core")); await writeFile(join(work, "ops/core/cli.ts"), "");
-    await writeFile(join(work, "scripts/deploy.sh"), "#!/usr/bin/env bash\nexit 99\n");
+    await writeFile(join(work, "scripts/lib/deploy.sh"), "#!/usr/bin/env bash\nexit 99\n");
     await writeFile(join(work, ".gitignore"), "data/\nlogs/\ntmp/\nbackup/\n.console/\n");
     await git("init", "--initial-branch=main");
     await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid"); await git("config", "core.autocrlf", "false");
@@ -275,7 +275,7 @@ async function buildTemplate() {
     await mkdir(stage, { recursive: true });
     const exported = await runCommand(processes, work, [bash!, "-c", `. '${posix(join(project, "scripts/lib/common.sh"))}'; git archive ${target} "\${UPGRADER_EXPORT_PATHS[@]}" | tar -x -C '${posix(stage)}'`], env);
     expect(exported.code, exported.text).toBe(0);
-    expect(existsSync(join(stage, "scripts/deploy.sh"))).toBe(false);
+    expect(existsSync(join(stage, "scripts/ops.sh"))).toBe(false);
     await writeFile(join(work, "data/config/models.json"), "{}"); await writeFile(join(work, "data/config/app-bot.json"), "{}");
     await writeFile(join(work, "data/config/directory.json"), '{"format":1,"all":true}\n');
     await writeFile(join(state, "bot-port"), "2022");

@@ -68,7 +68,7 @@ export function configurationRoutes(drafts: ConfigurationDrafts, query = configu
       const result = await query("check", { version: 1, snapshot: input.snapshot, network: params.network, refresh: params.refresh }, signal) as ConfigurationCheckResult;
       signal.throwIfAborted();
       if (result?.protocol !== "mixin-configuration" || result.version !== 1 || result.success !== true) throw new Error("校验结果无效");
-      return drafts.validated(id, session.label, rev, input.digest, result.summary, result.catalog);
+      return drafts.validated(id, session.label, rev, input.digest, result.summary, result.catalog, params.network === true);
     }),
     "POST /api/configuration/discard": wrap(async ({ body, session }) => {
       const params = body as Record<string, unknown>; fields(params, ["id"]); drafts.discard(textParam(params.id), session.label); return { discarded: true };

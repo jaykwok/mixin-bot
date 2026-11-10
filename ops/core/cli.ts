@@ -7,7 +7,7 @@ import { createServiceHost } from "./service-host.ts";
 import { runServiceCommand, type ServiceAction } from "./service.ts";
 import type { OpsResult } from "./result.ts";
 import { MaintenanceRefused, refusing } from "./maintenance.ts";
-import { checkTaskPlan } from "./check-plan.ts";
+import { checkTaskPlan, checkUninstallTask } from "./check-plan.ts";
 import { TaskStore } from "./tasks.ts";
 import { consoleDir } from "./console-state.ts";
 import { codeDigest } from "./source-runtime.ts";
@@ -68,8 +68,11 @@ export async function runCore(args: string[], dependencies: Dependencies = {}, s
     throw new Error("用法：ops core service <start|stop|restart|repair>、maintenance <history-clear|history-compact|stat-import|tmp-ls|tmp-preview|tmp-purge|tmp-reclaim|tmp-discard|configuration-apply|configuration-restore|runtime-configure|backup-scan|backup-clean|relay-ls|relay-test|relay-purge>、maintenance-recover 或 uninstall-check；--project <目录> [--json]");
   if (!values.project) throw new Error("缺少 --project，未执行操作");
   const project = resolve(values.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), action = recovery ? "maintenance-recover" : positionals[1]!;
-  // Read-only, under the lock the uninstalling entry holds; never a console task.
-  if (uninstall) return { result: await checkUninstall(project, dependencies.env ?? process.env), json: !!values.json };
+  // Read-only, under the lock the uninstalling entry holds; a console uninstall's task and plan are checked there too.
+  if (uninstall) {
+    const env = dependencies.env ?? process.env;
+    return { result: await checkUninstall(project, env, () => refusing(() => checkUninstallTask(project, source, env, dependencies.checkPlan))), json: !!values.json };
+  }
   const historyInput = history ? historyRequest(action, [...positionals.slice(2),
     ...["all", "direct", "storage-segment", "group-id"].filter(key => values[key as "all"]).map(key => "--" + key),
     ...(values.expect ? ["--expect", values.expect] : [])]) : undefined;

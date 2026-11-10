@@ -57,6 +57,8 @@ export interface Overview {
   console: ConsoleInfo;
   deployment: DeploymentView | null;
   deploymentError: string | null;
+  /** No unfinished transaction, deployment record or runtime data yet: the first deployment runs in the terminal. */
+  undeployed: boolean;
   /** Set when only continue/rollback/diagnose is possible (recovery view or CLI). */
   recovery: string | null;
   pending: { subject: string; record: string[] } | null;

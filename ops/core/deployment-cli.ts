@@ -7,7 +7,10 @@ import { MaintenanceRefused, refusing } from "./maintenance.ts";
 import { preflightWindowsDeploy, preflightWindowsUpgrade, runWindowsLifecycle } from "./windows-lifecycle.ts";
 import { preflightDockerDeploy, preflightDockerUpgrade, runDockerLifecycle, type DockerInput } from "./docker-lifecycle.ts";
 import { preflightMacosDeploy, preflightMacosUpgrade, runMacosLifecycle } from "./macos-lifecycle.ts";
-import { readDeployStage } from "./deploy-stage.ts";
+import { readDeployStage, type DeployStage } from "./deploy-stage.ts";
+import { opsCommandOf } from "./operations.ts";
+import { STAGED_KINDS } from "../config/configuration-stage.ts";
+import { configurationDigest } from "../config/configuration-draft.ts";
 import type { DeploymentOptions } from "./deployment-host.ts";
 import { checkTaskPlan } from "./check-plan.ts";
 import { TaskStore, type TaskRequest } from "./tasks.ts";
@@ -107,8 +110,8 @@ interface Invocation {
   command: string;
   json: boolean;
   gitPath?: string;
-  /** The accepted console task still asks for what this invocation carries. */
-  matches(request: TaskRequest): boolean;
+  /** The accepted console task still asks for what this invocation carries (`staged`: the deploy stage as already read). */
+  matches(request: TaskRequest, staged?: DeployStage): boolean;
 }
 
 /** Windows and macOS run the checkout itself; Linux builds and runs a candidate image. */
@@ -132,8 +135,14 @@ function hostOptions(call: Invocation, dependencies: Dependencies, source: strin
       const expected = env.MIXIN_OPS_EXPECT_CODE;
       if (!expected) throw new MaintenanceRefused(`控制台${noun}缺少确认版本`);
       const request = new TaskStore(consoleDir(project)).request(env.MIXIN_OPS_TASK_ID);
-      if (request.operation !== command || !call.matches(request)) throw new MaintenanceRefused(`${noun}目标或选择与已接单任务不一致`);
+      if (opsCommandOf(request.operation) !== command || !call.matches(request)) throw new MaintenanceRefused(`${noun}目标或选择与已接单任务不一致`);
       await (dependencies.checkPlan ?? checkTaskPlan)(project, request.id, expected);
+    }),
+    // The stage is read again to be installed: what is installed is what was compared, not an earlier read.
+    confirmStage: staged => refusing(async () => {
+      if (!env.MIXIN_OPS_TASK_ID) return;
+      const request = new TaskStore(consoleDir(project)).request(env.MIXIN_OPS_TASK_ID);
+      if (!call.matches(request, staged)) throw new MaintenanceRefused(`${noun}暂存的选择或配置与已接单任务不一致`);
     }),
     async finish(value) { if (env.MIXIN_OPS_RESULT_FILE) await publishJson(env.MIXIN_OPS_RESULT_FILE, value); },
     ...(call.json ? { output: (text: string) => { process.stderr.write(text); } } : {}),
@@ -186,10 +195,16 @@ async function runDeployCli(args: DeployArgs, dependencies: Dependencies, signal
   return (dependencies.host ?? host.run)({ operation: "deploy", command, rollback: args.rollback, ...(stage ? { stage } : {}),
     ...(args.confirmation ? { confirmation: args.confirmation } : {}) }, hostOptions({ noun: "部署", project, pending, command, json: args.json,
     ...(args.gitPath ? { gitPath: args.gitPath } : {}),
-    matches(request) {
+    matches(request, read) {
       if (!stage) return true;
-      const { choices } = readDeployStage(stage);
-      return request.params.port === choices.port && workspace(request.params.workspace) === workspace(choices.workspace);
+      const { choices, configuration } = read ?? readDeployStage(stage);
+      // A console redeployment keeps the installed configuration; a first deployment stages exactly the drafts it was confirmed with.
+      const drafts = request.operation === "install" ? { app: request.params.app, models: request.params.models } : {};
+      const staged = STAGED_KINDS.every(kind => {
+        const expected = (drafts as Record<string, { digest?: unknown } | undefined>)[kind]?.digest, found = configuration[kind];
+        return expected === undefined ? !found : !!found && configurationDigest(found.stage) === expected;
+      });
+      return staged && request.params.port === choices.port && workspace(request.params.workspace) === workspace(choices.workspace);
     } }, dependencies, source), signal);
 }
 

@@ -4,7 +4,7 @@ import { describeUntil } from "../../ops/lib/age.ts";
 import { describeAttention, describeScope, describeScopeState } from "../../ops/tools/directory-admin.ts";
 import { probeService, type Service } from "./data.ts";
 import { describeMode, loadDeployment, PROJECT_DIR, type Deployment } from "../../ops/core/platform.ts";
-import { recoveryReason } from "./recovery.ts";
+import { entryState } from "./recovery.ts";
 import { describePendingTransaction, loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { versionFacts, versionRows } from "../../ops/tools/version-info.ts";
 
@@ -41,7 +41,7 @@ export async function loadOverview(info: ConsoleInfo): Promise<Overview> {
   try {
     const transaction = loadPendingTransaction(PROJECT_DIR);
     if (transaction) pending = describePendingTransaction(transaction);
-  } catch { /* recoveryReason explains an unreadable record */ }
+  } catch { /* entryState explains an unreadable record */ }
 
   const service: Service = deployment ? await probeService(deployment.port) : { state: "unreachable" };
   const facts = versionFacts(PROJECT_DIR, service.program, info.build);
@@ -51,7 +51,7 @@ export async function loadOverview(info: ConsoleInfo): Promise<Overview> {
     deployment: deployment && { platform: deployment.platform, runtime: deployment.runtime, mode: describeMode(deployment),
       port: deployment.port, dataRoot: deployment.dataRoot, workspaceRoot: deployment.workspaceRoot },
     deploymentError,
-    recovery: recoveryReason(),
+    ...entryState(),
     pending,
     service: serviceView(service),
     versions: versionRows(facts),

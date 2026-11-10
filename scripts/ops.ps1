@@ -676,8 +676,8 @@ function Invoke-DeployCommand {
     $source = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { $OpsSource } else { $Project }
     $previousProject = $env:MIXIN_OPS_PROJECT
     try {
-        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { Assert-ConsoleLifecycle 'deploy' $Project; $env:MIXIN_OPS_PROJECT=$Project }
-        $script:OpsCoreExitCode = Invoke-ConsoleProcess $deployHost @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $source 'scripts\deploy.ps1'))
+        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { Assert-ConsoleLifecycle (Get-ConsoleLifecycle) $Project; $env:MIXIN_OPS_PROJECT=$Project }
+        $script:OpsCoreExitCode = Invoke-ConsoleProcess $deployHost @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $source 'scripts\lib\deploy.ps1'))
         return ($script:OpsCoreExitCode -eq 0)
     } finally { $env:MIXIN_OPS_PROJECT=$previousProject }
 }
@@ -866,11 +866,32 @@ function Uninstall-Bot {
     $lockPath = Join-Path $DataDir 'state\deploy.lock'
     New-Item -ItemType Directory -Force -Path (Split-Path $lockPath -Parent) | Out-Null
     try { $script:UninstallLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-    catch { Err '部署、升级或另一个维护操作正在进行；卸载未开始'; return $false }
+    catch {
+        # 只有共享冲突（32、33：另一个操作独占着锁）才是“正在进行”；权限、只读属性等照实说明，重试也不会好。
+        $code = Get-Win32ErrorCode $_.Exception
+        if ($code -eq 32 -or $code -eq 33) {
+            $script:UninstallRefusal = '部署、升级或另一个维护操作正在进行；未执行操作'; Err '部署、升级或另一个维护操作正在进行；卸载未开始'
+        } else {
+            $reason = $_.Exception.GetBaseException().Message
+            $script:UninstallRefusal = "部署锁文件 data\state\deploy.lock 无法打开（$reason）；未执行操作"; Err "部署锁文件无法打开：$reason；卸载未开始"
+        }
+        return $false
+    }
     try {
         $env:BOT_DEPLOY_LOCK_HELD = $lockPath
         try { $checked = Invoke-CoreMaintenance @('uninstall-check') } finally { Remove-Item Env:BOT_DEPLOY_LOCK_HELD -ErrorAction SilentlyContinue }
-        if (-not $checked) { Err '卸载未开始（原因见上方）'; return $false }
+        if (-not $checked) { $script:UninstallRefusal = '卸载前检查未通过（原因见任务输出），未执行操作'; Err '卸载未开始（原因见上方）'; return $false }
+        # 同名计划任务属于另一个目录的部署时拒绝：按名称注销会删掉那个部署的任务。
+        $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($existing) {
+            $actions = @($existing.Actions)
+            $directory = if ($actions.Count -eq 1 -and $actions[0].WorkingDirectory) { [IO.Path]::GetFullPath($actions[0].WorkingDirectory).TrimEnd('\') } else { '' }
+            if ($directory -ne [IO.Path]::GetFullPath($Project).TrimEnd('\')) {
+                $script:UninstallRefusal = "计划任务 $TaskName 属于另一个目录的部署，未执行操作"
+                Err "计划任务 $TaskName 的工作目录（$(if ($directory) { $directory } else { '未知' })）不是本目录：它属于另一个目录的部署，请在那个目录卸载；卸载未开始"
+                return $false
+            }
+        }
         return (Remove-BotInstallation)
     } finally { if ($script:UninstallLock) { $script:UninstallLock.Dispose(); $script:UninstallLock = $null } }
 }
@@ -904,20 +925,24 @@ function Remove-BotInstallation {
         Move-ToProjectArchive $RuntimeDir $Project
         Done "空的 data\runtime 目录已删除"
     }
-    if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N]" $false) {
+    # 控制台任务不提问：用网页确认的选择（核心在锁内随任务和计划一起核对过，uninstall-check）。
+    $archiveData = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { $env:MIXIN_OPS_UNINSTALL_DATA -ceq '1' }
+        else { Read-YesNo "是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N]" $false }
+    if ($archiveData) {
         $logsDir = Join-Path $Project "logs"
         $script:UninstallLock.Dispose(); $script:UninstallLock = $null
         try {
-            if (Test-Path -LiteralPath $DataDir) {
-                Move-ToProjectArchive $DataDir $Project
-            }
+            # logs/ 先移：任何一步失败时 data/ 都还在，控制台仍按已部署处理，可以再次卸载。
             if (Test-Path -LiteralPath $logsDir) {
                 Move-ToProjectArchive $logsDir $Project
+            }
+            if (Test-Path -LiteralPath $DataDir) {
+                Move-ToProjectArchive $DataDir $Project
             }
             if ((Test-Path -LiteralPath $DataDir) -or (Test-Path -LiteralPath $logsDir)) {
                 throw "目录仍然存在"
             }
-            Done "data/ 和 logs/ 已删除"
+            Done "data/ 和 logs/ 已移入 backup\rm"
         } catch {
             Err "data/ 或 logs/ 删除不完整：$($_.Exception.Message)"
             return $false
@@ -930,6 +955,19 @@ function Remove-BotInstallation {
     }
     Done "卸载流程完成；如上方有警告，请按提示补充清理。"
     return $true
+}
+
+# 控制台卸载按观察到的最终状态写结构化结果；没有取得部署锁或卸载前检查未通过时为拒绝（什么都没有执行）。
+function Invoke-ConsoleUninstall {
+    $script:UninstallRefusal = ''
+    $wasRunning = (Get-FinalRunState) -eq 'running'
+    $code = 1; $outcome = 'failed'; $message = '卸载未完成，请查看任务日志'
+    try { if (Uninstall-Bot) { $code = 0 } }
+    catch { $message = $_.Exception.Message; Err $message }
+    if ($script:UninstallRefusal) { $outcome = 'refused'; $message = $script:UninstallRefusal }
+    elseif ($code -eq 0) { $outcome = 'success'; $message = '卸载完成' }
+    $written = Write-OpsResult $outcome $wasRunning (Get-FinalRunState) $code $message
+    return ($code -eq 0 -and $written)
 }
 
 if ($Json -and $Command -in @("doctor", "status")) {
@@ -945,7 +983,7 @@ switch ($Command) {
         if ($env:MIXIN_OPS_CONSOLE -ceq '1') { if (-not (Invoke-LifecycleOperation { Invoke-DeployCommand })) { exit 1 } }
         else {
             $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy.ps1') }
+            Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\lib\deploy.ps1') }
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }
     }
@@ -1071,7 +1109,10 @@ switch ($Command) {
         if ($ConfirmCode) { $backupArgs += @('--confirm', $ConfirmCode) }
         if (-not (Invoke-CoreMaintenance $backupArgs)) { exit $script:OpsCoreExitCode }
     }
-    "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
+    "uninstall" {
+        $uninstalled = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { Invoke-ConsoleUninstall } else { Uninstall-Bot }
+        if (-not $uninstalled) { exit 1 }
+    }
     default {
         # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
         $unknown = $Command -and $Command -ne "help"

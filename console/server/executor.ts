@@ -1,15 +1,16 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cliArgs } from "../../ops/lib/cli.ts";
-import { operationCommand, operationObserver } from "../../ops/core/operations.ts";
+import { operationCommand, operationObserver, opsCommandOf } from "../../ops/core/operations.ts";
 import { PlanStore } from "../../ops/core/plans.ts";
 import { consoleDir } from "../../ops/core/console-state.ts";
 import { TaskStore } from "../../ops/core/tasks.ts";
 import type { ExecutorIdentity, TaskRequest, TaskResult } from "../../ops/core/tasks.ts";
 import { executorIdentity, taskObservers, unregisterTask } from "./task-host.ts";
 import { UploadStore } from "./uploads.ts";
-import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { ConfigurationDrafts, taskDrafts } from "../../ops/core/configuration-drafts.ts";
 import { readOpsResult } from "../../ops/core/result.ts";
+import { settleCreatedDependencies } from "./host-dependencies.ts";
 
 interface ExecutorDependencies {
   identity: ExecutorIdentity;
@@ -21,7 +22,7 @@ interface ExecutorDependencies {
 }
 
 function outcome(id: string, request: TaskRequest, exitCode: number, source: unknown): Omit<TaskResult, "version" | "id" | "finishedAt"> {
-  const value = readOpsResult(source, request.operation, exitCode);
+  const value = readOpsResult(source, opsCommandOf(request.operation), exitCode);
   if (!value) {
     return { outcome: "failed", exitCode: exitCode || 1, finalState: "unknown", message: `任务 ${id} 没有完整且一致的执行结果，请检查维护状态` };
   }
@@ -103,7 +104,8 @@ if (import.meta.main) {
         try {
           if (existsSync(join(store.dir(request.id), "result.json"))) {
             if (request.params.upload !== undefined) new UploadStore(consoleDir(project)).finish(request);
-            if (request.operation === "configuration-apply") new ConfigurationDrafts(project).finish(String(request.params.draft), request.id);
+            for (const { draft } of taskDrafts(request)) try { new ConfigurationDrafts(project).finish(draft, request.id); } catch { /* not bound to this task: reconciled at startup */ }
+            if (request.operation === "install" && JSON.parse(readFileSync(join(store.dir(request.id), "result.json"), "utf8")).outcome === "success") settleCreatedDependencies(project);
             if (request.operation === "configuration-restore") {
               const drafts = new ConfigurationDrafts(project), id = String(request.params.draft), owner = drafts.task(id);
               if (owner) drafts.finish(id, owner);

@@ -79,7 +79,7 @@ function classify(path: string): RequestKind | null {
 /** Routes that only read rely on a code check of the last few seconds. Named one by one: any other route, a new one included, checks in full. */
 const READ_ROUTES: ReadonlySet<string> = new Set([
   "GET /api/overview", "GET /api/spaces", "GET /api/storage/scopes", "GET /api/forms/runtime", "GET /api/directory/selection", "GET /api/push/settings",
-  "GET /api/configuration/catalog", "GET /api/configuration/state", "GET /api/lifecycle", "GET /api/lifecycle/deploy", "GET /api/lifecycle/upgrade",
+  "GET /api/configuration/catalog", "GET /api/configuration/state", "GET /api/lifecycle", "GET /api/lifecycle/deploy", "GET /api/lifecycle/upgrade", "GET /api/setup",
   "POST /api/conversation/activity", "POST /api/conversation/boundaries", "POST /api/conversation/entries", "POST /api/conversation/entry", "POST /api/conversation/requests",
   "POST /api/conversation/search", "POST /api/views/close", "POST /api/views/search", "POST /api/views/space", "POST /api/views/stats", "POST /api/search", "POST /api/stats",
   "POST /api/exports/status", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/groups", "POST /api/directory/children",

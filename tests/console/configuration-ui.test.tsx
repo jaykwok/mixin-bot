@@ -68,6 +68,28 @@ test("配置表单只提交草稿编号供预览；凭据保持/替换明确，�
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
 
+test("没有已设置的密钥时只能填写新值；草稿收下密钥后才可以保留", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  const form = (hasSecret: boolean) => ({ id: "config-test", revision: hasSecret ? 1 : 0, validated: false, summary: [], expiresAt: Date.now() + 60000,
+    form: { kind: "app", appId: "", environment: "production", hasSecret } });
+  globalThis.fetch = (async (url: string) => {
+    const path = String(url);
+    if (path.endsWith("/open")) return Response.json(form(false));
+    if (path.endsWith("/edit")) return Response.json(form(true));
+    if (path.endsWith("/check")) return Response.json({ ...form(true), validated: true, summary: ["应用：fixture"] });
+    return Response.json({});
+  }) as typeof fetch;
+  const modes = () => [...(root.querySelector('[aria-label="应用密钥处理方式"]') as HTMLSelectElement).options].map(option => option.value);
+  try {
+    render(<ConfigurationForm kind="app" />, root); button(root, "编辑配置").click(); await until(() => !!root.querySelector('input[type="password"]'));
+    expect(modes()).toEqual(["set"]);
+    expect(root.textContent).not.toContain("原值不回显");
+    const input = root.querySelector('input[type="password"]') as HTMLInputElement; input.value = "first-secret"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    await Bun.sleep(10); button(root, "保存草稿并校验").click(); await until(() => !!button(root, "预览应用配置"));
+    expect(modes()).toEqual(["keep", "set"]);
+  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+});
+
 test("取消后迟到的配置校验不会重新显示可应用草稿；恢复入口区分回滚和已提交收尾", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root); let resolveCheck: (response: Response) => void = () => {};
   const draft = { id: "config-test", revision: 1, validated: false, summary: [], form: { kind: "relay", enabled: false } };

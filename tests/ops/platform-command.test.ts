@@ -208,9 +208,9 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
 windowsTest("Windows 管理入口调用部署脚本并保留失败退出码", async () => {
   const fixture = await fixtureWrapper();
   try {
-    await mkdir(join(fixture.root, "scripts"), { recursive: true });
+    await mkdir(join(fixture.root, "scripts/lib"), { recursive: true });
     for (const code of [0, 17]) {
-      await writeFile(join(fixture.root, "scripts/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nWrite-Output "UI=$env:MIXIN_OPS_UI"\nexit ' + code + '\n');
+      await writeFile(join(fixture.root, "scripts/lib/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nWrite-Output "UI=$env:MIXIN_OPS_UI"\nexit ' + code + '\n');
       const result = await fixture.run(["deploy"]);
       expect(result.stdout).toContain("DEPLOY_FIXTURE"); expect(result.code, result.stderr).toBe(code);
       expect(result.stdout).toContain("UI=cli");

@@ -18,12 +18,12 @@ for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "
       for (const path of ["data/config/models.json", "data/config/app-bot.json", "data/runtime/pi/settings.json", "data/config/directory.json"]) {
         mkdirSync(dirname(join(project, path)), { recursive: true }); writeFileSync(join(project, path), "{}");
       }
-      mkdirSync(join(project, "data/state"), { recursive: true }); mkdirSync(join(source, "scripts"), { recursive: true }); mkdirSync(join(project, "scripts"), { recursive: true });
+      mkdirSync(join(project, "data/state"), { recursive: true }); mkdirSync(join(source, "scripts/lib"), { recursive: true }); mkdirSync(join(project, "scripts/lib"), { recursive: true });
       const entryName = platform === "windows" ? "deploy.ps1" : "deploy.sh", marker = join(project, "invoked.json"), output = join(project, "result.json");
-      writeFileSync(join(project, "scripts", entryName), platform === "windows" ? "exit 99" : "exit 99\n");
+      writeFileSync(join(project, "scripts/lib", entryName), platform === "windows" ? "exit 99" : "exit 99\n");
       let argv: string[];
       if (platform === "windows") {
-        writeFileSync(join(source, "scripts", entryName), "\uFEFF" + [
+        writeFileSync(join(source, "scripts/lib", entryName), "\uFEFF" + [
           "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
           "[IO.File]::WriteAllText((Join-Path $env:MIXIN_OPS_PROJECT 'invoked.json'), (@{project=$env:MIXIN_OPS_PROJECT;port=$env:BOT_PORT;root=$env:WORKSPACE_ROOT;stdin=[Console]::IsInputRedirected}|ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))",
           "Write-Host ('中文部署输出' * 16000)", "exit ([int]$env:FIXTURE_EXIT)",
@@ -40,7 +40,7 @@ for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "
         ].join("\r\n"));
         argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script];
       } else {
-        writeFileSync(join(source, "scripts", entryName), [
+        writeFileSync(join(source, "scripts/lib", entryName), [
           'test ! -t 0 || exit 98',
           'if [ "${FIXTURE_SIGNAL:-}" = 1 ]; then trap \'printf settled > "$MIXIN_OPS_PROJECT/settled"; exit 143\' TERM; printf ready > "$MIXIN_OPS_PROJECT/signal-ready"; while :; do sleep 0.05; done; fi',
           'printf \'{"project":"%s","port":"%s","command":"%s"}\' "$MIXIN_OPS_PROJECT" "$BOT_PORT" "$1" > "$MIXIN_OPS_PROJECT/invoked.json"',
@@ -79,6 +79,17 @@ for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "
         expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ project: projectArg, port: "2022", ...(platform === "linux" ? { command: "deploy" } : {}) });
         expect(JSON.parse(readFileSync(output, "utf8"))).toMatchObject({ command: "deploy", outcome: code ? "failed" : "success", exitCode: expected, finalState: "running" });
       }
+      // A first deployment goes through the same wrapper: it checks the install choices (drafts, no saved scope), not a redeploy's.
+      rmSync(output); rmSync(marker); rmSync(join(project, "data/config/directory.json"));
+      const draft = (letter: string) => ({ draft: `config-${letter.repeat(32)}`, digest: letter.repeat(64) });
+      const install = Bun.spawn(argv, { cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env,
+        ...deploymentEnvironment("install", { app: draft("a"), models: draft("b"), directory: "all", port: 2022, workspace: "" }, project),
+        MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "fixture", MIXIN_OPS_PROJECT: "", MIXIN_OPS_RESULT_FILE: platform === "linux" ? posix(output) : output,
+        FIXTURE_PROJECT: projectArg, FIXTURE_SOURCE: sourceArg, FIXTURE_EXIT: "0", FIXTURE_SIGNAL: "" } });
+      const [installExit, installOut, installErr] = await Promise.all([install.exited, new Response(install.stdout).text(), new Response(install.stderr).text()]);
+      expect(installExit, installOut.slice(-1000) + installErr).toBe(0);
+      expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ project: projectArg, port: "2022" });
+      writeFileSync(join(project, "data/config/directory.json"), "{}");
       if (platform === "linux") {
         rmSync(output);
         const child = Bun.spawn(argv, { cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env,
@@ -109,7 +120,7 @@ test("真实部署入口从固定包加载库，但项目目录与当前目录�
     const project = join(f.root, "live project"), source = join(f.root, "fixed source"), windows = process.platform === "win32", darwin = process.platform === "darwin";
     for (const path of [project, join(source, "scripts"), join(source, "scripts/lib")]) mkdirSync(path, { recursive: true });
     const name = windows ? "deploy.ps1" : "deploy.sh";
-    writeFileSync(join(source, "scripts", name), readFileSync(join(repo, "scripts", name)));
+    writeFileSync(join(source, "scripts/lib", name), readFileSync(join(repo, "scripts/lib", name)));
     if (windows) writeFileSync(join(source, "scripts/lib/common.ps1"), "\uFEFF" + [
       "function Start-OperationLog { [Console]::WriteLine(('PROJECT=' + $Project)); [Console]::WriteLine(('CWD=' + (Get-Location).Path)); exit 0 }",
     ].join("\r\n"));
@@ -123,8 +134,8 @@ test("真实部署入口从固定包加载库，但项目目录与当前目录�
       for (const library of ["deployment.sh", "ops-runtime.sh", "core-handoff.sh"]) writeFileSync(join(source, "scripts/lib", library), "# fixture library\n");
       // The real entry changes cwd after operation_start, so capture its resolved project at this early boundary.
     }
-    const child = Bun.spawn(windows ? ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(source, "scripts", name)]
-      : ["bash", join(source, "scripts", name)], {
+    const child = Bun.spawn(windows ? ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(source, "scripts/lib", name)]
+      : ["bash", join(source, "scripts/lib", name)], {
       cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_PROJECT: project, MIXIN_OPS_BUN: process.execPath },
     });
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -144,7 +155,7 @@ test.skipIf(process.platform !== "linux")("real deploy validates incoming consol
       mkdirSync(dirname(join(work, path)), { recursive: true }); writeFileSync(join(work, path), "");
     }
     mkdirSync(join(source, "scripts"), { recursive: true }); mkdirSync(join(source, "scripts/lib"), { recursive: true });
-    writeFileSync(join(source, "scripts/deploy.sh"), readFileSync(join(repo, "scripts/deploy.sh")));
+    writeFileSync(join(source, "scripts/lib/deploy.sh"), readFileSync(join(repo, "scripts/lib/deploy.sh")));
     writeFileSync(join(source, "scripts/lib/deployment.sh"), "# No transaction or Docker mutation is allowed in this pre-lock fixture.\n");
     writeFileSync(join(source, "scripts/lib/core-handoff.sh"), "# fixture library\n");
     // Neither Bun nor the core exists here: the core's read-only preflight passes.
@@ -160,7 +171,7 @@ test.skipIf(process.platform !== "linux")("real deploy validates incoming consol
       `assertDeploymentEnvironment("deploy", ${JSON.stringify(params)}, process.env.MIXIN_OPS_PROJECT!);\n`);
     for (const incoming of ["", "0.0.0.0"]) {
       if (existsSync(marker)) unlinkSync(marker);
-      const child = Bun.spawn(["bash", join(source, "scripts/deploy.sh")], { cwd: work, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      const child = Bun.spawn(["bash", join(source, "scripts/lib/deploy.sh")], { cwd: work, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { ...process.env, ...deploymentEnvironment("deploy", params, work), BOT_HOST: incoming, BOT_DEPLOY_LOCK_HELD: "",
           MIXIN_OPS_PROJECT: work, MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "fixture", MIXIN_OPS_BUN: process.execPath,
           MIXIN_OPS_GUARD: guard, MIXIN_OPS_EXPECT_CODE: "0".repeat(64), FIXTURE_COMMON: join(repo, "scripts/lib/common.sh"), FIXTURE_MARKER: marker } });

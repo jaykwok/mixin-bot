@@ -76,6 +76,24 @@ test("托管条件不足、范围改变、计划过期在创建任务前拒绝�
   } finally { await h.fixture.cleanup(); }
 });
 
+test("同一时间只有一个首次部署：另一个仍在进行时拒绝新的首次部署（两个标签页各自确认），其他操作不受影响", async () => {
+  const h = await setup();
+  try {
+    const install = async () => (await (await h.request("/api/plans", { operation: "install", params: {} })).json()) as { id: string };
+    const [first, second] = [await install(), await install()];
+    // Submitted together: exactly one becomes a task.
+    const responses = await Promise.all([h.request("/api/tasks", { plan: first.id, key: "install-first" }), h.request("/api/tasks", { plan: second.id, key: "install-second" })]);
+    expect(responses.map(response => response.status).sort()).toEqual([202, 409]);
+    const refused = await responses.find(response => response.status === 409)!.json() as { error: string };
+    expect(refused.error).toMatch(/首次部署/);
+    expect(h.time.launches).toBe(1);
+    // The running first deployment still refuses a later one; other operations are not held up.
+    const third = await install();
+    expect((await h.request("/api/tasks", { plan: third.id, key: "install-third" })).status).toBe(409);
+    expect((await h.request("/api/tasks", { plan: (await h.plan()).id, key: "stop-meanwhile" })).status).toBe(202);
+  } finally { await h.fixture.cleanup(); }
+});
+
 test("过期一小时后的计划和中断写入的临时文件在新建计划时删除；未到期和无法读取的计划保留", async () => {
   const fixture = await tempFixture("console-plan-prune-");
   try {

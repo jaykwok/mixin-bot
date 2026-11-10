@@ -267,7 +267,7 @@ try {
     checkedAt: Date.now(),
     console: { version: VERSION, build: BUILD, hostname: "mixin-bot", platform: "linux", port: 10001, pid: process.pid, startedAt: consoleStarted },
     deployment: { platform: "linux", runtime: "docker", mode: "Docker", port: 3000, dataRoot: "/opt/mixin-bot/data", workspaceRoot: "/opt/mixin-bot/workspace" },
-    deploymentError: null, recovery: null, pending: null,
+    deploymentError: null, undeployed: false, recovery: null, pending: null,
     service: serviceView(await probeService(bot.port!, instanceFile)),
     versions: versionRows({ source: "running", program, dataVersion: DATA_VERSION, local: program }),
   });

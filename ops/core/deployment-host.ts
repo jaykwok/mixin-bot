@@ -55,6 +55,8 @@ export interface DeploymentOptions {
   source: string;
   /** Console confirmation is rechecked under deploy.lock before preparation or recovery writes. */
   verify(): Promise<void>;
+  /** Under deploy.lock, the stage exactly as it will be installed still matches the accepted task (verify read it earlier). */
+  confirmStage?(stage: DeployStage): Promise<void>;
   finish(result: OpsResult): Promise<void>;
   native?: NativeRunner;
   output?: NativeOutput;
@@ -245,6 +247,7 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
       if (!pending && deploy && !deploy.stage) throw new MaintenanceRefused("没有未完成的部署事务");
       const fresh = !pending, name = pending?.snapshot ?? "deploy-" + randomUUID().replaceAll("-", "");
       const stage = !pending && deploy ? readDeployStage(deploy.stage!) : undefined;
+      if (stage) await options.confirmStage?.(stage);
       const snapshot = join(project, transactionDirectory(name)), pointer = join(project, "data/state", deploy ? "deploy-transaction" : platform.upgradePointer);
       // macOS: data/state belongs to the service account, so every file root writes there must land where its path says
       // (atomic-file.ts within).

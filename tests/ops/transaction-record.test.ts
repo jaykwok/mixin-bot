@@ -187,7 +187,7 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     // A pending deployment goes to the core through the host Bun, here a stand-in; a new one to the deploy entry.
     const runtime = join(root, "bun-stand-in");
     await writeFile(runtime, '#!/usr/bin/env bash\nif [ "$1" = --version ]; then echo 1.4.4; exit 0; fi\necho "DISPATCHED ${*:3} end"\n', { mode: 0o755 });
-    await writeFile(join(root, "scripts/deploy.sh"), '#!/usr/bin/env bash\necho "DEPLOY ENTRY command=$1"\n');
+    await writeFile(join(root, "scripts/lib/deploy.sh"), '#!/usr/bin/env bash\necho "DEPLOY ENTRY command=$1"\n');
     await mkdir(join(root, "backup/snapshots/deploy-abc123"), { recursive: true });
     await writeFile(join(root, "backup/snapshots/deploy-abc123/transaction"), serialize(record));
     await writeFile(join(root, "data/state/deploy-transaction"), "deploy-abc123");

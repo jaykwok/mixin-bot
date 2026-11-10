@@ -7,10 +7,20 @@ import { configurationForm, configurationSnapshot, assertConfigurationBase,
 import { writeAtomic } from "./console-state.ts";
 import { configurationDigest, parseConfigurationDraft, type ConfigurationDraft } from "../config/configuration-draft.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
-import type { TaskObservers, TaskStore } from "./tasks.ts";
+import type { TaskObservers, TaskRequest, TaskStore } from "./tasks.ts";
 
 const ID = /^config-[a-f0-9]{32}$/;
 const TTL = 30 * 60_000;
+/** The drafts a task consumes, each with the digest it was confirmed with: one for applying a configuration, two for a first deployment. */
+export function taskDrafts(request: Pick<TaskRequest, "operation" | "params">): { draft: string; digest: string }[] {
+  const ref = (value: unknown) => {
+    const item = value as { draft?: unknown; digest?: unknown } | null;
+    return item && typeof item === "object" && typeof item.draft === "string" && typeof item.digest === "string" ? [{ draft: item.draft, digest: item.digest }] : [];
+  };
+  if (request.operation === "configuration-apply") return ref(request.params);
+  if (request.operation === "install") return [...ref(request.params.app), ...ref(request.params.models)];
+  return [];
+}
 export class ConfigurationDrafts {
   readonly root: string;
   constructor(readonly project: string, readonly now = Date.now) {
@@ -19,13 +29,19 @@ export class ConfigurationDrafts {
     if (!stat.isDirectory() || stat.isSymbolicLink() || (process.platform !== "win32" && (stat.mode & 0o077))) throw new Error("配置草稿目录不私有或不是普通目录");
   }
   path(id: string): string { if (!ID.test(id)) throw new Error("配置草稿编号无效"); return join(this.root, id + ".json"); }
+  /** Every write is a use: an unbound draft lives TTL after it was last used (the session's own idle limit ends it sooner). */
   private write(draft: ConfigurationDraft): void {
+    draft.expiresAt = this.now() + TTL;
     const text = JSON.stringify(draft) + "\n";
     if (Buffer.byteLength(text) > 40 * 1024 * 1024) throw new Error("配置草稿过大，请检查模型目录缓存");
     writeAtomic(this.path(draft.id), text);
   }
   read(id: string): ConfigurationDraft {
-    const path = this.path(id), stat = lstatSync(path);
+    const path = this.path(id);
+    let stat;
+    // An expired draft is deleted (prune): say so, not the file system's error with this host's path.
+    try { stat = lstatSync(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("配置草稿已过期（最后一次使用后 30 分钟）或已结束，请重新填写并校验"); throw error; }
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 40 * 1024 * 1024) throw new Error("配置草稿损坏，已保留现场");
     return parseConfigurationDraft(readFileSync(path, "utf8"), id);
   }
@@ -66,14 +82,39 @@ export class ConfigurationDrafts {
     const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);
     return { digest: configurationDigest(draft), snapshot: draft.next };
   }
-  validated(id: string, session: string, revision: number, digest: string, summary: string[], catalog?: string) {
+  validated(id: string, session: string, revision: number, digest: string, summary: string[], catalog?: string, network = false) {
     const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);
     if (configurationDigest(draft) !== digest || !Array.isArray(summary) || summary.some(value => typeof value !== "string" || value.length > 4096)) throw new Error("校验期间草稿已变化，请重新校验");
     if (catalog !== undefined) {
       if (draft.next.kind !== "models" || typeof catalog !== "string" || Buffer.byteLength(catalog) > 8 * 1024 * 1024) throw new Error("模型目录缓存无效");
       JSON.parse(catalog); draft.next.files.catalog = catalog; draft.revision++;
     }
-    draft.validated = { digest: configurationDigest(draft), summary, at: this.now() }; this.write(draft); return this.view(id, session);
+    draft.validated = { digest: configurationDigest(draft), summary, at: this.now(), ...network ? { network: true } : {} }; this.write(draft); return this.view(id, session);
+  }
+  /**
+   * A first deployment's draft of one kind: complete, checked online (against the platform or the model provider) and still
+   * current; `digest`, when given, is the one the deployment was confirmed with. Not session-bound: the task re-reads it.
+   */
+  deploymentDraft(id: string, kind: "app" | "models", digest?: string): ConfigurationDraft {
+    const draft = this.read(id); assertConfigurationBase(this.project, draft.base);
+    const label = kind === "app" ? "应用机器人凭据" : "模型配置", files = draft.next.files;
+    if (draft.next.kind !== kind || (kind === "app" ? typeof files.app !== "string" : typeof files.models !== "string" || typeof files.settings !== "string"))
+      throw new Error(`请先填写${label}`);
+    const current = configurationDigest(draft);
+    if (draft.validated?.digest !== current || draft.validated.network !== true || (digest !== undefined && digest !== current)) throw new Error(`请先在线校验${label}`);
+    return draft;
+  }
+  /** A first deployment's application text; department queries before that deployment use it for app-bot.json. A use of the draft. */
+  appText(id: string, session: string): string {
+    this.owned(id, session);
+    const draft = this.deploymentDraft(id, "app"); this.write(draft);
+    return draft.next.files.app!;
+  }
+  /** The browser's draft as a first deployment confirms it. A use of the draft. */
+  deploymentReference(id: string, session: string, kind: "app" | "models"): { draft: string; digest: string } {
+    this.owned(id, session);
+    const draft = this.deploymentDraft(id, kind); this.write(draft);
+    return { draft: id, digest: configurationDigest(draft) };
   }
   prepare(id: string, session: string): { draft: string; digest: string } {
     const draft = this.owned(id, session); assertConfigurationBase(this.project, draft.base);
@@ -114,8 +155,7 @@ export class ConfigurationDrafts {
       try {
         const id = name.slice(0, -5), owner = this.task(id); if (!owner) continue;
         const request = tasks.request(owner), view = await tasks.view(owner, observers);
-        if (request.operation === "configuration-apply" && request.params.draft === id
-          && ["succeeded", "failed", "not-accepted"].includes(view.state)) this.finish(id, owner);
+        if (taskDrafts(request).some(ref => ref.draft === id) && ["succeeded", "failed", "not-accepted"].includes(view.state)) this.finish(id, owner);
       } catch { /* Unknown/corrupt task or maintenance state is retained; a heartbeat timeout is not proof of termination. */ }
     }
   }

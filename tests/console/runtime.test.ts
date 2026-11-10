@@ -189,3 +189,14 @@ test("启动控制台时只在任务都已结束、部署锁空闲、没有未�
     expect(existsSync(path)).toBe(false);
   } finally { await f.cleanup(); }
 });
+
+test("尚未部署（没有 data/state）时清理旧版本不取部署锁，也不创建 data/：macOS 首次部署会把 root 建的目录当作别人的", async () => {
+  const f = await tempFixture("console-runtime-fresh-");
+  try {
+    const project = f.root, old = "b".repeat(64), path = join(project, ".console/runtime", version(join(project, ".console/runtime"), "source-" + old, 30));
+    const tasks = new TaskStore(join(project, ".console")), observers = { hosting: async () => ({ state: "ended" as const }), needsRecovery: async () => false };
+    expect(await pruneUnusedRuntimes(project, tasks, observers, [])).toEqual(["source-" + old]);
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(join(project, "data"))).toBe(false);
+  } finally { await f.cleanup(); }
+});

@@ -63,6 +63,8 @@ function events(tasks: TaskStore, id: string, context: RouteContext): Response {
 
 export function taskRoutes(api: TaskApi): Record<string, Route> {
   const { tasks, plans, observers, audit } = api;
+  // A first deployment being submitted (between reading the task list and creating its task).
+  let installing = false;
   const writable = () => { if (api.current && !api.current()) throw new Error("代码已变化，请退出并重新运行 bun run console"); };
   const get = async (id: string | undefined) => {
     if (!id || !/^task-[a-f0-9]{32}$/.test(id)) throw new ApiProblem(400, "input", "任务编号无效");
@@ -103,17 +105,26 @@ export function taskRoutes(api: TaskApi): Record<string, Route> {
         if (!check.ok) throw new Error(check.reason);
         const plan = await plans.verify(value.plan);
         writable();
-        audit.write({ action: "task-submit", scope: plan.operation, session: session.label, mode: "default" });
-        const task = tasks.create({ planId: plan.id, operation: plan.operation, params: plan.params,
-          project: plan.facts.project, mechanism: check.mechanism }, `plan:${plan.id}`);
-        tasks.bindKey(value.key, task.id);
-        // Only the creator launches. Browser cancellation never propagates into this handoff.
-        if (task.created) {
-          api.created?.(tasks.request(task.id));
-          try { await api.launch(task.id); } catch { /* return the durable task; expiration arbitrates a late launcher */ }
+        // One first deployment at a time: its entry creates the service, account and directories before the core's lock.
+        if (plan.operation === "install") {
+          if (installing) throw new Error("另一个首次部署正在提交");
+          installing = true;
         }
-        const view = display(await tasks.view(task.id, observers));
-        return new Response(JSON.stringify(view), { status: 202, headers: { "Content-Type": "application/json" } });
+        try {
+          if (plan.operation === "install" && (await tasks.list(observers)).some(view => view.request?.operation === "install" && ["queued", "running"].includes(view.state)))
+            throw new Error("已有首次部署任务正在进行，请等它结束");
+          audit.write({ action: "task-submit", scope: plan.operation, session: session.label, mode: "default" });
+          const task = tasks.create({ planId: plan.id, operation: plan.operation, params: plan.params,
+            project: plan.facts.project, mechanism: check.mechanism }, `plan:${plan.id}`);
+          tasks.bindKey(value.key, task.id);
+          // Only the creator launches. Browser cancellation never propagates into this handoff.
+          if (task.created) {
+            api.created?.(tasks.request(task.id));
+            try { await api.launch(task.id); } catch { /* return the durable task; expiration arbitrates a late launcher */ }
+          }
+          const view = display(await tasks.view(task.id, observers));
+          return new Response(JSON.stringify(view), { status: 202, headers: { "Content-Type": "application/json" } });
+        } finally { if (plan.operation === "install") installing = false; }
       } catch (error) { return problem(error); }
     } },
     "GET /api/tasks": { run: async () => ({ tasks: (await tasks.list(observers)).map(display) }) },

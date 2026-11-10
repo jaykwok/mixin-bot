@@ -1,6 +1,7 @@
-// Uninstall stays in the entries (the questions, removing the container or the scheduled task, archiving data/); the core
-// decides under deploy.lock, which the entry holds for the whole uninstall, whether anything still needs this deployment:
-// an unfinished deployment or upgrade (its rollback container, image tag and records), an unfinished ops task or configuration.
+// Uninstall stays in the entries (the questions, or a console task's confirmed choices; removing the container or the scheduled
+// task, archiving data/); the core decides under deploy.lock, which the entry holds for the whole uninstall, whether anything
+// still needs this deployment: an unfinished deployment or upgrade (its rollback container, image tag and records), an
+// unfinished ops task or configuration. A console task is checked there too (check-plan.ts checkUninstallTask).
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
@@ -14,8 +15,8 @@ import type { OpsResult } from "./result.ts";
  * Linux adopts the entry's descriptor 9 (acquire_deploy_lock). On Windows the entry holds the file open with FileShare.None and
  * names it in BOT_DEPLOY_LOCK_HELD: while it does, nobody else can, so a busy lock at that path is the entry's own.
  */
-async function underEntryLock<T>(project: string, env: NodeJS.ProcessEnv, work: () => T): Promise<T> {
-  try { return await withDeploymentLock(project, async () => work()); }
+async function underEntryLock<T>(project: string, env: NodeJS.ProcessEnv, work: () => Promise<T>): Promise<T> {
+  try { return await withDeploymentLock(project, work); }
   catch (error) {
     if (!(error instanceof DeploymentBusy) || process.platform !== "win32" || !env.BOT_DEPLOY_LOCK_HELD) throw error;
     const held = realpathSync(env.BOT_DEPLOY_LOCK_HELD), own = join(realpathSync(join(project, "data", "state")), "deploy.lock");
@@ -32,12 +33,14 @@ export function assertUninstallable(root: string): void {
   if (readConfigurationState(root)) throw new MaintenanceRefused("有未结束的配置提交；请先在控制台恢复或收尾，卸载未开始");
 }
 
-export async function checkUninstall(project: string, env: NodeJS.ProcessEnv = process.env): Promise<OpsResult> {
+/** `verify`: a console task's check, under the same lock; a refusal from it is a refusal. */
+export async function checkUninstall(project: string, env: NodeJS.ProcessEnv = process.env, verify: () => Promise<void> = async () => {}): Promise<OpsResult> {
   const base: OpsResult = { protocol: "mixin-ops", version: 1, command: "uninstall", outcome: "failed", exitCode: 1, wasRunning: false, finalState: "unknown", message: "" };
   const root = resolve(project);
   try {
-    return await underEntryLock(root, env, () => {
+    return await underEntryLock(root, env, async () => {
       assertUninstallable(root);
+      await verify();
       return { ...base, outcome: "success" as const, exitCode: 0, message: "卸载前检查通过：没有未完成的部署、升级、运维任务或配置提交" };
     });
   } catch (error) {

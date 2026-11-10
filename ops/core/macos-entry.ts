@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// macOS ops entry. On Darwin scripts/deploy.sh, ops.sh and upgrade.sh hand their arguments to scripts/lib/macos-entry.sh,
+// macOS ops entry. On Darwin scripts/ops.sh, upgrade.sh and lib/deploy.sh hand their arguments to scripts/lib/macos-entry.sh,
 // which runs this file: `deploy [deploy|repair]`, `ops <command> [arguments]` (the commands and arguments of ops.sh) or
 // `upgrade <project> <target> [continue|rollback]` (the target release's upgrader). The shared core (ops/core/cli.ts) owns
 // every write that needs deploy.lock; this entry asks, checks and hands over, like ops.ps1 does on Windows.
@@ -11,12 +11,13 @@ import { loadDeploymentState, type DeploymentState } from "./deployment-state.ts
 import { describePendingTransaction } from "./pending-transaction.ts";
 import { accountIdentity, LaunchdPlatform, SERVICE_ACCOUNT, trustCheckout, type Identity, type ServiceDefinition } from "./launchd-host.ts";
 import { checkoutOperator } from "./macos-lifecycle.ts";
-import { accountEnvironment, deployEntry, removeAsAccount, runCore, upgradeEntry } from "./macos-deploy.ts";
+import { accountEnvironment, deployCheck, deployEntry, removeAsAccount, runCore, upgradeEntry } from "./macos-deploy.ts";
 import { AT_FDCWD, close, mkdirAt, O, openAt, renameAt, statAt } from "../../src/lib/darwin.ts";
 import { handOverLog } from "../../src/lib/operation-log.ts";
 import { doctorReport, printDoctor } from "./macos-doctor.ts";
 import { serviceReady } from "./readiness.ts";
 import { assertUninstallable } from "./uninstall.ts";
+import { checkUninstallTask } from "./check-plan.ts";
 import { assertConfirmedTransaction, transactionDirectory } from "../lib/confirmed-transaction.ts";
 import { askTransactionAction, askYesNo, attached, captured, EntryError, fail, hint, ok, requireRoot, setStage, silence, SOURCE, startLog, step, warn, writeResult } from "./macos-terminal.ts";
 
@@ -256,21 +257,28 @@ function archiveServiceData(project: string): void {
     const root = open(AT_FDCWD, project), backup = open(root, "backup");
     if (!statAt(backup, "rm")) mkdirAt(backup, "rm", 0o700);
     const archive = open(backup, "rm");
-    for (const name of ["data", "logs"]) {
+    // logs/ first: when a step fails data/ is still there, the console still sees a deployment and the uninstall can be retried.
+    for (const name of ["logs", "data"]) {
       if (statAt(root, name)) renameAt(root, name, archive, `${Math.floor(Date.now() / 1000)}-${randomBytes(4).toString("hex")}-${name}`, true);
     }
   } finally { for (const fd of opened.reverse()) close(fd); }
 }
+
+/** Nothing was done: the lock was busy, or this deployment or the console task's plan refused the uninstall. */
+class UninstallRefused extends EntryError {}
 
 async function uninstall(context: Context): Promise<number> {
   const { project } = context;
   step("卸载 mixin-bot");
   let lock;
   try { lock = acquireDeploymentLock(project); }
-  catch (error) { if (error instanceof DeploymentBusy) throw new EntryError("部署、升级或另一个维护操作正在进行；卸载未开始"); throw error; }
+  catch (error) { if (error instanceof DeploymentBusy) throw new UninstallRefused("部署、升级或另一个维护操作正在进行；卸载未开始"); throw error; }
   try {
-    try { assertUninstallable(project); }
-    catch (error) { throw new EntryError(error instanceof Error ? error.message : String(error)); }
+    try { assertUninstallable(project); await checkUninstallTask(project, SOURCE, context.env); }
+    catch (error) { throw new UninstallRefused(error instanceof Error ? error.message : String(error)); }
+    // Read before data/ may be archived.
+    let workspace = "";
+    try { workspace = (await Bun.file(join(project, "data/state/workspace-root")).text()).trim(); } catch { workspace = ""; }
     const service = new LaunchdPlatform(project), facts = await service.inspect();
     if (!facts.owned) throw new EntryError("LaunchDaemon 属于其他目录或其他账户；卸载已停止");
     if (facts.state !== "absent" || facts.leftovers > 0) {
@@ -279,12 +287,13 @@ async function uninstall(context: Context): Promise<number> {
     }
     if (facts.state !== "absent") { rmSync(service.plist, { force: true }); ok("LaunchDaemon 已删除"); }
     else warn("没有可删除的 LaunchDaemon");
-    if (askYesNo("是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N] ", false, context.env)) {
+    // A console task does not ask: its confirmed choice, checked with the task and plan above.
+    const archive = context.env.MIXIN_OPS_CONSOLE === "1" ? context.env.MIXIN_OPS_UNINSTALL_DATA === "1"
+      : askYesNo("是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N] ", false, context.env);
+    if (archive) {
       archiveServiceData(project);
       ok("data/ 和 logs/ 已移入 backup/rm");
     } else ok("已保留 data/ 和 logs/（配置、状态、资料、会话与统计保留）");
-    let workspace = "";
-    try { workspace = (await Bun.file(join(project, "data/state/workspace-root")).text()).trim(); } catch { workspace = ""; }
     if (workspace) warn(`外置共享资料目录不属于本项目，未删除：${workspace}`);
     if (context.account) warn(`服务账户 ${SERVICE_ACCOUNT} 已保留（data/ 及其归档仍属于它）；不再需要时：sudo dscl . -delete /Users/${SERVICE_ACCOUNT} 和 sudo dscl . -delete /Groups/${SERVICE_ACCOUNT}`);
     ok("卸载流程完成。");
@@ -292,9 +301,23 @@ async function uninstall(context: Context): Promise<number> {
   } finally { lock.close(); }
 }
 
+/** A console uninstall reports the observed end state; a refusal did nothing. */
+async function consoleUninstall(context: Context): Promise<number> {
+  const wasRunning = await runState(context.project) === "running";
+  let code = 1, outcome: "success" | "refused" | "failed" = "failed", message = "卸载未完成，请查看任务日志";
+  try { code = await uninstall(context); if (code === 0) { outcome = "success"; message = "卸载完成"; } }
+  catch (error) {
+    message = error instanceof Error ? error.message : String(error); fail(message);
+    code = error instanceof EntryError ? error.code : 1;
+    if (error instanceof UninstallRefused) outcome = "refused";
+  }
+  const written = writeResult({ command: "uninstall", outcome, wasRunning, finalState: await runState(context.project), exitCode: code, message }, context.env);
+  return code === 0 && !written ? 1 : code;
+}
+
 function help(): void {
   console.log(`mixin-bot 运维工具（macOS，实验性支持）
-用法：sudo bash scripts/ops.sh <命令>；部署：sudo bash scripts/deploy.sh
+用法：sudo bash scripts/ops.sh <命令>；部署：sudo bash scripts/ops.sh deploy
 运维控制台：在项目根目录运行 sudo bun run console，在浏览器中打开。
 
   doctor     健康检查：共享资料目录、LaunchDaemon、本机端口、版本、事件 Stream、通讯录同步、配置
@@ -367,7 +390,7 @@ async function ops(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
     case "directory-scope": return dataTool(context, "ops/tools/directory-admin.ts", ["scope", ...rest]);
     case "stat": return dataTool(context, "ops/tools/stats-admin.ts", rest);
     case "history-ls": return dataTool(context, "ops/tools/history-admin.ts", ["list", ...rest]);
-    case "uninstall": return uninstall(context);
+    case "uninstall": return env.MIXIN_OPS_CONSOLE === "1" ? consoleUninstall(context) : uninstall(context);
   }
   if (WIZARDS[command]) return configure(context, command);
   return core(context, ["maintenance", command, ...rest]);
@@ -382,7 +405,8 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (entry === "upgrade") return await upgradeEntry(rest, env);
     if (entry === "deploy") {
       const command = rest[0] ?? "deploy";
-      if (rest.length > 1 || command !== "deploy" && command !== "repair") throw new EntryError("用法：sudo bash scripts/deploy.sh [deploy|repair]", 2);
+      if (rest.length > 1 || !["deploy", "repair", "check"].includes(command)) throw new EntryError("用法：sudo bash scripts/ops.sh deploy|repair", 2);
+      if (command === "check") return await deployCheck(resolve(env.MIXIN_OPS_PROJECT || SOURCE));
       if (command === "repair") return await ops(["repair"], env);
       return await ops(["deploy"], env);
     }

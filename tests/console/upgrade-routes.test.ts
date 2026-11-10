@@ -1,16 +1,47 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { undeployed } from "../../console/server/recovery.ts";
 import { upgradeRoutes } from "../../console/server/upgrade-routes.ts";
+import { DATA_VERSION } from "../../src/core/version.ts";
 import type { RouteContext } from "../../console/server/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const context = (body: unknown = {}): RouteContext => ({ body, signal: new AbortController().signal, session: {} as RouteContext["session"] });
 
+const record = JSON.stringify({ dataVersion: DATA_VERSION, appVersion: "2.0.0", build: "", transaction: "deploy-fixture", application: "a".repeat(64) });
+
+test("尚未部署：没有未完成的事务、部署记录和运行数据；重部署设置指向首次部署", async () => {
+  const f = await tempFixture("redeploy-fresh-");
+  try {
+    const routes = upgradeRoutes(f.root, async () => { throw new Error("尚未部署时不应读取 Git"); });
+    const get = () => routes["GET /api/lifecycle/deploy"]!.run(context());
+    expect(undeployed(f.root)).toBe(true);
+    await expect(get()).rejects.toThrow("尚未部署：重新部署只用于已有实例");
+    // Settings written before the first deployment do not make it a deployment.
+    mkdirSync(join(f.root, "data/state"), { recursive: true }); writeFileSync(join(f.root, "data/state/bot-port"), "12011");
+    expect(undeployed(f.root)).toBe(true);
+    await expect(get()).rejects.toThrow("尚未部署");
+    // Runtime data without a record, a damaged record, or an unreadable transaction is not a fresh checkout.
+    mkdirSync(join(f.root, "data/conversations"));
+    expect(undeployed(f.root)).toBe(false);
+    rmSync(join(f.root, "data/conversations"), { recursive: true });
+    writeFileSync(join(f.root, "data/state/data-version.json"), "{");
+    expect(undeployed(f.root)).toBe(false);
+    rmSync(join(f.root, "data/state/data-version.json"));
+    writeFileSync(join(f.root, "data/state/deploy-transaction"), "corrupt");
+    expect(undeployed(f.root)).toBe(false);
+    rmSync(join(f.root, "data/state/deploy-transaction"));
+    writeFileSync(join(f.root, "data/state/data-version.json"), record);
+    expect(undeployed(f.root)).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
 test("重部署设置来自状态文件，读取不联网；损坏和未完成事务阻止填写旧默认值", async () => {
   const f = await tempFixture("redeploy-settings-");
   try {
     mkdirSync(join(f.root, "data/state"), { recursive: true });
+    writeFileSync(join(f.root, "data/state/data-version.json"), record);
     writeFileSync(join(f.root, "data/state/bot-port"), "12011\n"); writeFileSync(join(f.root, "data/state/workspace-root"), "");
     const routes = upgradeRoutes(f.root, async argv => {
       expect(argv).toEqual(["git", "-C", f.root, "rev-parse", "--abbrev-ref", "HEAD"]);

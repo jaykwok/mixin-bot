@@ -190,6 +190,9 @@ export async function reconcileTasks(store: TaskStore, mechanism: Mechanism, run
  */
 export async function pruneUnusedRuntimes(project: string, store: TaskStore, observers: TaskObservers, keep: Iterable<string>): Promise<string[]> {
   for (const view of await store.list(observers)) if (view.needsRecovery || !["succeeded", "failed", "not-accepted"].includes(view.state)) return [];
+  // Nothing deployed (no data/state): no transaction or maintenance can name a version. Taking the lock would create
+  // data/ and data/state as this console's user (root under sudo), which a macOS first deployment finds foreign and must ask about.
+  if (!existsSync(join(project, "data", "state"))) return pruneRuntimes(consoleDir(project), new Set(keep));
   let lock;
   try { lock = acquireDeploymentLock(project); }
   catch (error) { if (error instanceof DeploymentBusy) return []; throw error; }

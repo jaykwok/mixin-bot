@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DeploymentDirectory, type DepartmentQuery } from "../../console/server/deployment-directory.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
 import { directoryAppHash } from "../../ops/lib/directory-choice.ts";
 import { deploymentEnvironment } from "../../ops/core/deployment-options.ts";
 import { operationPreparer } from "../../console/server/prepare-operation.ts";
@@ -69,5 +71,40 @@ test("部署部门草稿拒绝过期、配置变化、平台拒绝和不完整�
     await expect(f.picker.prepare({ view: opened.view, selected: [opened.children[0]!.key] }, "one")).rejects.toThrow("过期");
     f.state.during = () => f.picker.end("one"); await expect(f.open()).rejects.toThrow("过期"); f.state.during = () => {};
     writeFileSync(join(f.root, "data/config/directory.json"), '{"format":1,"all":true}'); await expect(f.open()).rejects.toThrow("已有同步范围");
+  } finally { await f.cleanup(); }
+});
+
+test("首次部署：部门树用在线校验过的应用草稿读取；草稿变化、未在线校验或已有部署时拒绝", async () => {
+  const f = await tempFixture("deployment-directory-draft-");
+  try {
+    const drafts = new ConfigurationDrafts(f.root), seen: (string | undefined)[] = [];
+    const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+    const query: DepartmentQuery = async (action, ids, _signal, app) => {
+      seen.push(app);
+      return { appHash: hash(app ?? ""), departments: action === "children" ? [{ id: "dept-root", name: "研发部" }] : ids.map(id => ({ id, name: "已核对部门" })) };
+    };
+    const picker = new DeploymentDirectory(f.root, query, Date.now, drafts), routes = picker.routes();
+    const open = (draft: string) => routes["POST /api/lifecycle/directory/open"]!.run(context({ draft })) as Promise<Opened>;
+    const patch = { appId: "fixture", environment: "production", secret: { mode: "set", value: "synthetic-private" } };
+    const draft = drafts.create("app", "one"), edited = drafts.edit(draft.id, "one", draft.revision, patch);
+    const check = (network: boolean) => {
+      const input = drafts.validationInput(draft.id, "one", edited.revision);
+      drafts.validated(draft.id, "one", edited.revision, input.digest, ["通过"], undefined, network);
+      return input.snapshot.files.app!;
+    };
+    check(false); await expect(open(draft.id)).rejects.toThrow("请先在线校验");
+    const app = check(true), opened = await open(draft.id);
+    expect(JSON.stringify(opened)).not.toContain("synthetic-private"); expect(seen).toEqual([app]);
+    const choice = await picker.prepare({ view: opened.view, selected: [opened.children[0]!.key] }, "one");
+    expect(choice).toEqual({ departments: ["dept-root"], names: ["已核对部门"], appHash: hash(app) });
+    await expect(routes["POST /api/lifecycle/directory/open"]!.run(context({ draft: draft.id }, "two"))).rejects.toThrow();
+    await expect(routes["POST /api/lifecycle/directory/open"]!.run(context({ draft: draft.id, extra: 1 }))).rejects.toThrow("参数无效");
+    expect(existsSync(join(f.root, "data"))).toBe(false);
+    // Edited after the tree was opened: the view no longer matches the draft.
+    drafts.edit(draft.id, "one", edited.revision, { ...patch, appId: "fixture-two" });
+    await expect(picker.prepare({ view: opened.view, selected: [opened.children[0]!.key] }, "one")).rejects.toThrow("请先在线校验");
+    // An existing deployment keeps its installed configuration.
+    mkdirSync(join(f.root, "data/state"), { recursive: true }); writeFileSync(join(f.root, "data/state/data-version.json"), "{}");
+    await expect(open(draft.id)).rejects.toThrow("只用于首次部署");
   } finally { await f.cleanup(); }
 });

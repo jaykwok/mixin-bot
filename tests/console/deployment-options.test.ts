@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, statSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { assertDeploymentEnvironment, deploymentOptions, deploymentEnvironment, deploymentScope } from "../../ops/core/deployment-options.ts";
+import { assertDeploymentEnvironment, deploymentOptions, deploymentEnvironment, deploymentScope, uninstallScope } from "../../ops/core/deployment-options.ts";
 import { operationArgs, operationCommand } from "../../ops/core/operations.ts";
 import { codeDigest } from "../../ops/core/source-runtime.ts";
 import { checkTaskPlan } from "../../ops/core/check-plan.ts";
@@ -33,17 +33,19 @@ async function fixture() {
     "data/config/app-bot.json": '{"secret":"synthetic-secret"}', "data/config/models.json": "{}", "data/runtime/pi/settings.json": "{}", "data/config/directory.json": '{"format":1,"all":true}' })) {
     mkdirSync(dirname(join(f.root, path)), { recursive: true }); writeFileSync(join(f.root, path), value);
   }
-  const state = { branch: "main", dirty: "", identity: "first", capability: 1 };
+  // service: the scheduled task, container or LaunchDaemon exists; rollback: an old mixin-bot-rollback container is left.
+  const state = { branch: "main", dirty: "", identity: "first", capability: 1, service: true, rollback: false };
   const run: Runner = async argv => {
     let stdout: string;
     if (argv[0] === "git" && argv[3] === "rev-parse") stdout = state.branch;
     else if (argv[0] === "git" && argv[3] === "status") stdout = state.dirty;
     else if (argv[0] === "git" && argv[3] === "show") stdout = JSON.stringify({ protocol: "mixin-console-lifecycle", version: state.capability });
-    else if (argv[0] === "powershell") stdout = JSON.stringify({ Principal: { UserId: state.identity }, Actions: [{ WorkingDirectory: f.root, Execute: "fixture" }] });
+    else if (argv[0] === "powershell") stdout = state.service ? JSON.stringify({ Principal: { UserId: state.identity }, Actions: [{ WorkingDirectory: f.root, Execute: "fixture" }] }) : "null";
+    else if (argv[0] === "docker" && argv[1] === "ps") stdout = [...state.service ? ["mixin-bot"] : [], ...state.rollback ? ["mixin-bot-rollback"] : []].join("\n");
     else if (argv[0] === "docker") stdout = JSON.stringify([{ Id: state.identity, Image: "synthetic-image", Config: { User: "10001:10001" }, Mounts: [{ Type: "bind", RW: true, Source: realpathSync(join(f.root, "data")), Destination: "/app/data" }] }]);
     // macOS: the LaunchDaemon of this project, its definition naming the identity under test.
     else if (argv[0] === "/usr/bin/plutil") stdout = JSON.stringify({ Label: "com.mixin-bot.service", UserName: "_mixinbot", WorkingDirectory: f.root, ProgramArguments: [state.identity] });
-    else if (argv[0] === "/bin/launchctl") stdout = "state = running\n";
+    else if (argv[0] === "/bin/launchctl") { if (!state.service) return { code: 113, stdout: "", stderr: "" }; stdout = "state = running\n"; }
     else if (argv[0] === "/usr/bin/id") stdout = "499\n";
     else throw new Error(`unexpected command ${argv}`);
     return { code: 0, stdout, stderr: "" };
@@ -111,6 +113,26 @@ test("重部署目标端口与控制台相同时停机前拒绝；预览期间�
   } finally { await f.cleanup(); }
 });
 
+test("重新部署：服务不在（卸载保留了数据）时预览写明会重新创建并绑定这一事实；升级仍要求服务存在", async () => {
+  const f = await fixture();
+  try {
+    const params = { directory: "saved", port: 1011, workspace: "" };
+    const present = await deploymentScope(f.root, "deploy", params, f.run, f.launchd);
+    f.state.service = false; rmSync(join(f.root, "service.plist"));
+    const missing = await deploymentScope(f.root, "deploy", params, f.run, f.launchd);
+    expect(missing.scope).not.toBe(present.scope);
+    expect(missing.summary.join("\n")).toMatch(/重新注册|重新安装|重新创建/);
+    if (process.platform === "linux") expect(missing.summary.join("\n")).toContain(`${statSync(join(f.root, "data/state")).uid}:${statSync(join(f.root, "data/state")).gid}`);
+    // Rootless (a non-root operator): the container runs as 0:0, mapped to the data's owner, as deploy.sh service_user_from_data.
+    if (process.platform === "linux" && process.geteuid!() !== 0) expect(missing.summary.join("\n")).toContain("以 0:0 运行");
+    await expect(deploymentScope(f.root, "update", choice, f.run, f.launchd)).rejects.toThrow("请先在维护页重新部署");
+    if (process.platform === "linux") {
+      f.state.rollback = true;
+      await expect(deploymentScope(f.root, "deploy", params, f.run, f.launchd)).rejects.toThrow("回滚容器");
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("锁内复核拒绝丢失或污染的命名选择，不只检查保存的计划", async () => {
   const f = await fixture();
   const env = deploymentEnvironment("update", choice, f.root), previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
@@ -155,7 +177,7 @@ test.skipIf(process.platform !== "linux")("Docker mount order is not a deploymen
     const original = [mount(realpathSync(join(f.root, "data")), "/app/data"), mount("/run/user/1001/docker.sock", "/run/mixin-task/docker.sock"),
       mount(join(f.root, "workspace"), "/app/workspace")];
     let mounts = structuredClone(original), user = "1001:1001", id = "same-container";
-    const run: Runner = async (argv, env) => argv[0] === "docker"
+    const run: Runner = async (argv, env) => argv[0] === "docker" && argv[1] !== "ps"
       ? { code: 0, stderr: "", stdout: JSON.stringify([{ Id: id, Image: "same-image", Config: { User: user }, Mounts: mounts }]) }
       : f.run(argv, env);
     const scope = async () => (await deploymentScope(f.root, "update", choice, run)).scope;
@@ -169,5 +191,55 @@ test.skipIf(process.platform !== "linux")("Docker mount order is not a deploymen
     expect(await scope()).not.toBe(initial);
     mounts = structuredClone(original); user = "0:0"; expect(await scope()).not.toBe(initial);
     user = "1001:1001"; id = "replaced-container"; expect(await scope()).not.toBe(initial);
+  } finally { await f.cleanup(); }
+});
+
+test("卸载只接收两项明确选择并逐项传给入口；预览绑定本部署的服务，拒绝别的目录的服务、未完成的事务和空目录", async () => {
+  const f = await fixture();
+  try {
+    const keep = { data: false, image: false }, archive = { data: true, image: false }, linux = process.platform === "linux";
+    expect(operationArgs("uninstall", keep)).toEqual(["uninstall"]);
+    for (const params of [{}, { data: false }, { data: "false", image: false }, { ...keep, argv: [] }]) expect(() => operationArgs("uninstall", params)).toThrow();
+    if (linux) expect(operationArgs("uninstall", { data: false, image: true })).toEqual(["uninstall"]);
+    else expect(() => operationArgs("uninstall", { data: false, image: true })).toThrow("只有 Linux");
+    const env = operationCommand(f.root, "uninstall", archive).env;
+    expect([env.MIXIN_OPS_UNINSTALL_DATA, env.MIXIN_OPS_UNINSTALL_IMAGE]).toEqual(["1", "0"]);
+    expect(() => assertDeploymentEnvironment("uninstall", keep, f.root, { MIXIN_OPS_UNINSTALL_DATA: "0", MIXIN_OPS_UNINSTALL_IMAGE: "0" })).not.toThrow();
+    for (const polluted of [{ MIXIN_OPS_UNINSTALL_DATA: "1", MIXIN_OPS_UNINSTALL_IMAGE: "0" }, { MIXIN_OPS_UNINSTALL_IMAGE: "0" }])
+      expect(() => assertDeploymentEnvironment("uninstall", keep, f.root, polluted)).toThrow("卸载选择未完整传递");
+
+    const kept = await uninstallScope(f.root, keep, f.run, f.launchd), archived = await uninstallScope(f.root, archive, f.run, f.launchd);
+    expect(kept.scope).not.toBe(archived.scope);
+    expect(kept.summary.join("\n")).toContain("保留 data/ 和 logs/");
+    expect(archived.summary.join("\n")).toContain("移入 backup/rm");
+    expect(archived.summary.join("\n")).toContain("workspace/ 目录（共享资料）不删除");
+    expect(archived.summary.join("\n")).toMatch(/注销计划任务|删除 LaunchDaemon|删除容器 mixin-bot/);
+    if (linux) {
+      expect((await uninstallScope(f.root, { data: false, image: true }, f.run)).summary.join("\n")).toContain("删除镜像 mixin-bot");
+      f.state.rollback = true;
+      expect((await uninstallScope(f.root, keep, f.run)).summary.join("\n")).toContain("mixin-bot、mixin-bot-rollback");
+      f.state.rollback = false;
+    }
+    // The service it removes is bound: a replaced one needs a new preview.
+    f.state.identity = "replacement";
+    expect((await uninstallScope(f.root, keep, f.run, f.launchd)).scope).not.toBe(kept.scope);
+    writeFileSync(join(f.root, "data/state/workspace-root"), "/srv/shared\n");
+    expect((await uninstallScope(f.root, archive, f.run, f.launchd)).summary.join("\n")).toContain("外置共享资料目录 /srv/shared 不删除");
+    // Another directory's service is removed by name by the entries: refuse it.
+    const foreign: Runner = async (argv, environment) => argv[0] === "powershell"
+      ? { code: 0, stderr: "", stdout: JSON.stringify({ Actions: [{ WorkingDirectory: join(f.root, "other"), Execute: "fixture" }] }) }
+      : argv[0] === "docker" && argv[1] !== "ps"
+        ? { code: 0, stderr: "", stdout: JSON.stringify([{ Id: "other", Mounts: [{ Type: "bind", RW: true, Source: join(f.root, "other/data"), Destination: "/app/data" }] }]) }
+        : argv[0] === "/usr/bin/plutil"
+          ? { code: 0, stderr: "", stdout: JSON.stringify({ Label: "com.mixin-bot.service", UserName: "_mixinbot", WorkingDirectory: join(f.root, "other"), ProgramArguments: ["x"] }) }
+          : f.run(argv, environment);
+    await expect(uninstallScope(f.root, keep, foreign, f.launchd)).rejects.toThrow("请在");
+    // Without a service the data can still be archived; with neither there is nothing to uninstall.
+    f.state.service = false; rmSync(join(f.root, "service.plist"));
+    expect((await uninstallScope(f.root, archive, f.run, f.launchd)).summary.join("\n")).toMatch(/不存在/);
+    writeFileSync(join(f.root, "data/state/deploy-transaction"), "corrupt");
+    await expect(uninstallScope(f.root, keep, f.run, f.launchd)).rejects.toThrow();
+    rmSync(join(f.root, "data"), { recursive: true });
+    await expect(uninstallScope(f.root, archive, f.run, f.launchd)).rejects.toThrow("没有可卸载");
   } finally { await f.cleanup(); }
 });

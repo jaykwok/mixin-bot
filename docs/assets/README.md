@@ -10,7 +10,7 @@
 | [console-stats.png](console-stats.png) | 统计：筛选、指标卡片、对比、趋势、排行 | 统计页布局、指标名称或统计口径变化 |
 | [console-picker.png](console-picker.png) | 路径选择框：在主机上选取统计文件 | 选择框布局或位置列表变化 |
 | [console-conversations.png](console-conversations.png) | 会话：成员列表、对话、工具调用与用量 | 会话页布局或消息展示方式变化 |
-| [console-maintain.png](console-maintain.png) | 维护：恢复、启停、升级、重新部署、后台任务、备份清理 | 维护页的操作或任务展示变化 |
+| [console-maintain.png](console-maintain.png) | 维护：恢复、启停、升级、重新部署、后台任务、备份清理、卸载 | 维护页的操作或任务展示变化 |
 | [console-confirm.png](console-confirm.png) | 确认面板：步骤、计划内容与有效期 | 确认面板布局或步骤变化 |
 
 ## 重新生成

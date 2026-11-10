@@ -28,10 +28,14 @@ export function directoryChoiceText(value: DirectoryChoice): string {
   return scopeFileText({ kind: "departments", departments: value.departments });
 }
 
-/** Internal console transport. Only a verified task may materialize this as the deployment transaction's plan. */
-export function consoleDirectoryScope(project: string, env = process.env): DirectoryScope {
+/**
+ * Internal console transport. Only a verified task may materialize this as the deployment transaction's plan. `app`: a first
+ * deployment's staged app-bot.json text, which the departments were read with in place of the installed one.
+ */
+export function consoleDirectoryScope(project: string, env = process.env, app?: string): DirectoryScope {
+  const appHash = app === undefined ? directoryAppHash(project) : createHash("sha256").update(app).digest("hex");
   if (env.MIXIN_OPS_CONSOLE !== "1" || !env.MIXIN_OPS_TASK_ID || env.MIXIN_OPS_DIRECTORY !== "selected" || env.BOT_DIRECTORY_SCOPE
-    || !env.MIXIN_OPS_DIRECTORY_INPUT || env.MIXIN_OPS_DIRECTORY_INPUT.length > 32 * 1024 || directoryAppHash(project) !== env.MIXIN_OPS_DIRECTORY_APP) throw new Error("控制台通讯录选择或应用配置已变化，未写入范围");
+    || !env.MIXIN_OPS_DIRECTORY_INPUT || env.MIXIN_OPS_DIRECTORY_INPUT.length > 32 * 1024 || appHash !== env.MIXIN_OPS_DIRECTORY_APP) throw new Error("控制台通讯录选择或应用配置已变化，未写入范围");
   const scope = parseScopeFile(JSON.parse(env.MIXIN_OPS_DIRECTORY_INPUT), "控制台通讯录范围");
   if (scope.kind !== "departments") throw new Error("部门选择必须包含明确的部门");
   return { kind: "departments", departments: parseScopeDepartments(scope.departments) };

@@ -182,7 +182,7 @@ container_cases() {
 
 deploy_cases() {
     local data="$PROJECT_DIR/data"
-    load_function "$here/../../scripts/deploy.sh" determine_service_user
+    load_function "$here/../../scripts/lib/deploy.sh" determine_service_user
     deploy_identity() {
         local name="$1"
         SERVICE_USER='' SERVICE_USER_SOURCE='' DOCKER_ROOTLESS="$2"
@@ -220,7 +220,7 @@ deploy_cases() {
     deploy_identity confirmed-rootless 1
     rm -f -- "$STATE_DIR/bot-port"
     # The directory step: data/ itself (made by root before the first deployment) goes to the default identity as well.
-    load_function "$here/../../scripts/deploy.sh" prepare_service_directories
+    load_function "$here/../../scripts/lib/deploy.sh" prepare_service_directories
     DATA_DIR="$data" CONFIG_DIR="$data/config" RUNTIME_DIR="$data/runtime" RUNTIME_HOME_DIR="$data/runtime/home"
     LOG_DIR="$PROJECT_DIR/logs"
     mkdir -p "$RUNTIME_HOME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"

@@ -8,7 +8,7 @@ import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts
 import { tempFixture } from "../helpers/temp.ts";
 import { transactionDirectory } from "../../ops/lib/confirmed-transaction.ts";
 
-// The Linux deployment entry (scripts/deploy.sh): first its hand-over pieces cut out with the preview container and
+// The Linux deployment entry (scripts/lib/deploy.sh): first its hand-over pieces cut out with the preview container and
 // the record writers stubbed, then the unmodified script run up to the hand-over with Docker, the build and the core
 // replaced (tests/helpers/deploy-entry-stubs.sh, deploy-entry-bun.sh). Stop, configuration, verification and rollback run
 // in core-docker-deploy.test.ts.
@@ -20,7 +20,7 @@ const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-
 const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(BOT_|PI_)/i.test(name)));
 
 function entryFunctions(...names: string[]): string {
-  const source = "\n" + readFileSync(join(project, "scripts/deploy.sh"), "utf8").replaceAll("\r\n", "\n");
+  const source = "\n" + readFileSync(join(project, "scripts/lib/deploy.sh"), "utf8").replaceAll("\r\n", "\n");
   return names.map(name => {
     const from = source.indexOf("\n" + name + "() {\n");
     if (from < 0) throw new Error("deploy.sh has no function " + name);
@@ -101,7 +101,6 @@ const git = (cwd: string, ...args: string[]) => {
 async function release(name: string, setup: { config?: boolean; deployed?: boolean; directory?: boolean } = {}) {
   const f = await tempFixture(name), root = join(realpathSync(f.root), "project");
   for (const directory of ["scripts", "scripts/lib", "ops/config", "src/server", "data/config", "data/state", "data/runtime/pi"]) mkdirSync(join(root, directory), { recursive: true });
-  copyFileSync(join(project, "scripts/deploy.sh"), join(root, "scripts/deploy.sh"));
   for (const name of readdirSync(join(project, "scripts/lib"))) if (name.endsWith(".sh")) copyFileSync(join(project, "scripts/lib", name), join(root, "scripts/lib", name));
   appendFileSync(join(root, "scripts/lib/core-handoff.sh"), "\n" + readFileSync(join(project, "tests/helpers/deploy-entry-stubs.sh"), "utf8"));
   const bun = join(f.root, "bun"); copyFileSync(join(project, "tests/helpers/deploy-entry-bun.sh"), bun); chmodSync(bun, 0o755);
@@ -113,7 +112,7 @@ async function release(name: string, setup: { config?: boolean; deployed?: boole
   const head = git(root, "rev-parse", "HEAD"), events = join(f.root, "events"), capture = join(f.root, "capture");
   const run = async (env: Record<string, string> = {}, input = "") => {
     writeFileSync(events, ""); rmSync(capture, { recursive: true, force: true });
-    const child = Bun.spawn(["bash", join(root, "scripts/deploy.sh")], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    const child = Bun.spawn(["bash", join(root, "scripts/lib/deploy.sh")], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
       env: { ...inherited, FIXTURE_EVENTS: events, FIXTURE_BUN: bun, FIXTURE_CAPTURE: capture, FIXTURE_IMAGE: IMAGE,
         ...setup.deployed ? { FIXTURE_ORIGINAL: ORIGINAL, FIXTURE_ORIGINAL_IMAGE: ORIGINAL_IMAGE } : {}, ...env } });
     child.stdin.write(input); child.stdin.end();
@@ -122,7 +121,7 @@ async function release(name: string, setup: { config?: boolean; deployed?: boole
   };
   return { root, head, capture, run, stages: () => existsSync(join(root, "tmp")) ? readdirSync(join(root, "tmp")) : [], cleanup: () => f.cleanup() };
 }
-const handover = (events: string[]) => events.findIndex(line => line.startsWith("bun ") && line.includes(" --stage "));
+const handover = (events: string[]) => events.findIndex(line => line.startsWith("bun ") && line.includes("/ops/core/cli.ts ") && line.includes(" --stage "));
 
 test.skipIf(!linux)("部署入口：停机前问完全部问题、核对完全部事实，再把完整的暂存交给核心；入口自己不停服务、不改容器", async () => {
   const f = await release("deploy-entry-run-", { config: true, deployed: true, directory: true });
@@ -204,6 +203,45 @@ test.skipIf(!linux)("部署入口：首次部署没有终端时在停机前拒�
     expect(result.events.some(line => line.includes(" ops/tools/data-current.ts check "))).toBe(true);
     expect(handover(result.events)).toBe(-1); expect(result.events.filter(line => line === "FORBIDDEN")).toEqual([]);
     expect(result.events.some(line => line.startsWith("release mixin-bot:candidate-"))).toBe(true); expect(f.stages()).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test.skipIf(!linux)("部署入口：控制台首次部署不运行向导，由宿主工具暂存网页确认的配置；部门核对用暂存的应用配置，配置随暂存交给核心", async () => {
+  const f = await release("deploy-entry-install-");
+  try {
+    const ref = (letter: string) => `config-${letter.repeat(32)}:${letter.repeat(64)}`;
+    const task = { MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_LIFECYCLE: "install", MIXIN_OPS_TASK_ID: "task-" + "c".repeat(32), MIXIN_OPS_BUN: join(f.root, "../bun"),
+      MIXIN_OPS_GUARD: "/fixture/console/ops/core/check-plan.ts", MIXIN_OPS_EXPECT_CODE: "f".repeat(64), MIXIN_OPS_SWITCH_MAIN: "0",
+      MIXIN_OPS_DIRECTORY: "all", BOT_DIRECTORY_SCOPE: "all", MIXIN_OPS_APP_DRAFT: ref("a"), MIXIN_OPS_MODELS_DRAFT: ref("b"), BOT_PORT: "3000" };
+    const refused = await f.run({ ...task, MIXIN_OPS_MODELS_DRAFT: "" });
+    expect(refused.code, refused.output).toBe(1); expect(refused.output).toContain("首次部署缺少已确认的配置草稿");
+    expect(handover(refused.events)).toBe(-1);
+    const result = await f.run(task);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).not.toContain("需要在终端里运行向导"); expect(result.events.filter(line => line === "FORBIDDEN")).toEqual([]);
+    const staged = result.events.findIndex(line => line.includes("/ops/core/console-stage.ts "));
+    expect(result.events[staged]).toMatch(new RegExp(`^bun --no-env-file ${f.root}/ops/core/console-stage\\.ts --project ${f.root} --stage ${f.root}/tmp/deploy-stage-[A-Za-z0-9]{8}$`));
+    const choose = result.events.findIndex(line => line.includes(" ops/config/directory-scope.ts choose "));
+    expect(result.events[choose]).toContain("--app /preview/configuration-app.json");
+    expect(staged).toBeLessThan(choose); expect(choose).toBeLessThan(handover(result.events));
+    expect(Object.keys(readDeployStage(f.capture).configuration).sort()).toEqual(["app", "models"]);
+    expect(f.stages()).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test.skipIf(!linux)("部署入口：已有部署但原容器不在时，终端要确认服务身份；控制台任务沿用预览中确认的身份，不提问", async () => {
+  const f = await release("deploy-entry-missing-", { config: true, deployed: true, directory: true });
+  try {
+    const terminal = await f.run({ FIXTURE_ORIGINAL: "" }, "n\n");
+    expect(terminal.code, terminal.output).toBe(1); expect(terminal.output).toContain("未确认服务的运行身份");
+    expect(handover(terminal.events)).toBe(-1);
+    const task = { MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_LIFECYCLE: "deploy", MIXIN_OPS_TASK_ID: "task-" + "c".repeat(32), MIXIN_OPS_BUN: join(f.root, "../bun"),
+      MIXIN_OPS_GUARD: "/fixture/console/ops/core/check-plan.ts", MIXIN_OPS_EXPECT_CODE: "f".repeat(64), MIXIN_OPS_SWITCH_MAIN: "0", MIXIN_OPS_DIRECTORY: "saved",
+      BOT_PORT: "3000", FIXTURE_ORIGINAL: "" };
+    const result = await f.run(task);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("沿用网页预览中确认的服务身份 0:0"); expect(result.output).not.toContain("?>");
+    expect(readDeployStage(f.capture).platform["service-user"]).toBe("format=1\nuser=0:0\nsource=confirmed\n");
   } finally { await f.cleanup(); }
 });
 

@@ -8,7 +8,7 @@ import { dayKey } from "../../src/agent/stats-ledger.ts";
 
 export type AuditAction = "view-open" | "identity-full" | "conversation-open" | "search"
   | "export-request" | "export-sent" | "export-interrupted" | "export-failed" | "log-view" | "log-export" | "plan" | "task-submit" | "directory-apply"
-  | "push-settings" | "push-view" | "push-remind" | "push-cc" | "push-delete" | "push-group";
+  | "push-settings" | "push-view" | "push-remind" | "push-cc" | "push-delete" | "push-group" | "setup-dependencies";
 
 export interface AuditRecord {
   action: AuditAction;

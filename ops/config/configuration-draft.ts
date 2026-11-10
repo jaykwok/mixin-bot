@@ -4,7 +4,8 @@ import { configurationFiles, configurationHash, configurationKind, type Configur
 export interface ConfigurationDraft {
   version: 1; id: string; session: string; createdAt: number; expiresAt: number; revision: number;
   base: ConfigurationSnapshot; next: ConfigurationSnapshot;
-  validated?: { digest: string; summary: string[]; at: number };
+  /** network: the check reached the platform or the model provider, not only the offline rules. */
+  validated?: { digest: string; summary: string[]; at: number; network?: true };
 }
 export function configurationDigest(draft: Pick<ConfigurationDraft, "base" | "next">): string {
   return configurationHash(JSON.stringify([draft.base, draft.next]))!;

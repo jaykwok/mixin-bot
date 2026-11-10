@@ -54,7 +54,7 @@ const T = NOW - 3_600_000;
 const session: SessionResponse = { session: { label: "s-test", createdAt: NOW, idleExpiresAt: NOW + 1_800_000, expiresAt: NOW + 8 * 3_600_000 }, now: NOW };
 const overview: Overview = {
   checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 10001, pid: 1, startedAt: NOW },
-  deployment: null, deploymentError: null, recovery: null, pending: null, service: { state: "ready", attention: [] }, versions: [],
+  deployment: null, deploymentError: null, undeployed: false, recovery: null, pending: null, service: { state: "ready", attention: [] }, versions: [],
 };
 const GEN = "00000000-0000-4000-8000-000000000001";
 const spaces: SpacesResponse = {

@@ -8,6 +8,7 @@ import { ApiProblem, type Route } from "./routes.ts";
 import { runCommand, type Runner } from "../../ops/core/hosting.ts";
 import { parsePort } from "../../ops/core/console-port.ts";
 import { hostPlatform } from "../../ops/core/platform.ts";
+import { undeployed } from "./recovery.ts";
 
 function setting(project: string, name: string): string {
   const path = join(project, "data/state", name);
@@ -27,6 +28,7 @@ export function upgradeRoutes(project: string, run: Runner = runCommand): Record
   };
   return {
     "GET /api/lifecycle/deploy": { run: async () => {
+      if (undeployed(project)) throw new ApiProblem(409, "input", "尚未部署：重新部署只用于已有实例，请先完成首次部署");
       try {
         const saved = await settings(), port = parsePort(setting(project, "bot-port"), "机器人 "), workspace = setting(project, "workspace-root");
         if (workspace && !isAbsolute(workspace)) throw new Error("保存的共享目录不是绝对路径，请先检查部署记录");

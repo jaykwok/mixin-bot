@@ -188,7 +188,7 @@ $bun=$bunPath=${quotePS(process.execPath)}
 $preview=$dataTool=${quotePS(probe)}
 $Project=${quotePS(root)}; $plan=${quotePS(plan)}; $Stage=${quotePS(stage)}
 $workspace=$finalWorkspace=${quotePS(workspace)}
-foreach($file in @(${quotePS(join(project, "scripts/upgrade.ps1"))},${quotePS(join(project, "scripts/deploy.ps1"))})) {
+foreach($file in @(${quotePS(join(project, "scripts/upgrade.ps1"))},${quotePS(join(project, "scripts/lib/deploy.ps1"))})) {
     $tokens=$null; $errors=$null
     $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
     if($errors.Count){throw ($errors | Out-String)}
@@ -388,7 +388,7 @@ try {
 
 test.skipIf(!bash || !existsSync(bash))("Docker deployment picks the port without asking and stops a bad, unpublishable or taken one before the build", async () => {
   const fixture = await tempFixture("deployment-rootless-port-");
-  const source = await readFile(join(project, "scripts/deploy.sh"), "utf8");
+  const source = await readFile(join(project, "scripts/lib/deploy.sh"), "utf8");
   const section = source.split("# 本机管理端口不再询问")[1]?.split('print_success "本机管理端口：127.0.0.1:$BOT_PORT')[0]?.replace(/^[^\n]*/, "");
   const trim = /^trim_input\(\) \{[\s\S]*?^\}/m.exec(source)?.[0];
   expect(section).toBeDefined(); expect(trim).toBeDefined();
@@ -431,6 +431,9 @@ echo "PORT=$BOT_PORT"
     result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_TAKEN: "10000" });
     expect(result.code, result.output).toBe(1); expect(result.port).toBeUndefined();
     expect(result.output).toContain("本机端口 10000 已被其他程序占用"); expect(result.output).toContain(fix);
+    // A console task: the way out is another preview with another port, not an environment variable.
+    result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_TAKEN: "10000", MIXIN_OPS_CONSOLE: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("在控制台重新预览并填写另一个端口"); expect(result.output).not.toContain("BOT_PORT=");
     // The explicit override is trimmed and probed as well.
     result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_PORT: " 3000 " });
     expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: "3000" });

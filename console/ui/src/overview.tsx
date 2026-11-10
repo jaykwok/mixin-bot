@@ -19,20 +19,23 @@ const SCOPE_STATES: Record<NonNullable<ServiceView["directory"]>["state"], [Tone
   effective: ["ok", "已生效"], applying: ["warn", "应用中"], failed: ["danger", "应用失败"], unset: ["danger", "未设置"],
 };
 
-export function StatusPill({ service, loading }: { service: ServiceView | undefined; loading: boolean }) {
+export function StatusPill({ service, undeployed = false, loading }: { service: ServiceView | undefined; undeployed?: boolean; loading: boolean }) {
   if (!service) return <span class="pill neutral"><span class="dot" />{loading ? "正在检查" : "状态未知"}</span>;
+  if (undeployed) return <span class="pill neutral" data-tip="机器人状态"><span class="dot" />机器人尚未部署</span>;
   const summary = serviceSummary(service);
   return <span class={`pill ${summary.tone}`} data-tip="机器人状态"><span class={`dot${service.state === "ready" ? " pulse" : ""}`} />机器人{summary.label}</span>;
 }
 
 function Hero({ data }: { data: Overview }) {
   const { service } = data;
-  const summary = serviceSummary(service);
+  const summary: { tone: Tone; icon: IconName } = data.undeployed ? { tone: "warn", icon: "server" } : serviceSummary(service);
   const now = data.checkedAt;
-  const title = { ready: "机器人运行中", verifying: "验证实例运行中", stopping: "机器人正在停止", unreachable: "机器人未运行" }[service.state];
+  const title = data.undeployed ? "机器人尚未部署"
+    : { ready: "机器人运行中", verifying: "验证实例运行中", stopping: "机器人正在停止", unreachable: "机器人未运行" }[service.state];
   // Ready only means the process answers: messages arrive over the event Stream.
   const offline = service.state === "ready" && service.stream?.connected === false;
-  const detail = offline ? "进程有应答，但事件 Stream 已断开，暂时收不到群聊和单聊消息；断开原因见下方“事件 Stream”。"
+  const detail = data.undeployed ? "首次部署完成后，这里显示机器人的运行状态。"
+    : offline ? "进程有应答，但事件 Stream 已断开，暂时收不到群聊和单聊消息；断开原因见下方“事件 Stream”。"
     : service.state === "ready" ? "正在接收并处理群聊和单聊消息。"
     : service.state === "verifying" ? "这是不连接平台的验证实例，不处理群消息。"
     : service.state === "stopping" ? "停止后不再处理消息。"
@@ -91,13 +94,19 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
   const stream = service.stream, directory = service.directory;
   return (
     <>
+      {data.undeployed && (
+        <Banner tone="info" icon="server" title="尚未部署" action={<a class="btn small-btn primary" href="#/maintain">开始首次部署</a>}>
+          在“维护”页按向导检查本机环境、填写应用机器人凭据和模型、选择通讯录范围，预览后部署。
+        </Banner>
+      )}
       {data.recovery && (
-        <Banner tone="danger" icon="alert" title="需要先处理部署" action={<a class="btn small-btn" href="#/maintain">前往维护</a>}>
-          {data.recovery}。到“维护”页的“部署恢复”继续或回滚上次操作，或重新部署；记录无法读取时，在终端运行 <code>ops doctor</code>（scripts 下的 ops.ps1 或 ops.sh）按提示处理。
+        <Banner tone="danger" icon="alert" title="需要先处理部署" action={data.pending && <a class="btn small-btn" href="#/maintain">前往维护</a>}>
+          {data.recovery}。{data.pending ? "到“维护”页的“部署恢复”继续或回滚上次操作。"
+            : <>在终端运行 <code>ops doctor</code>（scripts 下的 ops.ps1 或 ops.sh）按提示处理。</>}
         </Banner>
       )}
       {!data.recovery && data.pending && (
-        <Banner tone="warn" icon="alert" title={data.pending.subject}>
+        <Banner tone="warn" icon="alert" title={data.pending.subject} action={<a class="btn small-btn" href="#/maintain">前往维护</a>}>
           <ul class="plain-list">{data.pending.record.map(line => <li key={line}>{line}</li>)}</ul>
         </Banner>
       )}
@@ -107,7 +116,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
         <Hero data={data} />
 
         <Card title="部署" icon="server" tint="graphite" span={6}>
-          {deployment ? (
+          {data.undeployed ? <p class="muted">尚未部署。</p> : deployment ? (
             <Rows rows={[
               ["运行方式", `${platformName(deployment.platform)} · ${deployment.mode}`],
               ["主机", data.console.hostname],

@@ -10,6 +10,7 @@
     "ops/config/{configure,configure-relay,configuration-check,configuration-apply,configuration-install,directory-scope,directory-query,runtime-apply,runtime-settings,validate-models}.ts!",
     "console/server/{start,main,executor,read-cli}.ts!",
     "ops/core/check-plan.ts!",
+    "ops/core/console-stage.ts!",
     "ops/core/cli.ts!",
     "ops/core/{launchd-supervisor,macos-entry,macos-become}.ts!",
     "ops/lib/confirmed-transaction.ts!",

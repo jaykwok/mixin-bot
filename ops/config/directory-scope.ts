@@ -70,13 +70,15 @@ export async function installScopePlan(plan: string, project: string): Promise<D
   return scope;
 }
 
-/** 同一次部署暂存的应用机器人配置（停机后才安装）：只取其中的结果，内容不出现在错误里。 */
-export function stagedAppBotConfig(path: string): AppBotConfig {
+/** 同一次部署暂存的 app-bot.json 文本（停机后才安装），内容不出现在错误里。 */
+export function stagedAppText(path: string): string {
   let text: string | null = null;
   try { text = readBoundedText(path, 1024 * 1024); } catch { /* Reported below. */ }
   if (text === null) throw new Error("读不到暂存的应用机器人配置");
-  return parseAppBotText(parseConfigurationStage(text, "app").next.files.app!, "暂存的 app-bot.json");
+  return parseConfigurationStage(text, "app").next.files.app!;
 }
+/** 同一次部署暂存的应用机器人配置：只取其中的结果。 */
+export const stagedAppBotConfig = (path: string): AppBotConfig => parseAppBotText(stagedAppText(path), "暂存的 app-bot.json");
 
 const describeError = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -109,7 +111,8 @@ if (import.meta.main) {
       const value = process.env.BOT_DIRECTORY_SCOPE?.trim();
       let scope: DirectoryScope;
       if (process.env.MIXIN_OPS_DIRECTORY === "selected") {
-        scope = consoleDirectoryScope(project);
+        // A first deployment from the console read its departments with the application it stages.
+        scope = consoleDirectoryScope(project, process.env, args.app !== undefined ? stagedAppText(resolve(args.app)) : undefined);
       } else if (value) {
         scope = scopeFromEnvironment(value);
       } else if (!process.stdin.isTTY || !process.stdout.isTTY) {

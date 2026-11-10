@@ -1,5 +1,5 @@
 #!/bin/bash
-# macOS 入口：scripts/deploy.sh、ops.sh、upgrade.sh 在 Darwin 上把参数原样交给这里。系统自带的 bash 3.2 也能运行：只确认
+# macOS 入口：scripts/ops.sh、upgrade.sh 和 lib/deploy.sh 在 Darwin 上把参数原样交给这里。系统自带的 bash 3.2 也能运行：只确认
 # Apple 芯片并找到 Bun，其余（root、工具、服务账户、命令本身）由 ops/core/macos-entry.ts 负责。
 # 用法：bash scripts/lib/macos-entry.sh <deploy|ops|upgrade> [参数...]
 set -u

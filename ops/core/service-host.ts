@@ -63,7 +63,9 @@ export function createServiceHost(options: ServiceHostOptions): ServiceControlHo
         const deployment = readOpsDeploymentRecord(options.project);
         if (deployment && !deployment.completion) throw new MaintenanceRefused("上次部署执行尚未收尾，请先继续或回滚原部署（数据已提交时只能继续）");
       }
-      if (options.expectedState && (await adapter.inspect()).rawState !== options.expectedState) throw new MaintenanceRefused("运行状态已变化，请重新预览");
+      // A container in a crash loop is planned as "running" (operations.ts): it alternates between the two.
+      const raw = options.expectedState ? (await adapter.inspect()).rawState : undefined;
+      if (options.expectedState && (raw === "restarting" ? "running" : raw) !== options.expectedState) throw new MaintenanceRefused("运行状态已变化，请重新预览");
     },
     async inspect() {
       const facts = await held().inspect(); expected ??= facts.identity;

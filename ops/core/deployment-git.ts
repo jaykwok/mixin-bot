@@ -178,25 +178,32 @@ export class DeploymentGit {
   async dependenciesReusable(original: string, target: string, signal?: AbortSignal): Promise<boolean> {
     if (![original, target].every(value => sha.test(value))) throw new Error("依赖比较提交无效");
     try {
-      if (!kind(join(this.project, "node_modules"))?.isDirectory()) return false;
-      const manifest = JSON.parse(readFileSync(join(this.project, "package.json"), "utf8"));
-      // Dependency patches are not used: a manifest with them always reinstalls.
-      if (manifest.workspaces || manifest.patchedDependencies) return false;
+      if (!dependenciesInstalled(this.project)) return false;
       const inputs = ["package.json", "bun.lock", "bun.lockb", "bunfig.toml", ".npmrc"];
-      if ((await this.git(["--literal-pathspecs", "diff", "--quiet", original, target, "--", ...inputs], signal)).code !== 0) return false;
-      for (const section of ["dependencies", "devDependencies", "optionalDependencies"]) {
-        for (const [name, version] of Object.entries(manifest[section] ?? {})) {
-          if (!/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name) || name.split("/").some(part => part === "." || part === "..")
-            || typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) return false;
-          const root = join(this.project, "node_modules", name), installed = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-          if (installed.name !== name || installed.version !== version) return false;
-          for (const bin of typeof installed.bin === "string" ? [installed.bin] : Object.values(installed.bin ?? {})) {
-            if (typeof bin !== "string" || isAbsolute(bin) || !resolve(root, bin).startsWith(resolve(root) + (process.platform === "win32" ? "\\" : "/"))
-              || !kind(join(root, bin))?.isFile()) return false;
-          }
-        }
-      }
-      return true;
+      return (await this.git(["--literal-pathspecs", "diff", "--quiet", original, target, "--", ...inputs], signal)).code === 0;
     } catch { signal?.throwIfAborted(); return false; }
   }
+}
+
+/** node_modules holds exactly the manifest's pinned versions, with the bins they declare. Never throws. */
+export function dependenciesInstalled(project: string): boolean {
+  try {
+    if (!kind(join(project, "node_modules"))?.isDirectory()) return false;
+    const manifest = JSON.parse(readFileSync(join(project, "package.json"), "utf8"));
+    // Dependency patches are not used: a manifest with them always reinstalls.
+    if (manifest.workspaces || manifest.patchedDependencies) return false;
+    for (const section of ["dependencies", "devDependencies", "optionalDependencies"]) {
+      for (const [name, version] of Object.entries(manifest[section] ?? {})) {
+        if (!/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name) || name.split("/").some(part => part === "." || part === "..")
+          || typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) return false;
+        const root = join(project, "node_modules", name), installed = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+        if (installed.name !== name || installed.version !== version) return false;
+        for (const bin of typeof installed.bin === "string" ? [installed.bin] : Object.values(installed.bin ?? {})) {
+          if (typeof bin !== "string" || isAbsolute(bin) || !resolve(root, bin).startsWith(resolve(root) + (process.platform === "win32" ? "\\" : "/"))
+            || !kind(join(root, bin))?.isFile()) return false;
+        }
+      }
+    }
+    return true;
+  } catch { return false; }
 }

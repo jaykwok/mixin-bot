@@ -36,7 +36,7 @@ const session = (idleMs = 30 * 60_000): SessionResponse => ({ session: { label: 
 const overview: Overview = {
   checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 10001, pid: 1, startedAt: NOW },
   deployment: { platform: "linux", runtime: "docker", mode: "rootless", port: 10000, dataRoot: "/srv/data", workspaceRoot: "/srv/workspace" },
-  deploymentError: null, recovery: null, pending: null, service: { state: "ready", pid: 2, latency: 3, attention: [] }, versions: [["机器人", "1.0.1"]],
+  deploymentError: null, undeployed: false, recovery: null, pending: null, service: { state: "ready", pid: 2, latency: 3, attention: [] }, versions: [["机器人", "1.0.1"]],
 };
 const unauthorized: Reply = { status: 401, body: { error: "登录已失效，请重新登录", code: "session" } };
 
@@ -161,8 +161,9 @@ test("控制台无法连接时显示离线提示；恢复后“重新连接”�
   expect(calls.some(call => call.path === "/api/session/exchange")).toBe(false);
 });
 
-test("总览：进程就绪但 Stream 断开时不说“正在接收”；需要恢复时指向维护页", async () => {
-  const disconnected: Overview = { ...overview, recovery: "上次升级尚未完成",
+test("总览：进程就绪但 Stream 断开时不说“正在接收”；有未完成的事务时指向维护页的部署恢复", async () => {
+  const disconnected: Overview = { ...overview, recovery: "数据尚未登记，请先部署",
+    pending: { subject: "未完成的部署：目标提交 abcdef0", record: ["本机端口 10000"] },
     service: { ...overview.service, stream: { connected: false, reconnects: 3, lastDisconnectReason: "换取 token 失败：HTTP 401" } } };
   routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: disconnected }) };
   mount(null);
@@ -170,6 +171,125 @@ test("总览：进程就绪但 Stream 断开时不说“正在接收”；需要
   expect(text()).toContain("运行中 · Stream 已断开");
   expect(text()).not.toContain("正在接收并处理");
   expect(text()).toContain("部署恢复");
+  expect(has('.banner a[href="#/maintain"]')).toBe(true);
+  expect(text()).not.toContain("重新部署");
+});
+
+test("总览：记录损坏但没有未完成的事务时指向终端诊断，不指向部署恢复", async () => {
+  const damaged: Overview = { ...overview, recovery: "版本标记损坏：data/state/data-version.json；请在新目录全新部署" };
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: damaged }) };
+  mount(null);
+  await shows("版本标记损坏");
+  expect(text()).toContain("ops doctor");
+  expect(text()).not.toContain("部署恢复");
+  expect(has('.banner a[href="#/maintain"]')).toBe(false);
+});
+
+test("尚未部署的检出：总览引导到首次部署向导；向导按步骤检查本机、在线校验两份草稿、选择范围后预览首次部署，不提供需要已有部署的操作", async () => {
+  const fresh: Overview = { ...overview, undeployed: true, service: { state: "unreachable", attention: [] },
+    console: { ...overview.console, platform: "windows" }, deployment: { ...overview.deployment!, platform: "windows", runtime: "scheduled-task", mode: "计划任务" } };
+  const id = (kind: string) => `config-${(kind === "app" ? "a" : "b").repeat(32)}`;
+  const draft = (kind: string, revision: number, validated = false) => ({ id: id(kind), revision, expiresAt: NOW + 1_800_000, validated,
+    summary: validated ? [`${kind} 已在线校验`] : [], form: kind === "app" ? { kind, environment: "production" } : { kind, providers: [] } });
+  let installed = false, plan: Record<string, unknown> | undefined;
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: fresh }),
+    "GET /api/tasks": () => ({ status: 200, body: { tasks: [] } }),
+    "GET /api/setup": () => ({ status: 200, body: { undeployed: true, dependencies: { installed, job: null } } }),
+    "POST /api/setup/dependencies": () => { installed = true; return { status: 200, body: { installed, job: { state: "succeeded" } } }; },
+    "POST /api/setup/check": () => ({ status: 200, body: { ok: true, items: [{ state: "ok", name: "管理员", detail: "当前是管理员 PowerShell" }] } }),
+    "POST /api/configuration/open": call => ({ status: 200, body: draft(JSON.parse(call.body!).kind, 0) }),
+    "POST /api/configuration/edit": call => ({ status: 200, body: draft(JSON.parse(call.body!).id === id("app") ? "app" : "models", 1) }),
+    "POST /api/configuration/check": call => {
+      const body = JSON.parse(call.body!);
+      // A first deployment's drafts are always checked online.
+      if (body.network !== true) return { status: 409, body: { error: "必须在线校验", code: "input" } };
+      return { status: 200, body: draft(body.id === id("app") ? "app" : "models", 1, true) };
+    },
+    "GET /api/configuration/catalog": () => ({ status: 200, body: { providers: [{ id: "synthetic", name: "合成服务商" }], apis: ["openai-completions"], models: [] } }),
+    "POST /api/plans": call => { plan = JSON.parse(call.body!); return { status: 200, body: { id: "plan-1", operation: "install", summary: ["首次部署当前代码"], expiresAt: NOW + 600_000 } }; },
+  };
+  mount(null);
+  await shows("机器人尚未部署");
+  await shows("开始首次部署");
+  expect(has('.banner a[href="#/maintain"]')).toBe(true);
+  expect(text()).not.toContain("需要先处理部署");
+  expect(text()).not.toContain("127.0.0.1:10000");
+  location.hash = "#/maintain";
+  await shows("1. 检查本机环境");
+  await shows("暂无任务记录");
+  for (const hidden of ["部署恢复", "运行控制", "软件更新", "重新部署与修复", "备份清理", "危险操作"]) expect(text()).not.toContain(hidden);
+  const buttons = (label: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].filter(button => button.textContent?.trim() === label);
+  const preview = () => buttons("预览首次部署")[0]!;
+  // The model check needs the host's dependencies: its form waits for them.
+  await shows("先在第 1 步安装依赖");
+  expect(buttons("填写").map(button => button.disabled)).toEqual([false, true]);
+  expect(preview().disabled).toBe(true);
+  buttons("安装依赖")[0]!.click();
+  await until(() => buttons("填写").every(button => !button.disabled), "依赖装好后可以填写模型");
+  buttons("开始检查")[0]!.click();
+  await shows("全部检查通过");
+  buttons("填写")[0]!.click();
+  await until(() => buttons("保存草稿并校验").length === 1, "应用草稿表单");
+  expect(text()).not.toContain("联网验证应用凭据");
+  buttons("保存草稿并校验")[0]!.click();
+  await shows("已在线校验，首次部署使用这份草稿");
+  buttons("填写")[0]!.click();
+  await until(() => buttons("保存草稿并校验").length === 2, "模型草稿表单");
+  buttons("保存草稿并校验")[1]!.click();
+  // The application is checked online (its token); the model is checked by Pi without an inference request.
+  await until(() => text().includes("已校验，首次部署使用这份草稿") && text().split("校验，首次部署使用这份草稿").length === 3, "两份草稿都校验过");
+  expect(text()).toContain("还差：未选择通讯录范围");
+  expect(preview().disabled).toBe(true);
+  container.querySelector<HTMLButtonElement>('[role="radiogroup"][aria-label="通讯录同步范围"] [data-value="all"]')!.click();
+  await until(() => !preview().disabled, "可以预览");
+  preview().click();
+  await shows("确认首次部署");
+  // The browser names its drafts; the console turns them into checked references when it prepares the plan.
+  expect(plan).toEqual({ operation: "install", params: { app: id("app"), models: id("models"), directory: "all", port: 10000, workspace: "" } });
+});
+
+test("首次部署进行中：事务发布后不再算尚未部署，本页跟踪的首次部署结束前维护页仍是向导；总览提示未完成的部署并指向维护页", async () => {
+  const { followTask } = await import("../../console/ui/src/tasks.tsx");
+  const task = "task-" + "c".repeat(32), view = { id: task, state: "running", needsRecovery: false, operation: "install", createdAt: NOW };
+  // The open first deployment: no data version recorded yet, so no "please deploy" recovery, only the pending deployment.
+  const deploying: Overview = { ...overview, undeployed: false, recovery: null, pending: { subject: "未完成的部署：目标提交 abcdef0", record: ["本机端口 10000"] },
+    service: { state: "unreachable", attention: [] } };
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: deploying }),
+    "GET /api/tasks": () => ({ status: 200, body: { tasks: [view] } }), [`GET /api/tasks/${task}`]: () => ({ status: 200, body: view }),
+    "GET /api/setup": () => ({ status: 200, body: { undeployed: false, dependencies: { installed: true, job: null } } }) };
+  mount(null);
+  await shows("未完成的部署：目标提交 abcdef0");
+  expect(text()).not.toContain("需要先处理部署");
+  expect(has('.banner a[href="#/maintain"]')).toBe(true);
+  followTask(view);
+  location.hash = "#/maintain";
+  await shows("1. 检查本机环境");
+  for (const hidden of ["运行控制", "重新部署与修复", "危险操作"]) expect(text()).not.toContain(hidden);
+});
+
+test("维护页在读到部署状态之前不显示已有部署的操作", async () => {
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 503, body: { error: "部署状态暂时读不到", code: "internal" } }),
+    "GET /api/tasks": () => ({ status: 200, body: { tasks: [] } }) };
+  location.hash = "#/maintain";
+  mount(null);
+  await shows("无法读取部署状态");
+  for (const hidden of ["运行控制", "重新部署与修复", "危险操作", "1. 检查本机环境"]) expect(text()).not.toContain(hidden);
+});
+
+test("已部署的维护页：危险操作里有卸载，两项选择默认不勾选；镜像只在 Linux 可选", async () => {
+  let plan: Record<string, unknown> | undefined;
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: overview }),
+    "GET /api/tasks": () => ({ status: 200, body: { tasks: [] } }), "GET /api/lifecycle": () => ({ status: 200, body: { pending: null } }),
+    "POST /api/plans": call => { plan = JSON.parse(call.body!); return { status: 200, body: { id: "plan-2", operation: "uninstall", summary: ["停止并删除容器 mixin-bot。"], expiresAt: NOW + 600_000 } }; } };
+  mount(null);
+  await shows("机器人运行中");
+  location.hash = "#/maintain";
+  await shows("预览卸载");
+  expect(text()).not.toContain("1. 检查本机环境");
+  expect(text()).toContain("同时删除镜像 mixin-bot");
+  [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "预览卸载")!.click();
+  await shows("确认卸载");
+  expect(plan).toEqual({ operation: "uninstall", params: { data: false, image: false } });
 });
 
 test("Ctrl+K 打开命令面板，输入过滤，Enter 执行；用户刷新带续期标记", async () => {

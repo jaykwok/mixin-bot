@@ -21,7 +21,7 @@ import { configurationDigest } from "../config/configuration-draft.ts";
 import { assertConfigurationBase } from "../config/configuration-form.ts";
 import { readConfigurationState, configurationStateDigest } from "../../src/core/configuration-state.ts";
 import { recoveryPlan, assertLifecycleTarget } from "./recovery-plan.ts";
-import { deploymentOptions, deploymentEnvironment, deploymentScope, repairScope, repairEnvironment } from "./deployment-options.ts";
+import { deploymentOptions, deploymentEnvironment, deploymentScope, installScope, repairScope, repairEnvironment, uninstallEnvironment, uninstallOptions, uninstallScope } from "./deployment-options.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
 import { readOpsDeploymentRecord } from "../../src/core/ops-deployment-state.ts";
 import { loadPendingTransaction } from "./pending-transaction.ts";
@@ -30,9 +30,9 @@ import { spaceLabel } from "../lib/format.ts";
 import { runtimeOption } from "./runtime-options.ts";
 import { RUNTIME_DEFAULTS } from "../../src/core/runtime-schema.ts";
 
-export const OPERATIONS = ["start", "stop", "restart", "maintenance-recover", "history-clear", "history-compact", "tmp-purge", "tmp-reclaim", "tmp-discard", "runtime-configure", "stat-import", "relay-test", "relay-purge", "backup-clean", "configuration-apply", "configuration-restore", "resume", "rollback", "update", "deploy", "repair"] as const;
+export const OPERATIONS = ["start", "stop", "restart", "maintenance-recover", "history-clear", "history-compact", "tmp-purge", "tmp-reclaim", "tmp-discard", "runtime-configure", "stat-import", "relay-test", "relay-purge", "backup-clean", "configuration-apply", "configuration-restore", "resume", "rollback", "update", "deploy", "install", "repair", "uninstall"] as const;
 export type Operation = typeof OPERATIONS[number];
-export const OPERATION_LABELS: Record<Operation, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", repair: "修复部署", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "登记会话压缩",
+export const OPERATION_LABELS: Record<Operation, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", install: "首次部署", repair: "修复部署", uninstall: "卸载", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "登记会话压缩",
   "tmp-purge": "归档临时文件", "tmp-reclaim": "物理回收临时文件", "tmp-discard": "永久删除归档", "runtime-configure": "应用运行参数",
   "stat-import": "导入统计", "relay-test": "测试外链存储", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复上次配置" };
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -46,15 +46,19 @@ export function textParam(value: unknown, pattern?: RegExp): string {
 }
 export function tmpReader(operation: string) { return operation === "tmp-purge" ? readTmpPlan : operation === "tmp-reclaim" ? readReclaimPlan : readRemovalPlan; }
 
+/** The ops command an operation runs, and the command its result reports: a first deployment is the deploy entry in its console mode. */
+export const opsCommandOf = (operation: string) => operation === "install" ? "deploy" : operation;
+
 export function operationArgs(operation: string, params: Record<string, unknown>, expected?: string): string[] {
   if (!OPERATIONS.includes(operation as Operation)) throw new Error("不支持这个管理操作");
-  const argv = [operation];
+  const argv = [opsCommandOf(operation)];
   switch (operation) {
     case "repair":
       if (nativeService()) fields(params, []); else deploymentOptions("deploy", params); break;
-    case "update": case "deploy": {
+    case "update": case "deploy": case "install": {
       const options = deploymentOptions(operation, params); if ("target" in options) argv.push(options.target); break;
     }
+    case "uninstall": uninstallOptions(params); break;
     case "resume": case "rollback":
       fields(params, ["confirmation"]); argv.push("--confirmed-transaction", textParam(params.confirmation, /^[A-Za-z0-9+/]+={0,2}$/)); break;
     case "configuration-apply":
@@ -92,8 +96,8 @@ export function operationArgs(operation: string, params: Record<string, unknown>
 
 export function operationCommand(project: string, operation: string, params: Record<string, unknown>, facts?: PlanFacts): ReturnType<typeof opsCommand> {
   const command = opsCommand(hostPlatform(), operationArgs(operation, params, facts?.scope), project, SOURCE_DIR, "console");
-  return { ...command, env: { ...command.env, ...(operation === "update" || operation === "deploy" ? deploymentEnvironment(operation, params, project)
-    : operation === "repair" ? repairEnvironment(project, params) : {}), MIXIN_OPS_BUN: process.execPath,
+  return { ...command, env: { ...command.env, ...(operation === "update" || operation === "deploy" || operation === "install" ? deploymentEnvironment(operation, params, project)
+    : operation === "repair" ? repairEnvironment(project, params) : operation === "uninstall" ? uninstallEnvironment(params) : {}), MIXIN_OPS_BUN: process.execPath,
     MIXIN_OPS_GUARD: join(SOURCE_DIR, "ops/core/check-plan.ts"), MIXIN_OPS_EXPECT_CODE: codeDigest(SOURCE_DIR),
     MIXIN_CONSOLE_PROJECT_ROOT: resolve(project), MIXIN_CONSOLE_SOURCE_ROOT: SOURCE_DIR,
     ...(facts ? { MIXIN_OPS_EXPECT_STATE: facts.runState } : {}) } };
@@ -104,7 +108,9 @@ export async function operationScope(project: string, operation: string, params:
   launchd: Partial<LaunchdHostFacts> = {}): Promise<{ scope: string; summary: string[] }> {
   operationArgs(operation, params);
   if (operation === "update" || operation === "deploy") return deploymentScope(project, operation, params, run, launchd);
+  if (operation === "install") return installScope(project, params, run, launchd);
   if (operation === "repair") return repairScope(project, params, run, launchd);
+  if (operation === "uninstall") return uninstallScope(project, params, run, launchd);
   const data = join(project, "data"), summary: string[] = []; let scope = planDigest([operation, params]);
   if (operation === "start" || operation === "restart") {
     // The core refuses these under its lock; say so before the confirmation, not after it. Stopping is always allowed.
@@ -199,7 +205,7 @@ export function operationObserver(project: string, run: Runner = runCommand, lau
     const read = await operationScope(project, operation, params, run, launchd);
     const head = await run(["git", "-C", project, "rev-parse", "HEAD"]);
     if (head.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("无法核对代码版本");
-    let identity: string, state: string, container: string | undefined;
+    let identity: string, state: string, container: string | undefined, restarting = false;
     if (process.platform === "win32") {
       const owner = JSON.parse(readFileSync(join(project, ".console", "owner.json"), "utf8"));
       identity = owner.sid;
@@ -225,9 +231,13 @@ export function operationObserver(project: string, run: Runner = runCommand, lau
       const found = /^([a-f0-9]{64}) (\S+)$/.exec(lines[0]?.trim() ?? "");
       if (lines.length > 1 || lines.length && !found) throw new Error("机器人容器清单不唯一或无法核对");
       [container, state] = found ? [found[1]!, found[2]!] : [undefined, "absent"];
+      // A crash loop (--restart unless-stopped) is "restarting" between attempts and "running" in them: one state, as the
+      // deployment core and service host treat it, so the plan stays stable and stop, redeploy and uninstall remain possible.
+      if (state === "restarting") { state = "running"; restarting = true; }
       if (!["running", "exited", "created", "absent"].includes(state)) throw new Error("机器人容器处于过渡状态");
     }
     return { facts: { project: resolve(project), platform: process.platform, identity, head: head.stdout.trim(), protocol: 1,
-      scope: read.scope, runState: state, ...(container ? { container } : {}) }, summary: [`操作：${OPERATION_LABELS[operation as Operation]}`, `当前状态：${RUN_STATES[state] ?? state}`, ...read.summary] };
+      scope: read.scope, runState: state, ...(container ? { container } : {}) }, summary: [`操作：${OPERATION_LABELS[operation as Operation]}`,
+      `当前状态：${restarting ? "反复重启中（按运行中处理）" : RUN_STATES[state] ?? state}`, ...read.summary] };
   };
 }

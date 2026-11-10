@@ -18,12 +18,13 @@ import { takeLoginToken } from "./login.ts";
 import { StatsPage } from "./stats.tsx";
 import { PushPage } from "./push.tsx";
 import { ReadOnlyPage } from "./read-pages.tsx";
-import { TasksPage, resetTasks } from "./tasks.tsx";
+import { TasksPage, resetTasks, taskEnded, useFollowed } from "./tasks.tsx";
+import { FirstDeployWizard } from "./first-deploy.tsx";
 import { TooltipLayer } from "./tooltip.tsx";
 import { DirectoryForm, RelayActions, StatsImportForm, StorageActions } from "./write-forms.tsx";
 import { SettingsPage } from "./configuration.tsx";
 import { applyTheme, nextTheme, storedTheme, themeLabel, type Theme } from "./theme.ts";
-import { Banner, EmptyState, Tile } from "./ui.tsx";
+import { Banner, EmptyState, Row, Section, Tile } from "./ui.tsx";
 
 const OVERVIEW_POLL_MS = 15_000;
 const SESSION_POLL_MS = 60_000;
@@ -32,6 +33,9 @@ const TOUCH_INTERVAL_MS = 60_000;
 /** Pages of tables and conversations use the full width; settings-like pages read best narrower. */
 const WIDE = new Set(["conversations", "stats", "push", "logs"]);
 const NARROW = new Set(["maintain", "settings", "directory", "storage", "relay", "health"]);
+
+/** Tasks after which the overview is read at once rather than at the next poll. */
+const LIFECYCLE = new Set(["install", "uninstall", "deploy", "repair", "update", "resume", "rollback"]);
 
 /** A logout that gets no answer within this time is reported as unconfirmed (a half-open SSH tunnel may never answer). */
 const LOGOUT_TIMEOUT_MS = 10_000;
@@ -216,6 +220,17 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
     return () => { clearInterval(overviewTimer); clearInterval(sessionTimer); resetExports(); resetTasks(); };
   }, []);
 
+  // A lifecycle task confirmed in this tab has ended: what is deployed may have changed (a first deployment, an uninstall).
+  const { followed } = useFollowed(), settled = useRef(new Set<string>());
+  // A first deployment this tab follows keeps its wizard until it ends: the transaction it publishes makes the checkout
+  // count as deployed while it still runs, and a rollback makes it undeployed again (the wizard keeps what was filled in).
+  const installing = followed.some(item => item.operation === "install" && !taskEnded(item.task?.state));
+  useEffect(() => {
+    const ended = followed.filter(item => LIFECYCLE.has(item.operation) && taskEnded(item.task?.state) && !settled.current.has(item.id));
+    for (const item of ended) settled.current.add(item.id);
+    if (ended.length) void loadOverview(false);
+  }, [followed]);
+
   // The session ends on the client clock too, so content disappears even if a poll never comes back.
   useEffect(() => { if (idleLeft <= 0 || absoluteLeft <= 0) onEnd("expired"); }, [idleLeft <= 0, absoluteLeft <= 0]);
 
@@ -274,7 +289,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
           </nav>
           <div class="topbar-right">
             {resultsOnly ? <span class="pill neutral" data-tip="代码已变化，控制台不再读取部署"><span class="dot" />只看任务结果</span>
-              : <StatusPill service={overview?.service} loading={!overview} />}
+              : <StatusPill service={overview?.service} undeployed={overview?.undeployed} loading={!overview} />}
             <span class={`session-chip${idleLeft < 5 * 60_000 ? " warn" : ""}`} data-tip={`闲置 ${duration(idleLeft)}后失效；登录 ${duration(absoluteLeft)}后到期`}>
               <Icon name="clock" size={14} />{duration(Math.min(idleLeft, absoluteLeft))}
             </span>
@@ -298,7 +313,10 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
                 onRefresh={() => void loadOverview(true)} sessionLeft={Math.min(idleLeft, absoluteLeft)} />}
               {route === "conversations" && <ConversationsPage />}
               {route === "stats" && <><StatsPage /><StatsImportForm /></>}
-              {route === "maintain" && <TasksPage />}
+              {route === "maintain" && <TasksPage platform={overview?.console.platform}
+                setup={!overview ? <Section title="首次部署"><Row icon={overviewError ? "alert" : "loader"} tint={overviewError ? "red" : "blue"}
+                    title={overviewError ? "无法读取部署状态" : "正在读取部署状态…"} detail={overviewError ?? "读到之后显示首次部署向导或已有部署的操作。"} /></Section>
+                  : overview.undeployed || installing ? <FirstDeployWizard platform={overview.console.platform} consolePort={overview.console.port} /> : undefined} />}
               {route === "health" && <ReadOnlyPage page="health" />}
               {route === "logs" && <ReadOnlyPage page="logs" />}
               {route === "storage" && <ReadOnlyPage page="storage"><StorageActions /></ReadOnlyPage>}
@@ -357,7 +375,7 @@ function Sidebar({ route, overview, resultsOnly = false, onSearch, onClose }: { 
           <Tile icon="server" tint="graphite" />
           <div class="host-text">
             <div class="host-name">{overview?.console.hostname ?? "—"}</div>
-            <div class="host-sub">{resultsOnly ? "代码已变化，不再读取部署" : deployment ? `${platformName(deployment.platform)} · ${deployment.mode}` : "读取部署中…"}</div>
+            <div class="host-sub">{resultsOnly ? "代码已变化，不再读取部署" : overview?.undeployed ? "尚未部署" : deployment ?`${platformName(deployment.platform)} · ${deployment.mode}` : "读取部署中…"}</div>
           </div>
         </div>
         {!resultsOnly && <div class="version-line">控制台 v{overview?.console.version ?? "—"}</div>}

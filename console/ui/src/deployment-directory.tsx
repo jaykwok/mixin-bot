@@ -5,7 +5,8 @@ import { api } from "./api.ts";
 
 type Department = { key: string; name: string };
 export interface DeploymentSelection { view: string; selected: string[] }
-export function DeploymentDirectoryPicker({ onChange }: { onChange(value: DeploymentSelection | null): void }) {
+/** `draft`: before the first deployment, the checked application draft the tree is read with. */
+export function DeploymentDirectoryPicker({ onChange, draft }: { onChange(value: DeploymentSelection | null): void; draft?: string }) {
   const [data, setData] = useState<{ view: string; children: Department[] } | null>(null), [selected, setSelected] = useState<Department[]>([]);
   const [tree, setTree] = useState<Record<string, Department[]>>({}), [busy, setBusy] = useState(false), [error, setError] = useState("");
   const controller = useRef<AbortController | null>(null), locked = useRef(false);
@@ -19,7 +20,7 @@ export function DeploymentDirectoryPicker({ onChange }: { onChange(value: Deploy
         const value = await api<{ children: Department[] }>("/api/lifecycle/directory/children", { method: "POST", body: { view: data.view, parent }, intent: true, signal: current.signal, timeoutMs: 90_000 });
         if (!current.signal.aborted) setTree(previous => ({ ...previous, [parent]: value.children }));
       } else {
-        const value = await api<NonNullable<typeof data>>("/api/lifecycle/directory/open", { method: "POST", body: {}, intent: true, signal: current.signal, timeoutMs: 90_000 });
+        const value = await api<NonNullable<typeof data>>("/api/lifecycle/directory/open", { method: "POST", body: draft === undefined ? {} : { draft }, intent: true, signal: current.signal, timeoutMs: 90_000 });
         if (!current.signal.aborted) setData(value);
       }
     } catch (error) { if (!current.signal.aborted) setError(error instanceof Error ? error.message : "部门查询失败"); }

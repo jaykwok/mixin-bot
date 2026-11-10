@@ -113,7 +113,7 @@ test.skipIf(!darwin || process.geteuid?.() === 0)("macOS 入口：帮助不需�
   const unknown = run("ops.sh", "restrat");
   expect(unknown.exitCode).toBe(1);
   expect(unknown.stderr.toString()).toContain("无法识别的命令：restrat");
-  const deploy = run("deploy.sh", "bogus");
+  const deploy = run("lib/deploy.sh", "bogus");
   expect(deploy.exitCode).toBe(2);
   const upgrader = run("upgrade.sh", root, "a".repeat(40));
   expect(upgrader.exitCode).toBe(2);

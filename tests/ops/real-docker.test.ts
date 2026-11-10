@@ -430,7 +430,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       mkdirSync(join(work, "data/config"), { recursive: true });
       writeFileSync(join(work, "data/config/models.json"), "{}");
       const labelled = () => docker("image", "ls", "-aq", "--filter", `label=org.mixin-bot.project=${projectId(work)}`).out;
-      for (const [name, args] of [["group-deploy", ["scripts/deploy.sh"]], ["group-update", ["scripts/ops.sh", "update"]]] as const) {
+      for (const [name, args] of [["group-deploy", ["scripts/ops.sh", "deploy"]], ["group-update", ["scripts/ops.sh", "update"]]] as const) {
         const result = await start(root, name, [...args], work, { BOT_PORT: String(await freePort()) }).done;
         expect(result.code === 0, result.output).toBe(false);
         expect(result.output).toContain("Docker 以 root 身份运行（rootful）");
@@ -441,6 +441,114 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         expect(existsSync(join(work, "data/state/deploy-transaction"))).toBe(false);
       }
     }, 300_000);
+  });
+
+  // A fresh checkout deployed from the console the way the wizard does it over HTTP: the console installs the dependencies,
+  // both drafts are checked online (the application against the fake platform; the model by Pi, without inference), then the
+  // whole directory, a free port and the default workspace. An uninstall that keeps data/ leaves a deployment without a
+  // service, which a web redeploy recreates as the data's owner; an uninstall that archives data/ and logs/ and removes the
+  // image leaves the checkout undeployed again. Runs before the layouts: a first deployment needs Docker without mixin-bot.
+  if (operator !== "group" && webLifecycle) describe("web console first deployment and uninstall", () => {
+    let work = "", port = 0, blocked = "";
+    let client: LifecycleConsole | undefined;
+    const identity = operator === "rootless" ? "0:0" : "1001:1001";
+    const sequence = (name: string, body: () => Promise<void>, timeout: number) => step(name, async () => {
+      if (blocked) throw new Error(`前置失败，未执行（${blocked}）`);
+      try { await body(); } catch (error) { blocked = name; throw error; }
+    }, timeout);
+    const services = () => containers().filter(item => ours(item) && ["mixin-bot", "mixin-bot-rollback"].includes(item.name));
+    const bot = () => {
+      const [running = "", user = ""] = docker("inspect", "--format", "{{.State.Running}} {{.Config.User}}", "mixin-bot").out.split(" ");
+      return { running: running === "true", user };
+    };
+    const healthy = () => docker("exec", "mixin-bot", "bun", "run", "ops/tools/health-check.ts").code === 0 &&
+      spawnSync("curl", ["--noproxy", "*", "--max-time", "3", "-fsS", `http://127.0.0.1:${port}/health`]).status === 0;
+    const overview = async () => (await client!.json<{ undeployed: boolean }>("/api/overview")).undeployed;
+    /** Preview and confirm like the page: the plan's summary, then the task, followed until it ends. */
+    const confirmed = async (operation: string, params: Record<string, unknown>) => {
+      const plan = await client!.json<{ id: string; summary: string[] }>("/api/plans", { operation, params });
+      const task = await client!.json<{ id: string }>("/api/tasks", { plan: plan.id, key: crypto.randomUUID() }, 202);
+      const view = await client!.wait(task.id);
+      const log = await client!.json<{ content: string }>(`/api/tasks/${task.id}/log`, {});
+      writeFileSync(join(root, "logs", `web-${operation}-${task.id}.log`), log.content);
+      return { summary: plan.summary, view, log: log.content };
+    };
+    afterAll(async () => { await client?.close(); }, 30_000);
+
+    sequence("web first deployment: dependencies, online drafts, directory, port and workspace from the wizard", async () => {
+      removeOurContainers();
+      ({ work } = repository(join(root, "web-install"), exportWithFakePlatform));
+      projects.push(projectId(work));
+      port = await freePort();
+      client = new LifecycleConsole(work, await freePort(), join(root, "logs", "web-install-console.log"),
+        { ...passthrough, PATH: hostPath, LANG: "C.UTF-8", TERM: "dumb" });
+      await client.login();
+      expect(await overview()).toBe(true);
+      // The model check needs Pi from node_modules: the console installs it as the checkout's owner, in the background.
+      expect(await client.json("/api/setup")).toMatchObject({ undeployed: true, dependencies: { installed: false } });
+      await client.json("/api/setup/dependencies", {});
+      for (const end = Date.now() + 1_200_000; ;) {
+        const { dependencies } = await client.json<{ dependencies: { installed: boolean; job: { state: string; message?: string } | null } }>("/api/setup");
+        if (dependencies.job?.state === "failed") throw new Error(`dependency install failed: ${dependencies.job.message}`);
+        if (dependencies.installed && dependencies.job?.state === "succeeded") break;
+        if (Date.now() > end) throw new Error("the dependency install did not finish");
+        await Bun.sleep(2000);
+      }
+      expect(existsSync(join(work, ".console/host-dependencies.json"))).toBe(true);
+      const check = await client.json<{ items: { state: string; name: string; detail: string }[] }>("/api/setup/check", {});
+      expect(check.items.filter(item => item.state !== "ok")).toEqual([]);
+      const draft = async (kind: "app" | "models", patch: unknown) => {
+        const opened = await client!.json<{ id: string; revision: number }>("/api/configuration/open", { kind });
+        const edited = await client!.json<{ revision: number }>("/api/configuration/edit", { id: opened.id, revision: opened.revision, patch });
+        await client!.json("/api/configuration/check", { id: opened.id, revision: edited.revision, network: true, refresh: false });
+        return opened.id;
+      };
+      const app = await draft("app", { appId: FIXTURE_APP_ID, environment: "production", secret: { mode: "set", value: fixtureSecret } });
+      const models = await draft("models", { provider: "fixture", mode: "custom", api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1",
+        key: { mode: "set", value: "test-only" }, thinking: "low", model: { id: "fixture-model", contextWindow: 64000, maxTokens: 8000,
+          input: ["text"], reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+      const { summary, view, log } = await confirmed("install", { app, models, directory: "all", port, workspace: "" });
+      expect(summary.join("\n")).toContain("构建镜像并创建服务容器 mixin-bot");
+      expect({ state: view.state, result: view.result }, log.slice(-6000)).toMatchObject({ state: "succeeded", result: { outcome: "success", finalState: "running" } });
+      expect(bot()).toEqual({ running: true, user: identity });
+      expect(await until("the first web deployment's service", () => healthy(), 60_000)).toBe(true);
+      expect(JSON.parse(readFileSync(join(work, "data/config/directory.json"), "utf8"))).toEqual({ format: 1, all: true });
+      expect(readFileSync(join(work, "data/state/bot-port"), "utf8").trim()).toBe(String(port));
+      // The drafts went with the task; a Linux host keeps no dependencies once the deployment has succeeded.
+      expect([app, models].filter(id => existsSync(join(work, ".console/config-drafts", `${id}.json`)))).toEqual([]);
+      expect(await until("the console's node_modules to go", () => !existsSync(join(work, "node_modules")) && !existsSync(join(work, ".console/host-dependencies.json")), 30_000)).toBe(true);
+      expect(await overview()).toBe(false);
+    }, 2_400_000);
+
+    sequence("web uninstall keeping data/, then a web redeploy recreates the service as the data's owner", async () => {
+      const kept = await confirmed("uninstall", { data: false, image: false });
+      expect({ state: kept.view.state, result: kept.view.result }, kept.log.slice(-6000)).toMatchObject({ state: "succeeded", result: { outcome: "success", finalState: "stopped" } });
+      expect(services()).toEqual([]);
+      expect(docker("image", "inspect", "mixin-bot").code).toBe(0);
+      expect(existsSync(join(work, "data/state/data-version.json"))).toBe(true);
+      expect(await overview()).toBe(false);
+      const settings = await client!.json<{ port: number; workspace: string }>("/api/lifecycle/deploy");
+      expect(settings.port).toBe(port);
+      const redeploy = await confirmed("deploy", { port: settings.port, workspace: settings.workspace, directory: "saved" });
+      expect(redeploy.summary.join("\n")).toContain("找不到容器 mixin-bot：重新部署会重新创建它");
+      expect({ state: redeploy.view.state, result: redeploy.view.result }, redeploy.log.slice(-6000)).toMatchObject({ state: "succeeded", result: { outcome: "success", finalState: "running" } });
+      expect(redeploy.log).toContain("沿用网页预览中确认的服务身份");
+      expect(bot()).toEqual({ running: true, user: identity });
+      expect(await until("the recreated service", () => healthy(), 60_000)).toBe(true);
+    }, 2_400_000);
+
+    sequence("web uninstall archiving data/ and logs/ and removing the image leaves the checkout undeployed", async () => {
+      const removed = await confirmed("uninstall", { data: true, image: true });
+      expect({ state: removed.view.state, result: removed.view.result }, removed.log.slice(-6000)).toMatchObject({
+        state: "succeeded", result: { outcome: "success", finalState: "stopped", message: "卸载完成" } });
+      expect(services()).toEqual([]);
+      expect({ latest: docker("image", "inspect", "mixin-bot").code === 0, previous: docker("image", "inspect", "mixin-bot:previous").code === 0 })
+        .toEqual({ latest: false, previous: false });
+      expect({ data: existsSync(join(work, "data")), logs: existsSync(join(work, "logs")), workspace: existsSync(join(work, "workspace")) })
+        .toEqual({ data: false, logs: false, workspace: true });
+      expect(readdirSync(join(work, "backup/rm")).length).toBeGreaterThanOrEqual(2);
+      expect(await overview()).toBe(true);
+    }, 600_000);
   });
 
   if (operator !== "group") for (const layout of layouts) {
@@ -530,7 +638,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         if (layout === "external") sharedBaseline = sharedEntries();
         // The credentials are in place, so the directory scope is chosen before the stop; without a terminal it comes from
         // BOT_DIRECTORY_SCOPE. Only this run gets it: a later step that asked again would fail.
-        const deploy = start(root, `${layout}-deploy`, ["scripts/deploy.sh"], work,
+        const deploy = start(root, `${layout}-deploy`, ["scripts/ops.sh", "deploy"], work,
           { ...env(), BOT_DIRECTORY_SCOPE: "all", ...(layout === "external" ? { WORKSPACE_ROOT: shared } : {}) }, deployAnswers);
         const result = await deploy.done;
         expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
@@ -779,7 +887,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         const saved = () => existsSync(savedPath) ? readFileSync(savedPath, "utf8") : null;
         const before = bot(), count = snapshots(), setting = saved();
         try {
-          const result = await start(root, `${layout}-illegal-workspace`, ["scripts/deploy.sh"], work,
+          const result = await start(root, `${layout}-illegal-workspace`, ["scripts/ops.sh", "deploy"], work,
             { ...env(), WORKSPACE_ROOT: link }, deployAnswers).done;
           expect(result.code === 0, result.output.slice(-3000)).toBe(false);
           expect(result.output).toContain("位于受管目录");

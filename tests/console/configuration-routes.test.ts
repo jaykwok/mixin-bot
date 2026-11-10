@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { SOURCE_DIR } from "../../ops/core/platform.ts";
 import type { QueryHost } from "../../console/server/runtime-query.ts";
 
-/** The container path, whatever the runner: Linux hosts query through the deployed image. */
-const linux: QueryHost = { platform: "linux", service: async () => null };
+/** The container path, whatever the runner: deployed Linux hosts query through the deployed image. */
+const linux: QueryHost = { platform: "linux", undeployed: () => false, operator: async () => null, service: async () => null };
 
 /** The bot container reports its data bind by the real path it was created with. */
 const dataMount = (root: string) => { mkdirSync(join(root, "data"), { recursive: true }); return { Type: "bind", RW: true, Destination: "/app/data", Source: realpathSync(join(root, "data")) }; };
@@ -71,7 +71,7 @@ test("校验进程的协议必须完整成功；秘密经 stdin，参数和环�
   try {
     const secret = "private-fixture-key";
     const definition = { args: ["/opt/homebrew/bin/bun", "ops/core/launchd-supervisor.ts"], env: { PATH: "/opt/homebrew/bin:/usr/bin:/bin" }, directory: f.root };
-    const macos = { platform: "darwin" as const, service: async () => ({ account: { uid: 480, gid: 480 }, definition }) };
+    const macos: QueryHost = { ...linux, platform: "darwin", service: async () => ({ account: { uid: 480, gid: 480 }, definition }) };
     const run = async (host: QueryHost) => {
       const calls: { command: string; args: string[]; env?: NodeJS.ProcessEnv }[] = [];
       const query = configurationQuery(f.root, async (command, args, options) => {
@@ -100,13 +100,44 @@ test("校验进程的协议必须完整成功；秘密经 stdin，参数和环�
     expect(native.env).toMatchObject({ HOME: "/var/empty", BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" });
     expect(JSON.parse(native.env!.MIXIN_BECOME_ENV!)).toMatchObject({ PATH: definition.env.PATH, HOME: join(f.root, "data/runtime/home"), LANG: "C.UTF-8" });
     expect(native.env?.SUDO_USER).toBeUndefined();
-    await expect(configurationQuery(f.root, async () => { throw new Error("not reached"); }, { platform: "darwin", service: async () => null })("check", {}))
+    await expect(configurationQuery(f.root, async () => { throw new Error("not reached"); }, { ...linux, platform: "darwin" })("check", {}))
       .rejects.toThrow("请先完成部署");
     const refused = configurationQuery(f.root, async (_command, args) => {
       if (args[0] === "container") return { code: 0, stdout: JSON.stringify([{ Image: "sha256:" + "a".repeat(64), Config: { User: "1001:1001" }, Mounts: [dataMount(f.root)] }]), stderr: "", timedOut: false };
       return { code: 1, stdout: '{"protocol":"mixin-configuration","version":1,"success":true}', stderr: secret, timedOut: false };
     }, linux);
     await expect(refused("check", {})).rejects.toThrow("未完成");
+  } finally { await f.cleanup(); }
+});
+
+test("尚未部署：校验在宿主机运行，root 控制台换成检出属主；Linux 运行检出里的副本，不查容器", async () => {
+  const f = await tempFixture("configuration-host-query-");
+  try {
+    const owner = { uid: 1000, gid: 1000, env: { HOME: "/home/owner", USER: "owner", LOGNAME: "owner" } };
+    const call = async (host: QueryHost) => {
+      let seen: { command: string; args: string[]; env?: NodeJS.ProcessEnv } | undefined;
+      await configurationQuery(f.root, async (command, args, options) => {
+        expect(args[0]).not.toBe("container");
+        seen = { command, args, env: options?.env };
+        return { code: 0, stdout: JSON.stringify({ protocol: "mixin-configuration-catalog", version: 1 }), stderr: "", timedOut: false };
+      }, host)("catalog", undefined);
+      return seen!;
+    };
+    const fresh: QueryHost = { ...linux, undeployed: () => true, service: async () => { throw new Error("not reached"); } };
+    // Rootless (or the owner's own console): the frozen copy, the console's own identity.
+    expect(await call(fresh)).toMatchObject({ command: process.execPath,
+      args: ["--no-env-file", join(SOURCE_DIR, "ops/config/configuration-check.ts"), "catalog", f.root] });
+    // Root: setpriv to the owner, with the owner's home; root's private .console is closed to them.
+    const dropped = await call({ ...fresh, operator: async () => owner });
+    expect(dropped.command).toBe("setpriv");
+    expect(dropped.args).toEqual(["--reuid=1000", "--regid=1000", "--init-groups", "--", process.execPath, "--no-env-file",
+      join(f.root, "ops/config/configuration-check.ts"), "catalog", f.root]);
+    expect(dropped.env).toMatchObject({ HOME: "/home/owner", USER: "owner", LOGNAME: "owner" });
+    // macOS: the identity switch, before any service account exists.
+    const mac = await call({ ...fresh, platform: "darwin", operator: async () => owner });
+    expect(mac.args.slice(0, 6)).toEqual(["--no-env-file", join(SOURCE_DIR, "ops/core/macos-become.ts"), "1000", "1000", "--", process.execPath]);
+    expect(JSON.parse(mac.env!.MIXIN_BECOME_ENV!)).toMatchObject({ HOME: "/home/owner", USER: "owner" });
+    expect(JSON.parse(mac.env!.MIXIN_BECOME_ENV!).SUDO_USER).toBeUndefined();
   } finally { await f.cleanup(); }
 });
 

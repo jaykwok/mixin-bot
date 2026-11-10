@@ -137,6 +137,12 @@ test.skipIf(process.platform !== "linux")("启停计划绑定容器 ID：重建�
   expect(absent.facts.runState).toBe("absent"); expect("container" in absent.facts).toBe(false);
   listing = `${"a".repeat(64)} running\n${"b".repeat(64)} exited\n`;
   await expect(observe("stop", {})).rejects.toThrow("不唯一");
+  // A crash loop alternates between restarting and running: planned as running either way, so its plan stays valid.
+  listing = `${"a".repeat(64)} restarting\n`;
+  const looping = await observe("stop", {});
+  expect(looping.facts).toEqual(first.facts); expect(looping.summary.join("\n")).toContain("反复重启");
+  listing = `${"a".repeat(64)} paused\n`;
+  await expect(observe("stop", {})).rejects.toThrow("过渡状态");
 });
 
 test("宿主查询使用创建时间，残留清理不删除陌生或其他项目的托管项", async () => {

@@ -9,17 +9,17 @@
 # （data/config/directory.json）由向导或 BOT_DIRECTORY_SCOPE 选定；无必需 .env/config.json。消息经平台事件 Stream 主动连出接收，不需要入站端口：HTTP 只监听本机回环，
 # 供控制台、/health 和 /_admin/shutdown 使用。出站需能访问 imtwo.zdxlz.com 与 imfl.zdxlz.com 的 443 端口。
 #
-# 用法：bash scripts/deploy.sh [deploy|repair]
+# 内部入口：由网页控制台的部署任务和 ops.sh deploy|repair 调用。用法：bash scripts/lib/deploy.sh [deploy|repair]
 
 # macOS：交给 bash 3.2 也能运行的引导，部署由 TypeScript 入口执行（scripts/lib/macos-entry.sh）。
-if [ "$(uname -s)" = Darwin ]; then exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/lib/macos-entry.sh" deploy "$@"; fi
+if [ "$(uname -s)" = Darwin ]; then exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/macos-entry.sh" deploy "$@"; fi
 set -euo pipefail
-DEPLOY_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROJECT_DIR="$(cd "${MIXIN_OPS_PROJECT:-$DEPLOY_SOURCE_DIR}" && pwd)"
 DEPLOY_COMMAND="${1:-deploy}"
 case "$DEPLOY_COMMAND" in
-    deploy|repair) ;;
-    *) echo "用法：bash scripts/deploy.sh [deploy|repair]" >&2; exit 2 ;;
+    deploy|repair|check) ;;
+    *) echo "用法：bash scripts/lib/deploy.sh [deploy|repair|check]" >&2; exit 2 ;;
 esac
 # 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
 COMMON_LIB="${DEPLOY_SOURCE_DIR}/scripts/lib/common.sh"
@@ -32,8 +32,11 @@ fi
 . "${DEPLOY_SOURCE_DIR}/scripts/lib/deployment.sh"
 . "${DEPLOY_SOURCE_DIR}/scripts/lib/ops-runtime.sh"
 . "${DEPLOY_SOURCE_DIR}/scripts/lib/core-handoff.sh"
-operation_start deploy
-trap 'operation_finish "$?"' EXIT
+# 环境检查只读，不写运维日志。
+if [ "$DEPLOY_COMMAND" != check ]; then
+    operation_start deploy
+    trap 'operation_finish "$?"' EXIT
+fi
 cd "$PROJECT_DIR"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
@@ -139,7 +142,10 @@ determine_service_user() {
     proposed="$(service_user_from_data "$DOCKER_ROOTLESS")" ||
         { print_error "找不到原容器 mixin-bot，也无法按 data/state 的属主确定服务身份（原因见上方）；部署已停止，服务和数据未改动"; return 1; }
     print_warning "找不到原容器 mixin-bot，无法读取服务原来的运行身份；按 data/state 的属主，服务应以 ${proposed} 运行"
-    if ! ask_yes_no "确认服务以 ${proposed} 运行（已有数据的属主不变）？[y/N]：" n; then
+    # 控制台任务不提问：预览已列出 data/state 的属主并由操作者确认，取得部署锁时和核心停机前都复核这份预览。
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then
+        print_status "沿用网页预览中确认的服务身份 ${proposed}"
+    elif ! ask_yes_no "确认服务以 ${proposed} 运行（已有数据的属主不变）？[y/N]：" n; then
         print_error "未确认服务的运行身份；部署已取消，服务和数据未改动"
         return 1
     fi
@@ -228,10 +234,18 @@ run_configuration_wizard() {
     [ "$status" = 0 ] && [ -s "$staged" ] || { print_error "配置未完成（取消或失败，原因见上方）；${UNCHANGED}"; exit 1; }
 }
 
-# 停机前的交互选择：只读取和校验，全部答完才交给核心。控制台部署沿用网页确认的配置，不运行向导（控制台要求配置齐全）。
+# 停机前的交互选择：只读取和校验，全部答完才交给核心。控制台部署不运行向导：重新部署沿用已有配置（控制台要求配置齐全），
+# 首次部署暂存网页确认的配置草稿（宿主工具 console-stage.ts，以本次的服务身份可读，部门核对要用应用配置）。
 choose_configuration() {
+    if [ "$(console_lifecycle)" = install ]; then
+        print_status "暂存网页确认的应用机器人与模型配置（停止服务后写入）..."
+        "$HOST_BUN" --no-env-file "$DEPLOY_SOURCE_DIR/ops/core/console-stage.ts" --project "$PROJECT_DIR" --stage "$PREVIEW_DIR" </dev/null &&
+            grant_service_access "$PREVIEW_DIR/configuration-app.json" "$PREVIEW_DIR/configuration-models.json" ||
+            { print_error "网页确认的配置无法暂存（原因见上方）；${UNCHANGED}"; exit 1; }
+        return 0
+    fi
     if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then
-        print_status "沿用网页确认的模型与机器人配置"
+        print_status "沿用已有的模型与机器人配置"
         return 0
     fi
     if [ ! -f "$MODELS_FILE" ] || [ ! -f "$SETTINGS_FILE" ]; then
@@ -278,6 +292,57 @@ write_stage_records() {
     )
 }
 
+# 控制台首次部署向导的环境检查：部署在停机前会逐项核对的运行环境，提前在这里只读地查一遍。不取部署锁、不建目录、
+# 不构建镜像；每项一行“ok|fail<TAB>项目<TAB>说明”，有一项不通过就以 1 退出。
+deploy_check() {
+    local failed=0 status=0 reason user='' previous path paths=()
+    check_line() {
+        local text="${3//$'\t'/ }"
+        text="${text//$'\n'/；}"
+        while [[ "$text" == *"； "* ]]; do text="${text//； /；}"; done
+        printf '%s\t%s\t%s\n' "$1" "$2" "$text"
+        [ "$1" = ok ] || failed=1
+    }
+    if ! docker info >/dev/null 2>&1; then
+        check_line fail "Docker" "无法连接 Docker：请确认 Docker 已安装并在运行；rootful Docker 用 sudo 启动控制台，rootless Docker 以运行它的用户启动"
+        return 1
+    fi
+    if docker_rootless; then
+        DOCKER_ROOTLESS=1
+        if [ "$(id -u)" = 0 ]; then check_line fail "运行身份" "Docker 是 rootless 模式，属于运行它的普通用户：请以该用户启动控制台，不要用 sudo"
+        else check_line ok "运行身份" "rootless Docker，以属主（UID $(id -u)）运行"; fi
+    else
+        DOCKER_ROOTLESS=0
+        if [ "$(id -u)" = 0 ]; then check_line ok "运行身份" "rootful Docker，以 root 运行"
+        else check_line fail "运行身份" "Docker 以 root 运行（rootful）：部署要检查镜像存储的磁盘空间并准备服务身份的文件，请用 sudo 启动控制台"; fi
+    fi
+    command -v flock >/dev/null && check_line ok "工具" "已找到 util-linux flock" || check_line fail "工具" "需要 util-linux flock（部署锁）"
+    if [ -e "$PENDING_POINTER" ]; then check_line fail "未完成的操作" "有未完成的部署事务；请在“维护”页继续或回滚"; fi
+    original_service_container 2>/dev/null || status=$?
+    case "$status" in
+        2) user="$(default_service_user "$DOCKER_ROOTLESS")" ;;
+        0) check_line fail "服务容器" "本机已有容器 mixin-bot（${ORIGINAL_CONTAINER_DATA:-数据目录不明}）；同一个 Docker 只能运行一个部署，请先在原目录卸载"; user="$ORIGINAL_CONTAINER_USER" ;;
+        *) check_line fail "服务容器" "无法读取 Docker 中的容器 mixin-bot" ;;
+    esac
+    if [ -n "$user" ]; then
+        if [ "$DOCKER_ROOTLESS" = 1 ]; then TASK_DOCKER_ENDPOINT="${BOT_TASK_DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
+        else TASK_DOCKER_ENDPOINT="${BOT_TASK_DOCKER_HOST:-unix:///run/user/${user%%:*}/docker.sock}"; fi
+        TASK_DOCKER_ID=''
+        if reason="$(task_runtime_check_endpoint "$user" "$DOCKER_ROOTLESS" 2>&1 >/dev/null)"; then
+            check_line ok "任务隔离" "agent 任务在 ${TASK_DOCKER_ENDPOINT#unix://} 的 rootless Docker 中运行（服务身份 ${user}）"
+        else check_line fail "任务隔离" "${reason:-任务 daemon 不可用：${TASK_DOCKER_ENDPOINT}}"; fi
+    fi
+    if [ "$(id -u)" = 0 ] || [ "$DOCKER_ROOTLESS" = 1 ]; then
+        previous="$(docker container inspect --format '{{.Image}}' mixin-bot 2>/dev/null)" || previous=''
+        # 部署先建好 data/ 和 backup/ 再检查空间（各留一份余量）；还不存在时它们会建在项目目录里，按项目目录所在磁盘计算。
+        for path in "$DATA_DIR" "$PROJECT_DIR/backup"; do if [ -e "$path" ]; then paths+=("$path"); else paths+=("$PROJECT_DIR"); fi; done
+        if reason="$(check_build_disk_space "$previous" "${paths[@]}" 2>&1 >/dev/null)"; then check_line ok "磁盘空间" "构建镜像所需的空间足够"
+        else check_line fail "磁盘空间" "${reason:-无法确认镜像存储所在磁盘的剩余空间}"; fi
+    fi
+    return "$failed"
+}
+if [ "$DEPLOY_COMMAND" = check ]; then deploy_check; exit $?; fi
+
 # ---- 前置检查 ----
 
 print_status "检查运行环境..."
@@ -311,7 +376,7 @@ if [ -e "$PENDING_POINTER" ]; then
     print_error "续做和回滚只使用事务记录，不重新部署；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
     exit 1
 fi
-assert_console_lifecycle deploy || exit 1
+assert_console_lifecycle "$(console_lifecycle)" || exit 1
 # 机器人只监听本机回环（运行参数里的 BOT_HOST）；rootless 下的端口发布由核心创建容器时配置。不改写调用方环境里的 BOT_HOST：
 # 控制台任务导出的环境原样传给核心，由它在部署锁内逐项核对，改写过的值会被当作“部署选择未完整传递”拒绝。
 LOOPBACK_HOST=127.0.0.1
@@ -346,7 +411,8 @@ else
     PORT_SOURCE=""
     BOT_PORT="$FALLBACK_PORT"
 fi
-PORT_FIX="改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(ops_command_hint deploy)）；服务尚未停止"
+if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then PORT_FIX="改端口：在控制台重新预览并填写另一个端口；服务尚未停止"
+else PORT_FIX="改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(ops_command_hint deploy)）；服务尚未停止"; fi
 if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
     print_error "${PORT_SOURCE} 中的端口无效（应为 1–65535 的整数）：${BOT_PORT}；${PORT_FIX}"
     exit 1
@@ -456,7 +522,7 @@ if [ "${MIXIN_OPS_UI:-}" != "console" ]; then
     echo "  底层命令（ops.sh 不适用时排障用）:"
     echo "    docker logs -f mixin-bot                         # 容器层日志"
     echo "    docker restart mixin-bot                         # 直接重启容器"
-    echo "    bash scripts/deploy.sh                        # 重配 AI 并验证新实例，失败回滚"
+    echo "    bash scripts/ops.sh deploy                    # 重配 AI 并验证新实例，失败回滚"
     echo ""
 fi
 

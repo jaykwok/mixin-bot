@@ -1,11 +1,16 @@
 import { expect, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
 import { serializeTransactionRecord, type TransactionRecord } from "../../ops/core/transaction-record.ts";
 import { checkUninstall } from "../../ops/core/uninstall.ts";
+import { checkUninstallTask } from "../../ops/core/check-plan.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { PlanStore, type PlanFacts } from "../../ops/core/plans.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import { codeDigest } from "../../ops/core/source-runtime.ts";
 import { CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts";
 import { OPS_MAINTENANCE_FILE } from "../../src/core/ops-maintenance-state.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
@@ -74,6 +79,126 @@ test("另一个进程持有部署锁时拒绝；Windows 只认入口点名的本
   } finally { await f.cleanup(); }
 });
 
+test("控制台卸载在锁内核对接单记录、执行版本和计划；终端卸载没有任务；复核拒绝即拒绝卸载", async () => {
+  const f = await tempFixture("core-uninstall-task-");
+  try {
+    const root = await project(join(f.root, "含空格 项目"), "clean");
+    for (const name of ["console", "ops", "scripts", "src"]) await mkdir(join(root, name), { recursive: true });
+    const params = { data: true, image: false };
+    const facts: PlanFacts = { project: root, platform: process.platform, identity: "fixture", head: "a".repeat(40), protocol: 1, scope: "uninstall", runState: "running" };
+    const plans = new PlanStore(join(root, ".console"), async () => ({ facts, summary: [] })), tasks = new TaskStore(join(root, ".console"));
+    const mechanism = process.platform === "win32" ? "windows-task" as const : "systemd-system" as const;
+    const task = tasks.create({ project: root, planId: (await plans.create("uninstall", params)).id, operation: "uninstall", params, mechanism }, "uninstall");
+    const stop = tasks.create({ project: root, planId: (await plans.create("stop", {})).id, operation: "stop", params: {}, mechanism }, "stop");
+    const digest = codeDigest(root), calls: string[][] = [], recorded = async (...args: [string, string, string]) => { calls.push(args); };
+    await checkUninstallTask(root, root, {}, async () => { throw new Error("a terminal uninstall has no task"); });
+    await expect(checkUninstallTask(root, root, { MIXIN_OPS_CONSOLE: "1" }, recorded)).rejects.toThrow("缺少接单记录");
+    await expect(checkUninstallTask(root, root, { MIXIN_OPS_TASK_ID: task.id, MIXIN_OPS_EXPECT_CODE: "0".repeat(64) }, recorded)).rejects.toThrow("执行版本不符");
+    await expect(checkUninstallTask(root, root, { MIXIN_OPS_TASK_ID: stop.id, MIXIN_OPS_EXPECT_CODE: digest }, recorded)).rejects.toThrow("不符");
+    expect(calls).toEqual([]);
+    await checkUninstallTask(root, root, { MIXIN_OPS_TASK_ID: task.id, MIXIN_OPS_EXPECT_CODE: digest }, recorded);
+    expect(calls).toEqual([[root, task.id, digest]]);
+    // Through the core entry: a plan that no longer holds is a refusal, reported before the entry removes anything.
+    const env = { MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: task.id, MIXIN_OPS_EXPECT_CODE: digest };
+    const { result } = await runCore(["uninstall-check", "--project", root], { source: root, env, checkPlan: async () => { throw new Error("计划已变化，请重新预览"); } });
+    expect(result).toMatchObject({ command: "uninstall", outcome: "refused", exitCode: 1, message: "计划已变化，请重新预览" });
+    expect((await runCore(["uninstall-check", "--project", root], { source: root, env, checkPlan: async () => {} })).result).toMatchObject({ outcome: "success", exitCode: 0 });
+  } finally { await f.cleanup(); }
+});
+
+const gitBash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+const posix = (value: string) => process.platform === "win32" ? value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase()) : value;
+for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "windows" ? process.platform !== "win32" : !gitBash || !existsSync(gitBash))(
+  `${platform} 控制台卸载不提问：按确认的选择执行并写结构化结果；锁被占用或卸载前检查未通过时为拒绝，什么都不做`, async () => {
+    const f = await tempFixture("core-uninstall-console-");
+    try {
+      const events = join(f.root, "events.txt"), output = join(f.root, "result.json");
+      let argv: string[];
+      if (platform === "windows") {
+        const driver = join(f.root, "uninstall.ps1");
+        await writeFile(driver, "\ufeff" + [
+          "param([string]$Project)", "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+          `. ${ps(join(repo, "scripts/lib/common.ps1"))}`,
+          `$OpsSource=${ps(repo)}; $DataDir=Join-Path $Project 'data'; $RuntimeDir=Join-Path $DataDir 'runtime'; $TaskName='mixin-bot-fixture'; $DeployedWorkspaceRoot=''; $Json=$false; $Command='uninstall'`,
+          "function Event($text) { Add-Content -LiteralPath $env:FIXTURE_EVENTS -Value $text -Encoding UTF8 }",
+          "foreach($name in @('Step','Err','Warn','Done')) { Set-Item \"function:$name\" { param($text) [Console]::Error.WriteLine($text) } }",
+          "function Get-OpsCommandHint($name) { \"ops.ps1 $name\" }; function Test-Administrator { $true }",
+          "function Stop-Bot { Event 'stop'; New-Item -ItemType File -Force -Path ($env:FIXTURE_EVENTS + '.stopped') | Out-Null; $true }; function Get-BotPids { @() }",
+          "function Get-ScheduledTask { if ($env:FIXTURE_FOREIGN) { [pscustomobject]@{ Actions = @([pscustomobject]@{ WorkingDirectory = 'C:/elsewhere' }) } } }",
+          "function Get-FinalRunState { if (Test-Path -LiteralPath ($env:FIXTURE_EVENTS + '.stopped')) { 'stopped' } else { 'running' } }",
+          "function Invoke-CoreMaintenance($arguments) { Event ('core ' + ($arguments -join ' ')); if ($env:FIXTURE_CORE_REFUSES) { [Console]::Error.WriteLine('有未完成的部署或升级；卸载未开始'); return $false }; $true }",
+          `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(${ps(join(repo, "scripts/ops.ps1"))},[ref]$tokens,[ref]$errors); if($errors){throw 'syntax'}`,
+          "foreach($name in @('Uninstall-Bot','Remove-BotInstallation','Invoke-ConsoleUninstall','Write-OpsResult')) {",
+          "$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)",
+          ". ([scriptblock]::Create($definition.Extent.Text)) }",
+          "$ok=Invoke-ConsoleUninstall; if($ok -isnot [bool]){throw 'return polluted'}; if($ok){exit 0}else{exit 1}",
+        ].join("\r\n"));
+        argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", driver];
+      } else {
+        const driver = join(f.root, "uninstall.sh");
+        await writeFile(driver, [
+          "set -uo pipefail", 'PROJECT_DIR="$1"; CONTAINER=mixin-bot; ROLLBACK_CONTAINER=mixin-bot-rollback; DEPLOYED_WORKSPACE_ROOT=""; OPS_COMMAND=uninstall',
+          `. '${posix(join(repo, "scripts/lib/lifecycle.sh"))}'`,
+          'P() { printf "%s\\n" "$1" >&2; }; OK() { printf "%s\\n" "$1" >&2; }; WA() { printf "%s\\n" "$1" >&2; }; ER() { printf "%s\\n" "$1" >&2; }',
+          'event() { printf "%s\\n" "$*" >> "$FIXTURE_EVENTS"; }',
+          'has_container() { [ ! -e "$FIXTURE_EVENTS.stopped" ]; }; has_rollback_container() { return 1; }',
+          'docker() { if [ "$1" = container ]; then if [ -n "${FIXTURE_FOREIGN:-}" ]; then echo /srv/elsewhere/data; else echo "$PROJECT_DIR/data"; fi; return 0; fi; event "docker $*"; [ "$1" != rm ] || : > "$FIXTURE_EVENTS.stopped"; }',
+          'final_run_state() { if [ -e "$FIXTURE_EVENTS.stopped" ]; then echo stopped; else echo running; fi; }',
+          'ask_yes_no() { echo "unexpected question: $1" >&2; exit 97; }',
+          'acquire_deploy_lock() { DEPLOY_LOCK_REFUSAL=""; [ -z "${FIXTURE_LOCK_BUSY:-}" ] || { DEPLOY_LOCK_REFUSAL="部署、升级或另一个维护操作正在进行；未执行操作"; return 1; }; }',
+          'ops_core() { event "core $*"; [ -z "${FIXTURE_CORE_REFUSES:-}" ] || { echo "有未完成的部署或升级；卸载未开始" >&2; return 1; }; }',
+          await opsShellFunctions("uninstall_choice", "uninstall", "container_owned", "finish_uninstall_command", "uninstall_command", "ops_result", "json_escape"),
+          "uninstall_command",
+        ].join("\n") + "\n");
+        argv = [gitBash!, "--noprofile", "--norc", posix(driver)];
+      }
+      const run = async (root: string, choices: { data: boolean; image: boolean }, fixture: Record<string, string> = {}) => {
+        await writeFile(events, ""); await rm(events + ".stopped", { force: true }); await rm(output, { force: true });
+        const child = Bun.spawn([...argv, platform === "linux" ? posix(root) : root], { cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
+          env: { ...process.env, MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_UNINSTALL_DATA: choices.data ? "1" : "0", MIXIN_OPS_UNINSTALL_IMAGE: choices.image ? "1" : "0",
+            MIXIN_OPS_RESULT_FILE: platform === "linux" ? posix(output) : output, FIXTURE_EVENTS: platform === "linux" ? posix(events) : events,
+            FIXTURE_LOCK_BUSY: "", FIXTURE_CORE_REFUSES: "", FIXTURE_FOREIGN: "", ...fixture } });
+        const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+        return { code, err: out + err, events: (await Bun.file(events).text()).trim().split(/\r?\n/).filter(Boolean),
+          result: existsSync(output) ? JSON.parse(await Bun.file(output).text()) : null };
+      };
+      const stopped = platform === "windows" ? ["core uninstall-check", "stop"] : ["core uninstall-check", "docker stop mixin-bot", "docker rm mixin-bot"];
+      // Data archived; on Linux the image too.
+      const archived = await project(join(f.root, "归档 数据"), "clean");
+      let value = await run(archived, { data: true, image: platform === "linux" });
+      expect(value.code, value.err).toBe(0);
+      expect(value.err).not.toContain("unexpected question");
+      expect(value.events).toEqual([...stopped, ...platform === "linux" ? ["docker image inspect mixin-bot:previous", "docker rmi mixin-bot:previous", "docker rmi mixin-bot"] : []]);
+      expect(existsSync(join(archived, "data"))).toBe(false);
+      expect(value.result).toEqual({ protocol: "mixin-ops", version: 1, command: "uninstall", outcome: "success", wasRunning: true, finalState: "stopped", exitCode: 0, message: "卸载完成" });
+      // Data kept: the service goes, data/ stays for a later redeployment.
+      const kept = await project(join(f.root, "保留 数据"), "clean");
+      value = await run(kept, { data: false, image: false });
+      expect(value.code, value.err).toBe(0); expect(value.events).toEqual(stopped);
+      expect(existsSync(join(kept, "data/config/marker"))).toBe(true);
+      expect(value.result).toMatchObject({ outcome: "success", finalState: "stopped" });
+      // Refusals: nothing stopped, nothing moved, reported as refused. A same-named service of another directory is not this one's to remove.
+      for (const [fixture, message] of [[{ FIXTURE_CORE_REFUSES: "1" }, "卸载前检查未通过"], [{ FIXTURE_LOCK_BUSY: "1" }, "部署、升级或另一个维护操作正在进行"],
+        [{ FIXTURE_FOREIGN: "1" }, "属于另一个目录的部署"]] as const) {
+        if (platform === "windows" && "FIXTURE_LOCK_BUSY" in fixture) continue;
+        value = await run(kept, { data: true, image: false }, fixture);
+        expect(value.code).toBe(1);
+        expect(value.events).toEqual("FIXTURE_LOCK_BUSY" in fixture ? [] : ["core uninstall-check"]);
+        expect(existsSync(join(kept, "data/config/marker"))).toBe(true);
+        expect(value.result).toMatchObject({ command: "uninstall", outcome: "refused", wasRunning: true, finalState: "running", exitCode: 1, message: expect.stringContaining(message) });
+      }
+      if (platform === "windows") {
+        // The entry's own lock: another holder refuses before the core runs.
+        const lock = acquireDeploymentLock(kept);
+        try {
+          value = await run(kept, { data: true, image: false });
+          expect(value.code).toBe(1); expect(value.events).toEqual([]);
+          expect(value.result).toMatchObject({ outcome: "refused", finalState: "running", message: expect.stringContaining("部署、升级或另一个维护操作正在进行") });
+        } finally { lock.close(); }
+      }
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
 test.skipIf(process.platform !== "win32")("真实 PowerShell 卸载持锁运行核心检查：拒绝时不停机不归档，通过后释放锁再归档 data/", async () => {
   const f = await tempFixture("core-uninstall-windows-");
   try {
@@ -140,9 +265,9 @@ test.skipIf(process.platform !== "linux")("真实 Shell 卸载经 fd 9 持锁运
       `. ${JSON.stringify(join(repo, "scripts/lib/common.sh"))}`, `. ${JSON.stringify(join(repo, "scripts/lib/ops-runtime.sh"))}`,
       'P() { printf "%s\\n" "$1" >&2; }; OK() { printf "%s\\n" "$1" >&2; }; WA() { printf "%s\\n" "$1" >&2; }; ER() { printf "%s\\n" "$1" >&2; }',
       'has_container() { return 0; }; has_rollback_container() { return 1; }',
-      'docker() { printf "docker %s\\n" "$*" >> "$FIXTURE_EVENTS"; }',
+      'docker() { if [ "$1" = container ]; then echo "$PROJECT_DIR/data"; return 0; fi; printf "docker %s\\n" "$*" >> "$FIXTURE_EVENTS"; }',
       'ask_yes_no() { case "$1" in *镜像*) return 1 ;; *) [ "$FIXTURE_ARCHIVE" = y ] ;; esac; }',
-      await opsShellFunctions("uninstall"),
+      await opsShellFunctions("uninstall_choice", "uninstall", "container_owned"),
       "uninstall",
     ].join("\n") + "\n");
     const run = async (root: string, archive: "y" | "n") => {

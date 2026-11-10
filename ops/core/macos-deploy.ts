@@ -13,6 +13,7 @@ import { AT_FDCWD, close, fstat, isDirectory, isFile, namesAt, O, openAt, statAt
 import { handOverLog } from "../../src/lib/operation-log.ts";
 import { REQUIRED_SETTINGS } from "../lib/settings-files.ts";
 import { checkoutOperator } from "./macos-lifecycle.ts";
+import { stageConsoleConfiguration } from "./console-stage.ts";
 import { attached, captured, EntryError, event, fail, hint, ok, requireRoot, setStage, SOURCE, startLog, step, warn, askYesNo } from "./macos-terminal.ts";
 
 const BUN_MINIMUM = [1, 4, 4];
@@ -124,15 +125,20 @@ export function createMissingServiceData(project: string, account: Identity): Pr
   return createServiceDirectories(project, account, accountCommand(account, project), true);
 }
 
+/** The service directories present that are not the account's own directories (`uid` null: the account does not exist yet). */
+function foreignServiceDirectories(project: string, uid: number | null): string[] {
+  return SERVICE_DIRECTORIES.filter(relative => {
+    try { const info = lstatSync(join(project, relative)); return info.isSymbolicLink() || !info.isDirectory() || info.uid !== uid; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  });
+}
+
 /**
  * The directories the service writes belong to the service account. Missing ones are created for it; existing ones that are
  * not its own (data restored by hand, or created by an earlier root process) are handed over after a question.
  */
-export async function prepareServiceData(project: string, account: Identity, deployed: boolean): Promise<void> {
-  const foreign = SERVICE_DIRECTORIES.filter(relative => {
-    try { const info = lstatSync(join(project, relative)); return info.isSymbolicLink() || !info.isDirectory() || info.uid !== account.uid; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
-  });
+export async function prepareServiceData(project: string, account: Identity, deployed: boolean, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const foreign = foreignServiceDirectories(project, account.uid);
   for (const relative of foreign) {
     const info = lstatSync(join(project, relative));
     if (info.isSymbolicLink() || !info.isDirectory()) throw new EntryError(`${relative} 不是目录（或是链接），无法交给服务账户；${UNCHANGED}`);
@@ -140,7 +146,9 @@ export async function prepareServiceData(project: string, account: Identity, dep
   const top = [...new Set(foreign.map(relative => relative.split("/")[0]!))];
   if (top.length) {
     if (deployed) warn(`${top.join("、")} 中有不属于服务账户 ${SERVICE_ACCOUNT} 的目录`);
-    if (!askYesNo(`把 ${top.map(name => name + "/").join("、")} 整个交给服务账户 ${SERVICE_ACCOUNT}（chown -R）？[Y/n] `, true)) throw new EntryError(`数据目录不属于服务账户，未部署；${UNCHANGED}`);
+    // Handing directories over is the operator's decision; a console task has nobody to ask.
+    if (env.MIXIN_OPS_CONSOLE === "1") throw new EntryError(`${top.map(name => name + "/").join("、")} 中有不属于服务账户 ${SERVICE_ACCOUNT} 的目录，控制台部署不交接已有目录：确认内容后移走它们，或在终端用 ${hint("deploy")} 部署；${UNCHANGED}`);
+    if (!askYesNo(`把 ${top.map(name => name + "/").join("、")} 整个交给服务账户 ${SERVICE_ACCOUNT}（chown -R）？[Y/n] `, true, env)) throw new EntryError(`数据目录不属于服务账户，未部署；${UNCHANGED}`);
     for (const name of top) {
       try { handOverTree(join(project, name), account); }
       catch (error) { throw new EntryError(`无法把 ${name}/ 交给服务账户（${error instanceof Error ? error.message : String(error)}）；服务尚未停止`); }
@@ -165,8 +173,49 @@ function pendingPointer(project: string): string | null {
   return null;
 }
 
+/**
+ * The console's first-deployment check: what deployEntry checks before the stop, read-only (no lock, account, directory or
+ * log). Before the first deployment the service account does not exist yet; `nobody` stands in for its access to the
+ * checkout and the tools (it cannot enter home directories either). One "ok|fail<TAB>item<TAB>detail" line each; 1 when
+ * any fails.
+ */
+export async function deployCheck(project: string): Promise<number> {
+  let failed = false;
+  const line = (state: "ok" | "fail", name: string, text: string) => {
+    console.log(`${state}\t${name}\t${text.replace(/\t/g, " ").replace(/\s*[\r\n]+\s*/g, "；")}`);
+    if (state !== "ok") failed = true;
+  };
+  if (process.getuid?.() !== 0) { line("fail", "运行身份", "部署需要 root：请用 sudo 启动控制台"); return 1; }
+  line("ok", "运行身份", "以 root 运行");
+  const pending = pendingPointer(project);
+  if (pending) line("fail", "未完成的操作", `有未完成的${pending}；请在“维护”页继续或回滚`);
+  const facts = await new LaunchdPlatform(project).inspect();
+  if (facts.state !== "absent" && !facts.owned) line("fail", "服务", "已有 LaunchDaemon 属于其他目录或其他账户；请先在那个目录卸载它");
+  let account = await accountIdentity(SERVICE_ACCOUNT);
+  const foreign = foreignServiceDirectories(project, account ? account.uid : null);
+  if (foreign.length) line("fail", "数据目录", `${foreign.join("、")} 已存在且不属于服务账户 ${SERVICE_ACCOUNT}，控制台部署不交接已有目录：确认内容后移走它们，或在终端用 ${hint("deploy")} 部署`);
+  if (account) line("ok", "服务账户", `${SERVICE_ACCOUNT}（UID ${account.uid}）`);
+  else {
+    const nobody = await accountIdentity("nobody");
+    if (!nobody) { line("fail", "服务账户", "读不到 nobody 账户，无法代为检查服务账户的访问"); return 1; }
+    // uid_t is unsigned: id(1) prints nobody as -2.
+    account = { uid: nobody.uid >>> 0, gid: nobody.gid >>> 0 };
+    line("ok", "服务账户", `${SERVICE_ACCOUNT} 将在首次部署时创建（无登录、无密码）`);
+  }
+  try { await checkProjectAccess(project, account); line("ok", "项目位置", "服务账户可以读取项目代码"); }
+  catch (error) { line("fail", "项目位置", (error as Error).message); }
+  try {
+    const tools = await findMacosTools(project, account);
+    line("ok", "工具", `bun（${tools.bun}）、git（${tools.git}）、uv（${tools.uv}）、bash（${tools.bash}）、GNU coreutils（${tools.coreutils}）`);
+  } catch (error) { line("fail", "工具", (error as Error).message); }
+  return failed ? 1 : 0;
+}
+
+/** The console task's operation inside the deploy entry: a first deployment (install) or a redeployment. A terminal deploys. */
+export const consoleLifecycle = (env: NodeJS.ProcessEnv = process.env) => env.MIXIN_OPS_CONSOLE === "1" && env.MIXIN_OPS_LIFECYCLE === "install" ? "install" : "deploy";
+
 /** Fresh console operations carry explicit choices (deployment-options.ts sets them); recovery uses the transaction instead. */
-export function assertConsoleLifecycle(operation: "deploy" | "update", project: string, branch = "main", env: NodeJS.ProcessEnv = process.env): void {
+export function assertConsoleLifecycle(operation: "deploy" | "install" | "update", project: string, branch = "main", env: NodeJS.ProcessEnv = process.env): void {
   if (env.MIXIN_OPS_CONSOLE !== "1") return;
   if (env.MIXIN_OPS_LIFECYCLE !== operation || !env.MIXIN_OPS_TASK_ID) throw new EntryError("控制台部署缺少明确选择或任务记录；服务尚未停止");
   if (!["0", "1"].includes(env.MIXIN_OPS_SWITCH_MAIN ?? "")) throw new EntryError("必须明确选择是否允许切换分支；服务尚未停止");
@@ -178,6 +227,12 @@ export function assertConsoleLifecycle(operation: "deploy" | "update", project: 
     case "selected": if (saved || env.BOT_DIRECTORY_SCOPE || !env.MIXIN_OPS_DIRECTORY_INPUT || !env.MIXIN_OPS_DIRECTORY_APP) throw new EntryError("部门选择与确认不符；服务尚未停止"); break;
     default: throw new EntryError("必须明确选择通讯录范围；服务尚未停止");
   }
+  // A first deployment's configuration comes from the drafts confirmed in the browser (console-stage.ts); the others keep the installed one.
+  if (operation === "install") {
+    if (env.MIXIN_OPS_DIRECTORY === "saved" || !env.MIXIN_OPS_APP_DRAFT || !env.MIXIN_OPS_MODELS_DRAFT) throw new EntryError("首次部署缺少已确认的配置草稿或通讯录范围；服务尚未停止");
+    return;
+  }
+  if (env.MIXIN_OPS_APP_DRAFT || env.MIXIN_OPS_MODELS_DRAFT) throw new EntryError("只有首次部署使用网页配置草稿；服务尚未停止");
   for (const required of REQUIRED_SETTINGS)
     if (!existsSync(join(project, required))) throw new EntryError("缺少已有配置，请先完成首次部署；服务尚未停止");
 }
@@ -195,7 +250,7 @@ const readState = (project: string, name: string) => { try { return readFileSync
 async function choosePort(project: string, env: NodeJS.ProcessEnv): Promise<number> {
   const saved = readState(project, "bot-port");
   const [raw, source] = env.BOT_PORT?.trim() ? [env.BOT_PORT.trim(), "BOT_PORT"] : saved !== null ? [saved, "data/state/bot-port"] : ["10000", ""];
-  const fix = `改端口：sudo BOT_PORT=<端口> bash scripts/ops.sh deploy；${UNCHANGED}`;
+  const fix = env.MIXIN_OPS_CONSOLE === "1" ? `改端口：在控制台重新预览并填写另一个端口；${UNCHANGED}` : `改端口：sudo BOT_PORT=<端口> bash scripts/ops.sh deploy；${UNCHANGED}`;
   const port = /^\d{1,5}$/.test(raw) ? Number(raw) : NaN;
   if (!(port >= 1 && port <= 65535)) throw new EntryError(`${source || "默认值"} 中的端口无效（应为 1–65535 的整数）：${raw}；${fix}`);
   // A kept port may be the running service's own: only a new one is probed.
@@ -269,11 +324,13 @@ export async function deployEntry(project: string, command: "deploy" | "repair",
     if (!existsSync(join(project, required))) throw new EntryError(`缺少必要文件：${required}`);
   const pending = pendingPointer(project);
   if (pending) throw new EntryError(`发现未完成的${pending}。续做和回滚只使用事务记录，不重新部署；请使用 ${hint("resume")} 继续，或 ${hint("rollback")} 回滚。`);
-  assertConsoleLifecycle("deploy", project, "main", env);
+  const lifecycle = consoleLifecycle(env);
+  assertConsoleLifecycle(lifecycle, project, "main", env);
   const service = new LaunchdPlatform(project), deployed = (await service.inspect()).state !== "absent";
   let account = await accountIdentity(SERVICE_ACCOUNT);
   if (!account) {
-    if (env.MIXIN_OPS_CONSOLE === "1") throw new EntryError(`服务账户 ${SERVICE_ACCOUNT} 不存在；请先在终端里完成首次部署`);
+    // A console redeployment needs the account it deployed with (data/ belongs to it); a first deployment creates it as the terminal one does.
+    if (env.MIXIN_OPS_CONSOLE === "1" && lifecycle !== "install") throw new EntryError(`服务账户 ${SERVICE_ACCOUNT} 不存在：数据目录的属主需要人工确认，请在终端用 ${hint("deploy")} 重新部署`);
     const made = await ensureServiceAccount();
     account = made.identity;
     ok(`已创建服务账户 ${SERVICE_ACCOUNT}（UID/GID ${account.uid}，无登录、无密码、不在登录窗口显示）`);
@@ -291,7 +348,7 @@ export async function deployEntry(project: string, command: "deploy" | "repair",
   setStage("deploy-preflight");
   if (await runCore(project, ["deployment", "deploy", "--project", project, "--preflight", "--git-path", tools.git], childEnv) !== 0)
     throw new EntryError(`部署预检未通过（原因见上方）；${UNCHANGED}`);
-  await prepareServiceData(project, account, deployed);
+  await prepareServiceData(project, account, deployed, env);
   await removeStaleStages(project, account);
   // The checks before the stop and the wizards need the dependencies: a first deployment installs them now (nothing runs yet).
   if (!existsSync(join(project, "node_modules"))) {
@@ -315,7 +372,12 @@ export async function deployEntry(project: string, command: "deploy" | "repair",
         throw new EntryError(`数据版本或配置校验未通过（原因见上方）；${UNCHANGED}`);
     } else if (await projectTool(project, tools.bun, account, dataTool, ["check", "--project", project, "--workspace", workspace.final], { BOT_OPERATION_LOG: log.name ?? "" }) !== 0)
       throw new EntryError(`数据版本核对未通过（原因见上方）；${UNCHANGED}`);
-    if (env.MIXIN_OPS_CONSOLE === "1") ok("沿用网页确认的模型与机器人配置");
+    if (lifecycle === "install") {
+      // Written by root and handed to the account through each new file's descriptor, like the rest of its stage: the
+      // department check reads the application as the account.
+      step("暂存网页确认的应用机器人与模型配置（停止服务后写入）...");
+      stageConsoleConfiguration(project, stage, env, account);
+    } else if (env.MIXIN_OPS_CONSOLE === "1") ok("沿用已有的模型与机器人配置");
     else if (!config("config/models.json") || !config("runtime/pi/settings.json")) {
       // Without the app bot's configuration this wizard asks for it first.
       await stagedWizard(project, tools.bun, account, stage, "首次配置 AI（provider/key/model）", "configure.ts", "configuration-models.json");

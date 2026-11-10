@@ -18,6 +18,19 @@ export async function checkTaskPlan(project: string, task: string, expected: str
   if (codeDigest(project) !== expected) throw new Error("复核期间代码变化；未执行操作");
 }
 
+/**
+ * An uninstall entry, under the lock it holds: a console run must be the confirmed uninstall task, run by the code that
+ * planned it, whose plan (the service it binds and the two choices) still holds. A terminal run has no task.
+ */
+export async function checkUninstallTask(project: string, source: string, env: NodeJS.ProcessEnv, check = checkTaskPlan): Promise<void> {
+  if (env.MIXIN_OPS_CONSOLE === "1" && !env.MIXIN_OPS_TASK_ID) throw new Error("控制台任务缺少接单记录，未执行操作");
+  if (!env.MIXIN_OPS_TASK_ID) return;
+  const expected = env.MIXIN_OPS_EXPECT_CODE ?? "";
+  if (codeDigest(source) !== expected) throw new Error("控制台任务执行版本不符，未执行操作");
+  if (new TaskStore(consoleDir(project)).request(env.MIXIN_OPS_TASK_ID).operation !== "uninstall") throw new Error("命令与确认的控制台任务不符");
+  await check(project, env.MIXIN_OPS_TASK_ID, expected);
+}
+
 if (import.meta.main) {
   try {
     const { values, positionals } = cliArgs(process.argv.slice(2), { project: { type: "string" }, task: { type: "string" }, digest: { type: "string" } });

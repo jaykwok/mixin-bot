@@ -184,7 +184,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 
 `package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本，依赖不打补丁。`tests/ops/knip.test.ts` 在普通和 production 两种模式下验证 Knip 把 Bun 脚本启动的入口算作生产代码：已用的代码和依赖不误报，无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
 
-命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。截图维护见[截图说明](assets/README.md)。
+命令行工具放在 `ops/config`、`ops/tools` 下，运维核心和控制台的进程入口在 `ops/core`（如 `cli.ts`、`check-plan.ts`、`console-stage.ts`）和 `console/server`（`start.ts`、`executor.ts` 等），由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。截图维护见[截图说明](assets/README.md)。
 
 | 工程入口 | 职责 |
 | --- | --- |
@@ -204,7 +204,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 | [outbound.ts](../src/durable/outbound.ts)、[send.ts](../src/durable/send.ts)、[file-delivery.ts](../src/durable/file-delivery.ts)、[relay.ts](../src/integrations/relay.ts) | 回复格式、持久交付、文件发送与外链对象 |
 | [ops/core](../ops/core) | 宿主机运维核心：部署、升级与维护事务，服务控制，中断恢复 |
 | [ops/config](../ops/config)、[ops/tools](../ops/tools)、[ops/lib](../ops/lib) | 配置向导与发布、数据工具（镜像内也运行）、运维共用的参数和协议 |
-| [scripts](../scripts) | Shell/PowerShell 入口：`ops`、`deploy`、`upgrade` 和它们共用的 `scripts/lib` |
+| [scripts](../scripts) | Shell/PowerShell 入口：命令行运维 `ops`、跨版本升级协议 `upgrade`（含 `scripts/deploy/upgrade.*`）；部署入口和共用代码在 `scripts/lib` |
 | [console/server](../console/server)、[console/ui](../console/ui) | 网页控制台：宿主服务与后台执行器、宿主机数据读取与查询进程池；浏览器界面 |
 | [src/lib](../src/lib) | 服务与运维共用的底层代码：原子写入、进程监督、操作日志、脱敏 |
 

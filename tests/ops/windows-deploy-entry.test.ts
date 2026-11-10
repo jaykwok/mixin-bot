@@ -12,6 +12,8 @@ import { tempFixture } from "../helpers/temp.ts";
 const source = resolve(import.meta.dir, "../.."), quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
 const head = "c".repeat(40);
 const library = "\ufeff" + `. ${quote(join(source, "scripts/lib/operation-log.ps1"))}
+# The real Get-ConsoleLifecycle; Assert-ConsoleLifecycle below records instead.
+. ${quote(join(source, "scripts/lib/console-plan.ps1"))}
 function Add-FixtureEvent([string]$Text) {
     $line = ($Text.Replace($env:FIXTURE_RELEASE, '<release>').Replace($env:FIXTURE_PROJECT, '<project>') -replace 'deploy-stage-[0-9a-f]{8}', 'deploy-stage-<id>')
     [IO.File]::AppendAllText($env:FIXTURE_EVENTS, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
@@ -57,6 +59,13 @@ function Invoke-ConsoleProcess([string]$FilePath, [string[]]$Arguments, [switch]
     # The entry's own environment stays as the task saw it: the console rechecks it under the lock.
     $own = 'own=' + $env:BOT_PORT + '|' + $env:WORKSPACE_ROOT + '|' + $env:BOT_HOST
     if ($Arguments[0] -ceq 'install') { Add-FixtureEvent ('install ' + ($Arguments -join ' ')); return 0 }
+    # A console first deployment stages the drafts confirmed in the browser with the release's tool.
+    if ($Arguments[1] -eq (Join-Path $env:FIXTURE_RELEASE 'ops\\core\\console-stage.ts')) {
+        $stage = $Arguments[[Array]::IndexOf($Arguments, '--stage') + 1]
+        foreach ($name in @('configuration-app.json', 'configuration-models.json')) { [IO.File]::WriteAllText((Join-Path $stage $name), '{}') }
+        Add-FixtureEvent ('stage ' + (@($Arguments | Select-Object -Skip 2) -join ' '))
+        return 0
+    }
     if ($Arguments[2] -eq (Join-Path $env:FIXTURE_PROJECT 'ops\\config\\runtime-settings.ts')) {
         $file = $Arguments[[Array]::IndexOf($Arguments, '--prepare-values') + 1]
         [IO.File]::WriteAllText($file, '{"format":1}')
@@ -77,9 +86,9 @@ const free = () => new Promise<number>((done, fail) => {
   const server = createServer(); server.once("error", fail);
   server.listen(0, "127.0.0.1", () => { const { port } = server.address() as { port: number }; server.close(() => done(port)); });
 });
-type Mode = "first" | "redeploy" | "reconfigure" | "console" | "pending" | "preflight" | "preview" | "workspace-missing" | "port-in-use" | "wizard-cancel"
+type Mode = "first" | "install" | "redeploy" | "reconfigure" | "console" | "pending" | "preflight" | "preview" | "workspace-missing" | "port-in-use" | "wizard-cancel"
   | "core-failed" | "not-admin";
-const MODES: Mode[] = ["first", "redeploy", "reconfigure", "console", "pending", "preflight", "preview", "workspace-missing", "port-in-use", "wizard-cancel", "core-failed",
+const MODES: Mode[] = ["first", "install", "redeploy", "reconfigure", "console", "pending", "preflight", "preview", "workspace-missing", "port-in-use", "wizard-cancel", "core-failed",
   "not-admin"];
 
 for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows deploy entry: ${mode}`, async () => {
@@ -87,9 +96,9 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
   const listener = mode === "port-in-use" ? createServer() : null;
   try {
     const release = join(f.root, "release"), project = join(f.root, "中文 project"), events = join(f.root, "events.txt"), staged = join(f.root, "staged");
-    const shared = join(f.root, "shared"), first = ["first", "wizard-cancel", "port-in-use"].includes(mode);
+    const shared = join(f.root, "shared"), first = ["first", "install", "wizard-cancel", "port-in-use"].includes(mode);
     await mkdir(join(release, "scripts"), { recursive: true }); await mkdir(join(release, "scripts/lib"));
-    await writeFile(join(release, "scripts/deploy.ps1"), await readFile(join(source, "scripts/deploy.ps1")));
+    await writeFile(join(release, "scripts/lib/deploy.ps1"), await readFile(join(source, "scripts/lib/deploy.ps1")));
     await writeFile(join(release, "scripts/lib/common.ps1"), library);
     for (const file of ["package.json", "src/server/index.ts", "ops/config/configure.ts"]) {
       await mkdir(join(project, file, ".."), { recursive: true }); await writeFile(join(project, file), "");
@@ -101,16 +110,19 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
       for (const file of ["data/config/app-bot.json", "data/config/models.json", "data/runtime/pi/settings.json", "data/config/directory.json"]) await writeFile(join(project, file), "{}");
       await writeFile(join(project, "data/state/bot-port"), "1011");
     }
+    // The console installed the dependencies before its first deployment.
+    if (mode === "install") await mkdir(join(project, "node_modules"));
     if (mode === "pending") await writeFile(join(project, "data/state/deploy-transaction"), "deploy-fixture\n");
     // An abandoned stage from a killed deployment two days ago goes; a recent one may belong to another deployment and stays.
     await mkdir(join(project, "tmp/deploy-stage-0badf00d"), { recursive: true }); await mkdir(join(project, "tmp/deploy-stage-12345678"));
     const old = new Date(Date.now() - 2 * 86_400_000); utimesSync(join(project, "tmp/deploy-stage-0badf00d"), old, old);
     let port = first ? await free() : 1011;
     if (listener) { await new Promise<void>(done => listener.listen(0, "127.0.0.1", done)); port = (listener.address() as { port: number }).port; }
-    const child = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(release, "scripts/deploy.ps1")], {
+    const child = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(release, "scripts/lib/deploy.ps1")], {
       cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
       env: { ...process.env, MIXIN_OPS_TASK_ID: undefined, MIXIN_OPS_RESULT_FILE: undefined, MIXIN_OPS_UI: undefined,
-        MIXIN_OPS_CONSOLE: mode === "console" ? "1" : undefined, MIXIN_OPS_PROJECT: project, BOT_HOST: undefined,
+        MIXIN_OPS_CONSOLE: mode === "console" || mode === "install" ? "1" : undefined, MIXIN_OPS_LIFECYCLE: mode === "install" ? "install" : undefined,
+        MIXIN_OPS_PROJECT: project, BOT_HOST: undefined,
         BOT_PORT: first ? String(port) : undefined, WORKSPACE_ROOT: mode === "reconfigure" ? shared : mode === "workspace-missing" ? join(f.root, "missing") : undefined,
         FIXTURE_MODE: mode, FIXTURE_EVENTS: events, FIXTURE_RELEASE: release, FIXTURE_PROJECT: project, FIXTURE_STAGE: staged, FIXTURE_WORKSPACE: "",
         FIXTURE_HEAD: mode === "redeploy" ? "" : head },
@@ -123,10 +135,13 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     const runtime = `runtime --prepare-values ${stage}\\runtime-values.json --deployment native child=BOT_HOST=127.0.0.1,BOT_PORT=${port},WORKSPACE_ROOT=${workspace} ${own}`;
     const core = `core deployment deploy --project <project> --stage ${stage} --command deploy --git-path fixture-git ${own}`;
     const preview = `data preview --project <project> --plan ${stage}\\data-plan.json --workspace ${workspace}`;
-    const before = ["lifecycle deploy", preflight];
+    const before = [mode === "install" ? "lifecycle install" : "lifecycle deploy", preflight];
     const expected: Record<Mode, { code: number; events: string[]; files?: string[] }> = {
       first: { code: 0, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
         "wizard configure.ts", `scope? app=${stage}\\configuration-app.json`, runtime, core],
+        files: ["configuration-app.json", "configuration-models.json", "deployment.json", "directory-scope-plan.json", "runtime-values.json", "windows-tools"] },
+      install: { code: 0, events: [...before, `protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
+        `stage --project <project> --stage ${stage}`, `scope? app=${stage}\\configuration-app.json`, runtime, core],
         files: ["configuration-app.json", "configuration-models.json", "deployment.json", "directory-scope-plan.json", "runtime-values.json", "windows-tools"] },
       redeploy: { code: 0, events: [...before, `protect ${stage}`, preview, "reconfigure?", runtime, core],
         files: ["data-plan.json", "deployment.json", "runtime-values.json", "windows-tools"] },

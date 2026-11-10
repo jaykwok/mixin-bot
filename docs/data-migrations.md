@@ -69,7 +69,7 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
      - 直连模式：Linux 删除注释为 `Mixin-Chatbot (平台IP)` 的 UFW 规则（`sudo ufw status numbered` 后按编号 `sudo ufw delete <编号>`）；Windows 以管理员运行 `Remove-NetFirewallRule -Group mixin-chatbot`。
      - 在 Mixin 后台停用旧的 webhook 回调。
      - Linux 执行 `docker rm mixin-chatbot`（还有 `mixin-chatbot-rollback` 时一并删除；数据在旧目录的挂载里，不受影响）；Windows 以管理员执行 `Unregister-ScheduledTask -TaskName mixin-chatbot -Confirm:$false`。
-3. **全新部署当前版本**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链和运行参数在控制台「设置」中重新设置；MCP 和辅助模型按旧目录的 `data/config/mcp.json`、`auxiliary.json` 重新写入（控制台只显示它们的状态）。
+3. **全新部署当前版本**：在新目录克隆仓库，启动控制台完成首次部署（见[部署与配置](deployment.md#执行部署)），配置应用机器人凭据和模型。外链和运行参数在控制台「设置」中重新设置；MCP 和辅助模型按旧目录的 `data/config/mcp.json`、`auxiliary.json` 重新写入（控制台只显示它们的状态）。
 4. **恢复统计**（需要旧数字时）：在新部署开始使用之前按下一节恢复。新账本一旦记下提问或用量，就不再接受恢复。
 5. **验收**：在客户端做最小验收（单聊、群里提问、文件回复）。
 

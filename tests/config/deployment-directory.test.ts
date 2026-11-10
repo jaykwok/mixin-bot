@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { directoryAppHash, consoleDirectoryScope } from "../../ops/lib/directory-choice.ts";
@@ -28,6 +29,20 @@ test("真实平台客户端通过本机合成平台查询部门，不连接 Stre
   } finally { platform.stop(); await f.cleanup(); }
 });
 
+test("首次部署前用应用草稿查询部门：编号取自草稿文本，不读也不写 app-bot.json", async () => {
+  const f = await tempFixture("deployment-directory-draft-"), platform = new FakePlatform();
+  try {
+    platform.directory = { children: { "1": ["d2"] }, members: {}, ids: {}, info: { d2: { name: "研发部" } } };
+    const make = (config: typeof platform.config) => new PlatformClient(config, { endpoints: platform.endpoints, retryDelaysMs: [] });
+    const app = JSON.stringify(platform.config, null, 2) + "\n";
+    const result = await queryDeploymentDirectory(f.root, "verify", { ids: ["d2"], app }, make);
+    expect(result.departments).toEqual([{ id: "d2", name: "研发部" }]);
+    expect(result.appHash).toBe(createHash("sha256").update(app).digest("hex"));
+    expect(existsSync(join(f.root, "data"))).toBe(false);
+    await expect(queryDeploymentDirectory(f.root, "verify", { ids: ["d2"] }, make)).rejects.toThrow();
+  } finally { platform.stop(); await f.cleanup(); }
+});
+
 test("部门查询 CLI 的 stdout 只留结果，失败时不在部署目录或当前目录留下日志", async () => {
   const f = await tempFixture("directory-query-cli-"), project = join(f.root, "project"), cwd = join(f.root, "cwd");
   try {
@@ -41,10 +56,12 @@ test("部门查询 CLI 的 stdout 只留结果，失败时不在部署目录或�
 });
 
 test("内部部门查询严格限制动作、根别名和数量；不接受任意平台路径或成员查询", () => {
-  expect(parseDirectoryQuery("children", { ids: ["1"] })).toEqual(["1"]);
-  expect(parseDirectoryQuery("verify", { ids: ["d_1"] })).toEqual(["d_1"]);
+  expect(parseDirectoryQuery("children", { ids: ["1"] })).toEqual({ ids: ["1"] });
+  expect(parseDirectoryQuery("verify", { ids: ["d_1"] })).toEqual({ ids: ["d_1"] });
+  expect(parseDirectoryQuery("verify", { ids: ["d_1"], app: "{}" })).toEqual({ ids: ["d_1"], app: "{}" });
   for (const [action, input] of [["members", { ids: ["d1"] }], ["verify", { ids: ["1"] }], ["children", { ids: ["1", "2"] }],
-    ["children", { ids: ["1"], path: "/elsewhere" }], ["verify", { ids: [] }], ["verify", { ids: ["d1", "d1"] }]] as const) {
+    ["children", { ids: ["1"], path: "/elsewhere" }], ["verify", { ids: [] }], ["verify", { ids: ["d1", "d1"] }],
+    ["children", { ids: ["1"], app: "" }], ["children", { ids: ["1"], app: 1 }], ["children", { app: "{}" }]] as const) {
     expect(() => parseDirectoryQuery(action, input)).toThrow();
   }
 });

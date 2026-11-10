@@ -11,13 +11,14 @@ import { PathField } from "./files.tsx";
 import { Icon, type IconName } from "./icons.tsx";
 import { Countdown, Dialog, Disclosure, PageHeader, ProgressBar, Row, Section, Segmented, Spinner, Stepper, Toggle } from "./ui.tsx";
 import { DeploymentDirectoryPicker, type DeploymentSelection } from "./deployment-directory.tsx";
+import type { ConsoleInfo } from "./contract.ts";
 
 export interface TaskView { id: string; operation: string; state: string; needsRecovery: boolean; createdAt: number;
   reason?: string; result?: { message: string; finalState: string; outcome: string; exitCode: number } }
 interface Plan { id: string; operation: string; summary: string[]; expiresAt: number }
 export interface TaskEvent { seq: number; at: number; kind: string; text: string }
 export const TASK_STATES: Record<string, string> = { queued: "等待接单", "not-accepted": "未接单", running: "执行中", interrupted: "执行中断", succeeded: "已完成", failed: "失败", unknown: "结果未知" };
-export const TASK_LABELS: Record<string, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", repair: "修复部署", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "会话压缩",
+export const TASK_LABELS: Record<string, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", install: "首次部署", repair: "修复部署", uninstall: "卸载", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "会话压缩",
   "tmp-purge": "归档临时文件", "tmp-reclaim": "物理回收", "tmp-discard": "删除归档", "stat-import": "导入统计", "runtime-configure": "运行参数",
   "relay-test": "测试外链", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复配置" };
 /** Operations whose interruption leaves maintenance to recover. */
@@ -102,7 +103,7 @@ export function useFollowed(): { followed: Followed[]; shown: string | null; han
  * hands the task over on confirmation. `danger`: the confirmation is red (the button itself only says it in red).
  */
 export function TaskAction({ operation, params, children, disabled, danger = false, primary = false, onStarted }: {
-  operation: string; params: Record<string, unknown>; children: ComponentChildren; disabled?: boolean; danger?: boolean; primary?: boolean; onStarted?: () => void;
+  operation: string; params: Record<string, unknown>; children: ComponentChildren; disabled?: boolean; danger?: boolean; primary?: boolean; onStarted?: (task: TaskView) => void;
 }) {
   // The preview's expiry is the server's: `now` and `received` are server time.
   const [plan, setPlan] = useState<Plan | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [now, setNow] = useState(serverTime);
@@ -128,8 +129,9 @@ export function TaskAction({ operation, params, children, disabled, danger = fal
       const task = await api<TaskView>("/api/tasks", { method: "POST", body: { plan: plan.id, key: key.current }, intent: true, timeoutMs: 90_000 });
       // The session ended meanwhile (logout): the task runs on, but this page no longer follows it.
       if (sentIn !== epoch) return;
-      if (live.current) { setPlan(null); onStarted?.(); }
-      followTask({ ...task, operation: task.operation ?? operation, createdAt: task.createdAt ?? Date.now(), needsRecovery: task.needsRecovery ?? false });
+      const accepted = { ...task, operation: task.operation ?? operation, createdAt: task.createdAt ?? Date.now(), needsRecovery: task.needsRecovery ?? false };
+      if (live.current) { setPlan(null); onStarted?.(accepted); }
+      followTask(accepted);
     } catch (error) {
       if (!live.current) return;
       // Only a lost or timed-out answer may have been accepted after all: the same preview and key cannot run twice.
@@ -287,7 +289,11 @@ export function TaskProgress({ id, recoveryAllowed, inSheet = false }: { id: str
 
 // ─── The maintenance page ───────────────────────────────────────────────────
 
-export function TasksPage({ resultsOnly = false }: { resultsOnly?: boolean }) {
+/**
+ * `setup`: the first deployment wizard while this checkout is not deployed yet; the controls of a deployment are hidden then.
+ * `platform`: the host's, for what only some platforms offer (removing the image on uninstall).
+ */
+export function TasksPage({ resultsOnly = false, setup, platform }: { resultsOnly?: boolean; setup?: ComponentChildren; platform?: ConsoleInfo["platform"] }) {
   const [tasks, setTasks] = useState<TaskView[]>([]), [selected, setSelected] = useState<string | null>(recent), [error, setError] = useState(""), [loaded, setLoaded] = useState(false);
   // The task in the sheet opens here once the sheet closes (one subscription per task).
   const { shown: inSheet } = useFollowed();
@@ -300,8 +306,10 @@ export function TasksPage({ resultsOnly = false }: { resultsOnly?: boolean }) {
     return () => { controller.abort(); clearInterval(timer); window.removeEventListener("console-task", choose); };
   }, []);
   return <>
-    <PageHeader title="维护" description={resultsOnly ? "查看后台任务及断线前的进度。" : "启停、更新和重新部署机器人，查看后台任务及断线前的进度。"} />
-    {!resultsOnly && <>
+    <PageHeader title="维护" description={resultsOnly ? "查看后台任务及断线前的进度。" : setup ? "在这里完成首次部署，查看后台任务及断线前的进度。"
+      : "启停、更新和重新部署机器人，查看后台任务及断线前的进度。"} />
+    {!resultsOnly && setup}
+    {!resultsOnly && !setup && <>
       <RecoveryActions />
       <Section title="机器人">
         <Row icon="power" tint="green" title="运行控制" detail="每个操作先预览，确认后由控制台在后台执行。">
@@ -329,14 +337,29 @@ export function TasksPage({ resultsOnly = false }: { resultsOnly?: boolean }) {
         </li>;
       })}</ul>}
     </Section>
-    {!resultsOnly && <>
+    {!resultsOnly && !setup && <>
       <BackupCleanup />
       <Section title="危险操作">
         <Row icon="trash" tint="red" title="清空全部会话" detail="包含单聊和所有群组；统计保留。此操作不可撤销。">
           <TaskAction operation="history-clear" params={{ space: "all" }} danger>预览清空全部会话</TaskAction>
         </Row>
+        <UninstallForm platform={platform} />
       </Section>
     </>}
+  </>;
+}
+
+/** Uninstall: the service always goes; data/ and logs/ (and on Linux the image) only when ticked. */
+function UninstallForm({ platform }: { platform?: ConsoleInfo["platform"] }) {
+  const [data, setData] = useState(false), [image, setImage] = useState(false);
+  const service = platform === "windows" ? "注销计划任务" : platform === "macos" ? "删除 LaunchDaemon" : "删除容器";
+  return <>
+    <Row icon="trash" tint="red" title="卸载" detail={`停止机器人并${service}。共享资料目录不删除。`}>
+      <TaskAction operation="uninstall" params={{ data, image: platform === "linux" && image }} danger>预览卸载</TaskAction>
+    </Row>
+    <div class="row"><Toggle label="同时归档 data/ 和 logs/" checked={data} onChange={setData}
+      detail={data ? "配置、部署状态、会话、临时文件和统计移入 backup/rm，本目录回到尚未部署。" : "保留数据：之后可以在本页重新部署，沿用原有配置、会话和统计。"} /></div>
+    {platform === "linux" && <div class="row"><Toggle label="同时删除镜像 mixin-bot" detail="下次部署重新构建。" checked={image} onChange={setImage} /></div>}
   </>;
 }
 
@@ -372,7 +395,7 @@ export function DeployForm() {
   const toggle = (next: boolean) => { setOpen(next); if (next && !saved && !busy) void load(); };
   const portValid = /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
   return <Disclosure title="重新部署与修复" icon="wrench" tint="graphite" open={open} onToggle={toggle}
-    detail="使用当前代码和已保存的配置重新部署，完成后启动机器人。首次部署仍从命令行进行。">
+    detail="使用当前代码和已保存的配置重新部署，完成后启动机器人。服务已被删除（卸载时保留了数据）时，重新部署会重新创建它。">
     <div class="action-row">
       <button type="button" class="btn small-btn" disabled={busy} onClick={() => void load()}>{busy ? <><Icon name="loader" size={13} class="spin" />正在读取部署设置…</> : "重新读取部署设置"}</button>
     </div>

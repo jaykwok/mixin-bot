@@ -68,11 +68,11 @@ flowchart TD
 
 | 部署方式 | 需要准备 |
 | --- | --- |
-| Windows 原生 | Bun 1.4.4+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
-| Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；rootful Docker 由 root 部署和升级（docker 组普通用户会被拒绝），rootless Docker 由其所属用户部署 |
-| macOS 原生（实验性支持） | Apple 芯片的 macOS 15 或 26；用 Homebrew 安装的 Bun 1.4.4+、bash、coreutils、uv，以及 Git；用 sudo 部署 |
+| Windows 原生 | Bun 1.4.4+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；在管理员 PowerShell 中启动控制台 |
+| Linux / Docker | glibc Linux、Git、Bun 1.4.4+、Docker Engine、Bash、curl、coreutils、util-linux（`flock`、`setpriv`）；rootful Docker 由 root 启动控制台（docker 组普通用户会被拒绝），rootless Docker 由其所属用户启动 |
+| macOS 原生（实验性支持） | Apple 芯片的 macOS 15 或 26；用 Homebrew 安装的 Bun 1.4.4+、bash、coreutils、uv，以及 Git；用 sudo 启动控制台 |
 
-Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用网页控制台时，宿主机另需 Bun 1.4.4+。Linux 需要可访问 `/proc`，不支持 Alpine/musl。macOS 的检出位置、服务账户和限制见 [macOS 原生部署](docs/deployment.md#macos-原生部署实验性支持)。安装链接见[选择部署方式](docs/deployment.md#选择部署方式)。
+部署和日常管理都在网页控制台里完成，控制台用宿主机的 Bun 运行。Docker 镜像已包含应用运行环境和文档解析依赖。rootful Docker 下控制台以 root 运行，Bun 要装在 root 和项目目录属主都能执行的位置（例如 `/usr/local/bin`）。Linux 需要可访问 `/proc`，不支持 Alpine/musl。macOS 的检出位置、服务账户和限制见 [macOS 原生部署](docs/deployment.md#macos-原生部署实验性支持)。安装链接见[选择部署方式](docs/deployment.md#选择部署方式)。
 
 同时准备：
 
@@ -80,63 +80,53 @@ Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需�
 - **应用机器人**：在量子密信开发者后台创建企业自建应用、启用机器人能力，记下 AppID 和 AppSecret，并授予收发消息、临时文件和通讯录读取权限（最小权限见[应用机器人](docs/deployment.md#应用机器人)）。通讯录可见范围要覆盖所有会使用机器人的成员。
 - **出站网络**：服务器能以 HTTPS（443 端口）访问 `imtwo.zdxlz.com` 和 `imfl.zdxlz.com`。不需要开放入站端口、域名或隧道。
 
-### 2. 获取代码并部署
+### 2. 获取代码并启动控制台
 
 ```sh
 git clone https://github.com/jaykwok/mixin-bot.git
 cd mixin-bot
 ```
 
-请在**新的空目录**部署，不要在更早版本的部署目录上部署。运行对应平台的部署脚本，按向导填写 AppID 和 AppSecret、选择模型并填写凭据：
+请在**新的空目录**部署，不要在更早版本的部署目录上部署。macOS（实验性支持）把检出放在服务账户能读取的目录，例如 `/opt/mixin-bot`。在项目目录启动网页控制台：
 
 **Windows**（管理员 PowerShell）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
+bun run console
 ```
 
-**Linux / Docker**：
+**Linux / Docker**：rootful Docker（默认安装）用 root 启动，rootless Docker 由其所属用户启动：
 
 ```sh
-bash scripts/deploy.sh
+sudo bun run console    # rootful Docker
+bun run console         # rootless Docker
 ```
 
-rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.sh`），rootless Docker 下用其所属用户运行。
-
-**macOS**（实验性支持；检出放在服务账户能读取的目录，例如 `/opt/mixin-bot`）：
+**macOS**：
 
 ```sh
-sudo bash scripts/deploy.sh
+sudo bun run console
 ```
-脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
 
-- 共享资料默认放在 `workspace/`；部署时可用 `WORKSPACE_ROOT` 指向已有的外置目录，服务只读。
-- 本机管理端口自动使用 `10000`，不需要填写；大文件外链可稍后配置。
-- 各项配置说明见[部署与配置](docs/deployment.md)。
+Windows 和 macOS 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录链接，在自己电脑的浏览器打开，见[通过 SSH 访问](docs/console.md#通过-ssh-访问)。
 
-### 3. 接入开发者后台并验证
+### 3. 在控制台完成首次部署
+
+总览显示“尚未部署”，点「开始首次部署」，在维护页按向导操作：
+
+1. **检查本机环境**：缺少依赖时点「安装依赖」，再点「开始检查」，按说明处理未通过的项。
+2. **应用机器人凭据**：填写 AppID 和 AppSecret，在线校验能取得访问令牌。
+3. **模型**：选择服务商和模型，填写凭据并校验（核对配置和凭据引用，不发起模型推理；能否回答在第 4 步验证）。
+4. **通讯录同步范围**：整个通讯录，或逐层勾选部门。
+5. **端口与共享资料**：机器人端口默认 `10000`；共享资料默认放在项目目录下的 `workspace/`，也可以选已有的外置目录（服务只读）。
+6. **预览并部署**：核对预览中的步骤后确认。部署在后台运行，关掉网页不会取消；完成后总览显示机器人运行状态。
+
+部署前会在目标运行环境（Linux 的候选镜像、macOS 的服务账户）里再完整检查一次，不通过就不部署；部署在提交前失败会自动撤销本次的改动，不留下服务，被中断时在维护页继续或回滚。大文件外链可稍后在「设置」中配置。各项配置说明见[部署与配置](docs/deployment.md)。
+
+### 4. 接入开发者后台并验证
 
 1. 服务启动后，在开发者后台的事件订阅中选择 **Stream**，点「验证连接」（服务必须已在运行）并保存，勾选机器人接收消息事件和卡片交互事件（推送卡片的按钮需要）并保存，再在「版本管理」提交并发布版本，事件才生效。步骤见[接入开发者后台](docs/deployment.md#接入开发者后台)。
-2. 运行 `doctor`，检查配置、服务、事件 Stream 和通讯录同步。首次通讯录同步在后台进行，完成前未同步到的成员会收到“正在同步通讯录”的提示。
-
-   **Windows**：
-
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops.ps1 doctor
-   ```
-
-   **Linux / Docker**：
-
-   ```sh
-   bash scripts/ops.sh doctor
-   ```
-
-   **macOS**：
-
-   ```sh
-   sudo bash scripts/ops.sh doctor
-   ```
-
+2. 在控制台「体检」页检查配置、服务、事件 Stream 和通讯录同步。首次通讯录同步在后台进行，进度见「通讯录」页；完成前未同步到的成员会收到“正在同步通讯录”的提示。
 3. **验证群聊**：在客户端把应用机器人加入测试群，@ 机器人发送“只回复 OK”，确认能收到回答。
 4. **验证单聊**：在应用机器人里发一条消息，再发一张图片或一个文件，确认机器人回复“已收到…”。
 5. 把资料同步到共享资料目录，再请求查找资料、发送文件，并试一下 `/status`、`/stop`。目录结构与备份见[数据目录](docs/deployment.md#数据目录)。
@@ -180,19 +170,19 @@ sudo bash scripts/deploy.sh
 
 ## 日常管理
 
-在项目目录启动网页控制台：
+日常管理同样在网页控制台里进行，启动方式与首次部署时相同（Windows 用管理员 PowerShell，rootful Docker 和 macOS 用 sudo）：
 
 ```sh
 bun run console
 ```
 
-macOS 上用 `sudo bun run console` 启动。Windows 和 macOS 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录链接。控制台只监听本机，机器人停止时也能使用；需要时启动，用完在终端按 Ctrl+C 退出。
+Windows 和 macOS 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录链接。控制台只监听本机，机器人停止时也能使用；需要时启动，用完在终端按 Ctrl+C 退出。
 
 | 总览 | 统计 |
 | --- | --- |
 | ![总览：机器人运行状态、事件 Stream、通讯录同步与版本](docs/assets/console-overview.png) | ![统计：提问次数与人数、对比、趋势和排行](docs/assets/console-stats.png) |
 | **会话** | **维护** |
-| ![会话：按空间和成员查看对话、工具调用与用量](docs/assets/console-conversations.png) | ![维护：启停、升级、重新部署、备份清理与后台任务](docs/assets/console-maintain.png) |
+| ![会话：按空间和成员查看对话、工具调用与用量](docs/assets/console-conversations.png) | ![维护：启停、升级、重新部署、后台任务、备份清理与卸载](docs/assets/console-maintain.png) |
 
 截图使用演示数据。
 
@@ -202,14 +192,14 @@ macOS 上用 `sudo bun run console` 启动。Windows 和 macOS 自动打开浏�
 | 查看用量、导出离线 HTML 报表或 CSV | 统计 |
 | 查看会话，清空或压缩上下文（清空相当于成员发送 `/clear`，不影响使用统计） | 会话；清空全部会话在维护页 |
 | 清理临时文件，测试和清理外链 | 临时文件 / 外链 |
-| 启停、升级、重新部署或修复，查看后台任务 | 维护 |
+| 启停、升级、重新部署或修复，查看后台任务；卸载 | 维护 |
 | 查看 Stream 与通讯录同步、选择同步范围 | 通讯录 |
 | 设置推送人与授权，查看推送记录、补推送、下载汇总包，登记群 | 推送 |
 | 修改模型、应用机器人凭据、外链和运行参数 | 设置 |
 
 总览显示正在运行的版本、构建、数据格式和待处理事项。登录、SSH 访问、身份模式与导出见[网页控制台](docs/console.md)。
 
-不用控制台时，把上面 `doctor` 命令里的 `doctor` 换成 `start`、`stop`、`restart`、`logs` 或 `update`，控制台与命令行升级共用同一流程。升级条件与备份清理规则见[命令行运维](docs/operations.md#命令行运维)。
+控制台的管理操作由与命令行共用的运维核心执行。脚本调用或排障时可以直接使用命令行入口 `scripts/ops.ps1`、`scripts/ops.sh`，见[命令行运维](docs/operations.md#命令行运维)。
 
 ### 版本与升级
 
@@ -221,7 +211,7 @@ macOS 上用 `sudo bun run console` 启动。Windows 和 macOS 自动打开浏�
 | --- | --- |
 | [部署与配置](docs/deployment.md) | 安装部署、选择模型、查配置项、同步资料和备份数据 |
 | [使用指南](docs/usage.md) | 群聊与单聊的提问方式、指令、发文件给机器人、文件交付和推送 |
-| [网页控制台](docs/console.md) | 启动与登录、各页面用途、身份模式与导出、管理任务与恢复 |
+| [网页控制台](docs/console.md) | 启动与登录、首次部署与卸载、各页面用途、身份模式与导出、管理任务与恢复 |
 | [运维手册](docs/operations.md) | 命令行管理、排查故障、通讯录同步、配置外链 |
 | [版本与从旧版切换](docs/data-migrations.md) | 版本、数据格式与应用绑定规则，以后的升级边界，从更早的版本切换与恢复统计 |
 | [开发指南](docs/development.md) | 理解架构、修改提示词与工具、了解文档加工能力、运行开发检查 |

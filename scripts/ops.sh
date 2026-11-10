@@ -135,6 +135,13 @@ has_rollback_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${ROLLBACK_CONTAINER}$"
 }
 
+# 按名称找到的容器须把本项目的 data/ 挂到 /app/data：同一个 Docker 里另一个目录的部署也叫这个名字，按名称删除会删错。
+container_owned() {
+    local source
+    source="$(docker container inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$1" 2>/dev/null)" || return 1
+    [ -n "$source" ] && [ "$(realpath -m -- "$source")" = "$(realpath -m -- "$PROJECT_DIR/data")" ]
+}
+
 # S3 credentials are never sent to curl or placed on the command line.
 # Full configuration validation occurs in the runtime; this check is intentionally read-only.
 check_relay() {
@@ -629,14 +636,14 @@ finish_deploy_command() {
 # The deployer owns commit and rollback. Keep this fixed wrapper alive to report its actual final state. The wrapper takes
 # deploy.lock and rechecks the console plan first, so a refusal is reported as one; the deployer inherits the lock on fd 9.
 deploy_command() {
-    if [ "${MIXIN_OPS_CONSOLE:-}" != 1 ]; then exec bash "$PROJECT_DIR/scripts/deploy.sh" "$OPS_COMMAND"; fi
+    if [ "${MIXIN_OPS_CONSOLE:-}" != 1 ]; then exec bash "$PROJECT_DIR/scripts/lib/deploy.sh" "$OPS_COMMAND"; fi
     operation_start deploy
     DEPLOY_WAS_RUNNING=0; UPGRADER_PID=''
     [ "$(final_run_state)" != running ] || DEPLOY_WAS_RUNNING=1
     trap finish_deploy_command EXIT
-    assert_console_lifecycle deploy || return 1
+    assert_console_lifecycle "$(console_lifecycle)" || return 1
     acquire_deploy_lock || { [ $? = 2 ] || ER "另一个部署、升级或维护操作正在进行；部署未开始"; return 1; }
-    MIXIN_OPS_PROJECT="$PROJECT_DIR" run_forwarding bash "$OPS_SOURCE_DIR/scripts/deploy.sh" "$OPS_COMMAND" </dev/null
+    MIXIN_OPS_PROJECT="$PROJECT_DIR" run_forwarding bash "$OPS_SOURCE_DIR/scripts/lib/deploy.sh" "$OPS_COMMAND" </dev/null
 }
 
 update() {
@@ -712,12 +719,24 @@ show_logs() {
     docker logs -f --tail 50 "$CONTAINER"
 }
 
+# 卸载的两项选择：终端里提问；控制台任务不提问，用网页确认的选择（核心在锁内随任务和计划一起核对过，uninstall-check）。
+uninstall_choice() {
+    local name="$1" prompt="$2"
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then [ "${!name:-}" = 1 ]; return; fi
+    ask_yes_no "$prompt"
+}
+
 uninstall() {
     P "卸载 mixin-bot"
     # 部署锁持有到卸载结束（fd 9），与部署、升级和运维任务互斥；核心在锁内拒绝仍需要本部署的未完成事务、运维任务和配置提交：
     # 升级中断时回滚容器就是原服务，data/ 里有事务记录，删掉或归档后都无法续做或回滚。
     acquire_deploy_lock || { [ $? = 2 ] || ER "部署、升级或另一个维护操作正在进行；卸载未开始"; return 1; }
-    ops_core uninstall-check || { ER "卸载未开始（原因见上方）"; return 1; }
+    ops_core uninstall-check || { UNINSTALL_REFUSAL='卸载前检查未通过（原因见任务输出），未执行操作'; ER "卸载未开始（原因见上方）"; return 1; }
+    if { has_container && ! container_owned "$CONTAINER"; } || { has_rollback_container && ! container_owned "$ROLLBACK_CONTAINER"; }; then
+        UNINSTALL_REFUSAL='同名容器属于另一个目录的部署，未执行操作'
+        ER "容器 ${CONTAINER} 或 ${ROLLBACK_CONTAINER} 挂载的不是本目录的 data/：它属于另一个目录的部署，请在那个目录卸载；卸载未开始"
+        return 1
+    fi
     if has_container; then
         if ! docker stop "$CONTAINER" >/dev/null 2>&1; then
             ER "容器停止失败；为避免删除仍在使用的数据，卸载已停止"
@@ -743,13 +762,16 @@ uninstall() {
         OK "部署遗留回滚容器已删除"
     fi
 
-    if ask_yes_no "是否删除 Docker 镜像 mixin-bot？[y/N] "; then
-        if docker image inspect mixin-bot:previous >/dev/null 2>&1 && ! docker rmi mixin-bot:previous >/dev/null 2>&1; then WA "部署回滚标签 mixin-bot:previous 删除失败"; fi
-        if docker rmi mixin-bot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; fi
+    if uninstall_choice MIXIN_OPS_UNINSTALL_IMAGE "是否删除 Docker 镜像 mixin-bot？[y/N] "; then
+        if docker image inspect mixin-bot:previous >/dev/null 2>&1 && ! docker rmi mixin-bot:previous >/dev/null 2>&1; then
+            WA "部署回滚标签 mixin-bot:previous 删除失败"; UNINSTALL_NOTE='；镜像未完全删除（见任务输出）'
+        fi
+        if docker rmi mixin-bot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; UNINSTALL_NOTE='；镜像未完全删除（见任务输出）'; fi
     fi
 
-    if ask_yes_no "是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N] "; then
-        if archive_project_path "${PROJECT_DIR}/data" && archive_project_path "${PROJECT_DIR}/logs" &&
+    if uninstall_choice MIXIN_OPS_UNINSTALL_DATA "是否删除 data/（配置、部署状态、runtime、会话、临时文件和统计）和 logs/？[y/N] "; then
+        # logs/ 先移：任何一步失败时 data/ 都还在，控制台仍按已部署处理，可以再次卸载。
+        if archive_project_path "${PROJECT_DIR}/logs" && archive_project_path "${PROJECT_DIR}/data" &&
             [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then
             OK "data/ 和 logs/ 已移入 backup/rm"
         else
@@ -763,6 +785,27 @@ uninstall() {
         WA "外置共享资料目录不属于本项目，未删除：$DEPLOYED_WORKSPACE_ROOT"
     fi
     OK "卸载流程完成。"
+}
+
+# 控制台卸载按观察到的最终状态写结构化结果；没有取得部署锁或卸载前检查未通过时为拒绝（什么都没有执行）。
+finish_uninstall_command() {
+    local status=$? outcome=failed message='卸载未完成，请查看任务日志' state
+    trap - EXIT
+    state="$(final_run_state)"
+    if [ -n "${DEPLOY_LOCK_REFUSAL:-}" ]; then outcome=refused; message="$DEPLOY_LOCK_REFUSAL"
+    elif [ -n "${UNINSTALL_REFUSAL:-}" ]; then outcome=refused; message="$UNINSTALL_REFUSAL"
+    elif [ "$status" = 0 ]; then outcome=success; message="卸载完成${UNINSTALL_NOTE}"; fi
+    [ "$outcome" = success ] || [ "$status" != 0 ] || status=1
+    ops_result "$outcome" "$UNINSTALL_WAS_RUNNING" "$state" "$status" "$message" || [ "$status" != 0 ] || status=1
+    exit "$status"
+}
+
+uninstall_command() {
+    if [ "${MIXIN_OPS_CONSOLE:-}" != 1 ]; then uninstall; return; fi
+    UNINSTALL_WAS_RUNNING=0; UNINSTALL_REFUSAL=''; UNINSTALL_NOTE=''
+    [ "$(final_run_state)" != running ] || UNINSTALL_WAS_RUNNING=1
+    trap finish_uninstall_command EXIT
+    uninstall
 }
 
 # 升级、继续和回滚忽略当前终端的 BOT_PORT，入口也不校验普通设置：有未完成事务时用事务记录，
@@ -811,7 +854,7 @@ case "${1:-}" in
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
     backup-scan)   shift; backup_admin scan "$@" ;;
     backup-clean)  shift; backup_admin apply "$@" ;;
-    uninstall) uninstall ;;
+    uninstall) uninstall_command ;;
     *)
         # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
         # 否则脚本或 CI 里少写一个字母（ops.sh restrat）会被当成执行成功。
