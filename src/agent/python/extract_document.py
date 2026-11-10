@@ -73,8 +73,12 @@ with open(destination, "w", encoding="utf-8", newline="\n") as output:
                             emit(" | ".join(cell.text for cell in row.cells))
         elif extension == ".xlsx":
             from openpyxl import load_workbook
-            workbook = load_workbook(source, read_only=True, data_only=False, keep_links=False)
+            # As a stream: given a path, openpyxl refuses any name that does not end in .xlsx, and the caller's snapshot
+            # is named without one. Read-only loading reads the sheets lazily, so the stream stays open until the end.
+            stream = open(source, "rb")
+            workbook = None
             try:
+                workbook = load_workbook(stream, read_only=True, data_only=False, keep_links=False)
                 emit("[公式按原文显示，未执行计算；行号对应原工作表]")
                 cells = 0
                 for sheet_number, sheet in enumerate(workbook.worksheets):
@@ -94,7 +98,9 @@ with open(destination, "w", encoding="utf-8", newline="\n") as output:
                     if (sheet.max_column or 0) > 256 or (sheet.max_row or 0) > 100000:
                         truncated = True
             finally:
-                workbook.close()
+                if workbook is not None:
+                    workbook.close()
+                stream.close()
         else:
             raise ValueError("不支持此文档格式")
     except LimitReached:

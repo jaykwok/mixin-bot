@@ -46,7 +46,10 @@ extractor = Path(__file__).with_name("extract_document.py").resolve()
 def extract(extension, limit=250000):
     target = root / (extension + "-" + str(limit) + ".txt")
     report = target.with_suffix(".json")
-    subprocess.run([sys.executable, str(extractor), str(root / ("sample." + extension)),
+    # The service hands the extractor a snapshot whose name has no extension; the format comes only from the argument.
+    snapshot = root / (".document-" + extension + "-" + str(limit))
+    snapshot.write_bytes((root / ("sample." + extension)).read_bytes())
+    subprocess.run([sys.executable, str(extractor), str(snapshot),
                    "." + extension, str(target), str(limit), str(report)], check=True, capture_output=True, text=True, encoding="utf-8")
     metadata = json.loads(report.read_text(encoding="utf-8"))
     content = target.read_text(encoding="utf-8")
