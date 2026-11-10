@@ -348,6 +348,55 @@ test("reply: 回复 starts collecting; texts and attachments are recorded, not h
   } finally { await h.close(); }
 });
 
+test("reply: a later direct message gets a receipt again after a pause or a reminder, not while contents follow one another", async () => {
+  // A pause far longer than the reminder, so the second case is the reminder's alone.
+  const h = harness({ limits: { replyReceiptMs: 10 * 3600_000 } });
+  const again = () => h.texts(ZHANG).filter(text => text.includes("没有当作提问"));
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    await h.settle();
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "A 机房正常")).toBe(true);
+    h.clock.now += 60_000;
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "B 机房缺一台")).toBe(true);
+    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-9", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
+    await h.settle();
+    expect(h.texts(ZHANG).filter(text => text.includes("已记入"))).toHaveLength(1);
+    expect(again()).toHaveLength(0);
+    // Forgotten: the reminder says later messages still count, and the next message is told what happened to it.
+    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
+    h.service.tick();
+    await h.settle();
+    expect(h.texts(ZHANG).at(-1)).toContain("提交前发来的消息都会记入这次回复");
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "顺便问一下，X100 的报价是多少？")).toBe(true);
+    await h.settle();
+    expect(again()).toHaveLength(1);
+    expect(again()[0]).toContain("记入了「机房盘点」的回复（第 4 条）");
+    expect(again()[0]).toContain("要提问请先发送 /完成 或 /取消");
+    // The receipt cleared the reminder: what follows at once is content again.
+    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "再补一句")).toBe(true);
+    await h.settle();
+    expect(again()).toHaveLength(1);
+    expect(h.store.items(id, ZHANG, 1)).toHaveLength(5);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+
+  // After a pause without a reminder (an attachment as well as a text).
+  const paused = harness({ limits: { replyReceiptMs: 5 * 60_000 } });
+  try {
+    await confirmed(paused, { mode: "reply" });
+    paused.click(ZHANG, paused.card(ZHANG), "回复", "card-zhang");
+    await paused.settle();
+    expect(paused.service.directText(paused.identity(ZHANG), paused.reply(ZHANG), "A 机房正常")).toBe(true);
+    paused.clock.now += 5 * 60_000;
+    expect(paused.service.directAttachment(paused.identity(ZHANG), paused.reply(ZHANG), { fileId: "f-10", kind: "image", name: "图片" })).toBe(true);
+    await paused.settle();
+    expect(paused.texts(ZHANG).filter(text => text.includes("没有当作提问"))).toHaveLength(1);
+    expect(paused.texts(ZHANG).at(-1)).toContain("第 2 条");
+    expect(paused.reports).toEqual([]);
+  } finally { await paused.close(); }
+});
+
 test("deadline: an open draft with content counts as replied, one without content does not; the package holds the replies; holds are released", async () => {
   const h = harness();
   try {

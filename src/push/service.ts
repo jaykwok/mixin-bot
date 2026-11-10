@@ -70,6 +70,11 @@ export const PUSH_LIMITS = {
   previewMs: 24 * 3600_000,
   /** A reply with content left open this long gets one reminder to press 「已回复」. */
   idleReminderMs: 30 * 60_000,
+  /**
+   * A direct reply's later items get a receipt again once the reply sat this long without content (or was reminded): the
+   * member may have forgotten the open reply and be asking a question. Contents sent one after another get only the first.
+   */
+  replyReceiptMs: 10 * 60_000,
   /** The "you have a push to reply to" notice: at most once per push and member within this. */
   hintMs: 12 * 3600_000,
   /** Card sends: attempts, and the waits before the second and third. */
@@ -1241,11 +1246,19 @@ export class PushService {
     { push: push.id, event: "card" });
   }
 
-  /** After a reply item was recorded: activity, the first item's receipt, the card. */
+  /**
+   * After a direct reply item was recorded: activity, a receipt, the card. `replying` is the recipient as it was before the
+   * item. The first item gets the receipt; so does one that arrives after the reply was reminded or sat without content for
+   * `replyReceiptMs`: it was recorded, not answered, and a member who forgot the open reply would otherwise get no response.
+   */
   #recorded(push: Push, replying: Recipient, reply: ReplyContext): void {
-    this.#store.updateRecipient(push.id, replying.member, { activityAt: this.#now(), remindedAt: null });
-    if (this.#store.items(push.id, replying.member, replying.draft).length === 1) {
+    const now = this.#now();
+    this.#store.updateRecipient(push.id, replying.member, { activityAt: now, remindedAt: null });
+    const count = this.#store.items(push.id, replying.member, replying.draft).length;
+    if (count === 1) {
       this.#notice(reply, `已记入「${push.subject}」的回复。可以继续发送文字或附件，发完点卡片上的「已回复」，或发送 /完成。`);
+    } else if (replying.remindedAt !== null || (replying.activityAt !== null && now - replying.activityAt >= this.#limits.replyReceiptMs)) {
+      this.#notice(reply, `这条消息记入了「${push.subject}」的回复（第 ${count} 条），没有当作提问。发完请点卡片上的「已回复」或发送 /完成；要提问请先发送 /完成 或 /取消。`);
     }
     this.#refreshCard(push.id, replying.member);
   }
@@ -1280,7 +1293,7 @@ export class PushService {
         for (const recipient of this.#store.unreminded(push.id)) {
           if (now - recipient.activityAt! < this.#limits.idleReminderMs || !this.#store.items(push.id, recipient.member, recipient.draft).length) continue;
           this.#store.updateRecipient(push.id, recipient.member, { remindedAt: now });
-          this.#text(this.#memberTarget(recipient), `「${push.subject}」的回复还没有提交。发完了请点卡片上的「已回复」或发送 /完成；截止时已发送的内容也会按已回复提交。`);
+          this.#text(this.#memberTarget(recipient), `「${push.subject}」的回复还没有提交。发完了请点卡片上的「已回复」或发送 /完成；提交前发来的消息都会记入这次回复，截止时已发送的内容也会按已回复提交。`);
         }
       }
       this.#pump();
