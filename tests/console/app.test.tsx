@@ -175,6 +175,17 @@ test("总览：进程就绪但 Stream 断开时不说“正在接收”；有未
   expect(text()).not.toContain("重新部署");
 });
 
+test("总览：Stream 连着但反复断开时写“不稳定”，提示核对是否有另一个实例", async () => {
+  const flapping: Overview = { ...overview,
+    service: { ...overview.service, stream: { connected: true, reconnects: 14, unstableSince: overview.checkedAt - 300_000, lastDisconnectReason: "连接断开（code 1006）" } } };
+  routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: flapping }) };
+  mount(null);
+  await shows("运行中 · Stream 不稳定");
+  expect(text()).toContain("另一个实例");
+  expect(text()).toContain("反复断开始于");
+  expect(text()).not.toContain("正在接收并处理");
+});
+
 test("总览：记录损坏但没有未完成的事务时指向终端诊断，不指向部署恢复", async () => {
   const damaged: Overview = { ...overview, recovery: "版本标记损坏：data/state/data-version.json；请在新目录全新部署" };
   routes = { "GET /api/session": () => ({ status: 200, body: session() }), "GET /api/overview": () => ({ status: 200, body: damaged }) };

@@ -32,7 +32,8 @@ export interface ServiceView {
   pid?: number;
   latency?: number;
   startedAt?: number;
-  stream?: { connected: boolean; reconnects: number; disconnectedSince?: number; lastDisconnectReason?: string };
+  /** unstableSince: connected now, but no connection has stayed open since then (set once that has lasted long enough to matter). */
+  stream?: { connected: boolean; reconnects: number; disconnectedSince?: number; unstableSince?: number; lastDisconnectReason?: string };
   /**
    * scope: the saved scope; state: whether it is in effect (applying: the previous list still is; failed: the same, retried
    * automatically; unset: no scope is saved and nothing syncs), stateText says which and when; failure: the last routine sync

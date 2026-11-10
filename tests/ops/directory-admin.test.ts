@@ -26,6 +26,12 @@ test("doctor rows: a Stream down for over two minutes fails; a scope not yet in 
   expect(rows({ verificationOnly: false, stream: { connected: false, reconnects: 1, disconnectedSince: now - 30_000 }, directory })[0]).toBe("warn 事件 Stream");
   expect(rows({ verificationOnly: false, stream: { connected: false, reconnects: 1, disconnectedSince: now - 180_000 }, directory })[0]).toBe("fail 事件 Stream");
   expect(rows({ verificationOnly: false, directory })[0]).toBe("fail 事件 Stream");
+  // Connected for the moment, but no connection has stayed open for two minutes (another instance on the same application):
+  // a warning that says so. A connection that just opened after a start or a drop is still a pass.
+  const flapping = { connected: true, reconnects: 14, unstableSince: now - 180_000, lastDisconnect: { at: now - 5000, reason: "连接断开（code 1006）" } };
+  expect(rows({ verificationOnly: false, stream: flapping, directory })[0]).toBe("warn 事件 Stream");
+  expect(doctorRows({ verificationOnly: false, stream: flapping, directory }, now)[0]).toContain("另一个实例");
+  expect(rows({ verificationOnly: false, stream: { connected: true, reconnects: 1, unstableSince: now - 20_000 }, directory })[0]).toBe("pass 事件 Stream");
   // The verification instance has no Stream row.
   expect(rows({ verificationOnly: true, directory })).toEqual(["pass 通讯录同步"]);
   const recheck = { count: 25, at: Date.now() + 7 * 60_000 };

@@ -129,6 +129,36 @@ describe("stream", () => {
     await until(() => fake.sockets.size === 0);
   });
 
+  test("a connection dropped as soon as it opens keeps backing off; only a connection that stayed open starts the backoff over", async () => {
+    // Another instance holding the application's one connection: every connection opens and is closed at once.
+    const stream = new StreamConnection(client(), { onEvent: () => {}, initialBackoffMs: 20, maxBackoffMs: 2000, stableAfterMs: 150 });
+    const seen = new Set<unknown>();
+    let dropping = true;
+    const dropper = setInterval(() => {
+      for (const socket of fake.sockets) seen.add(socket);
+      if (dropping && fake.sockets.size) fake.dropSockets();
+    }, 1);
+    stream.start();
+    try {
+      await Bun.sleep(1200);
+      // 20 + 40 + 80 + 160 + 320 + 640 ms of waits fit into 1.2 s; at the initial delay it would be about sixty connections.
+      expect(seen.size).toBeGreaterThanOrEqual(3);
+      expect(seen.size).toBeLessThanOrEqual(9);
+      expect(stream.status().unstableSince).toBeNumber();
+      dropping = false;
+      await until(() => stream.status().connected && stream.status().unstableSince === undefined, 5000);
+      // Stable again: the next drop is followed by a reconnect at the initial delay, not at the grown one.
+      const before = seen.size, dropped = Date.now();
+      fake.dropSockets();
+      await until(() => seen.size > before && stream.status().connected, 5000);
+      expect(Date.now() - dropped).toBeLessThan(600);
+      expect(stream.status().unstableSince).toBeNumber();
+    } finally {
+      clearInterval(dropper);
+      await stream.stop();
+    }
+  });
+
   test("a half-open connection that stops answering pings is dropped and reconnected; a peer that never answers is left alone", async () => {
     // 原始 TCP 上的 WebSocket 对端：完成握手后按 mode 回应客户端的帧（Bun.serve 会自动回 pong，模拟不了静默）。
     const silentPeer = (mode: "pong-once" | "never") => {

@@ -1,7 +1,7 @@
 // Home page data: deployment identity, bot status and versions, from the shared host readers.
 import type { ConsoleInfo, Overview, ServiceView } from "../ui/src/contract.ts";
 import { describeUntil } from "../../ops/lib/age.ts";
-import { describeAttention, describeScope, describeScopeState } from "../../ops/tools/directory-admin.ts";
+import { describeAttention, describeScope, describeScopeState, streamUnstable } from "../../ops/tools/directory-admin.ts";
 import { probeService, type Service } from "./data.ts";
 import { describeMode, loadDeployment, PROJECT_DIR, type Deployment } from "../../ops/core/platform.ts";
 import { entryState } from "./recovery.ts";
@@ -16,6 +16,7 @@ export function serviceView(service: Service): ServiceView {
   if (service.stream) {
     view.stream = { connected: service.stream.connected, reconnects: service.stream.reconnects };
     if (service.stream.disconnectedSince !== undefined) view.stream.disconnectedSince = service.stream.disconnectedSince;
+    if (streamUnstable(service.stream)) view.stream.unstableSince = service.stream.unstableSince!;
     if (service.stream.lastDisconnect) view.stream.lastDisconnectReason = service.stream.lastDisconnect.reason;
   }
   if (service.directory) {

@@ -7,7 +7,8 @@ import { Banner, Card, PageHeader, Rows, type Tone } from "./ui.tsx";
 
 export function serviceSummary(service: ServiceView): { tone: Tone; label: string; icon: IconName } {
   switch (service.state) {
-    case "ready": return service.stream?.connected === false ? { tone: "warn", label: "运行中 · Stream 已断开", icon: "alert" } : { tone: "ok", label: "运行中", icon: "check" };
+    case "ready": return service.stream?.connected === false ? { tone: "warn", label: "运行中 · Stream 已断开", icon: "alert" }
+      : service.stream?.unstableSince !== undefined ? { tone: "warn", label: "运行中 · Stream 不稳定", icon: "alert" } : { tone: "ok", label: "运行中", icon: "check" };
     case "verifying": return { tone: "warn", label: "验证实例", icon: "shield" };
     case "stopping": return { tone: "warn", label: "正在停止", icon: "power" };
     case "unreachable": return { tone: "danger", label: "未运行", icon: "power" };
@@ -34,8 +35,10 @@ function Hero({ data }: { data: Overview }) {
     : { ready: "机器人运行中", verifying: "验证实例运行中", stopping: "机器人正在停止", unreachable: "机器人未运行" }[service.state];
   // Ready only means the process answers: messages arrive over the event Stream.
   const offline = service.state === "ready" && service.stream?.connected === false;
+  const unstable = service.state === "ready" && !offline && service.stream?.unstableSince !== undefined;
   const detail = data.undeployed ? "首次部署完成后，这里显示机器人的运行状态。"
     : offline ? "进程有应答，但事件 Stream 已断开，暂时收不到群聊和单聊消息；断开原因见下方“事件 Stream”。"
+    : unstable ? "事件 Stream 连上后反复断开，消息可能延迟。同一个应用只能有一条连接，请确认没有另一个实例在使用它；详情见下方“事件 Stream”。"
     : service.state === "ready" ? "正在接收并处理群聊和单聊消息。"
     : service.state === "verifying" ? "这是不连接平台的验证实例，不处理群消息。"
     : service.state === "stopping" ? "停止后不再处理消息。"
@@ -60,8 +63,8 @@ function Hero({ data }: { data: Overview }) {
       </div>
       <div class="hero-side">
         <div class="hero-stats">
-          <Stat label="事件 Stream" value={service.stream ? (service.stream.connected ? "已连接" : "已断开") : "—"}
-            tone={service.stream ? (service.stream.connected ? "ok" : "danger") : "neutral"} />
+          <Stat label="事件 Stream" value={service.stream ? (!service.stream.connected ? "已断开" : service.stream.unstableSince !== undefined ? "不稳定" : "已连接") : "—"}
+            tone={service.stream ? (!service.stream.connected ? "danger" : service.stream.unstableSince !== undefined ? "warn" : "ok") : "neutral"} />
           <Stat label="通讯录映射" value={service.directory ? service.directory.mappings.toLocaleString("zh-CN") : "—"} />
           <Stat label="待留意" value={service.state === "ready" ? String(attention) : "—"} tone={attention > 0 ? "warn" : "neutral"} />
         </div>
@@ -134,10 +137,11 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
           ]} />
         </Card>
 
-        <Card title="事件 Stream" icon="radio" tint="indigo" aside={stream && <span class={`pill small ${stream.connected ? "ok" : "danger"}`}><span class="dot" />{stream.connected ? "已连接" : "已断开"}</span>}>
+        <Card title="事件 Stream" icon="radio" tint="indigo" aside={stream && <span class={`pill small ${!stream.connected ? "danger" : stream.unstableSince !== undefined ? "warn" : "ok"}`}><span class="dot" />{!stream.connected ? "已断开" : stream.unstableSince !== undefined ? "不稳定" : "已连接"}</span>}>
           {stream ? (
             <Rows rows={[
               ["重连次数", String(stream.reconnects)],
+              ...(stream.connected && stream.unstableSince !== undefined ? [["反复断开始于", ago(stream.unstableSince, data.checkedAt)] as [string, string]] : []),
               ...(stream.disconnectedSince !== undefined ? [["断开于", ago(stream.disconnectedSince, data.checkedAt)] as [string, string]] : []),
               ...(stream.lastDisconnectReason ? [["最近断开", stream.lastDisconnectReason] as [string, string]] : []),
             ]} />

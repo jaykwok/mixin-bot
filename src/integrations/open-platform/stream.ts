@@ -19,6 +19,8 @@ export interface StreamStatus {
   readonly reconnects: number;
   /** 当前断开开始的时间；连接正常时为 undefined。 */
   readonly disconnectedSince?: number;
+  /** Set from the first disconnect (or the start) until a connection has stayed open for `stableAfterMs`. */
+  readonly unstableSince?: number;
   readonly lastEventAt?: number;
 }
 
@@ -31,10 +33,13 @@ export interface StreamOptions {
   readonly warnAfterMs?: number;
   /** 存活检查：每隔这么久发一次 ping。 */
   readonly pingIntervalMs?: number;
+  /** A connection open this long is stable: only then does the backoff start over. */
+  readonly stableAfterMs?: number;
 }
 
 const DEFAULT_WARN_AFTER_MS = 60_000;
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+const DEFAULT_STABLE_AFTER_MS = 30_000;
 const NOT_CONNECTED = "尚未连接";
 
 export class StreamConnection {
@@ -43,14 +48,16 @@ export class StreamConnection {
   #attempts = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #warnTimer: ReturnType<typeof setTimeout> | undefined;
+  #stableTimer: ReturnType<typeof setTimeout> | undefined;
   #everConnected = false;
   #forceToken = false;
   #status: { connected: boolean; connectedAt?: number; lastDisconnect?: { at: number; reason: string }; reconnects: number;
-    disconnectedSince?: number; lastEventAt?: number } = { connected: false, reconnects: 0 };
+    disconnectedSince?: number; unstableSince?: number; lastEventAt?: number } = { connected: false, reconnects: 0 };
   readonly #initialBackoff: number;
   readonly #maxBackoff: number;
   readonly #warnAfter: number;
   readonly #pingInterval: number;
+  readonly #stableAfter: number;
   #closed: Promise<void> = Promise.resolve();
 
   constructor(private readonly client: PlatformClient, private readonly options: StreamOptions) {
@@ -58,6 +65,7 @@ export class StreamConnection {
     this.#maxBackoff = options.maxBackoffMs ?? 60_000;
     this.#warnAfter = options.warnAfterMs ?? DEFAULT_WARN_AFTER_MS;
     this.#pingInterval = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    this.#stableAfter = options.stableAfterMs ?? DEFAULT_STABLE_AFTER_MS;
   }
 
   status(): StreamStatus { return { ...this.#status }; }
@@ -74,6 +82,7 @@ export class StreamConnection {
     this.#stopped = true;
     clearTimeout(this.#timer);
     clearTimeout(this.#warnTimer);
+    clearTimeout(this.#stableTimer);
     const socket = this.#socket;
     this.#socket = undefined;
     if (socket && socket.readyState !== WebSocket.CLOSED) {
@@ -89,12 +98,16 @@ export class StreamConnection {
   #markDisconnected(reason: string): void {
     const now = this.client.now();
     this.#status = { ...this.#status, connected: false, connectedAt: undefined, lastDisconnect: { at: now, reason },
-      disconnectedSince: this.#status.disconnectedSince ?? now };
+      disconnectedSince: this.#status.disconnectedSince ?? now, unstableSince: this.#status.unstableSince ?? now };
+    clearTimeout(this.#stableTimer);
     if (this.#warnTimer === undefined && !this.#stopped) {
       this.#warnTimer = setTimeout(() => {
         this.#warnTimer = undefined;
-        if (!this.#status.connected && !this.#stopped)
-          log.warn(`Stream 已断开超过 ${Math.round(this.#warnAfter / 1000)} 秒：${this.#status.lastDisconnect?.reason ?? "未知原因"}`);
+        // Still without a stable connection: disconnected, or connected for the moment between two drops.
+        if (this.#status.unstableSince === undefined || this.#stopped) return;
+        const seconds = Math.round(this.#warnAfter / 1000), reason = this.#status.lastDisconnect?.reason ?? "未知原因";
+        log.warn(this.#status.connected ? `Stream 连上后反复断开已超过 ${seconds} 秒：${reason}；同一个应用只能有一条连接，请确认没有另一个实例在使用它`
+          : `Stream 已断开超过 ${seconds} 秒：${reason}`);
       }, this.#warnAfter);
       this.#warnTimer.unref?.();
     }
@@ -132,10 +145,18 @@ export class StreamConnection {
     socket.addEventListener("open", () => {
       if (this.#socket !== socket) return;
       opened = true;
-      this.#attempts = 0;
       this.#forceToken = false;
-      clearTimeout(this.#warnTimer);
-      this.#warnTimer = undefined;
+      // The backoff and the disconnect warning start over only once the connection has stayed open: a connection that
+      // opens and is dropped at once (another instance holds the application's one connection) keeps backing off.
+      clearTimeout(this.#stableTimer);
+      this.#stableTimer = setTimeout(() => {
+        if (this.#socket !== socket || this.#stopped) return;
+        this.#attempts = 0;
+        clearTimeout(this.#warnTimer);
+        this.#warnTimer = undefined;
+        this.#status = { ...this.#status, unstableSince: undefined };
+      }, this.#stableAfter);
+      this.#stableTimer.unref?.();
       const now = this.client.now();
       const downFor = this.#status.disconnectedSince === undefined ? 0 : now - this.#status.disconnectedSince;
       if (this.#everConnected) this.#status.reconnects++;

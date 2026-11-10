@@ -243,8 +243,20 @@ export async function scopeRows(scope: readonly string[], port?: number, file = 
   })];
 }
 
-export function describeStream(stream: StreamStatus | undefined, verificationOnly = false): string {
+/** 连上后仍反复断开这么久算不稳定：服务自己的告警在 60 秒，这里与“断开超过两分钟算失败”用同一个时长。 */
+const STREAM_UNSTABLE_MS = 120_000;
+
+/** 当前连着，但从 `unstableSince` 起一直没有一条保持住的连接（例如另一个实例在用同一个应用，双方互相顶掉）。 */
+export function streamUnstable(stream: StreamStatus | undefined, now = Date.now()): boolean {
+  return !!stream?.connected && typeof stream.unstableSince === "number" && now - stream.unstableSince >= STREAM_UNSTABLE_MS;
+}
+
+export function describeStream(stream: StreamStatus | undefined, verificationOnly = false, now = Date.now()): string {
   if (!stream) return verificationOnly ? "验证实例不连接 Stream" : "尚未启动";
+  if (streamUnstable(stream, now)) {
+    return `连接不稳定：${describeAge(stream.unstableSince!)}起连上后反复断开，重连 ${stream.reconnects} 次${stream.lastDisconnect ? `（最近：${stream.lastDisconnect.reason}）` : ""}`
+      + "；同一个应用只能有一条连接，请确认没有另一个实例在使用它";
+  }
   if (stream.connected) return `已连接${stream.connectedAt ? `（连上于 ${describeAge(stream.connectedAt)}）` : ""}，启动以来重连 ${stream.reconnects} 次`;
   const since = stream.disconnectedSince ? `（断开于 ${describeAge(stream.disconnectedSince)}）` : "";
   return `未连接${since}${stream.lastDisconnect ? `：${stream.lastDisconnect.reason}` : ""}`;
@@ -296,8 +308,8 @@ export function doctorRows(status: ServiceStatus, now = Date.now()): string[] {
   const rows: string[] = [];
   if (!status.verificationOnly) {
     const stream = status.stream;
-    const state = stream?.connected ? "pass" : stream?.disconnectedSince && now - stream.disconnectedSince < 120_000 ? "warn" : "fail";
-    rows.push([state, "事件 Stream", describeStream(stream)].join("\t"));
+    const state = streamUnstable(stream, now) ? "warn" : stream?.connected ? "pass" : stream?.disconnectedSince && now - stream.disconnectedSince < 120_000 ? "warn" : "fail";
+    rows.push([state, "事件 Stream", describeStream(stream, false, now)].join("\t"));
   }
   const directory = status.directory;
   const settled = directory?.state === "effective" && !directory.failure && !directory.recheck && directory.lastCompleteAt;
