@@ -17,7 +17,7 @@ import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PY
 import { holdDirectory } from "../../../core/held-directory.ts";
 import { removalNeedsPermit } from "../../../core/reclamation.ts";
 import { isPathInside } from "../../../contracts/paths.ts";
-import { resolveToolPath } from "../../tool-path.ts";
+import { realToolPath } from "../../tool-path.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "../../python-toolchain.ts";
 import type { DocumentOptions } from "../../document-extract.ts";
 import type { DocumentTemplates } from "../../modules.ts";
@@ -95,7 +95,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       if (result.exitCode !== 0) throw new Error("文档操作失败：" + result.output.slice(-2000));
     };
     const locate = async (value: string): Promise<string> => {
-      const original = await realpath(resolveToolPath(value, workspace));
+      const original = await realToolPath(value, workspace);
       await assertTaskPathAllowed(original);
       if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取共享资料 workspace 或当前用户 tmp 中的文件");
       return original;

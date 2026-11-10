@@ -21,8 +21,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -54,4 +55,26 @@ function normalizePath(input: string, toolPath: boolean): string {
 export function resolveToolPath(path: string, cwd: string): string {
   const normalized = normalizePath(path, true);
   return isAbsolute(normalized) ? resolve(normalized) : resolve(normalizePath(cwd, false), normalized);
+}
+
+/** 交付快照所在的目录名：登记时在成员临时目录下建立，请求结束并交付后清理（agent/deliverables.ts）。 */
+export const SNAPSHOT_DIRECTORY = ".deliverables";
+
+/** 快照路径的形状：`.deliverables/<请求摘要 24 位>/<UUID>/<文件名>`（freezeFile）。资料库里同名的普通目录不算。 */
+function snapshotPath(path: string): boolean {
+  const parts = path.split(sep), at = parts.lastIndexOf(SNAPSHOT_DIRECTORY);
+  return at >= 0 && parts.length === at + 4 && /^[0-9a-f]{24}$/.test(parts[at + 1]!) && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(parts[at + 2]!);
+}
+
+/**
+ * 工具的源文件：解析后的真实路径。快照在登记它的请求结束后清理，而登记结果里的路径留在对话历史中，模型曾在下一个请求里
+ * 继续用它；这时说明原因和该用哪个路径，不让模型面对一条 ENOENT 去猜。
+ */
+export async function realToolPath(path: string, cwd: string): Promise<string> {
+  const resolved = resolveToolPath(path, cwd);
+  try { return await realpath(resolved); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !snapshotPath(resolved)) throw error;
+    throw new Error("这个路径是之前请求登记交付物时的快照，那次请求结束后已清理。请改用文件原来的生成路径（登记时传入的 path）；原文件也不在时重新生成。");
+  }
 }

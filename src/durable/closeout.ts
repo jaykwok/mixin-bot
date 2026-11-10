@@ -148,7 +148,7 @@ export function deliverableTool(options: BaseToolsOptions, maxBytes = NATIVE_FIL
           if (!current || current.closedAt !== undefined) throw new Error("任务已结束，不能再登记交付物");
           return structuredClone(registerDeliverable(current, entry));
         }, call.context);
-        return { output: [{ type: "text", text: JSON.stringify({ ...record, message: !complete ? "文件结构不完整，不会自动发送" : downgrade ? "未渲染该版本，已降为草稿" : "已登记，发送时使用 snapshot 路径", snapshot: record.path }) }], details: record, ...(complete ? {} : { isError: true }) };
+        return { output: [{ type: "text", text: JSON.stringify({ ...record, message: !complete ? "文件结构不完整，不会自动发送" : downgrade ? "未渲染该版本，已降为草稿" : "已登记，本次请求内发送时使用 snapshot 路径；快照在请求结束后清理，继续修改或以后再用仍按原文件路径", snapshot: record.path }) }], details: record, ...(complete ? {} : { isError: true }) };
       } catch (error) { await unlink(frozen.path).catch(() => {}); throw error; }
     },
   };

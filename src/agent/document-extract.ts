@@ -17,7 +17,7 @@ import { hashFile } from "../core/file-hash.ts";
 import { removalNeedsPermit } from "../core/reclamation.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
 import { isPathInside } from "../contracts/paths.ts";
-import { resolveToolPath } from "./tool-path.ts";
+import { realToolPath } from "./tool-path.ts";
 import { structuredResult } from "./structured-result.ts";
 import { fileDigest } from "./deliverables.ts";
 
@@ -79,7 +79,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
   signal?.throwIfAborted();
   if (!Number.isInteger(maxChars) || maxChars < 1000 || maxChars > 2000000) throw new Error("maxChars 必须为 1000–2000000");
   const workspace = await realpath(options.workspaceDir), temp = await realpath(options.tempDir);
-  const path = await realpath(resolveToolPath(source, workspace));
+  const path = await realToolPath(source, workspace);
   await assertTaskPathAllowed(path);
   if (![workspace, temp].some(root => isPathInside(path, root))) throw new Error("只能解析共享资料 workspace 或当前用户 tmp 中的文档");
   const extension = extname(path).toLowerCase();

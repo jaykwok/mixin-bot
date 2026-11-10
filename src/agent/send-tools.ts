@@ -17,7 +17,7 @@ import { imageInfo, type ImageInfo } from "../integrations/open-platform/image.t
 import type { LinkNote } from "../durable/records.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "../contracts/paths.ts";
-import { resolveToolPath } from "./tool-path.ts";
+import { realToolPath } from "./tool-path.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { application } from "../core/lifecycle.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
@@ -65,8 +65,7 @@ export async function resolveSource(
     realpath(resolve(workspaceDir)),
     realpath(resolve(tempDir)),
   ]);
-  const requestedPath = resolveToolPath(source, roots[0]!);
-  const path = await realpath(requestedPath);
+  const path = await realToolPath(source, roots[0]!);
   await assertTaskPathAllowed(path);
   if (!roots.some((root) => isPathInside(path, root))) {
     throw new Error("只能发送共享资料 workspace 或当前调用用户 tmp 目录内的文件");

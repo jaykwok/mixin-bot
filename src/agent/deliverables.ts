@@ -3,6 +3,7 @@ import { copyFile, mkdir, open, stat, unlink, realpath, lstat } from "node:fs/pr
 import { createHash, randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import { isPathInside } from "../contracts/paths.ts";
+import { SNAPSHOT_DIRECTORY } from "./tool-path.ts";
 import { type Deliverable, openPart, type RequestRecord } from "../durable/records.ts";
 
 /** Streaming, abortable digest: large relay files do not occupy the JavaScript heap. */
@@ -28,7 +29,7 @@ export async function fileDigest(path: string, signal?: AbortSignal, maxBytes = 
 /** Copy before recording; check both sides so later edits cannot change a registered version. */
 export async function freezeFile(sourcePath: string, tempDir: string, requestId: string, maxBytes: number, signal?: AbortSignal, sourceDigest?: string) {
   const sha256 = sourceDigest ?? await fileDigest(sourcePath, signal, maxBytes);
-  const parent = await realpath(tempDir), root = join(parent, ".deliverables");
+  const parent = await realpath(tempDir), root = join(parent, SNAPSHOT_DIRECTORY);
   await mkdir(root, { recursive: true });
   if ((await lstat(root)).isSymbolicLink() || await realpath(root) !== root) throw new Error("交付快照目录不能是链接");
   const dir = join(root, createHash("sha256").update(requestId).digest("hex").slice(0, 24), randomUUID());
@@ -114,7 +115,7 @@ export async function deleteSnapshots(paths: readonly string[], tempDir: string)
   let root: string | undefined;
   for (const path of paths) {
     try {
-      root ??= join(await realpath(tempDir), ".deliverables");
+      root ??= join(await realpath(tempDir), SNAPSHOT_DIRECTORY);
       const actual = await realpath(path);
       if (actual === root || !isPathInside(actual, root)) throw new Error("交付快照清理路径越界");
       await unlink(actual);
