@@ -37,6 +37,14 @@ export function memberShell(config: ReturnType<typeof getShellConfig> = getShell
 }
 
 function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+
+/**
+ * `python` 和 `python3` 在成员的 bash 里就是文档解析环境的解释器（"$PI_PYTHON"）。模型常直接写 `python - <<'EOF'`：
+ * Windows 上没有这个命令（或是应用商店的占位程序），Linux 上是没有解析依赖的系统 Python。环境还没建立时说明该先做什么，
+ * 不留一条 command not found。写成函数而不是改 PATH：虚拟环境目录里的 pip 等其他命令不随之出现。
+ */
+const PYTHON_COMMANDS = `python() { if [ -x "$PI_PYTHON" ]; then "$PI_PYTHON" "$@"; else echo 'Python 环境还没有准备好：先调用 document_environment 工具，成功后再运行 python' >&2; return 127; fi; }
+python3() { python "$@"; }`;
 class AllowedPathGuard {
   private constructor(
     private readonly roots: string[],
@@ -249,7 +257,7 @@ async function executeMember(command: string | readonly string[], opts: ShellExe
       const exports = Object.entries(explicit).filter((entry): entry is [string, string] => typeof entry[1] === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry[0]))
         .map(([key, value]) => "export " + key + "=" + shellQuote(value)).join("\n");
       const processOptions = { command: typeof command === "string" ? shell!.shell : command[0]!,
-        args: typeof command === "string" ? [...shell!.args, exports + "\n" + command] : [...command.slice(1)],
+        args: typeof command === "string" ? [...shell!.args, exports + "\n" + PYTHON_COMMANDS + "\n" + command] : [...command.slice(1)],
         cwd: opts.cwd ?? member.workspaceDir, env: environment, signal: context.abortSignal, timeoutMs: seconds * 1000,
         onOutput: (data: Buffer, stream: "stdout" | "stderr") => {
           bytes += data.length; for (const byte of data) if (byte === 10) lines++;

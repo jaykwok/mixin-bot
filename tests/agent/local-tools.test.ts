@@ -1,12 +1,16 @@
 import { expect, test } from 'bun:test';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { copyFile, link, mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { existsSync } from 'node:fs';
 import { getShellConfig } from '@earendil-works/pi-coding-agent';
 import { createMemberEnv, memberShell } from '../../src/durable/member-env.ts';
 import { tempFixture } from '../helpers/temp.ts';
 import { groupScope } from '../../src/core/layout.ts';
+import { venvPythonPath } from '../../src/agent/python-toolchain.ts';
+
+/** A path as a bash command takes it on every platform. */
+const shellPath=(path:string)=>path.replaceAll(String.fromCharCode(92),'/');
 
 test('string commands run with argv shells only; the stdin-only WSL launcher is refused with what to install',()=>{
  // macOS: whatever Pi found, the shell is the first bash on PATH, and Apple's 3.2 is not accepted.
@@ -34,6 +38,28 @@ test.skipIf(process.platform!=='win32')('the WindowsApps bash alias is refused l
  expect(getShellConfig(alias)).toEqual({shell:alias,args:['-c']});
  expect(()=>memberShell(getShellConfig(alias))).toThrow('WSL 启动器');
 });
+
+test('python and python3 in a member command are the document environment\'s interpreter, and say what to do before it exists',async()=>{
+ if(process.platform==='win32'&&!existsSync(getShellConfig().shell))return;
+ const f=await tempFixture('native-member-python-');
+ try{
+  const workspace=join(f.root,'workspace'),tempDir=join(f.root,'tmp'),venvDir=join(f.root,'venv');
+  for(const path of [workspace,tempDir])await mkdir(path,{recursive:true});
+  const env=await createMemberEnv({workspaceDir:workspace,tempDir,phone:'alice',scope:groupScope('g'),venvDir,materialsIndexPath:join(f.root,'index/materials.md')});
+  const run=async(command:string)=>{let output='';const result=await env.exec(command,{timeout:60,onOutput:text=>{output+=text;}},context);return{code:result.ok?result.value.exitCode:result.error.message,output:output.trim()};};
+  // Before the environment exists: the reason and the tool to call, not "command not found".
+  for(const name of ['python','python3'])expect(await run(name+' -c "print(1)"; echo "code=$?"')).toEqual({code:0,output:'Python 环境还没有准备好：先调用 document_environment 工具，成功后再运行 python\ncode=127'});
+  // The interpreter is whatever "$PI_PYTHON" names: a stand-in that prints its arguments and its input.
+  const python=venvPythonPath(venvDir);
+  await mkdir(dirname(python),{recursive:true});
+  await link(process.execPath,python).catch(()=>copyFile(process.execPath,python));
+  const script='const input=await Bun.stdin.text();console.log(JSON.stringify([process.argv.slice(2),input.trim()]))';
+  await writeFile(join(tempDir,'echo.ts'),script);
+  const echo=shellPath(join(tempDir,'echo.ts'));
+  expect(await run(`python "${echo}" a "b c" <<'EOF'\nfrom stdin\nEOF`)).toEqual({code:0,output:'[["a","b c"],"from stdin"]'});
+  expect(await run(`echo piped | python3 "${echo}" x`)).toEqual({code:0,output:'[["x"],"piped"]'});
+ }finally{await f.cleanup();}
+},60_000);
 
 test('per-call native environments keep cwd independent and binary reads bounded while preserving read-only resources',async()=>{
  const f=await tempFixture('native-member-env-');
