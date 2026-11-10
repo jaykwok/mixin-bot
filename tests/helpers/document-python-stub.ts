@@ -26,7 +26,7 @@ async function inspection(path: string, outline = false) {
   if (outline) result.outline = format === "docx"
     ? { headings: [{ block: 1, level: 1, text: "概述" }], tables: 1, inlineImages: 0, styles: ["Heading 1", "Caption"],
         page: { widthCm: 21, heightCm: 29.7 }, header: "" }
-    : { slides: [1, 2].map((page) => ({ page, layout: "Title and Content", title: "第 " + page + " 页", chars: 40, pictures: 1, tables: 0,
+    : { slides: [1, 2].map((page) => ({ page, layout: "Title and Content", title: page === 1 ? "第 1 页" : null, chars: 40, pictures: 1, tables: 0,
           charts: 0, groups: 0, hidden: false })), layouts: [{ name: "Title and Content", placeholders: ["TITLE", "BODY"] }],
         titleStyle: { left: 0.5, top: 0.3 }, size: { widthInches: 13.33, heightInches: 7.5 } };
   return result;

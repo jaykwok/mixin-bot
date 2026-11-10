@@ -471,7 +471,9 @@ def check_pictures_and_headings(root):
     found = document_ops.images({"source": str(folder / "pictures.pptx"), "directory": str(folder / "pptx"), "minSize": 16})
     assert len(found["images"]) == 2, found
     assert found["skipped"]["unsupported"] == 1 and any("无法读取" in w for w in found["warnings"]), found
-    assert document_build.outline(str(folder / "pictures.pptx"), "pptx")["slides"][0]["pictures"] == 3
+    pictures = document_build.outline(str(folder / "pictures.pptx"), "pptx")["slides"][0]
+    # No text in the upper part of the slide: the title is None, which the tool's result schema has to allow.
+    assert pictures["pictures"] == 3 and pictures["title"] is None, pictures
 
     document = Document()
     document.add_heading("第一章", 1)

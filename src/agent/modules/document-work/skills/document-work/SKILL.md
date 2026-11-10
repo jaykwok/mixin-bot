@@ -29,7 +29,7 @@ description: 基于共享资料修改 Word、选编和修改 PPT，或在产品�
 // 比较两份方案：大纲并行取回，只返回每页标题
 const sources = ["方案/甲方案.pptx", "方案/乙方案.pptx"];
 const outlines = await Promise.all(sources.map((source) => tools.document_inspect({ source, outline: true })));
-return outlines.map((r) => ({ source: r.source, slides: r.outline.slides.map((s) => s.page + " " + s.title) }));
+return outlines.map((r) => ({ source: r.source, slides: r.outline.slides.map((s) => s.page + " " + (s.title ?? "（无标题）")) }));
 ```
 
 ```js

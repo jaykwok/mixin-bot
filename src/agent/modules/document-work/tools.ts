@@ -230,9 +230,9 @@ function outputPath(directory: string, filename: string | undefined, extension: 
 // schema：共用时模型曾到 document_compose 的结果里找 outline。成功之外一律抛错。
 const pages = arr(int({ minimum: 1 }));
 const outlineSchema = union([
-  obj({ slides: arr(obj({ page: int(), layout: str(), title: str(), chars: int(),
+  obj({ slides: arr(obj({ page: int(), layout: str(), title: nullable(str()), chars: int(),
     pictures: int(), tables: int(), charts: int(), hidden: bool() }, { open: true })), layouts: arr(unknown()) },
-    { open: true, description: "PPT 大纲：每页推断标题、文字量、图片/表格/图表数与版式" }),
+    { open: true, description: "PPT 大纲：每页推断标题（页面上部没有文字时为 null）、文字量、图片/表格/图表数与版式" }),
   obj({ headings: arr(obj({ block: int(), level: int(), text: str() }, { open: true })), styles: arr(str()) },
     { open: true, description: "Word 大纲：标题层级与正文块位置、可用样式" }),
 ]);
