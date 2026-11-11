@@ -180,6 +180,11 @@ export function createHandler(options: ConsoleServerOptions): (request: Request,
       return json(result);
     } catch (error) {
       if (error instanceof ApiProblem) return failure(error.status, error.message, error.code);
+      // The page dropped the request (it was left, or refreshed while a slow read such as the health check was running):
+      // the route was cancelled through request.signal and nobody reads the answer. Not a failure of the console.
+      if (request.signal.aborted && (error === request.signal.reason || (error instanceof Error && error.name === "AbortError"))) {
+        return failure(499, "请求已取消", "internal");
+      }
       console.error(`控制台接口 ${route} 出错：${error instanceof Error ? error.message : String(error)}`);
       return failure(500, "控制台内部错误，详情见运行控制台的终端", "internal");
     }

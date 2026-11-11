@@ -110,6 +110,29 @@ test("升级后的旧入口只保留登录和任务结果，拒绝新读取/写�
   expect((await handle(request("/api/tasks", { headers }))).status).toBe(401);
 });
 
+test("页面放弃的请求（离开或刷新时取消）不记为控制台出错；接口自己的错误仍然记录", async () => {
+  const auth = new Auth(), login = auth.exchange(auth.issueToken().token)!, headers = { cookie: auth.cookieName + "=" + login.sessionId };
+  const handle = createHandler({ port: PORT, guard: guardConfig(PORT), bundle, auth, instanceId: "abort", overview: async () => ({}) as Overview,
+    routes: {
+      // As the query pool does: a cancelled read rejects with the signal's reason.
+      "POST /api/read/health": { run: ({ signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) },
+      "POST /api/read/logs": { run: async ({ signal }) => { await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true })); throw new Error("读取日志时的真实错误"); } },
+    } });
+  const logged: string[] = [], original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.join(" ")); };
+  try {
+    for (const [path, lines] of [["/api/read/health", 0], ["/api/read/logs", 1]] as const) {
+      const controller = new AbortController(), sent = request(path, { method: "POST", body: "{}", headers });
+      const response = handle(new Request(sent, { signal: controller.signal }));
+      await Bun.sleep(10);
+      controller.abort(new DOMException("The connection was closed.", "AbortError"));
+      expect((await response).status).toBe(lines ? 500 : 499);
+      expect(logged.length, logged.join("\n")).toBe(lines);
+    }
+    expect(logged[0]).toBe("控制台接口 POST /api/read/logs 出错：读取日志时的真实错误");
+  } finally { console.error = original; }
+});
+
 test("只读接口接受几秒内的代码核对；其余接口和 /api/runtime 每次完整核对", async () => {
   const auth = new Auth(), login = auth.exchange(auth.issueToken().token)!, asked: boolean[] = [];
   const handle = createHandler({ port: PORT, guard: guardConfig(PORT), bundle, auth, instanceId: "frozen",
