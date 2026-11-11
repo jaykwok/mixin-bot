@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 // Identity documents of the Durable store: the space (all direct chats, or one group) is decided by which database, the
 // member by the directory; tools and prompt sections read the identity document, never model arguments or a changeable cwd.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { AgentDoc, configure, defineDoc, defineDocFamily, type AgentChange, type AgentState, type Conversation, type ConversationId, type DocumentReader,
   type Extension, type Harness, type ModelRef } from "@earendil-works/pi-durable";

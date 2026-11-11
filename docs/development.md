@@ -8,7 +8,7 @@
 
 ## 工作原理
 
-基于 **Bun + Hono + Pi Durable 1.5.0 引擎**，支持 Windows 原生部署、Linux / Docker 和 macOS 原生部署（实验性支持）。消息经量子密信开放平台的应用机器人事件 Stream 进入，回复和文件经开放平台接口发出。每个空间（一个群，或所有单聊共用的 `direct`）一个 Durable 数据库（`<空间目录>/durable.sqlite`），空间内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
+基于 **Bun + Hono + Pi Durable 1.5.2 引擎**，支持 Windows 原生部署、Linux / Docker 和 macOS 原生部署（实验性支持）。消息经量子密信开放平台的应用机器人事件 Stream 进入，回复和文件经开放平台接口发出。每个空间（一个群，或所有单聊共用的 `direct`）一个 Durable 数据库（`<空间目录>/durable.sqlite`），空间内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
 
 ```mermaid
 flowchart TD
@@ -264,7 +264,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 程序版本取自 `package.json`（2.0.0），数据格式 `DATA_VERSION` 为 2，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。
 
-七个直接 Pi 依赖（含 `pi-schema`）精确锁为 1.5.0，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides，也不打补丁。请求门（[door.ts](../src/durable/door.ts)）按官方随每次生成与压缩请求传入的 `sessionId`（会话的 `pi.provider`）找到会话和成员：映射只取成员目录、会话身份与 `pi.provider` 三者一致的已提交数据，空间开启时在恢复调度前载入，新建成员会话提交后登记，遇到未知 `sessionId` 重读一次，仍未知或被两个会话占用则不发送；分叉不继承身份，没有发送资格。门在最后一次同步检查（取消、关闭、总时限、待执行控制命令）之后直接交给 provider，中间没有 await；凭证解析等异步步骤都在检查之前。门本身不写记录，用量由 Durable 记入 `pi.usage`。升级 Pi 时需要重新验证 `sessionId` 仍随生成与压缩请求传入，以及取消、恢复语义。
+七个直接 Pi 依赖（含 `pi-schema`）精确锁为 1.5.2，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides，也不打补丁。请求门（[door.ts](../src/durable/door.ts)）按官方随每次生成与压缩请求传入的 `sessionId`（会话的 `pi.provider`）找到会话和成员：映射只取成员目录、会话身份与 `pi.provider` 三者一致的已提交数据，空间开启时在恢复调度前载入，新建成员会话提交后登记，遇到未知 `sessionId` 重读一次，仍未知或被两个会话占用则不发送；分叉不继承身份，没有发送资格。门在最后一次同步检查（取消、关闭、总时限、待执行控制命令）之后直接交给 provider，中间没有 await；凭证解析等异步步骤都在检查之前。门本身不写记录，用量由 Durable 记入 `pi.usage`。升级 Pi 时需要重新验证 `sessionId` 仍随生成与压缩请求传入，以及取消、恢复语义。
 
 会话库只接受 Durable SQLite schema 2：`src/durable/schema-gate.ts` 在官方打开（会自动升级旧 schema）之前只读核对，服务、离线维护和诊断快照共用。Durable 的退避重试、压缩重试和延迟轮询是 `sleeping` 任务，`src/durable/task-states.ts` 把它列为未完成工作（发现、闲置回收、结果回收和维护预览都据此保护）；看门狗按 `pi.live` 的 retry／deferred 判断，不把它当作模型无进展；它读的是 Session 内存里的进度，流式进度最多晚 `persistWithinMs` 才写入会话库，不影响判断。运行设置显式写明 `afterFailedRun: "keep"`（成员工作者一次只提交一条，失败由服务自己答复）和 `restartLimit` 5：连续因崩溃中断且没有进展的任务到限即结束（工具调用得到错误结果，运行以 `restart_limit` 结束）；模型回答途中服务异常停止算一次失败的尝试，重试用完时运行以 `interrupted` 结束。两种情况 Durable 都报告 `task_interrupted`，写入服务日志并记为关注项；成员收到按 `pi.live.runFailure` 的原因和说明写的失败答复，下一条消息照常处理。按模型的压缩预算作为 Durable 原生 `modelOverrides` 传入，后台阈值按各模型窗口算好显式给出。
 

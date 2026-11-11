@@ -28,7 +28,8 @@
 //   without running the script (deadline passed, another code mode version or sandbox, a divergence) or is cancelled
 //   before its replay reaches a finished call still shows it, and only once. The outcome's display snapshot can lag a
 //   later child; `pi.usage` still counts it.
-import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
+import { type Context } from "@earendil-works/chord/context";
+import { copyJson, type JsonValue } from "@earendil-works/chord/json";
 import type { Usage } from "@earendil-works/pi-ai";
 import { CodemodeSandbox, type CodemodeResult, type CodemodeRun, type CodemodeRunOptions, type CodemodeSandboxBase } from "@earendil-works/pi-codemode";
 import {

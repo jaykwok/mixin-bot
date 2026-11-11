@@ -10,7 +10,7 @@
 // Controls. A /stop or /clear is committed to `mixin.controls` (with the stream sequence the request door uses) before
 // it runs and removed after; the door holds the member's model requests in between (src/durable/door.ts). On startup
 // the waiting controls are loaded into the door before scheduling resumes, then executed again (both are idempotent).
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { type ConversationId, defineDoc, type Harness } from "@earendil-works/pi-durable";
 import type { ReplyContext } from "./records.ts";
 import { checkpointDue } from "./checkpoint.ts";

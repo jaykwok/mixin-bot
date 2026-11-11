@@ -5,7 +5,7 @@
 // Worker.terminate waits for it to finish), so cancelling only means not starting the next one. The caller runs each
 // operation in one short read transaction and releases it before the next page.
 //
-// Semantics this relies on (pi-durable, checked on 1.4.0 and again on 1.5.0): entries are appended and never
+// Semantics this relies on (pi-durable, checked on 1.4.0 and again on 1.5.2): entries are appended and never
 // updated or deleted; `/clear` appends a reset entry (`head` = itself) and a compaction appends a summary (`head` = the
 // first kept entry), so an entry number bounds a fixed history range. Documents, tasks and submissions change in place:
 // what is read from them is the state stored at reading time (streamed progress is stored up to `persistWithinMs` after

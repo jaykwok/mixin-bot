@@ -2,7 +2,7 @@ import { afterAll, describe, mock, test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, symlinkSync, type PathLike, type StatOptions } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, createSession, defineExtension, Harness, type HarnessInspection, type SubmissionId } from "@earendil-works/pi-durable";

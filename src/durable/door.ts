@@ -45,7 +45,7 @@
 //
 // Not gated: deferred polls, which continue a request that already went through the door; a control aborts them like any
 // background work.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {

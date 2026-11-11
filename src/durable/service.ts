@@ -37,7 +37,7 @@ import { randomUUID } from "node:crypto";
 import { access, lstat, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import {

@@ -12,7 +12,7 @@
 // `sending` after a restart is uncertain. Uncertain parts count as sent and are never sent again (the platform does not
 // deduplicate). A failed part is tried again after a growing wait, also across restarts, until the delivery's window
 // ends; a failure that retrying cannot fix (an expired link, a changed snapshot) is final at once.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, type DocumentReader, type Tx } from "@earendil-works/pi-durable";
 import type { RelayReference } from "../integrations/relay.ts";
 import { checkpointDue } from "./checkpoint.ts";

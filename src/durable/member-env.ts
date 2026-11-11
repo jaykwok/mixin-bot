@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { dirname, join, resolve, win32 } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { err, ok, ExecutionError, FileError, StreamDecoder, type ExecutionEnv, type ShellExecOptions, type Result, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";

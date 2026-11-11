@@ -6,7 +6,7 @@
 // (`memberSessions` below). Credentials stay the runtime's: the door asks
 // `getAuth` for each request, so models.json keys, environment and command references and headers behave as without it.
 // A routed (virtual) model is refused here at startup, and again by the door for any request that names one.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Api, CacheRetention, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { type ConversationId, type Harness, type HarnessSettings, type ModelRef, ProviderDoc } from "@earendil-works/pi-durable";

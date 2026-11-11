@@ -9,7 +9,7 @@
 // 5. Linux: hand the remaining due, unreferenced records to the reclamation queue (frees the active quota);
 // 6. retry a bounded batch of the queue, rotating deferred items;
 // 7. sweep isolated task receipts no live or queued ownership claims.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Harness } from "@earendil-works/pi-durable";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";

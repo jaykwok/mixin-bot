@@ -1,4 +1,4 @@
-// Durable (since 1.2.0, rechecked on 1.5.0) fails the Session on any Storage error, as its own guard decides (pi-durable session.js
+// Durable (since 1.2.0, rechecked on 1.5.2) fails the Session on any Storage error, as its own guard decides (pi-durable session.js
 // `GuardedStorage`): every commit or mintId error, and every read error except a `StorageRequestError` (an invalid
 // request) or one whose caller's context was aborted. A failed Session never runs or commits again; reopening recovers
 // from what was committed. The SQL worker is shared by every group of the process, so the process stops (fail-stop) and

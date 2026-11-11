@@ -1,6 +1,6 @@
 // The per-member reclamation queue: ownership records handed out of the active table, each its own document, linked
 // head → tail. Handoff, bounded batch reads, rotation and exact (offline) settlement are each one transaction step.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { defineDocFamily, type DocumentReader, type Tx } from "@earendil-works/pi-durable";
 import { sameOwnership, type ResultOwnership } from "../../contracts/maintenance.ts";
 import { ResultsDoc } from "./ownership.ts";

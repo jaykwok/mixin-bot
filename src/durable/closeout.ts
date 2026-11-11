@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Message } from "@earendil-works/pi-ai";
 import { defineExtension, type DocumentReader, GenerationTask, ToolTask, hook, type HookApi, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import { arr, obj, oneOf, opt, str } from "@earendil-works/pi-schema";

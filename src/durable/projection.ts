@@ -2,7 +2,7 @@
 // its conversation's `pi.usage` totals. Both are idempotent, so every sync point (after a run or a command, maintenance,
 // opening a space) may run them again.
 import type { Database } from "bun:sqlite";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { type ConversationId, type Harness, UsageDoc } from "@earendil-works/pi-durable";
 import { statsSegment, userSegment, type Scope } from "../core/layout.ts";
 import { recordAsks, syncUsage, type UsageState } from "../agent/stats-ledger.ts";

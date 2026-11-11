@@ -1,7 +1,7 @@
 // Active result ownership: one record per result directory, written by the same commit that makes the directory the
 // member's. The table is bounded; maintenance (maintenance.ts) frees it by handing records to the reclamation queue
 // (queue.ts) — moving a record out of the active table never means its bytes are gone.
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { defineDoc, type Tx } from "@earendil-works/pi-durable";
 import type { ResultOwnership } from "../../contracts/maintenance.ts";
 import { checkpointDue } from "../checkpoint.ts";

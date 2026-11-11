@@ -17,7 +17,7 @@
 // Each open times its steps and counts its database's SQL meanwhile, for the service log (`onOpened`).
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT, withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
 import { createSession, Harness, type HarnessOptions, type Storage } from "@earendil-works/pi-durable";
 import { scopeKey, spaceDatabase, spacePath, type Layout, type Scope } from "../core/layout.ts";
@@ -46,7 +46,7 @@ async function storedData(storage: Storage, context: Context): Promise<boolean> 
 }
 
 /**
- * The error that failed the Harness's Session, if one did. pi-durable (since 1.2.0, rechecked on 1.5.0) marks `failure` internal on the Session but
+ * The error that failed the Harness's Session, if one did. pi-durable (since 1.2.0, rechecked on 1.5.2) marks `failure` internal on the Session but
  * documents it as what close listeners read when a failure closes the Session (session.d.ts `fail`, `subscribeClose`);
  * the fail-stop test in tests/durable/spaces.test.ts depends on it.
  */
@@ -327,7 +327,7 @@ export class SpaceHarnesses {
 
   /**
    * The recorded space, read without a Harness: a bare Session only reads (closing it would close the storage). It is
-   * never closed, so it keeps no document: with the default retention (ten minutes since pi-durable 1.2.0, rechecked on 1.5.0) its eviction
+   * never closed, so it keeps no document: with the default retention (ten minutes since pi-durable 1.2.0, rechecked on 1.5.2) its eviction
    * timer would hold the Session, and through the storage's failure callback the evicted Harness.
    */
   #recordedSpace(connection: Connection, storage: Storage): Promise<Scope | undefined> {
