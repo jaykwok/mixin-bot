@@ -62,7 +62,7 @@ test("an inbound message beyond capacity gets the busy notice and is not admitte
     expect(f.service.hasUserRequestCapacity()).toBe(false);
     const busy = event("im-b", "second");
     router.handle(busy); await router.drain();
-    expect(f.out.sent.filter(item => item.kind === "notice").map(item => item.text)).toEqual(["⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。"]);
+    expect(f.out.sent.filter(item => item.kind === "notice").map(item => item.text)).toEqual(["⚠️ 现在处理不过来，这条消息没有收下，也不会自动处理，请过一会儿再发。"]);
     // A redelivery of the refused message is dropped in process; it is not admitted later either.
     router.handle(busy); await router.drain();
     expect(f.out.sent.filter(item => item.kind === "notice")).toHaveLength(1);

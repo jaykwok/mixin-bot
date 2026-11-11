@@ -134,7 +134,7 @@ test("/stop ends the retries of an earlier failing reply", async () => {
   try {
     await service.admit(f.out.message(GROUP, PHONE, "question"));
     await until(() => attempts === 1, "the first attempt");
-    expect(await service.control(f.out.message(GROUP, PHONE, "/stop"))).toContain("已停止");
+    expect(await service.control(f.out.message(GROUP, PHONE, "/stop"))).toContain("已经停下");
     await Bun.sleep(600);
     expect(attempts).toBe(1);
     expect(await pendingOf(service)).toEqual([]);
@@ -201,7 +201,7 @@ test("a watchdog abort committed just before a restart still answers the member,
     resumed = new DurableService(f.common); await resumed.start();
     await until(() => replyTexts(f.out.sent).some(text => text.includes("时限检查已中止本次运行")), "the failure reply");
     await until(() => resumed!.hasUserRequestCapacity(), "item removed");
-    expect(replyTexts(f.out.sent).filter(text => text.includes("超过时限已被停止"))).toHaveLength(1);
+    expect(replyTexts(f.out.sent).filter(text => text.includes("超时被停下"))).toHaveLength(1);
   } finally { first.open(); second.open(); await resumed?.close(); await original.close(); }
 }, 30000);
 

@@ -117,11 +117,11 @@ test("quantum-session messages are skipped; unsupported, empty and overlong mess
   expect(h.calls).toEqual([]);
   const texts = h.notices.map(n => n.text);
   expect(texts).toHaveLength(5);
-  expect(texts[0]).toContain("群里暂不支持接收图片、文件和视频，请在单聊中发送。");
-  expect(texts[1]).toContain("附件信息不完整，请重新发送。");
-  expect(texts[2]).toContain("暂不支持该类型的消息，请发送文字。");
+  expect(texts[0]).toContain("群里收不了图片、文件和视频，请在单聊里发给我。");
+  expect(texts[1]).toContain("附件没有收全，请再发一次。");
+  expect(texts[2]).toContain("这种消息我还处理不了，请发文字。");
   expect(texts[3]).toContain("请输入问题");
-  expect(texts[4]).toContain("消息过长");
+  expect(texts[4]).toContain("消息太长了");
 });
 
 test("direct images, files and videos are registered in arrival order with what the event declares; failures are answered", async () => {
@@ -144,7 +144,7 @@ test("direct images, files and videos are registered in arrival order with what 
   h.router.handle(h.event({ ...direct, type: "file", msgUid: "a-5", content: { fileId: "file-5", filename: "x" } }));
   await h.router.drain();
   expect(h.reports.map(String)).toEqual(["Error: storage down"]);
-  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("附件未能登记，请稍后重发。")]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("附件没有收下，请过一会儿再发。")]);
 });
 
 test("a late state-changing command is ignored with a notice; a late /status and late questions still run", async () => {
@@ -154,7 +154,7 @@ test("a late state-changing command is ignored with a notice; a late /status and
   h.router.handle(h.event({ content: { content: "late question" } }, late));
   await h.router.drain();
   expect(h.calls.map(call => [call.kind, (call.message as Inbound).content])).toEqual([["control", "/status"], ["admit", "late question"]]);
-  expect(h.notices.filter(n => n.text.includes("这条命令是 5 分钟前发的，已忽略"))).toHaveLength(3);
+  expect(h.notices.filter(n => n.text.includes("这条指令是 5 分钟前发的，没有执行"))).toHaveLength(3);
 });
 
 test("arrival order reaches the service synchronously; a redelivery while one is queued, or one the service recorded, is dropped", async () => {
@@ -189,7 +189,7 @@ test("a full queue is answered with the service's message and remembered; failur
   h.router.handle(h.event({})); h.router.handle(h.event({ content: { content: "/stop" } }));
   await h.router.drain();
   expect(h.reports.map(String)).toEqual(["Error: storage down", "Error: control down"]);
-  expect(h.notices.slice(1).map(n => n.text)).toEqual([expect.stringContaining("消息未能加入队列"), expect.stringContaining("指令未能执行")]);
+  expect(h.notices.slice(1).map(n => n.text)).toEqual([expect.stringContaining("这条消息没有收下"), expect.stringContaining("指令没有执行成功")]);
   h.abort.abort();
   h.router.handle(h.event({})); h.router.handle(h.event({ content: { content: "/clear" } }));
   await h.router.drain();
@@ -277,7 +277,7 @@ test("/完成 and /取消 go to the push service in direct chats and groups, /�
   h.router.handle(h.event({ content: { content: "/stop" } }));
   await h.router.drain();
   expect(fake.calls).toEqual(["text /完成", "group 100 /取消", "group 100 /登记群 销售一部", "group 100 /stop"]);
-  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("这条命令是 5 分钟前发的，已忽略"), expect.stringContaining("这条命令是 5 分钟前发的，已忽略")]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("这条指令是 5 分钟前发的，没有执行"), expect.stringContaining("这条指令是 5 分钟前发的，没有执行")]);
   expect(h.calls.map(call => [call.kind, call.message.scope, (call.message as Inbound).content])).toEqual([["control", groupScope("100"), "/stop"]]);
 });
 
@@ -291,7 +291,7 @@ test("a group replying to a push has its members' texts taken by it; group media
   await h.router.drain();
   expect(fake.calls).toEqual(["group 100 我们组已盘点", "group 100 /status", "group 200 其他群的问题"]);
   expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "gr-2"], ["admit", "gr-4"]]);
-  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("群里暂不支持接收图片、文件和视频")]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("群里收不了图片、文件和视频")]);
   // Redelivered: the push service has it.
   h.router.handle(h.event({ msgUid: "gr-1", content: { content: "我们组已盘点" } }));
   await h.router.drain();

@@ -143,7 +143,7 @@ test("a file followed at once by a question is bound to it; a /status and a refu
     expect(m.prompts[1]).toContain(stored.path!.replace(/\\/g, "/"));
     expect(await readFile(stored.path!, "utf8")).toBe("hello attachment");
     expect(stored.path!.startsWith(join(tmpOf(where, DIRECT_SPACE, ALICE), "received", `${stored.id}-`))).toBe(true);
-    expect(notices(out)).toContain("已收到文件「a.txt」，请说明要怎么处理。");
+    expect(notices(out)).toContain("文件「a.txt」收到了，想让我怎么处理？");
     // Bound once: the next question sees no attachment. With no queue it waits for the second answer: the run's inbox
     // item is removed just before that reply, and until then a new message is refused as queue-full.
     await until(() => replyTexts(out.sent).length === 2, "the second answer");
@@ -192,7 +192,7 @@ test("no project size limit: a file larger than the event declared lands whole; 
     await service.attach(attachment(out, ALICE, { fileId: upload("y"), name: "second.txt" }));
     await service.attach(attachment(out, ALICE, { fileId: upload("z"), name: "third.txt" }));
     const fourth = attachment(out, ALICE, { fileId: upload("u"), name: "fourth.txt" });
-    expect(await service.attach(fourth)).toEqual({ status: "full", message: "未接收文件「fourth.txt」：你还有 3 个附件尚未处理，请先发消息说明要怎么处理。" });
+    expect(await service.attach(fourth)).toEqual({ status: "full", message: "文件「fourth.txt」没有收下：你之前发的 3 个附件还没处理，请先发消息告诉我怎么处理。" });
     expect(await stateOf(service, fourth.reply.msgUid)).toBeUndefined();
     expect(await service.attach(fourth)).toEqual({ status: "duplicate" });
     await until(async () => (await attachments(service)).every(item => item.state !== "pending"), "settled downloads");
@@ -212,7 +212,7 @@ test("a failed download is told to the member and explained to the request that 
     const missing = attachment(out, ALICE, { fileId: "gone", name: "gone.txt" });
     await service.attach(missing);
     await until(async () => (await stateOf(service, missing.reply.msgUid))?.state === "failed", "the failure");
-    expect(notices(out).some(text => text.startsWith("文件「gone.txt」下载失败：") && text.endsWith("请重新发送。"))).toBe(true);
+    expect(notices(out).some(text => text.startsWith("文件「gone.txt」没有下载成功：") && text.endsWith("请再发一次。"))).toBe(true);
     await service.admit(ask(out, ALICE, "read it"));
     await until(() => m.prompts.length === 1, "the run");
     expect(m.prompts[0]).toMatch(/- 文件「gone\.txt」：下载失败，/);
@@ -300,7 +300,7 @@ test("an attachment whose registration commits after a /clear that arrived later
     expect((await stateOf(service, file.reply.msgUid))!.state).toBe("void");
     await Bun.sleep(100);
     expect(downloads(fileId)).toBe(0);
-    expect(notices(out).some(text => text.startsWith("已收到"))).toBe(false);
+    expect(notices(out).some(text => text.endsWith("收到了，想让我怎么处理？"))).toBe(false);
   } finally { release.resolve(); spy.mockRestore(); await service.close(); }
 });
 
@@ -326,7 +326,7 @@ test("an attachment whose registration commits after a /stop that arrived later 
     release.resolve();
     await registering;
     await until(async () => (await stateOf(service, file.reply.msgUid))?.state === "ready", "the download");
-    expect(notices(out).some(text => text.startsWith("已收到"))).toBe(true);
+    expect(notices(out).some(text => text.endsWith("收到了，想让我怎么处理？"))).toBe(true);
     await service.admit(ask(out, ALICE, "use it"));
     await until(() => m.prompts.length === 2, "the next message");
     expect(m.prompts[1]).toContain("late.txt");

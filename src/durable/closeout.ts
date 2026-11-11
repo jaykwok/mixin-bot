@@ -86,7 +86,7 @@ export function closeoutExtension(write: RecordWriter, timing: CloseoutTiming, r
         const now = Date.now(), deadline = item.startedAt + runTimeoutMs, remaining = Math.max(0, deadline - now), stage = phase(remaining, timing);
         const seconds = Math.ceil(remaining / 1000), versions = Object.values(item.record.events).filter(x => DOCUMENT_TOOLS.includes(x.name)).length;
         const registered = deliverableCandidates(item.record), sent = item.record.files.filter(x => fileSendOutcome(x) === "sent").length;
-        const direction = stage === "交付" ? "立即登记并发送最佳可交付版本，简述检查范围和未检查项。" : stage === "收尾" ? "停止美化及非必要重建；先登记最佳版本再发送，只修正事实错误。" : "";
+        const direction = stage === "交付" ? "立即登记并发送最佳可交付版本，回复里一句话说明发了什么，有已知问题才提。" : stage === "收尾" ? "停止美化及非必要重建；先登记最佳版本再发送，只修正事实错误。" : "";
         // Counts only once there is something to count: a plain question should not be steered towards files.
         const counts = [versions ? `本任务已生成文档 ${versions} 版` : "", registered.length ? `已登记交付物 ${registered.length} 个` : "", sent ? `已发送 ${sent} 个` : ""]
           .filter(Boolean).map(part => "；" + part).join("");
@@ -152,7 +152,7 @@ const registerParams = obj({
   issues: arr(str({ maxLength: 300 }), { maxItems: 10 }),
 }, { open: true });
 /** What the service adds to `unchecked` when a Word or PowerPoint version is registered as checked without a rendering of it. */
-export const UNRENDERED = "版式（这个版本没有渲染看图的记录）";
+export const UNRENDERED = "版式（这个版本没有看过排版效果）";
 
 /** deliverable_register (model-only): an immutable copy of a generated file, for send_file and the closeout fallback. */
 export function deliverableTool(options: BaseToolsOptions, maxBytes = NATIVE_FILE_MAX_BYTES) {

@@ -259,7 +259,7 @@ export class AttachmentDownloads {
     });
     // A bound attachment is explained in its request's prompt; an unbound one gets a notice now.
     const label = attachmentLabel((await this.host.read(active.space, active.phone)).attachments[id] ?? { kind: "file", name: "" });
-    if (reply) this.host.notify(reply, `${label}下载失败：${error}。请重新发送。`);
+    if (reply) this.host.notify(reply, `${label}没有下载成功：${error}。请再发一次。`);
   }
 }
 

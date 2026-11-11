@@ -150,7 +150,7 @@ test("manual compaction shows in /status while the summary runs, and stop cancel
     command = service.control(w.message("/compact"));
     await held.started;
     expect(await service.control(w.message("/status"))).toContain("压缩会话历史");
-    await service.control(w.message("/stop")); expect(await command).toContain("未完成");
+    await service.control(w.message("/stop")); expect(await command).toContain("这次压缩没有完成");
   } finally { held.open(); await command?.catch(() => {}); await service.close(); }
 });
 

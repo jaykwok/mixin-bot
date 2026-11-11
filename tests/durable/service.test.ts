@@ -252,9 +252,9 @@ describe("durable service: manual compaction receipt", () => {
       try {
         await until(async () => (await storage.scanSubmissions({}, 100, undefined, context)).items.some(s => s.type === "write" && s.status === "queued"), "queued summary");
         expect(resolved).toBe(false);
-        expect(out.sent.some(item => item.text.includes("压缩已完成"))).toBe(false);
+        expect(out.sent.some(item => item.text.includes("压缩好了"))).toBe(false);
         held.open();
-        expect(await compact).toContain("摘要已写入会话");
+        expect(await compact).toContain("整理成摘要");
         const summaries = (await storage.scanSubmissions({}, 100, undefined, context)).items.filter(s => s.requestId?.startsWith("compaction:"));
         expect(summaries).toHaveLength(1); expect(summaries[0]?.status).toBe("done");
       } finally { await storage.close(context); }
@@ -264,7 +264,7 @@ describe("durable service: manual compaction receipt", () => {
   test("an empty conversation reports no history to compact", async () => {
     const { models, model } = fauxModels(), where = place(), out = recordingOutbound();
     const { service } = open(where, models, model, out.outbound);
-    try { expect(await service.control(out.message(GROUP, ALICE, "/compact"))).toContain("无需压缩"); }
+    try { expect(await service.control(out.message(GROUP, ALICE, "/compact"))).toContain("不用压缩"); }
     finally { await service.close(); }
   });
 });
@@ -301,7 +301,7 @@ describe("durable service: admission, worker and reply", () => {
     } finally { await service.close(); }
   });
 
-  const ACK = "收到，正在处理，请稍候。处理时间较长时可以发送 /status 查看进度。";
+  const ACK = "收到，正在处理。等得久的话可以发 /status 看进度。";
   const acks = (sent: Sent[]) => sent.filter(item => item.kind === "notice" && item.text.includes(ACK)).map(item => item.msgUid);
 
   test("acknowledge in a group: the first question of a window gets the notice before its answer; anyone's question in that window gets none", async () => {
@@ -383,7 +383,7 @@ describe("durable service: admission, worker and reply", () => {
       expect((await service.admit(out.message(GROUP, BOB, "别人的消息"))).status).toBe("accepted");
       await until(() => replies(out.sent).includes("别人"), "the other member's reply");
       for (let index = 2; index <= 9; index++) expect((await service.admit(out.message(GROUP, ALICE, `第${index}条`))).status).toBe("accepted");
-      expect(await service.admit(out.message(GROUP, ALICE, "第10条"))).toEqual({ status: "full", message: "本会话已有 8 条消息排队，请稍后重发" });
+      expect(await service.admit(out.message(GROUP, ALICE, "第10条"))).toEqual({ status: "full", message: "你已经有 8 条消息在排队，这条没有收下，请过一会儿再发。" });
       first.open();
       await until(() => replies(out.sent).length === 10, "all replies");
       expect(replies(out.sent).filter((text) => text !== "别人")).toEqual(["一", ...Array.from({ length: 8 }, (_, index) => `回答${index + 2}`)]);
@@ -400,7 +400,7 @@ describe("durable service: admission, worker and reply", () => {
       await service.admit(out.message(GROUP, ALICE, "会失败"));
       await until(() => failures(out.sent).length === 1, "the failure text");
       const failure = failures(out.sent)[0]!;
-      expect(failure).toContain("⚠️ 抱歉，处理您的请求时出错了。");
+      expect(failure).toContain("⚠️ 抱歉，这次没有处理成功。");
       expect(failure).toContain("401 invalid api key");
       expect(out.sent.find((item) => item.kind === "reply")!.mention).toBe(`im-${ALICE}`);
       await until(async () => (await pending(service)).length === 0, "no pending delivery");
@@ -556,7 +556,7 @@ describe("durable service: controls", () => {
       await service.admit(out.message(GROUP, ALICE, "排队的"));
       await until(() => held.state.started === 1, "the request");
       const receipt = await service.control(out.message(GROUP, ALICE, "/stop"));
-      expect(receipt).toContain("⏹ 已停止你在本群的当前任务");
+      expect(receipt).toContain("⏹ 已经停下：你在本群正在处理的任务");
       await service.admit(out.message(GROUP, ALICE, "停止之后"));
       await until(() => replies(out.sent).length === 1, "the next reply");
       expect(replies(out.sent)).toEqual(["新的回答"]);
@@ -587,7 +587,7 @@ describe("durable service: controls", () => {
       await until(() => held.state.started === 1, "the second request");
       const clearing = service.control(out.message(GROUP, ALICE, "/clear"));
       await service.admit(out.message(GROUP, ALICE, "清空之后"));
-      expect(await clearing).toContain("🧹 已为你在本群开启新会话");
+      expect(await clearing).toContain("🧹 好，你在本群的对话从下一条消息起重新开始");
       await until(() => replies(out.sent).length === 2, "the reply after clear");
       expect(replies(out.sent)).toEqual(["第一轮回答", "新会话回答"]);
       const text = JSON.stringify(seen);
@@ -883,7 +883,7 @@ describe("durable service: threshold compaction", () => {
       await service.admit(out.message(GROUP, ALICE, "第二轮"));
       await until(() => failures(out.sent).some((text) => text.includes("会话历史压缩未完成")), "the failure text");
       const text = failures(out.sent).find((text) => text.includes("会话历史压缩未完成"))!;
-      expect(text).toStartWith("⚠️ 抱歉，处理您的请求时出错了。");
+      expect(text).toStartWith("⚠️ 抱歉，这次没有处理成功。");
       expect(text).toMatch(/会话历史压缩未完成（任务 \d+，达到阈值时压缩；Compaction failed: /);
       expect(text).toContain("400 synthetic summarize refusal");
       expect(replies(out.sent)).toHaveLength(1);
@@ -976,7 +976,7 @@ describe("durable service: restart", () => {
       expect(faux.state.callCount).toBe(3);
       expect(replies(out.sent)).toEqual(["第一条回答", "停止之后的回答", "重启后新消息的回答"]);
       // The replayed /stop answers its own command message.
-      expect(notices(out.sent).some((text) => text.startsWith("⏹ 已停止你在本群的当前任务"))).toBe(true);
+      expect(notices(out.sent).some((text) => text.startsWith("⏹ 已经停下：你在本群正在处理的任务"))).toBe(true);
       await until(async () => (await pending(opened.service)).length === 0, "no pending delivery");
       expect(seen.join("")).not.toContain("不该运行");
     } finally { await opened.service.close(); }
@@ -1250,7 +1250,7 @@ test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation wit
     if (process.platform === "win32") held = await holdDirectory(temp, ["codemode", "1-locked"]);
     else await chmod(locked, 0o555);
     command = service.control(out.message(GROUP, ALICE, "/clear"));
-    expect(await command).toContain("开启新会话");
+    expect(await command).toContain("重新开始");
     await service.admit(out.message(GROUP, ALICE, "later question"));
     await until(() => replies(out.sent).length === 2, "new context proceeds with deferred physical reclamation");
     expect(replies(out.sent)).toEqual(["seed", "after the failed cleanup"]);

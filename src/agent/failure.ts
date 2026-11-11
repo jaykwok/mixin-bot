@@ -48,15 +48,15 @@ export class RequestStopped extends Error {
 }
 
 const STOP_HINTS: Record<StopKind, string> = {
-  model_idle: "模型长时间没有产生新的有效内容，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  model_response_timeout: "模型未能在规定时间内完成本次响应，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  task_timeout: "这次处理超过了最长等待时间，已停止。请联系管理员，并提供下方的任务编号以便排查。",
-  watchdog_restart: "这次处理超过时限已被停止，服务随后重启。请重新发送一次问题；持续出现请联系管理员，并提供下方的任务编号以便排查。",
+  model_idle: "模型很久没有新的进展，这次先停下了。请把下面的任务编号发给管理员。",
+  model_response_timeout: "模型这一步回答得太久，这次先停下了。请把下面的任务编号发给管理员。",
+  task_timeout: "这次处理的时间超过了上限，先停下了。请把下面的任务编号发给管理员。",
+  watchdog_restart: "这次处理超时被停下，服务也重启了一次。请再发一次问题；总是这样的话，把下面的任务编号发给管理员。",
   // 模型回答途中服务意外停止（崩溃、断电、被强行结束），次数超过了重试次数。
-  interrupted: "机器人服务在模型回答途中意外停止，这次回答没有完成。请重新发送一次问题；持续出现请联系管理员。",
+  interrupted: "回答到一半时服务意外停了，这次没有答完。请再发一次问题；总是这样的话请联系管理员。",
   // 生成任务连续 restartLimit 次被异常中断。
-  restart_limit: "这个任务连续多次被异常中断，已经结束。请重新发送一次问题；持续出现请联系管理员。",
-  no_reply: "模型没有返回回复。请重新发送一次问题；如果仍然没有回复，请联系管理员。",
+  restart_limit: "这个任务接连几次被意外打断，不再继续了。请再发一次问题；总是这样的话请联系管理员。",
+  no_reply: "模型这次没有给出回复。请再发一次问题；还是没有的话请联系管理员。",
 };
 
 // pi-ai 的 formatProviderError 会把状态码拼成 `429: <body>` 或 `<provider> (429): <body>`；
@@ -88,7 +88,7 @@ interface FailureRule {
 }
 
 // 顺序即优先级：特征更具体的排前面。窗口用尽和额度耗尽都必须排在限流之前——它们的响应
-// 同样是 429、原文里同样带 rate_limit_exceeded，但「稍等片刻再发一次」对要等几小时才重置
+// 同样是 429、原文里同样带 rate_limit_exceeded，但「过一会儿再发一次」对要等几小时才重置
 // 的窗口纯属误导。运行被结束的几种情况（时限、服务中断、空回复）不在这里：它们按 RequestStopped 的 kind 给结论。
 const FAILURE_RULES: readonly FailureRule[] = [
   {
@@ -111,7 +111,7 @@ const FAILURE_RULES: readonly FailureRule[] = [
   {
     pattern: /rate[_ ]?limit|too many requests|请求过于频繁|并发上限/i,
     statuses: [429],
-    hint: "模型服务正在限流，稍等片刻再发一次；持续出现请联系管理员。",
+    hint: "模型服务正在限流，过一会儿再发一次；总是这样的话请联系管理员。",
   },
   {
     pattern:
@@ -136,15 +136,15 @@ const FAILURE_RULES: readonly FailureRule[] = [
   },
   {
     pattern: /timed?\s?out|timeout|超时/i,
-    hint: "这次处理超时了，暂时无法确定原因。请把这条提示发给管理员排查。",
+    hint: "这次处理超时了，原因还不清楚。请把这条消息转给管理员。",
   },
   {
     statuses: [500, 502, 503, 504, 529],
-    hint: "模型服务暂时故障或过载，请过几分钟再发送一次问题；持续出现请联系管理员。",
+    hint: "模型服务暂时出了故障或者太忙，过几分钟再发一次问题；总是这样的话请联系管理员。",
   },
 ];
 
-const FALLBACK_HINT = "暂时无法确定原因，请把这条提示连同下方的错误信息发给管理员排查。";
+const FALLBACK_HINT = "原因还不清楚，请把这条消息和下面的错误信息一起转给管理员。";
 
 // 报错原文里的重置时刻。有它才知道是「等一分钟」还是「等三小时」，可它埋在原文中段，
 // 而群里真正会被读的只有结论那一行，所以单独拎出来。
@@ -195,8 +195,8 @@ export function describeRequestFailure(error: unknown): string {
     : error instanceof ModelRequestError && error.reason === "context_overflow" ? CONTEXT_OVERFLOW_HINT : classifyFailure(raw, extractHttpStatus(raw));
   const reset = extractResetMoment(raw);
   const detail = formatDetail(raw);
-  const lines = ["⚠️ 抱歉，处理您的请求时出错了。", hint];
+  const lines = ["⚠️ 抱歉，这次没有处理成功。", hint];
   if (reset) lines.push(`额度将在 ${reset} 重置。`);
-  if (detail) lines.push(`原始错误：${detail}`);
+  if (detail) lines.push(`错误信息：${detail}`);
   return lines.join("\n");
 }

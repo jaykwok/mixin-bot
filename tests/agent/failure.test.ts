@@ -10,9 +10,9 @@ import {
 describe("请求失败回执", () => {
   test("时限检查的中止原因随重启丢失时，仍说明是超过时限并带任务编号", () => {
     const reply = describeRequestFailure(new RequestStopped("时限检查已中止本次运行，服务随后重启（任务：abcd1234）", "watchdog_restart"));
-    expect(reply).toContain("超过时限已被停止");
+    expect(reply).toContain("超时被停下");
     expect(reply).toContain("abcd1234");
-    expect(reply).not.toContain("暂时无法确定原因");
+    expect(reply).not.toContain("原因还不清楚");
   });
   test("额度用尽给出续费/换模型的结论，并附带 provider 原文", () => {
     const reply = describeRequestFailure(
@@ -22,7 +22,7 @@ describe("请求失败回执", () => {
     );
     expect(reply).toContain("额度或余额已经用完");
     expect(reply).toContain("请联系管理员");
-    expect(reply).toContain("原始错误：模型未返回回复：429:");
+    expect(reply).toContain("错误信息：模型未返回回复：429:");
     expect(reply).toContain("insufficient_quota");
     // 额度耗尽也是 429，但「稍后再试」对它没有意义。
     expect(reply).not.toContain("正在限流");
@@ -70,7 +70,7 @@ describe("请求失败回执", () => {
 
   test("模型服务 5xx 说明会自行恢复", () => {
     const reply = describeRequestFailure(new Error("模型未返回回复：zai (503): upstream overloaded"));
-    expect(reply).toContain("故障或过载");
+    expect(reply).toContain("故障或者太忙");
   });
 
   test("网络不通归到出网检查而不是模型侧", () => {
@@ -82,30 +82,30 @@ describe("请求失败回执", () => {
 
   test("generic and whole-task timeouts do not claim the model is unreachable", () => {
     const generic = describeRequestFailure(new Error("The operation timed out."));
-    expect(generic).toContain("暂时无法确定原因");
+    expect(generic).toContain("原因还不清楚");
     expect(generic).not.toContain("连不上模型服务");
     const deadline = describeRequestFailure(new RequestStopped("任务总时限 1200 秒已到（阶段：压缩会话历史；任务：abcd1234）", "task_timeout"));
-    expect(deadline).toContain("超过了最长等待时间");
+    expect(deadline).toContain("时间超过了上限");
     expect(deadline).toContain("abcd1234");
     expect(deadline).not.toContain("连不上模型服务");
   });
 
   test("model inactivity explains the early stop and retains the task ID", () => {
     const reply = describeRequestFailure(new RequestStopped("模型连续 180 秒无有效进展（阶段：接收模型输出；任务：555d838a）", "model_idle"));
-    expect(reply).toContain("模型长时间没有产生新的有效内容");
-    expect(reply).toContain("本次处理已停止");
+    expect(reply).toContain("模型很久没有新的进展");
+    expect(reply).toContain("这次先停下了");
     expect(reply).toContain("任务：555d838a");
     expect(reply).not.toContain("连不上模型服务");
-    expect(reply).not.toContain("超过了最长等待时间");
+    expect(reply).not.toContain("时间超过了上限");
   });
 
   test("model response deadline is distinct from inactivity and whole-task timeout", () => {
     const reply = describeRequestFailure(new RequestStopped("单次模型响应时限 600 秒已到（阶段：接收模型输出；任务：e78cd520）", "model_response_timeout"));
-    expect(reply).toContain("模型未能在规定时间内完成本次响应");
+    expect(reply).toContain("模型这一步回答得太久");
     expect(reply).toContain("任务：e78cd520");
     expect(reply).not.toContain("连不上模型服务");
     expect(reply).not.toContain("没有产生新的有效内容");
-    expect(reply).not.toContain("超过了最长等待时间");
+    expect(reply).not.toContain("时间超过了上限");
   });
 
   test("上下文超限提示用户自己 /clear", () => {
@@ -135,31 +135,31 @@ describe("请求失败回执", () => {
 
   test("没有任何线索的空回复单独描述，可直接重发", () => {
     const reply = describeRequestFailure(new RequestStopped("Pi 未返回回复", "no_reply"));
-    expect(reply).toContain("模型没有返回回复");
-    expect(reply).toContain("原始错误：Pi 未返回回复");
+    expect(reply).toContain("模型这次没有给出回复");
+    expect(reply).toContain("错误信息：Pi 未返回回复");
   });
 
   test("运行被结束的结论只按原因给出：别处的报错里出现同样的字眼不算，Durable 的两种原因不靠英文原文", () => {
     // 收尾配置的报错里也有“任务总时限”，模型报文里也可能有“未返回回复”：都不是这次运行超时或空回复。
     const config = describeRequestFailure(new Error("收尾配置无效：收尾时间须小于任务总时限的一半"));
-    expect(config).not.toContain("超过了最长等待时间");
-    expect(describeRequestFailure(new Error("上游网关：模型未返回回复"))).toContain("暂时无法确定原因");
+    expect(config).not.toContain("时间超过了上限");
+    expect(describeRequestFailure(new Error("上游网关：模型未返回回复"))).toContain("原因还不清楚");
     const interrupted = describeRequestFailure(new RequestStopped("The run ended: the wording here may change with Durable", "interrupted"));
-    expect(interrupted).toContain("机器人服务在模型回答途中意外停止");
-    expect(interrupted).toContain("原始错误：The run ended");
-    expect(describeRequestFailure(new RequestStopped("cut off 3 times", "restart_limit"))).toContain("连续多次被异常中断");
+    expect(interrupted).toContain("回答到一半时服务意外停了");
+    expect(interrupted).toContain("错误信息：The run ended");
+    expect(describeRequestFailure(new RequestStopped("cut off 3 times", "restart_limit"))).toContain("接连几次被意外打断");
     // 没有原因的同一段英文按普通报错处理。
-    expect(describeRequestFailure(new Error("The host stopped while the model was answering, on attempt 2"))).toContain("暂时无法确定原因");
+    expect(describeRequestFailure(new Error("The host stopped while the model was answering, on attempt 2"))).toContain("原因还不清楚");
   });
 
   test("认不出的失败保留原文并要求转给管理员", () => {
     const reply = describeRequestFailure(new Error("something went sideways"));
-    expect(reply).toContain("暂时无法确定原因");
-    expect(reply).toContain("原始错误：something went sideways");
+    expect(reply).toContain("原因还不清楚");
+    expect(reply).toContain("错误信息：something went sideways");
   });
 
   test("非 Error 抛出物也能生成回执", () => {
-    expect(describeRequestFailure("boom")).toContain("原始错误：boom");
+    expect(describeRequestFailure("boom")).toContain("错误信息：boom");
     expect(describeRequestFailure(undefined)).toContain("⚠️");
   });
 

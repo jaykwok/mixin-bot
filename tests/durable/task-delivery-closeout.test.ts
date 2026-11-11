@@ -106,7 +106,7 @@ test("model failure delivers only the registered immutable version, explanation 
     await f.service.admit(f.message("make a report"));
     await until(() => f.files().length === 1, "fallback file");
     expect(f.uploads).toEqual(["report.txt:original version"]);
-    const explanation = f.out.sent.findIndex(x => x.kind === "reply" && x.text.includes("未完成全部检查"));
+    const explanation = f.out.sent.findIndex(x => x.kind === "reply" && x.text.includes("没检查完的草稿"));
     expect(explanation).toBeGreaterThan(-1); expect(explanation).toBeLessThan(f.out.sent.findIndex(x => x.kind === "file"));
     expect(f.out.sent[explanation]!.text).not.toContain("已检查");
     // The explanation leads with the @ of the asker, like a reply.
@@ -127,7 +127,7 @@ test.each(["unregistered", "rejected", "incomplete"])("failure never auto sends 
     await until(() => f.out.sent.some(x => x.text.includes("Synthetic model error")), "failure explanation");
     expect(f.files()).toEqual([]);
     // A run that registered nothing is only told why it failed: a plain question is not steered towards files.
-    expect(f.out.sent.some(x => x.text.includes("没有可交付"))).toBe(kind !== "unregistered");
+    expect(f.out.sent.some(x => x.text.includes("没有可以发给你的文件"))).toBe(kind !== "unregistered");
   } finally { await f.service.close(); }
 });
 
@@ -146,9 +146,10 @@ test.each([false, true])("fallback prefers a checked version and falls back when
     await f.service.admit(f.message("make a report"));
     await until(() => f.files().length === 1, "selected version");
     expect(f.uploads).toEqual(["report.txt:" + (tampered ? "new unreviewed content" : "checked content")]);
-    const text = f.out.sent.find(x => x.text.includes("系统将交付"))!.text;
-    expect(text).toContain(tampered ? "未完成全部检查" : "正文数据与资料核对");
-    if (!tampered) expect(text).toContain("已检查版本");
+    const text = f.out.sent.find(x => x.text.includes("发给你："))!.text;
+    // The member reads which file and whether it is a draft; what the model noted as checked stays in the record.
+    expect(text.split("\n")).toContain(tampered ? "· 《report.txt》（草稿）" : "· 《report.txt》");
+    expect(text.includes("其中有没检查完的草稿")).toBe(tampered); expect(text).not.toContain("正文数据与资料核对");
   } finally { await f.service.close(); }
 });
 
@@ -199,7 +200,7 @@ test.each(["/stop", "/clear"])("%s wins over a registered draft and no fallback 
   try {
     await f.service.admit(f.message("make a report")); await started.promise;
     await f.service.control(f.message(command));
-    expect(f.out.sent.some(x => x.kind === "file" || x.text.includes("系统将交付"))).toBe(false);
+    expect(f.out.sent.some(x => x.kind === "file" || x.text.includes("发给你："))).toBe(false);
     expect(pendingDeliveries(await f.service.records(scopeOf(GROUP), PHONE))).toEqual([]);
   } finally { await f.service.close(); }
 });
@@ -483,7 +484,7 @@ test("a relay link of the run goes out once when the run then fails, and is not 
     await until(async () => (await f.record(service))?.delivery !== undefined && pendingDeliveries(await service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
     expect(f.files()).toEqual([]);
     expect(f.out.sent.filter(x => x.text.includes("relay.example/fresh"))).toHaveLength(1);
-    expect(f.out.sent.some(x => x.text.includes("下载链接随后发出"))).toBe(true);
+    expect(f.out.sent.some(x => x.text.includes("下载链接在后面"))).toBe(true);
     expect((await f.record(service))!.delivery!.parts.find(part => part.kind === "file")!.state).toBe("sent");
   } finally { await service.close(); await f.service.close(); }
 });
@@ -510,7 +511,7 @@ test.each(["sent", "uncertain"] as const)("a run that only sent a file (%s) and 
   try {
     await service.admit(f.message("send it"));
     await until(() => f.out.sent.some(x => x.kind === "reply"), "the reply");
-    expect(f.out.sent.filter(x => x.kind === "reply").map(x => x.text)).toEqual([expect.stringContaining("文件已发出")]);
+    expect(f.out.sent.filter(x => x.kind === "reply").map(x => x.text)).toEqual([expect.stringContaining("文件发给你了")]);
   } finally { await service.close(); await f.service.close(); }
 });
 
@@ -811,10 +812,10 @@ test("a file a document tool produced is saved as an unchecked draft: a run that
     await service.admit(f.message("make a plan"));
     await until(() => f.files().length === 2, "both saved drafts");
     expect([...f.uploads].sort()).toEqual(["方案.txt:version 5", "附件.txt:appendix"].sort());
-    const text = f.out.sent.find(x => x.text.includes("系统将交付"))!.text;
-    expect(text).toContain("系统将交付本任务已生成的文件：");
-    expect(text).toContain("· 《方案.txt》— 系统自动保存的生成结果，未经检查；文件结构完整。");
-    expect(text).toContain("这些文件没有经过检查，请核对后使用。");
+    const text = f.out.sent.find(x => x.text.includes("发给你："))!.text;
+    expect(text).toContain("先把已经生成的文件发给你：");
+    expect(text.split("\n")).toContain("· 《方案.txt》");
+    expect(text).toContain("这些文件还没有检查过，用之前请自己看一遍。");
     expect(text).not.toContain("模型登记"); expect(text).not.toContain("已登记的可用版本");
   } finally { await service.close(); await f.service.close(); }
 });
@@ -828,9 +829,9 @@ test("what the model registered decides the fallback: saved drafts of other name
     await until(() => f.files().length === 1, "the registered version");
     await until(async () => pendingDeliveries(await service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
     expect(f.uploads).toEqual(["report.txt:original version"]);
-    const text = f.out.sent.find(x => x.text.includes("系统将交付"))!.text;
-    expect(text).toContain("系统将交付本任务已登记的可用版本：");
-    expect(text).toContain("存在已知错误或不完整的版本，未作为交付候选。");
+    const text = f.out.sent.find(x => x.text.includes("发给你："))!.text;
+    expect(text).toContain("先把已经做好的版本发给你：");
+    expect(text).toContain("有的版本有错误或者不完整，没有发。");
     expect(text).not.toContain("初稿"); expect(text).not.toContain("错误.txt");
     // Every snapshot of the request goes once it is delivered, the saved drafts nothing sent included.
     await until(async () => await snapshots(f.temp) === 0, "snapshots released");
@@ -843,7 +844,7 @@ test("a saved draft the model then rejected is not delivered", async () => {
   try {
     await service.admit(f.message("make a report"));
     await until(() => f.out.sent.some(x => x.text.includes("Synthetic model error")), "failure explanation");
-    expect(f.out.sent.find(x => x.text.includes("Synthetic model error"))!.text).toContain("本任务没有可交付的已登记版本。");
+    expect(f.out.sent.find(x => x.text.includes("Synthetic model error"))!.text).toContain("这次没有可以发给你的文件。");
     expect(f.files()).toEqual([]);
   } finally { await service.close(); await f.service.close(); }
 });

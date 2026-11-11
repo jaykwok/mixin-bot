@@ -147,7 +147,7 @@ describe("durable service: sleeping tasks", () => {
     try {
       await service.admit(out.message(GROUP, ALICE, "会失败的问题"));
       await until(() => logs.some((line) => line.endsWith("阶段: 等待重试")), "the backoff");
-      expect(await service.control(out.message(GROUP, ALICE, "/stop"))).toContain("⏹ 已停止你在本群的当前任务");
+      expect(await service.control(out.message(GROUP, ALICE, "/stop"))).toContain("⏹ 已经停下：你在本群正在处理的任务");
       // Past the backoff: the stopped run sends nothing more.
       await Bun.sleep(1300);
       expect(faux.state.callCount).toBe(1);
@@ -240,7 +240,7 @@ describe("durable service: failed runs", () => {
       await opened.service.start();
       // The second cut-off attempt leaves no retry: the run ends without another request, and the member is told why.
       await until(() => failures(out.sent).length === 1, "the failure reply");
-      expect(failures(out.sent)[0]).toContain("机器人服务在模型回答途中意外停止");
+      expect(failures(out.sent)[0]).toContain("回答到一半时服务意外停了");
       expect(failures(out.sent)[0]).toContain("The host stopped while the model was answering, on attempt 2");
       const interrupted = opened.reports.filter((line) => line.includes("task_interrupted"));
       expect(interrupted).toHaveLength(1);

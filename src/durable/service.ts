@@ -89,12 +89,12 @@ import {
   pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
 } from "./records.ts";
 
-const lateNotice = (minutes: number) => `这条消息约 ${minutes} 分钟前发出，服务维护后才收到，正在处理。`;
-const queueFull = (limit: number) => `本会话已有 ${limit} 条消息排队，请稍后重发`;
-const ACKNOWLEDGED = "收到，正在处理，请稍候。处理时间较长时可以发送 /status 查看进度。";
+const lateNotice = (minutes: number) => `这条消息是大约 ${minutes} 分钟前发的，服务刚维护完才收到，现在开始处理。`;
+const queueFull = (limit: number) => `你已经有 ${limit} 条消息在排队，这条没有收下，请过一会儿再发。`;
+const ACKNOWLEDGED = "收到，正在处理。等得久的话可以发 /status 看进度。";
 /** How long a model request waits for a materials index scan before it goes ahead without it. */
 const MATERIALS_WAIT_MS = 3000;
-const CAPACITY_FULL = "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。";
+const CAPACITY_FULL = "⚠️ 现在处理不过来，这条消息没有收下，也不会自动处理，请过一会儿再发。";
 
 export interface ServiceLimits {
   /** Ordinary requests from admission through cleanup, including queued messages. */
@@ -491,7 +491,7 @@ export class DurableService {
           };
           // As when a /clear runs: an unbound attachment behind its admitted boundary is void; a /stop leaves it for the next message (a held one is not the request's).
           if (hold === undefined && receivedAt <= (member.clearBefore ?? -Infinity)) attachment.state = "void";
-          else if (downloads === undefined) Object.assign(attachment, { state: "rejected", error: "当前服务未开启附件接收" });
+          else if (downloads === undefined) Object.assign(attachment, { state: "rejected", error: "现在不接收附件" });
           records.attachments[attachment.id] = attachment;
           return { status: "added" as const, attachment: { ...attachment, reply: { ...attachment.reply } } };
         }, this.#context);
@@ -499,13 +499,13 @@ export class DurableService {
       this.#remember(reply.msgUid);
       if (outcome.status === "duplicate") return { status: "duplicate" };
       if (outcome.status === "full") {
-        return { status: "full", message: `未接收${attachmentLabel(event)}：你还有 ${limits.memberCount} 个附件尚未处理，请先发消息说明要怎么处理。` };
+        return { status: "full", message: `${attachmentLabel(event)}没有收下：你之前发的 ${limits.memberCount} 个附件还没处理，请先发消息告诉我怎么处理。` };
       }
       const { attachment } = outcome;
       if (attachment.state === "pending") {
         downloads!.schedule(space, phone, attachment.id);
-        if (hold === undefined) this.#track(this.#notify(reply, `已收到${attachmentLabel(attachment)}，请说明要怎么处理。`));
-      } else if (attachment.state === "rejected" && hold === undefined) this.#track(this.#notify(reply, `未接收${attachmentLabel(attachment)}：${attachment.error}。`));
+        if (hold === undefined) this.#track(this.#notify(reply, `${attachmentLabel(attachment)}收到了，想让我怎么处理？`));
+      } else if (attachment.state === "rejected" && hold === undefined) this.#track(this.#notify(reply, `${attachmentLabel(attachment)}没有收下：${attachment.error}。`));
       return { status: "accepted", attachment: attachment.id };
     } finally {
       member.uses--;
@@ -631,22 +631,22 @@ export class DurableService {
         const outcome = queued.submissionId !== undefined
           ? { status: "completed" as const, result: { submissionId: queued.submissionId, entryId: undefined } }
           : (await handle.harness.waitForTask(queued.taskId, this.#context)).state.outcome;
-        const library = scope.kind === "direct" ? "单聊库" : "群库";
+        const done = "📦 压缩好了：之前的对话已经整理成摘要，可以接着聊；聊天记录都还留着。";
         if (outcome.status !== "completed") {
-          reply = "⚠️ 本次会话压缩未完成，原会话仍保留；可用 /status 查看状态。";
+          reply = "⚠️ 这次压缩没有完成，之前的对话都还在；可以发 /status 看情况。";
         } else if (outcome.result.entryId !== undefined) {
           // A compaction owned by a generation places its entry in the task's terminal commit.
-          reply = `📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在${library}里。`;
+          reply = done;
         } else if (outcome.result.submissionId === undefined) {
-          reply = "📦 本次无需压缩，当前会话没有可压缩的历史。";
+          reply = "📦 这次不用压缩，还没有可以整理的对话。";
         } else {
           // Task completion only generated a summary. Placement is a separate durable submission.
           const summary = await handle.harness.submission(outcome.result.submissionId, this.#context);
           if (!summary) throw new Error("压缩摘要提交不存在，无法确认已写入会话");
           const placed = await summary.wait(this.#context);
           reply = placed.status === "done"
-            ? `📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在${library}里。`
-            : "⚠️ 压缩摘要未写入会话（已过期或取消），原会话仍保留；可用 /status 查看状态。";
+            ? done
+            : "⚠️ 这次压缩没有生效（过期或者被取消了），之前的对话都还在；可以发 /status 看情况。";
         }
         await this.#syncStats(handle.harness, member);
       } finally { handle.release(); }
@@ -725,7 +725,7 @@ export class DurableService {
           const delay = retryDelay(attempt);
           member.controlRetry = { attempt: attempt + 1, nextAt: Date.now() + delay, message: String(error) };
           this.#report(error);
-          if (attempt === 0 && reply) await this.#notify(reply, "控制操作暂未完成，将自动重试；完成前暂停本会话的新任务。可用 /status 查看。");
+          if (attempt === 0 && reply) await this.#notify(reply, "这个指令还没有执行完，会自动再试；完成之前先不处理你的新消息。可以发 /status 看情况。");
           await retryWait(delay, this.#closing.signal);
         }
       }
@@ -1070,7 +1070,7 @@ export class DurableService {
         : undefined;
       const text = textOf(answer), sent = record.files.some(file => fileSendOutcome(file) !== undefined);
       if (!text && !record.notes.length && !sent) failure = describeRequestFailure(new RequestStopped("Pi 未返回回复", "no_reply"));
-      else delivery = replyDelivery(record.reply, text || (record.notes.length ? "文件链接已生成。" : "文件已发出，没有收到的话请再说一声。"), record.notes, now);
+      else delivery = replyDelivery(record.reply, text || (record.notes.length ? "文件的下载链接在下面。" : "文件发给你了，没收到的话跟我说一声。"), record.notes, now);
     } else if (settled.status === "unanswered") {
       // Only the watchdog aborts an item that is not cancelled (a control commits the cancellation first). Its reason
       // does not survive a restart, when only the total deadline can still tell it.
@@ -1114,17 +1114,19 @@ export class DurableService {
     const sendOf = (sha256: string) => record.files.find(f => f.sha256 === sha256);
     const descriptions = candidates.map(x => {
       const file = sendOf(x.sha256), outcome = fileSendOutcome(file);
-      const status = outcome === "uncertain" ? "；该版本可能已发出" : outcome !== "sent" ? "" : file!.state === "sent" ? "；该版本已在任务中发出" : "；该版本的下载链接随后发出";
-      // A draft the service saved has no review to report: nobody looked at it.
-      if (x.auto) return `· 《${x.name}》— 系统自动保存的生成结果，未经检查；文件结构完整${status}。`;
-      return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
+      const status = outcome === "uncertain" ? "可能已经发给你了" : outcome !== "sent" ? "" : file!.state === "sent" ? "刚才已经发给你了" : "下载链接在后面";
+      // What a member needs per file: whether it is a draft, whether it already went out, and real known issues. What
+      // the model noted as checked and unchecked stays in the record (the console shows it). A draft the service
+      // saved has nothing more to say: the closing line tells that nobody looked at it.
+      const marks = [x.auto || x.status === "checked" ? "" : "草稿", status].filter(Boolean).join("，");
+      return `· 《${x.name}》${marks ? `（${marks}）` : ""}${!x.auto && x.issues.length ? `：已知问题有${x.issues.join("、")}` : ""}`;
     });
     const rejected = record.deliverables.some(x => x.status === "rejected" || !x.complete);
     // Nothing about deliverables when the run registered none: a plain question that failed is only told why.
     const saved = candidates.length > 0 && candidates.every(x => x.auto);
-    const text = [failure, saved ? "系统将交付本任务已生成的文件：" : candidates.length ? "系统将交付本任务已登记的可用版本：" : record.deliverables.length ? "本任务没有可交付的已登记版本。" : "",
-      ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
-      saved ? "这些文件没有经过检查，请核对后使用。" : candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
+    const text = [failure, saved ? "先把已经生成的文件发给你：" : candidates.length ? "先把已经做好的版本发给你：" : record.deliverables.length ? "这次没有可以发给你的文件。" : "",
+      ...descriptions, rejected ? "有的版本有错误或者不完整，没有发。" : "",
+      saved ? "这些文件还没有检查过，用之前请自己看一遍。" : candidates.some(x => x.status === "draft") ? "其中有没检查完的草稿，用之前请自己看一遍。" : ""].filter(Boolean).join("\n");
     const delivery = failureDelivery(record.reply, text, record.notes, now);
     candidates.forEach((x, index) => {
       delivery.parts.push({ id: `f${index}`, kind: "file", file: { name: x.name, path: x.path, size: x.size, sha256: x.sha256 },
@@ -1386,8 +1388,8 @@ export class DurableService {
   async #controlReceipt(member: MemberState, command: ControlCommand): Promise<string> {
     const here = member.scope.kind === "direct" ? "单聊" : "本群";
     return command === "/stop"
-      ? `⏹ 已停止你在${here}的当前任务，并取消排队中的消息。已发出的内容不会撤回。`
-      : `🧹 已为你在${here}开启新会话，下条消息从新会话开始，之前的聊天记录留在${member.scope.kind === "direct" ? "单聊库" : "群库"}里。其他人的聊天记录不受影响。`;
+      ? `⏹ 已经停下：你在${here}正在处理的任务和排队的消息都取消了。已经发出去的内容收不回来。`
+      : `🧹 好，你在${here}的对话从下一条消息起重新开始。之前的聊天记录还留着，别人的对话不受影响。`;
   }
 
   async #notify(reply: ReplyContext, text: string): Promise<void> {

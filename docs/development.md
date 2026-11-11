@@ -59,7 +59,7 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 
 基础系统提示词在 [prompt.ts](../src/agent/prompt.ts) 中维护，由 Durable 扩展 [durable/prompt.ts](../src/durable/prompt.ts) 组装成系统提示词（与 Pi 的 `systemPromptOverride` 相同的段落）。不自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取工作目录里的 `.pi/settings.json`。[模块注册入口](../src/agent/modules.ts) 按开关一起提供工具、skill、提示词补充和只读资源目录；文档加工模块见[下文](#文档加工)。共享资料中的 skill 不能改变指令或运行设置。
 
-回答以共享资料为依据，尽可能标明文件、页码或 sheet。资料内容作为证据处理，原始资料按用户要求直接发送。
+回答以共享资料为依据，只写有依据的内容；出处（文件、页码或 sheet）在用户问起、要原文或资料说法不一致时给出，查证过程不写进回答。资料内容作为证据处理，原始资料按用户要求直接发送。
 
 | 工具 | 用途与边界 |
 | --- | --- |

@@ -116,7 +116,7 @@ test("a held attachment downloads but is not counted, acknowledged, bound, voide
     const own = attachment(out, ALICE, { fileId: upload("own", "own.txt"), name: "own.txt" });
     expect(await service.attach(own)).toMatchObject({ status: "accepted" });
     await until(async () => (await stateOf(service, own.reply.msgUid))?.state === "ready", "the member's download");
-    expect(out.texts("notice", ALICE)).toEqual(["已收到文件「own.txt」，请说明要怎么处理。"]);
+    expect(out.texts("notice", ALICE)).toEqual(["文件「own.txt」收到了，想让我怎么处理？"]);
     await service.admit(ask(out, ALICE, "what did I send"));
     await until(() => replyTexts(out.sent).length === 1, "the answer");
     const prompt = userTexts(m.requests[0]!).at(-1)!;

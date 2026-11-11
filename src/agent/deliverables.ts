@@ -102,7 +102,7 @@ export function registerAutoDraft(record: RequestRecord, entry: Omit<Deliverable
   const all = record.deliverables;
   if (all.some(each => each.sha256 === entry.sha256)) return { dropped: [] };
   const added: Deliverable = { ...entry, id: randomUUID(), seq: nextSeq(all), at: now, auto: true,
-    status: "draft", checked: [], unchecked: ["系统自动保存的生成结果，未经检查"], issues: [] };
+    status: "draft", checked: [], unchecked: ["自动保存的版本，还没有检查过"], issues: [] };
   const slots = [...new Set(all.filter(each => each.auto && each.slot !== entry.slot).map(each => each.slot))]
     .sort((a, b) => nextSeq(all.filter(each => each.auto && each.slot === b)) - nextSeq(all.filter(each => each.auto && each.slot === a)));
   const kept = new Set(slots.slice(0, AUTO_DRAFT_SLOTS - 1));

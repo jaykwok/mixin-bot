@@ -1,7 +1,7 @@
 /** Single source of truth for command recognition and /help output. */
 export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
   ["/help", "查看本帮助"],
-  ["/clear", "开启新会话，之前的聊天记录仍保留在库里"],
+  ["/clear", "重新开始对话，之前的聊天记录还留着"],
   ["/stop", "停止你的当前任务，取消还在排队的消息"],
   ["/status", "查看处理进度、排队消息和正在运行的工具"],
   ["/compact", "压缩你在当前群或单聊的会话，保留聊天记录；会产生模型用量"],

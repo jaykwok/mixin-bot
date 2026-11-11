@@ -159,8 +159,8 @@ export class InboundRouter {
     const media = type === "image" || type === "file" || type === "video";
     const attachment = media && message.groupId === undefined ? attachmentEvent(type, message.content) : undefined;
     if (attachment === undefined) {
-      this.#notice(reply, !media ? "暂不支持该类型的消息，请发送文字。"
-        : message.groupId !== undefined ? "群里暂不支持接收图片、文件和视频，请在单聊中发送。" : "附件信息不完整，请重新发送。");
+      this.#notice(reply, !media ? "这种消息我还处理不了，请发文字。"
+        : message.groupId !== undefined ? "群里收不了图片、文件和视频，请在单聊里发给我。" : "附件没有收全，请再发一次。");
       return;
     }
     if (this.#options.push?.directAttachment(identity, reply, attachment)) { this.#remember(msgUid); return; }
@@ -174,7 +174,7 @@ export class InboundRouter {
     }, error => {
       if (this.#options.signal.aborted) { log.warn("服务关闭中，一个单聊附件未能登记"); return; }
       this.#report(error);
-      this.#notice(reply, "⚠️ 附件未能登记，请稍后重发。", false);
+      this.#notice(reply, "⚠️ 附件没有收下，请过一会儿再发。", false);
     }).finally(() => this.#inflight.delete(msgUid)));
   }
 
@@ -187,13 +187,13 @@ export class InboundRouter {
       return;
     }
     if (Buffer.byteLength(trimmed, "utf8") > MAX_CONTENT_LENGTH) {
-      this.#notice(reply, `消息过长（上限 ${MAX_CONTENT_LENGTH} 字节），请精简后重发。`);
+      this.#notice(reply, `消息太长了（最多 ${MAX_CONTENT_LENGTH} 字节），请缩短后再发。`);
       return;
     }
     const command = isSlashCommandMessage(trimmed) ? canonicalCommand(trimmed) : undefined;
     const late = lateMinutes(reply);
     if (command !== undefined && late !== undefined && STATEFUL.has(command)) {
-      this.#notice(reply, `这条命令是 ${late} 分钟前发的，已忽略，如仍需要请重发。`);
+      this.#notice(reply, `这条指令是 ${late} 分钟前发的，没有执行；还需要的话请再发一次。`);
       return;
     }
     const push = this.#options.push;
@@ -210,7 +210,7 @@ export class InboundRouter {
         // Shutdown closes the group under a waiting command; it stays in the stream and runs again at the next start.
         if (this.#options.signal.aborted) return;
         this.#report(error);
-        this.#notice(reply, "⚠️ 指令未能执行，请稍后重发。", false);
+        this.#notice(reply, "⚠️ 指令没有执行成功，请过一会儿再发。", false);
       }).finally(() => this.#inflight.delete(msgUid)));
       return;
     }
@@ -225,7 +225,7 @@ export class InboundRouter {
       // Sends are closed by then; the sender gets no notice, so leave a trace without the content.
       if (this.#options.signal.aborted) { log.warn(`服务关闭中，一条消息未能加入队列（${reply.kind === "group" ? "群" : "单聊"}）`); return; }
       this.#report(error);
-      this.#notice(reply, "⚠️ 消息未能加入队列，请稍后重发。", false);
+      this.#notice(reply, "⚠️ 这条消息没有收下，请过一会儿再发。", false);
     }).finally(() => this.#inflight.delete(msgUid)));
   }
 
