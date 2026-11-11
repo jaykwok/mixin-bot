@@ -185,6 +185,16 @@ describe("read channel against a running service", () => {
     }
   });
 
+  // The exit code is read out of Durable's diagnostic of the real bash tool (its wording is not a public contract): a
+  // release that words it differently fails here.
+  test("gives the exit code of a real command that ended with a non-zero one", async () => {
+    const DAVE = "13800000004";
+    await ask("direct", DAVE, "比较两个文件", [fauxAssistantMessage([fauxToolCall("bash", { command: "exit 3" })], { stopReason: "toolUse" }), fauxAssistantMessage("不一样。")]);
+    const dave = (await read<Members>({ op: "members", ...direct, after: 0, limit: 10 })).items.find(member => member.phone === DAVE)!;
+    const page = await read<q.EntryPage>({ op: "entries", ...direct, conversation: dave.conversationId, older: false, cursor: null, upper: null, limit: 200 });
+    expect(page.items.find(entry => entry.kind === "pi.tool-result")!.tool).toMatchObject({ name: "bash", isError: true, exitCode: 3 });
+  });
+
   test("looks names up in the directory cache, and nothing when there is no state database", async () => {
     const names = await read<{ found: { phone: string; name: string }[]; observedAt: number }>({ op: "names", phones: [ALICE, BOB] });
     expect(names.found.map(row => [row.phone, row.name])).toEqual([[ALICE, "张三"]]);
