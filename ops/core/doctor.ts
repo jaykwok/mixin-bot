@@ -2,6 +2,10 @@
 // ops.ps1 and the macOS entry alike. What only the host's own tools can tell (the container, the scheduled task, the
 // LaunchDaemon, whether the service answers, the model check under the service's identity) arrives as facts; the files and
 // the service's /health are read here. Read-only. Built-in modules only: the Linux host runs this without node_modules.
+//
+// The facts and the `lines` format are an interface between versions: after an upgrade from a terminal, the ops.sh still
+// in memory is the previous version's, and it runs this file of the new one for the check that closes the upgrade. A new
+// fact therefore needs a default, and an existing fact or line level keeps its meaning.
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";

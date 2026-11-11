@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ATTENTION_RECENT_MS, changeScope, departmentPath, departmentRow, describeAttention, describeDepartments, describeDirectory, describeScope,
   describeScopeChange, describeScopeState, directoryStatus, doctorRows, listDepartments, main, readScopePaths, readServiceStatus, scopeRows } from "../../ops/tools/directory-admin.ts";
 import { type DirectoryScope, parseScopeRequest, readDirectoryScope, sameScope, scopeChoiceHint, scopeDepartments, WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
@@ -87,6 +88,15 @@ test("status goes only to the recorded instance over the local control port", as
     const status = await readServiceStatus(undefined, file);
     expect(status).toEqual({ stream: { connected: true, reconnects: 2 }, directory: settled,
       attention: { deliveryAbandoned: { count: 1, lastAt: now, space: "单聊" } }, verificationOnly: false });
+    // `doctor` is not in the usage but still answers with the rows, tab-separated: the ops.sh of 2.0.0 calls it in the
+    // health check after an upgrade from a terminal, where that older script is the one still in memory.
+    await mkdir(join(fixture.root, "data", "state"), { recursive: true });
+    await writeFile(join(fixture.root, "data", "state", "instance.json"), JSON.stringify({ port: server.port, token, instanceId, pid: process.pid, startedAt }));
+    const legacy = Bun.spawn([process.execPath, "--no-env-file", fileURLToPath(new URL("../../ops/tools/directory-admin.ts", import.meta.url)), "doctor"],
+      { cwd: fixture.root, stdout: "pipe", stderr: "pipe" });
+    const printed = (await new Response(legacy.stdout).text()).trim().split("\n").map(line => line.trim().split("\t"));
+    expect({ code: await legacy.exited, names: printed.map(row => row[1]), stream: printed[0]![0] })
+      .toEqual({ code: 0, names: ["事件 Stream", "通讯录同步", "运行状况"], stream: "pass" });
     // Another instance on the port (a stale record) is refused before anything is sent.
     await writeFile(file, JSON.stringify({ port: server.port, token, instanceId: randomUUID(), pid: process.pid, startedAt }));
     await expect(readServiceStatus(undefined, file)).rejects.toThrow("不是当前实例");

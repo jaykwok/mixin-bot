@@ -3,6 +3,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { healthProgram, shortBuild, versionFacts, versionRows } from "../../ops/tools/version-info.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -47,6 +48,19 @@ test("a record without a program version or a damaged record is reported, not gu
   expect(legacy[0]).toEqual(["应用机器人", "未知：部署记录没有程序版本"]);
   const damaged = versionRows(versionFacts(await project("1.0.0", "{broken"), undefined, "x"));
   expect(damaged[0]![1]).toStartWith("未知：无法读取版本状态");
+});
+
+test("--health-stdin still prints the rows for the ops.sh of 2.0.0, which checks the new code with it after an upgrade", async () => {
+  const root = await project("2.0.0", deployed);
+  const run = async (health: string) => {
+    const child = Bun.spawn([process.execPath, "--no-env-file", fileURLToPath(new URL("../../ops/tools/version-info.ts", import.meta.url)), "--health-stdin"],
+      { cwd: root, stdin: new Blob([health]), stdout: "pipe", stderr: "pipe" });
+    const lines = (await new Response(child.stdout).text()).trim().split("\n").map(line => line.trim());
+    return { code: await child.exited, first: lines[0] };
+  };
+  expect(await run(JSON.stringify({ service: "mixin-bot", version: 1, appVersion: "2.1.0", build: "abc1234def5678" }))).toEqual({ code: 0, first: "应用机器人\tv2.1.0" });
+  // No running service (an empty body): the deployment record speaks, as in the rows above.
+  expect(await run("")).toEqual({ code: 0, first: "应用机器人\tv2.0.0（未运行，取自部署记录）" });
 });
 
 test("only a /health body with appVersion names a program; builds shorten to seven characters", () => {

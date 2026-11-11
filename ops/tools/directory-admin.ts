@@ -331,6 +331,12 @@ const USAGE = "用法：bun run ops/tools/directory-admin.ts status | scope [all
 export async function main(argv: readonly string[], terminal = Boolean(process.stdin.isTTY && process.stdout.isTTY)): Promise<number> {
   const [action = "status", ...rest] = argv;
   try {
+    // 不在用法里：2.0.0 及更早的 ops.sh 在体检时调用它。从终端升级时内存里还是旧脚本，升级后的体检由它对着新代码运行；
+    // 没有这个子命令，那一次体检会多出“无法读取服务状态”的警告。现在的体检在 ops/core/doctor.ts。
+    if (action === "doctor" && !rest.length) {
+      for (const row of doctorRows(await readServiceStatus())) console.log(row.replace(/[\r\n]/g, " "));
+      return 0;
+    }
     if (action === "status" && !rest.length) {
       const status = await readServiceStatus();
       console.log(`事件 Stream：${describeStream(status.stream, status.verificationOnly)}`);

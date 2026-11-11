@@ -108,3 +108,13 @@ export async function probeProgram(project: string, port: number): Promise<Progr
   } catch { return undefined; }
 }
 
+// `--health-stdin`: one tab-separated version row per line, the running program taken from the /health body on stdin.
+// The ops.sh of 2.0.0 and earlier calls this in its health check; in an upgrade from a terminal that script is still the
+// one in memory and checks the new code with it, and without this entry its version rows would be missing that once.
+// Today's health check is ops/core/doctor.ts.
+if (import.meta.main && process.argv.includes("--health-stdin")) {
+  let running: ProgramVersion | undefined;
+  try { running = healthProgram(JSON.parse(await Bun.stdin.text())); } catch { running = undefined; }
+  for (const [name, value] of versionRows(versionFacts(process.cwd(), running))) console.log(`${name}\t${value}`);
+}
+

@@ -156,6 +156,8 @@ esac
 const coreStub = `#!/usr/bin/env bash
 set -u
 [ "\${1:-}" != --version ] || { echo 1.4.4; exit 0; }
+# The health check after an upgrade runs on the host's Bun as well: the real core, on this fixture's project.
+case "\${2:-}" in */ops/core/doctor.ts) shift 2; exec "$FIXTURE_BUN" --no-env-file "$FIXTURE_DOCTOR" "$@" ;; esac
 mock="$FIXTURE_MOCK" work="$FIXTURE_WORK" pointer="$FIXTURE_WORK/data/state/deploy-transaction" entry="$2" args=("$@")
 value() {
     local index
@@ -314,6 +316,7 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
   // would see another project than the stub's container mounts. PWD pins the form the stubs use, for every entry.
   const env = (extra: Record<string, string> = {}) => ({ PATH: `${posix(bin)}:${process.env.PATH}`, PWD: posix(work), MIXIN_OPS_BUN: posix(join(bin, "fixture-core")),
     FIXTURE_EVENTS: posix(events), FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work),
+    FIXTURE_BUN: posix(process.execPath), FIXTURE_DOCTOR: posix(join(project, "ops/core/doctor.ts")),
     DOCKER_HOST: "unix:///var/run/docker.sock", BOT_TASK_DOCKER_HOST: `unix://${socket}`, "BASH_FUNC_df%%": dfFunction,
     // Socket ownership is part of the synthetic daemon's fixture, including root-operated UID 1000 scenarios.
     "BASH_FUNC_stat%%": `() { if [ "$*" = '-c %u -- ${socket}' ]; then if [ "\${FIXTURE_ROOTLESS:-$([ "$(id -u)" = 0 ] && echo 0 || echo 1)}" = 1 ]; then id -u; else printf '%s' "\${FIXTURE_TASK_UID:-1000}"; fi; else command stat "$@"; fi\n}`, ...extra });
