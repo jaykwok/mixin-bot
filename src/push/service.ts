@@ -204,6 +204,8 @@ const sameName = (a: string, b: string) => compactName(a) === compactName(b);
 const chars = (text: string) => [...text].length;
 const truncate = (text: string, max: number) => chars(text) > max ? [...text].slice(0, max).join("") + "…" : text;
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
+/** Text to go between 「 and 」 in a note: its own corner brackets become the double ones, so it cannot end the quotation. */
+const quoted = (text: string) => text.replaceAll("「", "『").replaceAll("」", "』");
 const NO_DEPARTMENT_GRANT = "你没有按部门推送的权限，请联系管理员在控制台授权";
 const NO_GROUP_GRANT = "你没有推送到群的权限，请联系管理员在控制台授权";
 const PREVIEW_GONE = "这张预览卡片对应的推送记录已清理，没有发出任何内容。确认发出一条推送后，在它之前准备、还没有确认的预览会一并清理；还需要的话请重新提出。";
@@ -1107,13 +1109,13 @@ export class PushService {
     const data = { push: push.id, event: "reply", revision: recipient.draft };
     if (group === undefined) {
       const text = replyText(items), files = items.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
-      this.#note(DIRECT_SCOPE, recipient.member, `reply:${push.id}:${recipient.draft}`, `[推送回复] 已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${push.subject}」：`
+      this.#note(DIRECT_SCOPE, recipient.member, `reply:${push.id}:${recipient.draft}`, `[推送回复] 已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${quoted(push.subject)}」：`
         + `${text ? truncate(oneLine(text), 500) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}。推送编号 ${push.id}`, data);
     } else {
       // Each sender's group conversation gets what they sent, never the others' texts.
       for (const sender of new Set(items.flatMap(item => item.sender ?? []))) {
         const own = items.filter(item => item.sender === sender).map(item => item.text ?? "").join("\n\n");
-        this.#note(groupScope(group), sender, `reply:${push.id}:${recipient.draft}`, `[推送回复] 本群已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${push.subject}」`
+        this.#note(groupScope(group), sender, `reply:${push.id}:${recipient.draft}`, `[推送回复] 本群已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${quoted(push.subject)}」`
           + `（${counts}），其中你发的：${truncate(oneLine(own), 500)}。推送编号 ${push.id}`, data);
       }
     }
@@ -1129,10 +1131,10 @@ export class PushService {
     const requestId = `abandon:${push.id}:${recipient.draft}`, data = { push: push.id, event: "abandon", revision: recipient.draft };
     const kept = recipient.submitted > 0 ? "修改，之前提交的回复仍然有效" : "";
     if (items.length && group === undefined) {
-      this.#note(DIRECT_SCOPE, recipient.member, requestId, `[推送回复] 放弃了这次对 ${push.pusherName} 推送的「${push.subject}」的回复${kept}。推送编号 ${push.id}`, data);
+      this.#note(DIRECT_SCOPE, recipient.member, requestId, `[推送回复] 放弃了这次对 ${push.pusherName} 推送的「${quoted(push.subject)}」的回复${kept}。推送编号 ${push.id}`, data);
     }
     for (const sender of group === undefined ? [] : new Set(items.flatMap(item => item.sender ?? []))) {
-      this.#note(groupScope(group!), sender, requestId, `[推送回复] 本群放弃了这次对 ${push.pusherName} 推送的「${push.subject}」的回复${kept}，你在其中发的内容不算回复。`
+      this.#note(groupScope(group!), sender, requestId, `[推送回复] 本群放弃了这次对 ${push.pusherName} 推送的「${quoted(push.subject)}」的回复${kept}，你在其中发的内容不算回复。`
         + `推送编号 ${push.id}`, data);
     }
   }
@@ -1263,11 +1265,15 @@ export class PushService {
     }
   }
 
-  /** The note of a card: in a recipient's direct conversation when it is sent, in a group member's when they next speak. */
+  /**
+   * The note of a card: in a recipient's direct conversation when it is sent, in a group member's when they next speak.
+   * The body is another person's text entering this member's conversation as a user message, so it is marked as a
+   * quotation (the system prompt says quoted push text is no instruction) and cannot close the marks itself.
+   */
   #cardNote(push: Push, scope: Scope, phone: string): void {
     const now = this.#now(), group = scope.kind === "group";
-    this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${push.subject}」：`
-      + `${truncate(oneLine(push.body), 500)}${chars(push.body) > 500 ? "（全文见卡片）" : ""}；要求：${group && push.mode === "reply" ? "需要回复（群里只能回复文字）" : requirementText(push)}；`
+    this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」，正文（引用）：`
+      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}；要求：${group && push.mode === "reply" ? "需要回复（群里只能回复文字）" : requirementText(push)}；`
       + `截止 ${shortTime(push.deadline, now)}。${push.mode !== "reply" ? "" : group ? "回复请先点卡片上的「回复」，再 @机器人 发送文字。" : "回复请点卡片上的「回复」。"}推送编号 ${push.id}`,
     { push: push.id, event: "card" });
   }
@@ -1408,7 +1414,7 @@ export class PushService {
     const failed = recipients.filter(recipient => recipient.sendState === "failed").length;
     log.info(`推送 ${pushId} 已发出：${recipients.length - failed} 张，失败 ${failed} 张`);
     const cc = push.cc.length ? `，抄送 ${push.cc.map(person => person.name).join("、")}` : "";
-    this.#note(DIRECT_SCOPE, push.pusher, `sent:${pushId}`, `[推送已发出]「${push.subject}」${shortTime(push.confirmedAt!, this.#now())} 发出，`
+    this.#note(DIRECT_SCOPE, push.pusher, `sent:${pushId}`, `[推送已发出]「${quoted(push.subject)}」${shortTime(push.confirmedAt!, this.#now())} 发出，`
       + `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed} 个）` : ""}${cc}；要求：${requirementText(push)}；截止 ${shortTime(push.deadline, this.#now())}。推送编号 ${pushId}`,
     { push: pushId, event: "sent" });
     this.#refreshPreview(pushId);
@@ -1540,8 +1546,8 @@ export class PushService {
         }
         this.#store.updatePush(pushId, { summaryDone: [...this.#store.push(pushId)!.summaryDone.filter(done => !done.startsWith(`${person.phone}|`)), person.phone] });
         this.#note(DIRECT_SCOPE, person.phone, `summary:${push.id}`, cc
-          ? `[推送汇总抄送] ${push.pusherName} 推送的「${push.subject}」：${tally}，汇总包已发出。推送编号 ${push.id}`
-          : `[推送汇总]「${push.subject}」：${tally}，汇总包已发出。推送编号 ${push.id}`, { push: push.id, event: cc ? "summary-cc" : "summary" });
+          ? `[推送汇总抄送] ${push.pusherName} 推送的「${quoted(push.subject)}」：${tally}，汇总包已发出。推送编号 ${push.id}`
+          : `[推送汇总]「${quoted(push.subject)}」：${tally}，汇总包已发出。推送编号 ${push.id}`, { push: push.id, event: cc ? "summary-cc" : "summary" });
       }
       if (failures.length) {
         // The log names no one.
