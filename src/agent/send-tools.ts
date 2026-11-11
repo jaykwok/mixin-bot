@@ -191,6 +191,11 @@ export interface SendToolsOptions {
   /** 外链地址交给运行时持久化并并入最终交付。 */
   notes: OutboundNotes;
   fileDelivery?: (source: ResolvedSource, name: string, signal: AbortSignal | undefined, send: (source: ResolvedSource, beforeSend: () => void) => Promise<FileTransfer>) => Promise<FileTransfer>;
+  /**
+   * The snapshot of a deliverable the running request registered, by the name send_file was given: its best version.
+   * Rejects with the registered names when the name matches none. Absent where nothing is registered (no closeout).
+   */
+  deliverable?: (name: string) => Promise<{ path: string; name: string }>;
 }
 
 export type FileTransfer = { mode: "direct"; alreadySent?: boolean } |
@@ -222,8 +227,9 @@ const imageParams = obj({
   height: opt(num({ description: "高度（像素，可选；默认从图片读取）" })),
 }, { open: true });
 const fileParams = obj({
-  source: str({ description: "文件来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径" }),
-  filename: opt(str({ description: "文件名（可选，默认从 source 推断）" })),
+  source: opt(str({ description: "文件来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径。与 deliverable 二选一" })),
+  deliverable: opt(str({ description: "已登记交付物的名称（deliverable_register 结果里的 slot）：发送它当前最好的版本，已检查的优先，其次最新的。与 source 二选一" })),
+  filename: opt(str({ description: "文件名（可选，默认用原文件名）" })),
 }, { open: true });
 
 /** What one call sends with: everything but the relay, which is fixed per registry. */
@@ -283,7 +289,7 @@ export function sendTools(relay: RelayConfig | null | undefined, context: (membe
   const sendFileTool: MemberToolSpec<typeof fileParams> = {
     name: "send_file",
     description:
-      "向当前会话（提问所在的群或单聊）发送一个文件。source 为 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。" +
+      "向当前会话（提问所在的群或单聊）发送一个文件。登记过的交付物用 deliverable 填登记名称；其他文件用 source 填 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。" +
       "图片默认用 send_image 在聊天里显示，用户明确要文件形式时才用本工具发图片。" +
       relayNote,
     callers: SEND_CALLERS,
@@ -292,8 +298,17 @@ export function sendTools(relay: RelayConfig | null | undefined, context: (membe
     async run(params, member, call) {
       const { signal } = call;
       const options = { ...await context(member, call), relay };
-      const resolved = await resolveSource(params.source, options.workspaceDir, options.tempDir, signal);
-      const name = sanitizeFilename(params.filename ?? filenameFromSource(params.source));
+      const named = params.deliverable?.trim(), given = params.source?.trim();
+      const one = "source 和 deliverable 填其中一个：登记过的交付物填 deliverable（登记名称），其他文件填 source（路径或 URL）";
+      if (!named && !given) throw new Error(one);
+      if (named && !options.deliverable) throw new Error("当前没有登记交付物的功能，请用 source 填文件路径");
+      const registered = named ? await options.deliverable!(named) : undefined;
+      // Both filled in: fine when the source is the registered deliverable's own file (models tend to fill every
+      // parameter); two different files are not guessed between.
+      if (registered && given && !await options.deliverable!(given).then(same => same.path === registered.path, () => false)) throw new Error(one);
+      const origin = registered?.path ?? given!;
+      const resolved = await resolveSource(origin, options.workspaceDir, options.tempDir, signal);
+      const name = sanitizeFilename(params.filename ?? registered?.name ?? filenameFromSource(origin));
 
       const send = (source: ResolvedSource, beforeSend: () => void) => transferFile(source, name, options, signal, beforeSend);
       const result = options.fileDelivery ? await options.fileDelivery(resolved, name, signal, send) : await send(resolved, () => {});

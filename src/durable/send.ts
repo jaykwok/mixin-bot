@@ -13,7 +13,8 @@ import { type BaseToolsOptions, type Member, type MemberCall, memberTool, type M
 import { fileDelivery } from "./file-delivery.ts";
 import { activeRequest } from "./closeout.ts";
 import { type Outbound, sendFileMessage, sendImageMessage } from "./outbound.ts";
-import { recordsOf, type ReplyContext } from "./records.ts";
+import { memberRecords, recordsOf, type ReplyContext } from "./records.ts";
+import { deliverableNamed, slotVersions } from "../agent/deliverables.ts";
 
 export interface SendToolsOptions extends Pick<BaseToolsOptions, "layout" | "scope" | "venvDir"> {
   /** The large-file relay, or null when none is configured. Fixed per registry: it also shapes send_file's description. */
@@ -50,6 +51,14 @@ async function sendContext(options: SendToolsOptions, member: Member, call: Memb
     workspaceDir: member.places.workspaceDir,
     tempDir: member.places.tempDir,
     fileDelivery: fileDelivery(member, call, active, options.relay?.maxBytes),
+    // From the record as it is now, not as it was when the context was built: a registration earlier in this turn counts.
+    deliverable: async name => {
+      const record = (await memberRecords(call.api, active.phone, call.context)).requests[active.requestId];
+      const versions = record && deliverableNamed(record, name);
+      if (versions) return { path: versions[0]!.path, name: versions[0]!.name };
+      const names = record ? slotVersions(record).map(each => `“${each[0]!.slot}”`) : [];
+      throw new Error(`没有名为“${name}”的可发送交付物；${names.length ? `已登记：${names.join("、")}` : "本任务还没有登记或自动保存的交付物"}。没有登记的文件用 source 填路径`);
+    },
     notes: {
       add: note => call.api.commit(async tx => {
         const record = (await recordsOf(tx, active.phone)).requests[active.requestId];

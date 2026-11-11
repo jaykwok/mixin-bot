@@ -392,7 +392,7 @@ export type RequestView = {
   delivery: { kind: string; abandoned: boolean; abandonedReason?: string;
     parts: { id: string; kind: string; state: string; attempts: number; retryAt?: number; error?: string; at?: number }[] } | null;
   files: { name: string; state: string; size: number; mode: string; error?: string }[];
-  deliverables: { name: string; status: string; size: number; complete: boolean }[];
+  deliverables: { name: string; status: string; size: number; complete: boolean; auto?: true }[];
 };
 
 /** Run records of one member that are still kept (closed ones are pruned after a day), with their submissions. */
@@ -422,7 +422,7 @@ export function requests(db: Database, phone: string, conversationId: number, li
       files: ((record.files ?? []) as Record<string, unknown>[]).map(file => ({ name: String(file.name ?? ""), state: String(file.state ?? ""), size: num(file.size) ?? 0,
         mode: String(file.mode ?? ""), ...(typeof file.error === "string" ? { error: file.error.slice(0, 2_000) } : {}) })),
       deliverables: ((record.deliverables ?? []) as Record<string, unknown>[]).map(item => ({ name: String(item.name ?? ""), status: String(item.status ?? ""),
-        size: num(item.size) ?? 0, complete: item.complete === true })),
+        size: num(item.size) ?? 0, complete: item.complete === true, ...(item.auto === true ? { auto: true as const } : {}) })),
     };
   });
   return { items, revisions, total: records.length };

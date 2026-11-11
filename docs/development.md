@@ -74,7 +74,7 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 | `document_build` | 用 Markdown 在模板的母版、版式与样式上整份生成 Word 或 PPT |
 | `document_images` | 从 PDF/PPTX/DOCX 提取内嵌图片或按区域截取渲染页，作为 Markdown 图片素材 |
 | `document_render` | 将 DOCX/PPTX/PDF 渲染为逐页图片及联系表；Office 需要 LibreOffice |
-| `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
+| `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则，`send_file` 还可按登记名称发送交付物 |
 | `codemode` | 在沙箱里运行模型写的 JavaScript，并行或按依赖顺序调用其他工具，只把筛选后的结果交给模型 |
 
 基础四工具由 `@earendil-works/pi-durable/tools` 原生注册；每次调用从持久身份解析成员并创建独立的 `ExecutionEnv`（`src/durable/member-env.ts`），不共享可变 cwd。`read` 使用 bounded BinaryReader 和官方 Photon 图片处理；bash 的结构化结果使用 `exitCode` / `fullOutputPath`，诊断由 Durable 统一呈现。

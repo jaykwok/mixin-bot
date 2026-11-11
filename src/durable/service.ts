@@ -46,7 +46,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { canonicalCommand, HELP_TEXT, unknownCommandText } from "../agent/commands.ts";
 import { clearRunning, markRunning } from "./running-requests.ts";
-import { deleteSnapshots, fileDigest, releasableSnapshots, slotVersions } from "../agent/deliverables.ts";
+import { deleteSnapshots, fallbackSlots, fileDigest, releasableSnapshots } from "../agent/deliverables.ts";
 import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming, type RecordWriter } from "./closeout.ts";
 import { describeRequestFailure, modelRequestError, RequestStopped } from "../agent/failure.ts";
@@ -1115,13 +1115,16 @@ export class DurableService {
     const descriptions = candidates.map(x => {
       const file = sendOf(x.sha256), outcome = fileSendOutcome(file);
       const status = outcome === "uncertain" ? "；该版本可能已发出" : outcome !== "sent" ? "" : file!.state === "sent" ? "；该版本已在任务中发出" : "；该版本的下载链接随后发出";
+      // A draft the service saved has no review to report: nobody looked at it.
+      if (x.auto) return `· 《${x.name}》— 系统自动保存的生成结果，未经检查；文件结构完整${status}。`;
       return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
     });
     const rejected = record.deliverables.some(x => x.status === "rejected" || !x.complete);
     // Nothing about deliverables when the run registered none: a plain question that failed is only told why.
-    const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : record.deliverables.length ? "本任务没有可交付的已登记版本。" : "",
+    const saved = candidates.length > 0 && candidates.every(x => x.auto);
+    const text = [failure, saved ? "系统将交付本任务已生成的文件：" : candidates.length ? "系统将交付本任务已登记的可用版本：" : record.deliverables.length ? "本任务没有可交付的已登记版本。" : "",
       ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
-      candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
+      saved ? "这些文件没有经过检查，请核对后使用。" : candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
     const delivery = failureDelivery(record.reply, text, record.notes, now);
     candidates.forEach((x, index) => {
       delivery.parts.push({ id: `f${index}`, kind: "file", file: { name: x.name, path: x.path, size: x.size, sha256: x.sha256 },
@@ -1135,7 +1138,7 @@ export class DurableService {
   /** Per slot the best version whose snapshot still matches. */
   async #validCandidates(record: Readonly<RequestRecord>): Promise<RequestRecord["deliverables"]> {
     const selected: RequestRecord["deliverables"] = [];
-    for (const versions of slotVersions(record)) {
+    for (const versions of fallbackSlots(record)) {
       for (const version of versions) {
         try { if (await fileDigest(version.path, this.#closing.signal) === version.sha256) { selected.push(version); break; } }
         catch { this.#closing.signal.throwIfAborted(); }
@@ -1590,7 +1593,7 @@ export class DurableService {
     const registry = createRegistry();
     const install = (extension: Extension) => registry.install(door.wrapTools(extension));
     if (this.#options.closeout) install(closeoutExtension(write, this.#options.closeout, this.#limits.runTimeoutMs,
-      (phone, requestId) => memberPlaces(this.#placesOptions(), scope, phone, requestId).requestDir!));
+      (phone, requestId) => memberPlaces(this.#placesOptions(), scope, phone, requestId)));
     if (this.#options.materials !== false) install(this.#materials());
     for (const extension of spaceExtensions({
       ...this.#placesOptions(), scope,

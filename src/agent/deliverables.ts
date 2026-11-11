@@ -1,10 +1,10 @@
 import { constants } from "node:fs";
 import { copyFile, mkdir, open, stat, unlink, realpath, lstat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { isPathInside } from "../contracts/paths.ts";
 import { SNAPSHOT_DIRECTORY } from "./tool-path.ts";
-import { type Deliverable, openPart, type RequestRecord } from "../durable/records.ts";
+import { type Deliverable, fileSendOutcome, openPart, type RequestRecord } from "../durable/records.ts";
 
 /** Streaming, abortable digest: large relay files do not occupy the JavaScript heap. */
 export async function fileDigest(path: string, signal?: AbortSignal, maxBytes = Number.MAX_SAFE_INTEGER): Promise<string> {
@@ -77,17 +77,45 @@ export async function completeFile(path: string, format: string): Promise<boolea
   } catch { return false; } finally { await f.close(); }
 }
 
-/** At most 3 deliverables (slots) and 8 versions per request. */
-export function registerDeliverable(record: RequestRecord, entry: Omit<Deliverable, "id" | "seq" | "at">, now = Date.now()): Deliverable {
-  const previous = record.deliverables;
-  if (previous.length >= 8) throw new Error("本任务最多登记 8 个版本，请发送已登记的最佳版本");
-  if (!previous.some(each => each.slot === entry.slot) && new Set(previous.map(each => each.slot)).size >= 3) throw new Error("本任务最多登记 3 个交付物");
-  const next: Deliverable = { ...entry, id: randomUUID(), seq: previous.length + 1, at: now };
+const nextSeq = (all: readonly Deliverable[]) => all.reduce((max, each) => Math.max(max, each.seq), 0) + 1;
+
+/** At most 3 deliverables (slots) and 8 versions per request, counting what the model registered. */
+export function registerDeliverable(record: RequestRecord, entry: Omit<Deliverable, "id" | "seq" | "at" | "auto">, now = Date.now()): Deliverable {
+  const previous = record.deliverables, own = previous.filter(each => !each.auto);
+  if (own.length >= 8) throw new Error("本任务最多登记 8 个版本，请发送已登记的最佳版本");
+  if (!own.some(each => each.slot === entry.slot) && new Set(own.map(each => each.slot)).size >= 3) throw new Error("本任务最多登记 3 个交付物");
+  const next: Deliverable = { ...entry, id: randomUUID(), seq: nextSeq(previous), at: now };
   previous.push(next);
   return next;
 }
 
-/** The complete, not rejected versions of every slot that has any, best first: checked before draft, newest first. */
+/** Slots that keep a service-saved draft; older ones give way. */
+export const AUTO_DRAFT_SLOTS = 3;
+
+/**
+ * A file a document tool produced, saved as an unchecked draft without the model asking: the newest per slot, in at most
+ * `AUTO_DRAFT_SLOTS` slots, outside the model's limits. Nothing is added when these bytes are registered already.
+ * `dropped` are the snapshots of the drafts this one replaced that nothing in the record refers to any more.
+ */
+export function registerAutoDraft(record: RequestRecord, entry: Omit<Deliverable, "id" | "seq" | "at" | "auto" | "status" | "checked" | "unchecked" | "issues">,
+  now = Date.now()): { added?: Deliverable; dropped: string[] } {
+  const all = record.deliverables;
+  if (all.some(each => each.sha256 === entry.sha256)) return { dropped: [] };
+  const added: Deliverable = { ...entry, id: randomUUID(), seq: nextSeq(all), at: now, auto: true,
+    status: "draft", checked: [], unchecked: ["系统自动保存的生成结果，未经检查"], issues: [] };
+  const slots = [...new Set(all.filter(each => each.auto && each.slot !== entry.slot).map(each => each.slot))]
+    .sort((a, b) => nextSeq(all.filter(each => each.auto && each.slot === b)) - nextSeq(all.filter(each => each.auto && each.slot === a)));
+  const kept = new Set(slots.slice(0, AUTO_DRAFT_SLOTS - 1));
+  const removed = all.filter(each => each.auto && !kept.has(each.slot));
+  record.deliverables = [...all.filter(each => !removed.includes(each)), added];
+  const used = new Set([...record.deliverables.map(each => each.path), ...record.files.map(each => each.path)]);
+  return { added, dropped: [...new Set(removed.map(each => each.path))].filter(path => !used.has(path)) };
+}
+
+/**
+ * The complete, not rejected versions of every slot that has any, best first: checked before draft, newest first. A
+ * service-saved draft competes like any draft in its slot.
+ */
 export function slotVersions(record: Pick<RequestRecord, "deliverables">): Deliverable[][] {
   const all = record.deliverables, rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
   return [...new Set(all.map(x => x.slot))].flatMap(slot => {
@@ -97,9 +125,38 @@ export function slotVersions(record: Pick<RequestRecord, "deliverables">): Deliv
   });
 }
 
-/** The best version of every slot. */
+/**
+ * The slots the fallback delivers, with their versions best first. What the model registered says what the deliverables
+ * are, so slots holding only service-saved drafts (intermediate files, mostly) are left out then; when the model
+ * registered nothing it can send, the saved drafts are all there is.
+ */
+export function fallbackSlots(record: Pick<RequestRecord, "deliverables" | "files">): Deliverable[][] {
+  const slots = slotVersions(record), own = slots.filter(versions => versions.some(version => !version.auto));
+  if (own.length) return own;
+  // A saved draft older than the last file the run itself sent was a step on the way to that file, unless it is that file.
+  const sends = record.files.filter(file => fileSendOutcome(file) !== undefined);
+  const last = sends.reduce((at, file) => Math.max(at, file.at), -Infinity), sent = new Set(sends.map(file => file.sha256));
+  return slots.filter(versions => versions[0]!.at > last || sent.has(versions[0]!.sha256));
+}
+
+/** The best version of every slot the model registered a sendable version in: what it is reminded to send. */
 export function deliverableCandidates(record: Pick<RequestRecord, "deliverables">): Deliverable[] {
-  return slotVersions(record).map(versions => versions[0]!);
+  return slotVersions(record).filter(versions => versions.some(version => !version.auto)).map(versions => versions[0]!);
+}
+
+/**
+ * The registered deliverable a name stands for, with its versions best first: the slot as registered, or the name with or
+ * without the file's extension, in any letter case; a path stands for its last segment. Undefined when no slot or more
+ * than one matches.
+ */
+export function deliverableNamed(record: Pick<RequestRecord, "deliverables">, name: string): Deliverable[] | undefined {
+  const slots = slotVersions(record), wanted = name.trim();
+  const exact = slots.filter(versions => versions[0]!.slot === wanted);
+  if (exact.length === 1) return exact[0];
+  const fold = (value: string) => value.toLocaleLowerCase(), given = new Set([wanted, wanted.split(/[\\/]/).at(-1)!].map(fold));
+  const loose = slots.filter(versions => versions.some(version => [version.slot, version.name, basename(version.name, extname(version.name))]
+    .some(each => given.has(fold(each)))));
+  return loose.length === 1 ? loose[0] : undefined;
 }
 
 /** Snapshots of a closed request that no delivery part still to be sent needs. */

@@ -4,13 +4,14 @@ import { defineExtension, type DocumentReader, GenerationTask, ToolTask, hook, t
 import { arr, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import { basename, extname } from "node:path";
 import { unlink } from "node:fs/promises";
-import { completeFile, deliverableCandidates, freezeFile, registerDeliverable } from "../agent/deliverables.ts";
+import { completeFile, deleteSnapshots, deliverableCandidates, freezeFile, registerAutoDraft, registerDeliverable } from "../agent/deliverables.ts";
 import { BASH_DEFAULT_TIMEOUT, NATIVE_FILE_MAX_BYTES } from "../core/config.ts";
 import { resolveSource } from "../agent/send-tools.ts";
 import { IdentityDoc } from "./identity.ts";
 import { InboxDoc } from "./inbox.ts";
 import { fileSendOutcome, memberRecords, recordsOf, type RequestRecord } from "./records.ts";
-import { memberTool, type BaseToolsOptions, type MemberToolSpec } from "./tools.ts";
+import { memberTool, type BaseToolsOptions, type MemberPlaces, type MemberToolSpec } from "./tools.ts";
+import { log } from "../core/log.ts";
 
 export interface CloseoutTiming { closeoutMs: number; reserveMs: number; fallbackMs: number }
 export function validateCloseout(timing: CloseoutTiming, runTimeoutMs: number): void {
@@ -77,7 +78,7 @@ export function localTime(now: number): string {
  * history; the system prompt stays the same for every member and request.
  */
 export function closeoutExtension(write: RecordWriter, timing: CloseoutTiming, runTimeoutMs: number,
-  requestTmp?: (phone: string, requestId: string) => string) {
+  places?: (phone: string, requestId: string) => MemberPlaces) {
   return defineExtension({ name: "mixin.clock", hooks: [
     hook(GenerationTask, {
       async beforeRequest(request, api, context) {
@@ -90,14 +91,16 @@ export function closeoutExtension(write: RecordWriter, timing: CloseoutTiming, r
         const counts = [versions ? `本任务已生成文档 ${versions} 版` : "", registered.length ? `已登记交付物 ${registered.length} 个` : "", sent ? `已发送 ${sent} 个` : ""]
           .filter(Boolean).map(part => "；" + part).join("");
         const text = `[任务计时] 剩余 ${Math.floor(seconds / 60)}分${seconds % 60}秒；阶段：${stage}；现在是 ${localTime(now)}${counts}。${direction}${versions >= 4 ? "除修正事实错误外不要再重建。" : ""}`
-          + (requestTmp ? `\n[临时目录] ${requestTmp(item.phone, item.requestId).replace(/\\/g, "/")}` : "");
+          + (places ? `\n[临时目录] ${places(item.phone, item.requestId).requestDir!.replace(/\\/g, "/")}` : "");
         return { messages: appendTiming(request.messages, text, now) };
       },
       async onYield(_answer, api, context) {
         const item = await activeRequest(api, context); if (!item) return;
         if (item.record.events.delivery_reminder) return;
-        const sends = item.record.files;
-        const missing = deliverableCandidates(item.record).filter(x => !sends.some(s => s.sha256 === x.sha256 && fileSendOutcome(s) !== undefined));
+        // A deliverable is taken care of once any version of it went out: the model may have sent a newer build of the
+        // same name (saved by the service) than the one it registered.
+        const sent = new Set(item.record.files.filter(s => fileSendOutcome(s) !== undefined).map(s => s.sha256));
+        const missing = deliverableCandidates(item.record).filter(x => !item.record.deliverables.some(each => each.slot === x.slot && sent.has(each.sha256)));
         if (!missing.length) return;
         await write(item.phone, item.requestId, record => { record.events.delivery_reminder ??= { name: "delivery_reminder", at: Date.now() }; });
         return { continue: `你登记了 ${missing.map(x => `《${x.name}》`).join("、")} 但尚未发送；请立即发送。如果不需要发送，请在回复中说明原因。` };
@@ -106,12 +109,39 @@ export function closeoutExtension(write: RecordWriter, timing: CloseoutTiming, r
     hook(ToolTask, { async afterTool(call, result, api, context) {
       if (result.isError || !["document_build", "document_compose", "document_patch", "document_render"].includes(call.name)) return;
       const item = await activeRequest(api, context); if (!item) return;
-      const output = result.structuredOutput ?? result.details;
-      const digest = output && typeof output === "object" && "digest" in output && typeof output.digest === "string" ? output.digest : undefined;
+      const output = (result.structuredOutput ?? result.details) as Record<string, unknown> | undefined;
+      const field = (name: string) => output && typeof output === "object" && typeof output[name] === "string" ? output[name] as string : undefined;
+      const digest = field("digest"), produced = field("output");
       await write(item.phone, item.requestId, record => { record.events[`${api.taskId}/${call.id}`] ??= { name: call.name, ...(digest ? { digest } : {}), at: Date.now() }; });
+      if (places && produced && digest && DOCUMENT_TOOLS.includes(call.name)) {
+        // The file is the tool's result either way: a draft that could not be saved only loses the fallback for it.
+        await saveDraft(write, item, places(item.phone, item.requestId), produced, digest, context.abortSignal)
+          .catch(error => log.warn(`生成结果未能自动保存为草稿：${error instanceof Error ? error.message : String(error)}`));
+      }
       return undefined;
     } }),
   ] });
+}
+
+/**
+ * Keep what a document tool just produced as an unchecked draft of the request, so that a run that ends without the model
+ * registering anything still has something to deliver. The copy is made before the record names it.
+ */
+async function saveDraft(write: RecordWriter, item: { phone: string; requestId: string; record: Readonly<RequestRecord> }, places: MemberPlaces,
+  output: string, digest: string, signal?: AbortSignal): Promise<void> {
+  if (item.record.deliverables.some(each => each.sha256 === digest)) return;
+  const source = await resolveSource(output, places.workspaceDir, places.tempDir, signal);
+  if (source.kind !== "local" || source.size > NATIVE_FILE_MAX_BYTES) return;
+  const frozen = await freezeFile(source.path, places.tempDir, item.requestId, NATIVE_FILE_MAX_BYTES, signal, digest);
+  let outcome: ReturnType<typeof registerAutoDraft> | undefined;
+  try {
+    const complete = await completeFile(frozen.path, extname(frozen.name).slice(1).toLowerCase());
+    await write(item.phone, item.requestId, record => {
+      outcome = registerAutoDraft(record, { ...frozen, slot: basename(frozen.name, extname(frozen.name)), complete });
+    });
+  } finally {
+    await deleteSnapshots([...(outcome?.added ? [] : [frozen.path]), ...(outcome?.dropped ?? [])], places.tempDir).catch(() => {});
+  }
 }
 
 const registerParams = obj({
@@ -121,11 +151,14 @@ const registerParams = obj({
   unchecked: arr(str({ maxLength: 300 }), { maxItems: 10 }),
   issues: arr(str({ maxLength: 300 }), { maxItems: 10 }),
 }, { open: true });
-/** deliverable_register (model-only): an immutable copy of a generated file, for the closeout fallback to send. */
+/** What the service adds to `unchecked` when a Word or PowerPoint version is registered as checked without a rendering of it. */
+export const UNRENDERED = "版式（这个版本没有渲染看图的记录）";
+
+/** deliverable_register (model-only): an immutable copy of a generated file, for send_file and the closeout fallback. */
 export function deliverableTool(options: BaseToolsOptions, maxBytes = NATIVE_FILE_MAX_BYTES) {
   const spec: MemberToolSpec<typeof registerParams> = {
     name: "deliverable_register", callers: ["model"],
-    description: "登记生成文件的不可变副本，供失败时自动交付。先登记再美化；检查后再登记 checked。图片、参数、事实错误必须标记 rejected；draft 只允许外观问题或尚未检查。每任务最多 3 个交付物、8 个版本。登记不等于发送，也不证明内容已核对。",
+    description: "登记文件的不可变副本并说明检查情况，供 send_file 按名称发送和失败时自动交付。document_build、document_compose、document_patch 的结果已由系统自动保存为未检查草稿，不必登记 draft；检查后登记 checked，写明查了什么、没查什么。其他方式生成的文件需要失败时自动交付的，登记 draft。图片、参数、事实错误必须登记 rejected。docx/pptx 的这个版本没有 document_render 记录时，系统在未检查项注明版式未看图。每任务最多登记 3 个交付物、8 个版本。登记不等于发送，也不证明内容已核对。",
     parameters: registerParams,
     async run(params, member, call) {
       const { signal } = call;
@@ -136,19 +169,26 @@ export function deliverableTool(options: BaseToolsOptions, maxBytes = NATIVE_FIL
       try {
         const format = extname(frozen.name).slice(1).toLowerCase();
         const complete = await completeFile(frozen.path, format);
-        const layout = ["docx", "pptx"].includes(format) && params.status === "checked" && params.checked.some(x => /版式|看图/.test(x));
-        const rendered = Object.values(item.record.events).some(x => x.name === "document_render" && x.digest === frozen.sha256);
-        const downgrade = layout && !rendered;
-        const entry = { ...frozen,
-          slot: params.slot?.trim() || basename(source.path, extname(source.path)), complete, status: downgrade ? "draft" as const : params.status,
-          checked: downgrade ? params.checked.filter(x => !/版式|看图/.test(x)) : params.checked,
-          unchecked: [...params.unchecked, ...(downgrade ? ["版式未检查（未渲染该版本）"] : [])], issues: params.issues };
+        // Whether the layout was looked at is a fact of the run: these bytes were rendered or they were not. It is noted
+        // from the run's own record, never read out of how the model worded its checks.
+        const unrendered = ["docx", "pptx"].includes(format) && params.status === "checked"
+          && !Object.values(item.record.events).some(x => x.name === "document_render" && x.digest === frozen.sha256);
+        const entry = { ...frozen, slot: params.slot?.trim() || basename(source.path, extname(source.path)), complete, status: params.status,
+          checked: params.checked, unchecked: [...params.unchecked, ...(unrendered ? [UNRENDERED] : [])], issues: params.issues };
         const record = await call.api.commit(async tx => {
           const current = (await recordsOf(tx, item.phone)).requests[item.requestId];
           if (!current || current.closedAt !== undefined) throw new Error("任务已结束，不能再登记交付物");
           return structuredClone(registerDeliverable(current, entry));
         }, call.context);
-        return { output: [{ type: "text", text: JSON.stringify({ ...record, message: !complete ? "文件结构不完整，不会自动发送" : downgrade ? "未渲染该版本，已降为草稿" : "已登记，本次请求内发送时使用 snapshot 路径；快照在请求结束后清理，继续修改或以后再用仍按原文件路径", snapshot: record.path }) }], details: record, ...(complete ? {} : { isError: true }) };
+        const send = `发送：send_file 的 deliverable 填 ${JSON.stringify(record.slot)}`;
+        const message = !complete ? "文件结构不完整，不会自动发送"
+          : record.status === "rejected" ? "已登记为不可用版本，不会自动发送"
+          : unrendered ? `已登记。这个版本没有 document_render 的记录，未检查项里已注明版式未看图；要说明版式已检查，先渲染这个版本再登记。${send}`
+          : `已登记。${send}`;
+        // The snapshot's path stays out of the answer: it is gone when the request ends, and send_file takes the name.
+        const { slot, name, seq, status, size, checked, unchecked, issues } = record;
+        return { output: [{ type: "text", text: JSON.stringify({ slot, name, seq, status, complete, size, checked, unchecked, issues, message }) }],
+          details: record, ...(complete ? {} : { isError: true }) };
       } catch (error) { await unlink(frozen.path).catch(() => {}); throw error; }
     },
   };

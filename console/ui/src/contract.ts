@@ -202,7 +202,7 @@ export interface RequestView {
   delivery: { kind: string; abandoned: boolean; abandonedReason?: string;
     parts: { id: string; kind: string; state: string; attempts: number; retryAt?: number; error?: string; at?: number }[] } | null;
   files: { name: string; state: string; size: number; mode: string; error?: string }[];
-  deliverables: { name: string; status: string; size: number; complete: boolean }[];
+  deliverables: { name: string; status: string; size: number; complete: boolean; auto?: true }[];
 }
 
 /** Run records still kept (closed ones are pruned after a day); mutable, read at `observedAt`. */

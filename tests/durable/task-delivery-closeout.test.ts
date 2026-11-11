@@ -6,13 +6,14 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import * as deliverables from "../../src/agent/deliverables.ts";
-import { completeFile, deliverableCandidates, fileDigest, freezeFile, registerDeliverable, releasableSnapshots } from "../../src/agent/deliverables.ts";
+import { completeFile, deliverableCandidates, deliverableNamed, fallbackSlots, fileDigest, freezeFile, registerAutoDraft, registerDeliverable, releasableSnapshots }
+  from "../../src/agent/deliverables.ts";
 import { InboxDoc } from "../../src/durable/inbox.ts";
 import { createSession, defineExtension, Harness } from "@earendil-works/pi-durable";
 import { obj } from "@earendil-works/pi-schema";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { IdentityDoc, MemberDirectory } from "../../src/durable/identity.ts";
-import { activeRequest, closeoutExtension, deliverableTool } from "../../src/durable/closeout.ts";
+import { activeRequest, closeoutExtension, deliverableTool, UNRENDERED } from "../../src/durable/closeout.ts";
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
 import type { MemberCall, MemberTool } from "../../src/durable/tools.ts";
@@ -399,18 +400,29 @@ function officeZip(): Buffer {
   end.writeUInt32LE(central.length, 12); end.writeUInt32LE(offset, 16); return Buffer.concat([...locals, central, end]);
 }
 
-test("layout checks require the same rendered digest; registrations are bounded and source changes cannot change a snapshot", async () => {
+test("a checked Word version nothing rendered is noted as not looked at; registrations are bounded and source changes cannot change a snapshot", async () => {
   const f = await setup(), source = join(f.temp, "report.docx"); await writeFile(source, officeZip());
   const run = fakeRun(`msg:${crypto.randomUUID()}`), tool = deliverableTool({ layout: appLayout(f.root), scope: groupScope(GROUP) });
+  const answer = (result: Awaited<ReturnType<typeof register>>) => JSON.parse(result.output!.map(part => part.type === "text" ? part.text : "").join("")) as Record<string, unknown>;
   try {
-    const params = { path: source, status: "checked", checked: ["版式看图", "正文与资料核对"], unchecked: [], issues: [] };
-    await register(tool, params, run);
+    const params = { path: source, status: "checked", checked: ["版式看图", "正文与资料核对"], unchecked: ["数据口径"], issues: [] };
+    const unrendered = answer(await register(tool, params, run));
     const initial = run.record.deliverables[0]!;
-    expect(initial.complete).toBe(true); expect(initial.status).toBe("draft"); expect(initial.checked).toEqual(["正文与资料核对"]);
+    // What the model wrote stays as written; that these bytes were never rendered is a fact the service adds.
+    expect(initial).toMatchObject({ complete: true, status: "checked", checked: params.checked, unchecked: ["数据口径", UNRENDERED] });
+    expect(unrendered).toMatchObject({ slot: "report", name: "report.docx", seq: 1, status: "checked", complete: true, unchecked: ["数据口径", UNRENDERED] });
+    expect(unrendered.message).toContain("先渲染这个版本再登记"); expect(unrendered.message).toContain('发送：send_file 的 deliverable 填 "report"');
+    // The answer names the deliverable and no path: the snapshot is gone when the request ends.
+    expect(Object.keys(unrendered).sort()).toEqual(["checked", "complete", "issues", "message", "name", "seq", "size", "slot", "status", "unchecked"]);
+    expect(JSON.stringify(unrendered)).not.toContain(".deliverables");
+    // A draft claims no check, so nothing is noted.
+    await register(tool, { ...params, status: "draft" }, run);
+    expect(run.record.deliverables[1]!.unchecked).toEqual(["数据口径"]);
     run.record.events.render = { name: "document_render", digest: await fileDigest(source), at: Date.now() };
-    await register(tool, params, run);
-    expect(run.record.deliverables[1]!.status).toBe("checked");
-    for (let n = 2; n < 8; n++) await register(tool, { ...params, status: "draft" }, run);
+    const rendered = answer(await register(tool, params, run));
+    expect(run.record.deliverables[2]).toMatchObject({ status: "checked", unchecked: ["数据口径"] });
+    expect(rendered.message).toBe('已登记。发送：send_file 的 deliverable 填 "report"');
+    for (let n = 3; n < 8; n++) await register(tool, { ...params, status: "draft" }, run);
     await expect(register(tool, params, run)).rejects.toThrow("8 个版本");
     await writeFile(source, "truncated"); expect(await fileDigest(initial.path)).toBe(initial.sha256);
     expect(await completeFile(source, "docx")).toBe(false);
@@ -732,7 +744,8 @@ test("bash always preserves delivery time, respects its configured default, and 
   for (const count of ["已生成文档", "已登记交付物", "已发送"]) expect(JSON.stringify(result!.messages)).not.toContain(count);
   // Without a temp-directory source (only tests build the extension so) the tail names none.
   expect(JSON.stringify(result!.messages)).not.toContain("[临时目录]");
-  const named = closeoutExtension(run.write, t, 7200000, (phone, requestId) => `C:\\data\\tmp\\${phone}\\tasks\\${requestId}`);
+  const named = closeoutExtension(run.write, t, 7200000, (phone, requestId) => ({ workspaceDir: "C:\\workspace", tempDir: `C:\\data\\tmp\\${phone}`,
+    requestDir: `C:\\data\\tmp\\${phone}\\tasks\\${requestId}`, indexPath: "C:\\data\\index\\materials.md", venvDir: "C:\\data\\venv" }));
   const tail = await (named.hooks![0] as { handlers: import("@earendil-works/pi-durable").GenerationHooks }).handlers
     .beforeRequest({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }, run.api as never, context);
   expect(JSON.stringify(tail!.messages)).toContain(`）。\\n[临时目录] C:/data/tmp/${PHONE}/tasks/bash-budget"`);
@@ -762,4 +775,180 @@ test("send_file reuses registered snapshots and duplicates without copying, and 
     await deliver({ kind: "local", path: f.path, size: 9 }, "report.txt", undefined, send);
     expect(copying).toHaveBeenCalledTimes(1); expect(opening).toHaveBeenCalledTimes(2); expect(sends).toBe(2);
   } finally { copying.mockRestore(); opening.mockRestore(); await f.service.close(); }
+});
+
+/** A stand-in for the document tools: writes `name` with `content` into the member's tmp and answers like document_build. */
+const buildFixture = (temp: string) => () => [defineExtension({ name: "document-fixture", tools: [{
+  name: "document_build", description: "Synthetic document build", parameters: obj({}, { open: true }), replay: "safe",
+  async execute(args) {
+    const { name, content } = args as { name: string; content: string };
+    const directory = join(temp, `document-work-${crypto.randomUUID().slice(0, 8)}`), output = join(directory, name);
+    await mkdir(directory); await writeFile(output, content);
+    const data = { output, digest: await fileDigest(output) };
+    return { output: [{ type: "text", text: JSON.stringify(data) }], structuredOutput: data, details: data };
+  },
+}] })];
+const build = (name: string, content: string) => fauxAssistantMessage([fauxToolCall("document_build", { name, content })], { stopReason: "toolUse" });
+/** The files kept below the member's snapshot directory. */
+const snapshots = async (temp: string) => (await fs.readdir(join(temp, ".deliverables"), { recursive: true }).catch(() => [] as string[]))
+  .filter(path => String(path).endsWith(".txt")).length;
+/** Where the stand-in wrote a file of this name. */
+const builtPath = async (temp: string, name: string) => join(temp, (await fs.readdir(temp, { recursive: true })).map(String)
+  .find(path => path.endsWith(name) && !path.includes(".deliverables"))!);
+const registerCall = (path: string, status: string) => fauxAssistantMessage([fauxToolCall("deliverable_register",
+  { path, status, checked: [], unchecked: [], issues: status === "rejected" ? ["参数错误"] : [] })], { stopReason: "toolUse" });
+
+test("a file a document tool produced is saved as an unchecked draft: a run that registered nothing delivers the newest of each name, said to be unchecked", async () => {
+  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp) });
+  // Five builds of one name, then another file: one saved draft per name, no version limit, the replaced copies removed.
+  f.faux.setResponses([...[1, 2, 3, 4, 5].map(n => build("方案.txt", `version ${n}`)), build("附件.txt", "appendix"), async () => {
+    const saved = (await f.record(service))!.deliverables;
+    expect(saved.map(x => [x.slot, x.name, x.auto, x.status, x.complete])).toEqual([["方案", "方案.txt", true, "draft", true], ["附件", "附件.txt", true, "draft", true]]);
+    expect(await snapshots(f.temp)).toBe(2);
+    return failModel();
+  }]);
+  try {
+    await service.admit(f.message("make a plan"));
+    await until(() => f.files().length === 2, "both saved drafts");
+    expect([...f.uploads].sort()).toEqual(["方案.txt:version 5", "附件.txt:appendix"].sort());
+    const text = f.out.sent.find(x => x.text.includes("系统将交付"))!.text;
+    expect(text).toContain("系统将交付本任务已生成的文件：");
+    expect(text).toContain("· 《方案.txt》— 系统自动保存的生成结果，未经检查；文件结构完整。");
+    expect(text).toContain("这些文件没有经过检查，请核对后使用。");
+    expect(text).not.toContain("模型登记"); expect(text).not.toContain("已登记的可用版本");
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("what the model registered decides the fallback: saved drafts of other names stay behind, a rejection covers the saved copy", async () => {
+  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp) });
+  f.faux.setResponses([build("初稿.txt", "intermediate"), build("错误.txt", "wrong numbers"),
+    async () => registerCall(await builtPath(f.temp, "错误.txt"), "rejected"), f.register("checked"), failModel()]);
+  try {
+    await service.admit(f.message("make a report"));
+    await until(() => f.files().length === 1, "the registered version");
+    await until(async () => pendingDeliveries(await service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
+    expect(f.uploads).toEqual(["report.txt:original version"]);
+    const text = f.out.sent.find(x => x.text.includes("系统将交付"))!.text;
+    expect(text).toContain("系统将交付本任务已登记的可用版本：");
+    expect(text).toContain("存在已知错误或不完整的版本，未作为交付候选。");
+    expect(text).not.toContain("初稿"); expect(text).not.toContain("错误.txt");
+    // Every snapshot of the request goes once it is delivered, the saved drafts nothing sent included.
+    await until(async () => await snapshots(f.temp) === 0, "snapshots released");
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("a saved draft the model then rejected is not delivered", async () => {
+  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp) });
+  f.faux.setResponses([build("错误.txt", "wrong numbers"), async () => registerCall(await builtPath(f.temp, "错误.txt"), "rejected"), failModel()]);
+  try {
+    await service.admit(f.message("make a report"));
+    await until(() => f.out.sent.some(x => x.text.includes("Synthetic model error")), "failure explanation");
+    expect(f.out.sent.find(x => x.text.includes("Synthetic model error"))!.text).toContain("本任务没有可交付的已登记版本。");
+    expect(f.files()).toEqual([]);
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("saved drafts: the newest per name in three names at most, outside the model's limits; steps before the run's last send are not delivered", async () => {
+  const f = await setup();
+  try {
+    const record = fakeRun("drafts").record;
+    const frozen = async (content: string) => { await writeFile(f.path, content); return freezeFile(f.path, f.temp, "drafts", 1024); };
+    const draft = async (slot: string, content: string) => registerAutoDraft(record, { ...await frozen(content), slot, complete: true });
+    const first = await draft("a", "a1");
+    expect(first.added).toMatchObject({ auto: true, status: "draft", seq: 1, checked: [], issues: [] }); expect(first.dropped).toEqual([]);
+    // The same bytes again add nothing; a newer build of the name replaces the saved one and hands back its snapshot.
+    expect(await draft("a", "a1")).toEqual({ dropped: [] });
+    expect((await draft("a", "a2")).dropped).toEqual([first.added!.path]);
+    for (const slot of ["b", "c"]) expect((await draft(slot, slot)).dropped).toEqual([]);
+    // A fourth name pushes out the name saved longest ago.
+    expect((await draft("d", "d")).dropped).toHaveLength(1);
+    expect(record.deliverables.map(x => x.slot)).toEqual(["b", "c", "d"]);
+    // A snapshot the run sent from is kept although its draft is replaced.
+    const b = record.deliverables.find(x => x.slot === "b")!;
+    record.files.push({ id: "s", name: b.name, path: b.path, sha256: b.sha256, size: b.size, mode: "direct", state: "sent", attempts: 1, at: Date.now() });
+    expect((await draft("b", "b2")).dropped).toEqual([]);
+    expect(record.deliverables.map(x => x.slot)).toEqual(["c", "d", "b"]);
+    // The model's own registrations are counted without the saved drafts: three names and eight versions of its own.
+    const own = { ...await frozen("own"), complete: true, checked: [], unchecked: [], issues: [] };
+    for (const slot of ["x", "y", "z"]) registerDeliverable(record, { ...own, slot, status: "draft" });
+    expect(() => registerDeliverable(record, { ...own, slot: "w", status: "draft" })).toThrow("3 个交付物");
+    for (let n = 3; n < 8; n++) registerDeliverable(record, { ...own, slot: "x", status: "draft" });
+    expect(() => registerDeliverable(record, { ...own, slot: "x", status: "draft" })).toThrow("8 个版本");
+    expect(new Set(record.deliverables.map(x => x.seq)).size).toBe(record.deliverables.length);
+    // With registrations of the model, the fallback and the reminder are about those names only.
+    expect(fallbackSlots(record).map(versions => versions[0]!.slot)).toEqual(["x", "y", "z"]);
+    expect(deliverableCandidates(record).map(x => x.slot)).toEqual(["x", "y", "z"]);
+    // A name finds its deliverable in any letter case; one that fits several (every file here is report.txt) finds none.
+    expect(deliverableNamed(record, " X ")![0]!.slot).toBe("x"); expect(deliverableNamed(record, "c")![0]!.auto).toBe(true);
+    expect(deliverableNamed(record, "report")).toBeUndefined(); expect(deliverableNamed(record, "w")).toBeUndefined();
+    // A path given out of habit stands for its file name.
+    const named = fakeRun("named").record;
+    registerAutoDraft(named, { ...await frozen("plan"), name: "方案.docx", slot: "方案", complete: true });
+    for (const given of ["方案.DOCX", "C:\\data\\tmp\\1001\\tasks\\r\\方案.docx", "/data/tmp/1001/.deliverables/abc/方案.docx"]) expect(deliverableNamed(named, given)![0]!.slot).toBe("方案");
+    expect(deliverableNamed(named, "/data/tmp/其他.docx")).toBeUndefined();
+
+    // Saved drafts alone: one made before the run's last send was a step towards it; the sent file itself and later ones stay.
+    const later = fakeRun("later").record, at = Date.now();
+    const saved = async (slot: string, madeAt: number) => registerAutoDraft(later, { ...await frozen(slot), slot, complete: true }, madeAt).added!;
+    await saved("step", at - 3000); const sent = await saved("final", at - 2000); await saved("after", at);
+    expect(fallbackSlots(later).map(versions => versions[0]!.slot)).toEqual(["step", "final", "after"]);
+    later.files.push({ id: "s", name: sent.name, path: sent.path, sha256: sent.sha256, size: sent.size, mode: "direct", state: "sent", attempts: 1, at: at - 1000 });
+    expect(fallbackSlots(later).map(versions => versions[0]!.slot)).toEqual(["final", "after"]);
+    // A send that certainly failed is no send.
+    Object.assign(later.files[0]!, { state: "failed", error: "upload failed" });
+    expect(fallbackSlots(later).map(versions => versions[0]!.slot)).toEqual(["step", "final", "after"]);
+    expect(deliverableCandidates(later)).toEqual([]);
+  } finally { await f.service.close(); }
+});
+
+test("send_file takes a registered deliverable by name: its best version, whatever the source file has become; an unknown name lists what there is", async () => {
+  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp) });
+  const results: string[] = [];
+  /** The text of the tool result the model is answering. */
+  const seen = (transcript: { messages: readonly { role: string; content: unknown }[] }) => {
+    const result = transcript.messages.findLast(message => message.role === "toolResult")!;
+    results.push((result.content as { type: string; text?: string }[]).map(part => part.text ?? "").join(""));
+  };
+  const send = (params: Record<string, string>) => (transcript: Parameters<typeof seen>[0]) => { seen(transcript); return fauxAssistantMessage([fauxToolCall("send_file", params)], { stopReason: "toolUse" }); };
+  f.faux.setResponses([
+    f.register("draft"),
+    async transcript => { seen(transcript); await writeFile(f.path, "checked version"); return f.register("checked"); },
+    async transcript => { seen(transcript); await writeFile(f.path, "later unreviewed edit"); return build("方案.txt", "built"); },
+    send({ deliverable: "Report.TXT" }), send({ deliverable: "方案", filename: "交付方案.txt" }), send({ deliverable: "没有这个" }),
+    send({ deliverable: "report", source: join(f.temp, "other.txt") }), send({}),
+    // Both filled in with the deliverable's own file: the registered version goes out (already sent here, so no second upload).
+    send({ deliverable: "方案", source: join(f.temp, "somewhere", "方案.txt"), filename: "又一份.txt" }),
+    transcript => { seen(transcript); return fauxAssistantMessage("都发了"); },
+  ]);
+  try {
+    await service.admit(f.message("send the report"));
+    await until(() => f.out.sent.some(x => x.kind === "reply" && x.text.includes("都发了")), "the reply");
+    // The checked version although the source has changed since; the saved draft under the name the call gave.
+    expect(f.uploads).toEqual(["report.txt:checked version", "交付方案.txt:built"]);
+    expect(JSON.parse(results[0]!)).toMatchObject({ slot: "report", status: "draft", message: '已登记。发送：send_file 的 deliverable 填 "report"' });
+    expect(results.slice(0, 2).join("")).not.toContain(".deliverables");
+    expect(results[5]).toContain("没有名为“没有这个”的可发送交付物；已登记：“report”、“方案”。没有登记的文件用 source 填路径");
+    for (const refusal of results.slice(6, 8)) expect(refusal).toContain("source 和 deliverable 填其中一个");
+    expect(results[8]).not.toContain("填其中一个");
+    // The registered name was sent, so the run ends without the reminder.
+    expect((await f.record(service))!.events.delivery_reminder).toBeUndefined();
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("the reminder takes a deliverable as sent once any version of its name went out, and never asks for a saved draft", async () => {
+  const run = fakeRun("reminder-slot"), f = await setup();
+  const hooks = closeoutExtension(run.write, timing, 3000).hooks![0] as { handlers: import("@earendil-works/pi-durable").GenerationHooks };
+  const frozen = async (content: string) => { await writeFile(f.path, content); return freezeFile(f.path, f.temp, "reminder-slot", 1024); };
+  const remind = async () => { delete run.record.events.delivery_reminder; return hooks.handlers.onYield!({} as never, run.api as never, context); };
+  try {
+    // A saved draft alone is nothing the model said it would deliver.
+    registerAutoDraft(run.record, { ...await frozen("other"), slot: "其他", complete: true });
+    expect(await remind()).toBeUndefined();
+    registerDeliverable(run.record, { ...await frozen("first"), slot: "report", complete: true, status: "draft", checked: [], unchecked: [], issues: [] });
+    const rebuilt = registerAutoDraft(run.record, { ...await frozen("rebuilt"), slot: "report", complete: true }).added!;
+    expect(await remind()).toMatchObject({ continue: "你登记了 《report.txt》 但尚未发送；请立即发送。如果不需要发送，请在回复中说明原因。" });
+    // The model sent the newer build of the name instead of the version it registered.
+    run.record.files = [{ id: "s", name: rebuilt.name, path: rebuilt.path, sha256: rebuilt.sha256, size: rebuilt.size, mode: "direct", state: "sent", attempts: 1, at: 1 }];
+    expect(await remind()).toBeUndefined();
+  } finally { await f.service.close(); }
 });

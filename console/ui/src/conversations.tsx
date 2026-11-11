@@ -1123,7 +1123,7 @@ function RunCard({ item, onJump }: { item: RequestView; onJump: (id: number) => 
         {item.deliverables.length > 0 && <>
           <dt>生成的文档</dt>
           <dd><ul class="parts">{item.deliverables.map((file, index) => (
-            <li key={index}><span class="mono">{file.name}</span><span class="muted small">{bytes(file.size)}{file.complete ? "" : " · 未完成"}</span>
+            <li key={index}><span class="mono">{file.name}</span><span class="muted small">{bytes(file.size)}{file.auto ? " · 系统自动保存" : ""}{file.complete ? "" : " · 未完成"}</span>
               <StateChip table={DELIVERABLE} state={file.status} /></li>
           ))}</ul></dd>
         </>}

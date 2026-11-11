@@ -22,7 +22,7 @@ description: 基于共享资料修改 Word、选编和修改 PPT，或在产品�
 
 - **互不依赖的读取放进一个脚本**：多份资料的大纲、摘取用 `Promise.all` 一次取回，在脚本里筛出需要的字段再 `return`。工具自己限制同时处理的文档数，不用手动分批。
 - **有先后依赖的步骤逐个 `await`**：patch 用 inspect 返回的 `digest`，render 用上一步返回的 `output`。前一步失败就停下，不要拿失败的结果往下用。
-- **看图用 `read`，发送在脚本外**：脚本里用 `image(await tools.read({ path }))` 显示 `document_render` 返回的联系表或单页，渲染和看图放进同一个脚本；脚本外也可以直接调用 `read`。成品用 `send_file` 发送，脚本里没有发送工具。
+- **看图用 `read`，发送在脚本外**：脚本里用 `image(await tools.read({ path }))` 显示 `document_render` 返回的联系表或单页，渲染和看图放进同一个脚本；脚本外也可以直接调用 `read`。成品在脚本外用 `deliverable_register` 登记、`send_file` 发送，这两个工具脚本里没有。
 - 内容清单、来源记录等大文件留在 tmp，脚本只返回路径和摘要，需要时再用 `read` 按需读取。
 
 ```js
@@ -44,7 +44,7 @@ return { output: patched.output, contacts: preview.contacts, unrenderedPages: pr
 
 ## 工作原则
 
-- **先保住交付**。默认一次生成、一次渲染看图、一次必要修正，然后登记并发送。生成后先用 `deliverable_register` 登记草稿，检查后再登记 checked；图片、参数或事实错误标记 rejected。第二轮修改只用于修正事实错误。看到收尾计时就停止美化，生成文件不等于完成检查，不能反复重建直到超时。
+- **先保住交付**。默认一次生成、一次渲染看图、一次必要修正，然后登记并发送。生成的文件系统已自动保存为未检查的草稿，超时或失败时会带着“未经检查”的说明交付；检查后用 `deliverable_register` 登记 checked，再用 `send_file` 的 `deliverable` 填登记名称发送；图片、参数或事实错误登记 rejected。第二轮修改只用于修正事实错误。看到收尾计时就停止美化，生成文件不等于完成检查，不能反复重建直到超时。
 - **按上下文找图**。DOCX 的 `document_images` 返回图片序号、段落、标题、图注及前后文。先用 `extract:false, match:["关键词"]` 定位，再用 `orders` 提取；返回 `next` 时传给 `after` 继续。不要编写逐张图片重复扫描前面全部段落的脚本。
 
 - **先看大纲再选材**。`document_inspect` 加 `outline: true` 返回 PPT 每页标题、文字量、图片与表格数，以及 Word 标题层级和可用样式；用它决定复用哪几页、以哪份文件为模板，不要通读全部段落。

@@ -42,6 +42,11 @@ export type Deliverable = {
   id: string; slot: string; seq: number; name: string;
   path: string; size: number; sha256: string; complete: boolean;
   status: ReviewStatus; checked: string[]; unchecked: string[]; issues: string[]; at: number;
+  /**
+   * Saved by the service when a document tool produced the file, not registered by the model: an unchecked draft, one per
+   * slot, outside the model's limits. The fallback sends such drafts only when the model registered nothing it can send.
+   */
+  auto?: true;
 };
 
 /** A file or image the model sent during its run (send_file, send_image); state as for delivery parts. */

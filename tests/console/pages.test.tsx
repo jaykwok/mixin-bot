@@ -281,7 +281,7 @@ test("运行记录区分平台已接收、结果不确定、失败与重试、�
         { id: "p4", kind: "links", state: "failed", attempts: 5 },
       ] },
       files: [{ name: "周报.docx", state: "sent", size: 2048, mode: "relay" }],
-      deliverables: [{ name: "周报.docx", status: "checked", size: 2048, complete: true }],
+      deliverables: [{ name: "周报.docx", status: "checked", size: 2048, complete: true }, { name: "附件.docx", status: "draft", size: 1024, complete: true, auto: true }],
     }],
   };
   routes = {
@@ -300,7 +300,9 @@ test("运行记录区分平台已接收、结果不确定、失败与重试、�
   container.querySelector<HTMLButtonElement>('[role="radio"][data-value="runs"]')!.click();
   await shows("帮我写周报");
   const chips = [...container.querySelectorAll(".run-card .chip")].map(chip => chip.textContent);
-  expect(chips).toEqual(["已完成", "已放弃：超出发送时限", "平台已接收", "结果不确定", "失败", "失败", "平台已接收", "已检查"]);
+  expect(chips).toEqual(["已完成", "已放弃：超出发送时限", "平台已接收", "结果不确定", "失败", "失败", "平台已接收", "已检查", "草稿"]);
+  // A draft the service saved without the model registering it says so.
+  expect([...container.querySelectorAll(".run-card .parts li")].filter(item => item.textContent!.includes("系统自动保存")).map(item => item.querySelector(".mono")!.textContent)).toEqual(["附件.docx"]);
   expect(chips.some(chip => chip?.includes("已读"))).toBe(false);
   expect(text()).toContain("没有已读证据");
   expect(text()).toContain("不再重试");
