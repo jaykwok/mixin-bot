@@ -82,7 +82,6 @@ $RuntimeDir = Join-Path $DataDir "runtime"
 $LogPath  = Join-Path $Project "logs\mixin-bot.log"
 $ModelsFile = Join-Path $ConfigDir "models.json"
 $AppBotFile = Join-Path $ConfigDir "app-bot.json"
-$RelayConfigFile = Join-Path $ConfigDir "relay.json"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
 
@@ -107,27 +106,6 @@ function Find-VersionedApplication([string]$Name, [string]$Pattern, [string[]]$A
         if ($exitCode -eq 0 -and (($output -join "`n") -match $Pattern)) { return $candidate }
     }
     return $null
-}
-function Get-TaskResultHex($Value) {
-    $unsigned = [int64]$Value -band [int64]0xffffffff
-    return "0x" + [Convert]::ToString($unsigned, 16).PadLeft(8, '0').ToUpperInvariant()
-}
-function Get-TaskLogonLabel($LogonType) {
-    switch ([string]$LogonType) {
-        "S4U" { return "S4U（无需登录）" }
-        "InteractiveToken" { return "交互式登录" }
-        "Interactive" { return "交互式登录" }
-        default { return [string]$LogonType }
-    }
-}
-function Get-TaskStateLabel($State) {
-    switch ([string]$State) {
-        "Running" { return "运行中" }
-        "Ready" { return "就绪" }
-        "Disabled" { return "已禁用" }
-        "Queued" { return "排队中" }
-        default { return [string]$State }
-    }
 }
 $script:GitPath = $null
 $script:GitPathResolved = $false
@@ -393,30 +371,6 @@ function Invoke-GitCapture([string[]]$GitArgs) {
 
 
 
-# 这里只读检查 S3 必填项；完整格式由运行时校验，凭据不传入 curl 或命令行。
-function Get-RelayDoctorRows {
-    if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) { return @() }
-    try {
-        $config = Get-Content -LiteralPath $RelayConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($config.provider -ne "s3") { throw "provider" }
-        foreach ($field in @("endpoint", "region", "bucket", "accessKeyId", "secretAccessKey")) {
-            if ($config.$field -isnot [string] -or -not $config.$field.Trim()) { throw "missing" }
-        }
-    } catch {
-        return @(New-DoctorRow "data/config/relay.json" "fail" "S3 必填项不全" "请重新运行外链配置向导。")
-    }
-    return @(New-DoctorRow "S3 外链配置必填项" "pass" "必填项齐全；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用 relay-test 验收。")
-}
-
-function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]$Fix = "") {
-    return [pscustomobject]@{
-        Name   = $Name
-        Status = $Status
-        Detail = $Detail
-        Fix    = $Fix
-    }
-}
-
 # 继续、回滚和有未完成事务的升级只把命令交给部署或升级脚本，由它们按事务记录执行：
 # 这里不读取普通设置，设置损坏或为空都不能挡住恢复入口。
 $pendingTransaction = (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) -or
@@ -464,194 +418,77 @@ function Wait-Local {
     return $lastStatus
 }
 
+# 体检核心无法运行时的结果：与核心同一结构，只有一项失败。
+function New-DoctorFailure([string]$Detail, [string]$Fix) {
+    $payload = [pscustomobject]@{
+        pass = 0; warn = 0; fail = 1; port = [int]$Port
+        checks = @([pscustomobject]@{ name = "体检"; status = "fail"; detail = $Detail; fix = $Fix })
+    }
+    return ($payload | ConvertTo-Json -Depth 4 -Compress)
+}
+
+# 体检的检查项、文案和 JSON 在 ops\core\doctor.ts，三个平台共用。这里只取 Windows 才知道的事实交给它（MIXIN_DOCTOR_*）：
+# 计划任务、端口上的监听进程、本项目的机器人进程、本机健康检查和模型配置校验的结果。只读。
+# -Json：返回核心输出的单行 JSON 和退出码，由入口写出；否则按级别着色逐行输出，返回是否没有失败项。
 function Show-Doctor {
-    if (-not $Json) { Step "mixin-bot 健康检查（本机端口=$Port）" }
-    $rows = @()
-
-    # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
-    if (-not $DeployedWorkspaceRoot) {
-        $rows += New-DoctorRow "共享资料目录" "pass" "$(Join-Path $Project 'workspace')（默认）"
-    } elseif (Test-Path -LiteralPath $DeployedWorkspaceRoot -PathType Container) {
-        $rows += New-DoctorRow "共享资料目录" "pass" "$DeployedWorkspaceRoot（外置，只读）"
-    } else {
-        $rows += New-DoctorRow "共享资料目录" "fail" "外置目录不存在：$DeployedWorkspaceRoot" "恢复该目录或挂载；改用其他目录请设置 WORKSPACE_ROOT 后使用 $(Get-OpsCommandHint 'deploy')。"
-    }
-
-    $localStatus = Test-Local
-    $botPids = @(Get-BotPids)
-    $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-
-    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    # 任务在、没有运行且本机没有应答：多半是有意停止（stop 之后任务保持就绪），也可能是意外退出，两种处理都要说清。
-    $stoppedTask = $t -and $t.State -ne "Disabled" -and $t.State -ne "Running" -and $localStatus -ne 200 -and $localStatus -ne 503
-    $stoppedHint = "有意停止的使用 $(Get-OpsCommandHint 'start') 启动；意外退出时先在 $(Get-OpsCommandHint 'logs') 查看日志，再使用 $(Get-OpsCommandHint 'doctor -Repair')。"
-    if (-not $t) {
-        if ($localStatus -eq 200 -and $botPids.Count -gt 0) {
-            $rows += New-DoctorRow "计划任务" "warn" "未安装；机器人当前以前台方式运行" "如需开机自启，请以管理员身份使用 $(Get-OpsCommandHint 'deploy')。"
-        } else {
-            $rows += New-DoctorRow "计划任务" "fail" "缺少，且没有健康的前台机器人" "请以管理员身份使用 $(Get-OpsCommandHint 'deploy')。"
-        }
-    } else {
-        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-        $taskLogon = if ($t.Principal) { Get-TaskLogonLabel $t.Principal.LogonType } else { "未知登录方式" }
-        $taskDetail = "$(Get-TaskStateLabel $t.State)，$taskLogon" + $(if ($taskInfo) { "，上次结果 $(Get-TaskResultHex $taskInfo.LastTaskResult)" } else { "" })
-        if ($t.State -eq "Disabled") {
-            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "使用 $(Get-OpsCommandHint 'start')，会启用计划任务并启动机器人。"
-        } elseif ($t.State -eq "Running") {
-            $rows += New-DoctorRow "计划任务" "pass" $taskDetail
-        } elseif ($localStatus -eq 200) {
-            $rows += New-DoctorRow "计划任务" "warn" "$taskDetail；机器人可能在任务外运行" "先通过 $(Get-OpsCommandHint 'stop') 停止手动启动的机器人，再使用 $(Get-OpsCommandHint 'start')。"
-        } else {
-            $rows += New-DoctorRow "计划任务" "fail" "$taskDetail；机器人没有运行" $stoppedHint
-        }
-    }
-
-    if ($listeners.Count -eq 0) {
-        $rows += New-DoctorRow "机器人监听 :$Port" "fail" "没有监听" $(if ($stoppedTask) { $stoppedHint } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')。" })
-    } else {
-        $ownerPids = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { [int]$_ })
-        $botOwnerPid = @($ownerPids | Where-Object { $botPids -contains $_ } | Select-Object -First 1)
-        if ($botOwnerPid.Count -gt 0) {
-            $rows += New-DoctorRow "机器人监听 :$Port" "pass" "pid $($botOwnerPid[0])（mixin-bot）"
-        } elseif ($localStatus -eq 200) {
-            $ownerList = $ownerPids -join ", "
-            $rows += New-DoctorRow "机器人监听 :$Port" "warn" "pid $ownerList；健康检查有响应但未识别进程身份" "在 Windows 任务管理器的「详细信息」中核对这些 PID 与命令行；$(Get-OpsCommandHint 'doctor') 可重新检查。"
-        } else {
-            $ownerList = $ownerPids -join ", "
-            $rows += New-DoctorRow "机器人监听 :$Port" "fail" "pid $ownerList 不是健康的 mixin-bot" "在 Windows 任务管理器中核对占用端口的进程，或通过 $(Get-OpsCommandHint 'deploy') 选择其他端口。"
-        }
-    }
-
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'resume') 继续上次操作并完成提交。" } elseif ($stoppedTask) { $stoppedHint } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
-
-    # Stream 与通讯录状态只读运行中服务的 /health，不另开 Stream 连接（同一应用只能有一条）。
-    if ($localStatus -eq 200) {
-        $streamRows = $null
-        $previousErrorActionPreference = $ErrorActionPreference
-        $bunPath = Get-BunPath
-        if ($bunPath) {
-            Push-Location $Project
-            try {
-                $ErrorActionPreference = "Continue"
-                $streamRows = @(Invoke-WithUtf8Output { & $bunPath run "ops\tools\directory-admin.ts" doctor 2>$null })
-                if ($LASTEXITCODE -ne 0) { $streamRows = $null }
-            } catch {
-                $streamRows = $null
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-                Pop-Location
-            }
-        }
-        if ($null -eq $streamRows) {
-            $rows += New-DoctorRow "事件 Stream" "warn" "无法读取服务状态" "查看 $(Get-OpsCommandHint 'logs')。"
-        } else {
-            foreach ($line in $streamRows) {
-                $parts = "$line" -split "`t", 3
-                if ($parts.Count -lt 3 -or -not $parts[1]) { continue }
-                $fix = switch ($parts[1]) {
-                    "事件 Stream" { "检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(Get-OpsCommandHint 'configure-app-bot')），再查看 $(Get-OpsCommandHint 'logs')。" }
-                    "通讯录同步" { "服务会自动重试和复核；用 $(Get-OpsCommandHint 'directory') 查看范围状态和原因，长时间没有恢复时查看 $(Get-OpsCommandHint 'logs')。" }
-                    "运行状况" { "在 $(Get-OpsCommandHint 'logs') 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" }
-                    default { "" }
-                }
-                $status = if ($parts[0] -in @("pass", "warn")) { $parts[0] } else { "fail" }
-                $rows += New-DoctorRow $parts[1] $status $parts[2] $(if ($status -eq "pass") { "" } else { $fix })
-            }
-        }
-    }
-
-    # 版本取自运行中服务的 /health；服务未运行时取部署记录。本地代码不同于运行版本时另起一行说明。
-    $versionRows = $null
-    $bunPath = Get-BunPath
+    $bunPath = if ($env:MIXIN_OPS_BUN) { $env:MIXIN_OPS_BUN } else { Get-BunPath }
+    $lines = @(); $code = 1
     if ($bunPath) {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $taskInfo = if ($task) { Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue } else { $null }
+        $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { [int]$_ })
+        $facts = [ordered]@{
+            MIXIN_DOCTOR_PORT        = "$Port"
+            MIXIN_DOCTOR_WORKSPACE   = "$DeployedWorkspaceRoot"
+            MIXIN_DOCTOR_LOCAL       = "$(Test-Local)"
+            MIXIN_DOCTOR_MODELS      = if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { "missing" } elseif (Test-ModelConfiguration $Project) { "valid" } else { "invalid" }
+            MIXIN_DOCTOR_TASK        = if ($task) { "$($task.State)" } else { "" }
+            MIXIN_DOCTOR_TASK_LOGON  = if ($task -and $task.Principal) { "$($task.Principal.LogonType)" } else { "" }
+            MIXIN_DOCTOR_TASK_RESULT = if ($taskInfo) { "$([int64]$taskInfo.LastTaskResult)" } else { "" }
+            MIXIN_DOCTOR_LISTENERS   = $listeners -join ","
+            MIXIN_DOCTOR_BOT_PIDS    = @(Get-BotPids) -join ","
+        }
+        $format = if ($Json) { "json" } else { "lines" }
         $previousErrorActionPreference = $ErrorActionPreference
-        Push-Location $Project
         try {
+            # 空值按“没有这个变量”传递；这些变量只属于体检，结束时从本进程环境中去掉。
+            foreach ($name in $facts.Keys) { [Environment]::SetEnvironmentVariable($name, $(if ($facts[$name]) { $facts[$name] } else { $null }), "Process") }
             $ErrorActionPreference = "Continue"
-            $versionArgs = if ($localStatus -eq 200) { @("--port", "$Port") } else { @() }
-            $versionRows = @(Invoke-WithUtf8Output { & $bunPath run "ops\tools\version-info.ts" @versionArgs 2>$null })
-            if ($LASTEXITCODE -ne 0) { $versionRows = $null }
+            $lines = @(Invoke-WithUtf8Output { & $bunPath --no-env-file (Join-Path $OpsSource "ops\core\doctor.ts") --platform windows --project $Project --format $format 2>$null })
+            $code = $LASTEXITCODE
         } catch {
-            $versionRows = $null
+            $lines = @(); $code = 1
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
-            Pop-Location
+            foreach ($name in $facts.Keys) { [Environment]::SetEnvironmentVariable($name, $null, "Process") }
         }
     }
-    if ($null -eq $versionRows) {
-        $rows += New-DoctorRow "应用机器人" "warn" "无法读取版本信息"
-    } else {
-        foreach ($line in $versionRows) {
-            $parts = "$line" -split "`t", 2
-            if ($parts.Count -lt 2 -or -not $parts[0]) { continue }
-            if ($parts[1].StartsWith("未知：")) {
-                $rows += New-DoctorRow $parts[0] "fail" $parts[1] "部署记录无法读取；不要在此目录覆盖部署，参见 docs\data-migrations.md。"
-            } else {
-                $rows += New-DoctorRow $parts[0] "pass" $parts[1]
-            }
-        }
-    }
+    $problem = if (-not $bunPath) { "找不到 Bun 1.4.4 或更高版本，未体检" } elseif ($lines.Count -eq 0 -or $code -notin @(0, 1)) { "体检核心没有给出结果（退出码 $code），未体检" } else { "" }
+    $problemFix = if (-not $bunPath) { "安装 Bun 1.4.4 或更高版本（https://bun.sh/docs/installation）后重试。" } else { "确认代码目录完整后重试；$(Get-OpsCommandHint 'deploy') 可重建部署。" }
 
-    if (Test-Path -LiteralPath $AppBotFile -PathType Leaf) {
-        $rows += New-DoctorRow "data/config/app-bot.json" "pass" "已配置（不显示凭据）"
-    } else {
-        $rows += New-DoctorRow "data/config/app-bot.json" "fail" "缺少（服务拒绝启动）" "使用 $(Get-OpsCommandHint 'configure-app-bot') 填写 AppID 和 AppSecret。"
-    }
-
-    # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
-    $modelsOk = Test-ModelConfiguration $Project
-    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "先修正 data/config/models.json 与 data/runtime/pi/settings.json。" })
-
-    $rows += Get-RelayDoctorRows
-
-    # doctor -Json 让控制台复用这同一套体检，而不是自己再实现一遍计划任务/Stream/配置的判断。
-    # stdout 必须只有 JSON，所以这里直接返回，不走下面的彩色输出。
     if ($Json) {
-        $payload = [pscustomobject]@{
-            pass   = @($rows | Where-Object { $_.Status -eq "pass" }).Count
-            warn   = @($rows | Where-Object { $_.Status -eq "warn" }).Count
-            fail   = @($rows | Where-Object { $_.Status -eq "fail" }).Count
-            port   = [int]$Port
-            # 单行输出：ConvertTo-Json 默认会把数组换行展开，Compress 后一行读完即可。
-            checks = @($rows | ForEach-Object {
-                [pscustomobject]@{ name = $_.Name; status = $_.Status; detail = $_.Detail; fix = $_.Fix }
-            })
-        }
-        # 返回结构化结果；JSON 序列化与退出码由入口处理，不与布尔结果混进同一条管道。
-        return $payload
+        if ($problem) { return [pscustomobject]@{ Json = (New-DoctorFailure $problem $problemFix); Code = 1 } }
+        return [pscustomobject]@{ Json = ($lines -join ""); Code = $code }
     }
-
-    foreach ($r in $rows) {
-        $tag = switch ($r.Status) { "pass" { "[+]" }; "warn" { "[!]" }; default { "[x]" } }
-        $color = switch ($r.Status) { "pass" { "Green" }; "warn" { "Yellow" }; default { "Red" } }
-        Write-Host ("{0} {1,-26} {2}" -f $tag, $r.Name, $r.Detail) -ForegroundColor $color
-    }
-
-    $pass = @($rows | Where-Object { $_.Status -eq "pass" }).Count
-    $warn = @($rows | Where-Object { $_.Status -eq "warn" }).Count
-    $fail = @($rows | Where-Object { $_.Status -eq "fail" }).Count
-    Write-Host ""
-    Write-Host ("结果：{0} 项通过，{1} 项警告，{2} 项失败" -f $pass, $warn, $fail) -ForegroundColor White
-
-    $actions = @($rows | Where-Object { $_.Status -ne "pass" -and $_.Fix } | Select-Object Name, Fix -Unique)
-    if ($actions.Count -gt 0) {
-        Write-Host ""
-        Write-Host "建议操作：" -ForegroundColor Cyan
-        foreach ($action in $actions) {
-            Write-Host ("  - {0}: {1}" -f $action.Name, $action.Fix) -ForegroundColor Yellow
-        }
-    }
-
-    if ($fail -gt 0) {
-        Warn "可尝试修复：$(Get-OpsCommandHint 'doctor -Repair')"
+    if ($problem) {
+        Write-Host "[x] $problem" -ForegroundColor Red
+        Write-Host "    $problemFix"
         return $false
-    } elseif ($warn -gt 0) {
-        Warn "必需检查已通过，但仍有警告"
-        return $true
-    } else {
-        Done "全部检查通过"
-        return $true
     }
+    # 每行是“级别<TAB>文字”，按本入口的样式输出。
+    foreach ($line in $lines) {
+        $parts = "$line" -split "`t", 2
+        $text = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+        switch ($parts[0]) {
+            "step" { Step $text }
+            "pass" { Done $text }
+            "warn" { Warn $text }
+            "fail" { Write-Host "[x] $text" -ForegroundColor Red }
+            default { Write-Host $text }
+        }
+    }
+    return ($code -eq 0)
 }
 
 # 未完成的部署由运维核心继续或回滚：它取事务固定的运行包，只使用事务记录，不重新提问。
@@ -973,9 +810,8 @@ function Invoke-ConsoleUninstall {
 if ($Json -and $Command -in @("doctor", "status")) {
     if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请使用 $(Get-OpsCommandHint 'doctor -Repair')。"); exit 2 }
     $result = Show-Doctor
-    Invoke-WithUtf8Output { [Console]::WriteLine(($result | ConvertTo-Json -Depth 4 -Compress)) }
-    if ($result.fail -gt 0) { exit 1 }
-    exit 0
+    Invoke-WithUtf8Output { [Console]::WriteLine($result.Json) }
+    exit $result.Code
 }
 
 switch ($Command) {

@@ -4,6 +4,7 @@
 import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { openOperationLog } from "../../src/lib/operation-log.ts";
+import { commandHint } from "./command-hint.ts";
 import type { OpsResult } from "./result.ts";
 import { becomeCommand, type Identity } from "./launchd-host.ts";
 
@@ -35,15 +36,7 @@ export class EntryError extends Error {
 }
 
 /** Where to go next: the console's page when a console task runs this, else the command for this terminal. */
-export function hint(command: string, env: NodeJS.ProcessEnv = process.env): string {
-  if (env.MIXIN_OPS_UI === "console") {
-    const pages: Record<string, string> = { deploy: "维护 → 重新部署", update: "维护 → 升级", resume: "维护 → 继续上次操作", rollback: "维护 → 回滚上次操作",
-      start: "维护 → 启动", stop: "维护 → 停止", restart: "维护 → 重启", repair: "维护 → 修复部署", "doctor --repair": "维护 → 修复部署", doctor: "体检 → 刷新",
-      status: "总览 → 刷新", logs: "日志", "configure-app-bot": "设置 → 应用机器人凭据", "relay-configure": "设置 → 外链配置", directory: "通讯录" };
-    if (pages[command]) return `「${pages[command]}」`;
-  }
-  return `sudo bash scripts/ops.sh ${command}`;
-}
+export const hint = (command: string, env: NodeJS.ProcessEnv = process.env): string => commandHint("macos", command, env);
 
 export function requireRoot(what: string): void {
   if (process.geteuid?.() !== 0) throw new EntryError(`${what}需要 root：请用 sudo 运行（sudo bash scripts/ops.sh …）`);

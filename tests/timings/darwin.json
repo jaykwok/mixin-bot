@@ -208,7 +208,7 @@
     "tests/ops/platform-command.test.ts": 5,
     "tests/ops/query-pool.test.ts": 16291,
     "tests/ops/redaction-parity.test.ts": 1,
-    "tests/ops/relay-doctor.test.ts": 234,
+    "tests/ops/doctor.test.ts": 234,
     "tests/ops/relay-validation.test.ts": 53,
     "tests/ops/release-data-protocol.test.ts": 1011,
     "tests/ops/runtime-configure.test.ts": 519,

@@ -322,7 +322,7 @@ export function doctorRows(status: ServiceStatus, now = Date.now()): string[] {
   return rows;
 }
 
-const USAGE = "用法：bun run ops/tools/directory-admin.ts status | doctor | scope [all]（不带 all 时在终端里逐层勾选部门；不接受部门 ID）";
+const USAGE = "用法：bun run ops/tools/directory-admin.ts status | scope [all]（不带 all 时在终端里逐层勾选部门；不接受部门 ID）";
 
 /**
  * 命令行入口，返回退出码：0 完成；1 失败（服务没有运行、拒绝了请求等）；2 用法错误（未知、重复或多余的参数，部门 ID），
@@ -331,10 +331,6 @@ const USAGE = "用法：bun run ops/tools/directory-admin.ts status | doctor | s
 export async function main(argv: readonly string[], terminal = Boolean(process.stdin.isTTY && process.stdout.isTTY)): Promise<number> {
   const [action = "status", ...rest] = argv;
   try {
-    if (action === "doctor" && !rest.length) {
-      for (const row of doctorRows(await readServiceStatus())) console.log(row.replace(/[\r\n]/g, " "));
-      return 0;
-    }
     if (action === "status" && !rest.length) {
       const status = await readServiceStatus();
       console.log(`事件 Stream：${describeStream(status.stream, status.verificationOnly)}`);

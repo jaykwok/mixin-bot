@@ -12,6 +12,7 @@
     "ops/core/check-plan.ts!",
     "ops/core/console-stage.ts!",
     "ops/core/cli.ts!",
+    "ops/core/doctor.ts!",
     "ops/core/{launchd-supervisor,macos-entry,macos-become}.ts!",
     "ops/lib/confirmed-transaction.ts!",
     "console/ui/src/main.tsx!",

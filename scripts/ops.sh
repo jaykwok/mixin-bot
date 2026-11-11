@@ -75,34 +75,13 @@ ask_yes_no() {
     done
 }
 
-# doctor --json 让控制台复用同一套体检，而不是自己再实现一遍 docker/配置的判断。
-# 逐项结果在 check() 里顺手攒起来，人类可读的输出一个字不改。
+# doctor --json 给控制台用：stdout 只有一行 JSON（检查项、文案和 JSON 都由 ops/core/doctor.ts 生成）。
 JSON_OUTPUT=0
-JSON_ROWS=""
 
 # 只处理 JSON 字符串里必须转义的字符：反斜杠、双引号和控制字符。
 # 详情里带的是路径和 URL，出现反斜杠（Windows 路径）和引号都不稀奇。
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
-}
-
-PASS=0; FAIL=0; CHECK_WARN=0
-check() {
-    local name="$1" ok="$2" detail="$3" fix="${4:-}"
-    [ "$ok" = "1" ] && fix=""
-    if [ "$JSON_OUTPUT" = "1" ]; then
-        # status 用 pass/warn/fail 三态而不是布尔：Windows 那边的体检本来就分三档，
-        # 两个平台吐同一个 schema，尚未验证的检查明确显示 warn。
-        local row status
-        case "$ok" in 1) status=pass ;; warn) status=warn ;; *) status=fail ;; esac
-        row="{\"name\":\"$(json_escape "$name")\",\"status\":\"${status}\",\"detail\":\"$(json_escape "$detail")\",\"fix\":\"$(json_escape "$fix")\"}"
-        JSON_ROWS="${JSON_ROWS:+${JSON_ROWS},}${row}"
-    fi
-    case "$ok" in 1) PASS=$((PASS+1)) ;; warn) CHECK_WARN=$((CHECK_WARN+1)) ;; *) FAIL=$((FAIL+1)) ;; esac
-    [ "$JSON_OUTPUT" = "1" ] && return 0
-    if [ "$ok" = "1" ]; then OK "$(printf '%-30s %s' "$name" "$detail")"
-    elif [ "$ok" = "warn" ]; then WA "$(printf '%-30s %s' "$name" "$detail")"
-    else ER "$(printf '%-30s %s' "$name" "$detail")"; fi
 }
 
 # JSON 模式下把提示类输出静音：stdout 必须是一份干净的 JSON，混进一行中文提示就没法解析了。
@@ -142,120 +121,55 @@ container_owned() {
     [ -n "$source" ] && [ "$(realpath -m -- "$source")" = "$(realpath -m -- "$PROJECT_DIR/data")" ]
 }
 
-# S3 credentials are never sent to curl or placed on the command line.
-# Full configuration validation occurs in the runtime; this check is intentionally read-only.
-check_relay() {
-    [ -f "$RELAY_CONFIG_FILE" ] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
-        check "S3 外链" "warn" "配置已存在；缺少 jq，尚未校验" "启动时执行完整格式校验；请用 relay-test 验收实际云端配置。"
-        return 0
+# 体检的检查项、文案和 JSON 在 ops/core/doctor.ts，三个平台共用。这里只取宿主机才知道的事实交给它（MIXIN_DOCTOR_*）：
+# 容器和回滚容器的状态、本机健康检查的结果、模型配置校验的结果。只读；宿主机没有可用的 Bun 时不下载，只报告这一项。
+# 体检核心无法运行时的结果：与核心同一结构，只有一项失败。用法：doctor_unavailable <名称> <说明> <建议>。
+doctor_unavailable() {
+    if [ "$JSON_OUTPUT" = 1 ]; then
+        printf '{"pass":0,"warn":0,"fail":1,"port":%s,"checks":[{"name":"%s","status":"fail","detail":"%s","fix":"%s"}]}\n' \
+            "$PORT" "$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "$3")"
+    else
+        ER "$1：$2；$3"
     fi
-    if ! jq -e 'type == "object" and .provider == "s3" and
-        ([.endpoint,.region,.bucket,.accessKeyId,.secretAccessKey] | all(type == "string" and length > 0))' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
-        check "data/config/relay.json" "0" "S3 必填项不全，请重新运行外链向导"
-        return 0
-    fi
-    check "S3 外链配置必填项" "1" "必填项齐全；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用 relay-test 验收。"
 }
 
 doctor() {
-    P "mixin-bot 健康检查（本机端口=$PORT）"
-    PASS=0; FAIL=0; CHECK_WARN=0; JSON_ROWS=""
-
-    # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
-    local workspace_ok="1" workspace_detail="${PROJECT_DIR}/workspace（默认）"
-    if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
-        workspace_detail="$DEPLOYED_WORKSPACE_ROOT（只读挂载）"
-        [ -d "$DEPLOYED_WORKSPACE_ROOT" ] || { workspace_ok="0"; workspace_detail="外置目录不存在：$DEPLOYED_WORKSPACE_ROOT"; }
-    fi
-    check "共享资料目录" "$workspace_ok" "$workspace_detail" "恢复该目录或挂载；改用其他目录请用 WORKSPACE_ROOT=<目录> $(ops_command_hint deploy)。"
-
-    local cstate="缺少"
-    if has_container; then
-        cstate="$(docker container inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "?")"
-    fi
-    local cstate_label="$cstate"
-    [ "$cstate" = "running" ] && cstate_label="运行中"
-    [ "$cstate" = "exited" ] && cstate_label="已退出"
-    check "容器" "$([ "$cstate" = "running" ] && echo 1 || echo 0)" "$cstate_label" \
-        "使用 $(ops_command_hint start)；尚未部署时请使用 $(ops_command_hint deploy)。"
-    check "部署回滚容器" "$(! has_rollback_container && echo 1 || echo 0)" \
-        "$(! has_rollback_container && echo 无 || echo "发现 ${ROLLBACK_CONTAINER}，请确认后恢复或删除")"
-
-    local health_status=0
-    bot_local_ready "$PORT" >/dev/null 2>&1 || health_status=$?
-    if [ "$health_status" = 0 ]; then check "本地机器人健康" 1 "就绪且实例身份匹配"
-    elif [ "$health_status" = 3 ]; then check "本地机器人健康" 0 "只验证实例，不处理消息" "使用 $(ops_command_hint resume) 继续上次操作并完成提交。"
-    else check "本地机器人健康" 0 "未就绪或实例身份不匹配" \
-        "使用 $(ops_command_hint restart)，再到 $(ops_command_hint logs) 查看日志。"; fi
-
-    # Stream 与通讯录状态只读运行中服务的 /health，不另开 Stream 连接（同一应用只能有一条）。
-    if [ "$health_status" = 0 ]; then
-        local row_status row_name row_detail row_fix rows
-        if rows="$(service_bun ops/tools/directory-admin.ts doctor 2>/dev/null)"; then
-            while IFS=$'\t' read -r row_status row_name row_detail; do
-                [ -n "$row_name" ] || continue
-                row_fix=""
-                case "$row_name" in
-                    事件\ Stream) row_fix="检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(ops_command_hint configure-app-bot)），再查看 $(ops_command_hint logs)。" ;;
-                    通讯录同步) row_fix="服务会自动重试和复核；用 $(ops_command_hint directory) 查看范围状态和原因，长时间没有恢复时查看 $(ops_command_hint logs)。" ;;
-                    运行状况) row_fix="在 $(ops_command_hint logs) 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" ;;
-                esac
-                case "$row_status" in pass) row_status=1 ;; warn) ;; *) row_status=0 ;; esac
-                check "$row_name" "$row_status" "$row_detail" "$row_fix"
-            done <<< "$rows"
-        else
-            check "事件 Stream" warn "无法读取服务状态" "查看 $(ops_command_hint logs)。"
-        fi
-    fi
-    # 版本取自运行中服务的 /health；服务未运行时取部署记录。本地代码不同于运行版本时另起一行说明。
-    local version_rows version_name version_value health_body=""
-    [ "$health_status" = 0 ] && health_body="$(curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
-    if version_rows="$(printf '%s' "$health_body" | service_bun ops/tools/version-info.ts --health-stdin 2>/dev/null)"; then
-        while IFS=$'\t' read -r version_name version_value; do
-            [ -n "$version_name" ] || continue
-            case "$version_value" in
-                未知：*) check "$version_name" 0 "$version_value" "部署记录无法读取；不要在此目录覆盖部署，参见 docs/data-migrations.md。" ;;
-                *) check "$version_name" 1 "$version_value" ;;
-            esac
-        done <<< "$version_rows"
-    else
-        check "应用机器人" warn "无法读取版本信息"
-    fi
-    if [ -s "$APP_BOT_FILE" ]; then check "data/config/app-bot.json" 1 "已配置（不显示凭据）"
-    else check "data/config/app-bot.json" 0 "缺少（服务拒绝启动）" "使用 $(ops_command_hint configure-app-bot) 填写 AppID 和 AppSecret。"; fi
-
-    # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
-    # 校验在一次性容器中按正式标签运行：部署、升级或未完成的事务期间标签可能是旧版本，跳过并说明。
-    local models_ok="0" models_detail='缺少或无效'
-    local models_fix="首次配置请使用 $(ops_command_hint deploy)；已有文件无效时，先修正 data/config/models.json 与 data/runtime/pi/settings.json。"
-    if [ ! -s "$MODELS_FILE" ]; then :
-    elif deployment_in_progress; then
-        models_detail='部署或升级尚未完成，未检查'
-        models_fix="完成或回滚上次操作（$(ops_command_hint resume) / $(ops_command_hint rollback)）后重新体检。"
-    elif validate_model_configuration >/dev/null 2>&1; then models_ok="1"; models_detail='有效'; fi
-    check "模型配置（models.json + Pi 设置）" "$models_ok" "$models_detail" "$models_fix"
-
-    check_relay
-
-    if [ "$JSON_OUTPUT" = "1" ]; then
-        printf '{"pass":%s,"warn":%s,"fail":%s,"port":%s,"checks":[%s]}\n' \
-            "$PASS" "$CHECK_WARN" "$FAIL" "$PORT" "$JSON_ROWS"
-        [ "$FAIL" -gt 0 ] && return 1
-        return 0
-    fi
-
-    echo ""
-    echo -e "结果：${GREEN}${PASS} 项通过${NC}，${YELLOW}${CHECK_WARN} 项待核验${NC}，${RED}${FAIL} 项失败${NC}"
-    if [ "$FAIL" -gt 0 ]; then
-        [ "$workspace_ok" = "1" ] || WA "       共享资料目录失败 -> 恢复外置目录或挂载；"
-        WA "       本地失败 -> 使用 $(ops_command_hint restart)；"
-        WA "       应用凭据缺少 -> 使用 $(ops_command_hint configure-app-bot)"
+    local runtime cstate='' rollback='' health=0 local_status=0 models=missing format=lines output status=0 line
+    [ "$JSON_OUTPUT" != 1 ] || format=json
+    if ! runtime="$(ops_bun_present)"; then
+        doctor_unavailable "宿主机 Bun" "没有可用的 Bun 1.4.4 或更高版本，未体检" \
+            "安装 Bun 1.4.4 或更高版本（https://bun.sh/docs/installation）后重试；部署时会自动准备固定版本。"
         return 1
-    else
-        if [ "$CHECK_WARN" -gt 0 ]; then WA "基础检查完成，请处理待核验项"; else OK "全部检查通过"; fi
-        return 0
     fi
+    if has_container; then cstate="$(docker container inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo '?')"; fi
+    ! has_rollback_container || rollback="$ROLLBACK_CONTAINER"
+    bot_local_ready "$PORT" >/dev/null 2>&1 || health=$?
+    case "$health" in 0) local_status=200 ;; 3) local_status=503 ;; esac
+    # 模型校验在一次性容器中按正式标签运行：部署、升级或未完成的事务期间标签可能是旧版本，此时不检查。
+    if [ ! -s "$MODELS_FILE" ]; then models=missing
+    elif deployment_in_progress; then models=busy
+    elif validate_model_configuration >/dev/null 2>&1; then models=valid
+    else models=invalid; fi
+    output="$(MIXIN_DOCTOR_PORT="$PORT" MIXIN_DOCTOR_WORKSPACE="$DEPLOYED_WORKSPACE_ROOT" MIXIN_DOCTOR_LOCAL="$local_status" MIXIN_DOCTOR_MODELS="$models" \
+        MIXIN_DOCTOR_CONTAINER="$cstate" MIXIN_DOCTOR_ROLLBACK="$rollback" \
+        "$runtime" --no-env-file "$OPS_SOURCE_DIR/ops/core/doctor.ts" --platform linux --project "$PROJECT_DIR" --format "$format")" || status=$?
+    # 核心只以 0（没有失败项）或 1（有失败项）结束并给出结果；其他情况是它没能运行。
+    if [ -z "$output" ] || { [ "$status" != 0 ] && [ "$status" != 1 ]; }; then
+        doctor_unavailable "体检" "体检核心没有给出结果（退出码 ${status}），未体检" "确认代码目录完整后重试；$(ops_command_hint deploy) 可重建部署。"
+        return 1
+    fi
+    if [ "$JSON_OUTPUT" = 1 ]; then printf '%s\n' "$output"; return "$status"; fi
+    # 每行是“级别<TAB>文字”，按本入口的样式输出。
+    while IFS= read -r line; do
+        case "${line%%$'\t'*}" in
+            step) P "${line#*$'\t'}" ;;
+            pass) OK "${line#*$'\t'}" ;;
+            warn) WA "${line#*$'\t'}" ;;
+            fail) ER "${line#*$'\t'}" ;;
+            *) echo "${line#*$'\t'}" ;;
+        esac
+    done <<< "$output"
+    return "$status"
 }
 
 # 结构化结果（控制台的任务执行器读它，console/server/executor.ts）：调用方设置 MIXIN_OPS_RESULT_FILE 时，命令结束写一份 JSON（先写临时文件再改名），

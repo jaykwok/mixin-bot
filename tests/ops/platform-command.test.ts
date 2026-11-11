@@ -43,7 +43,7 @@ foreach ($name in @('Invoke-WithUtf8Output', 'Get-OpsCommandHint')) {
     $definition = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     $parts += $definition.Extent.Text
 }
-foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Clear-SpaceHistory', 'Invoke-CoreMaintenance', 'Invoke-TmpAdmin', 'Invoke-RelayAdmin',
+foreach ($name in @('Show-Doctor', 'New-DoctorFailure', 'Step', 'Done', 'Warn', 'Clear-SpaceHistory', 'Invoke-CoreMaintenance', 'Invoke-TmpAdmin', 'Invoke-RelayAdmin',
     'Invoke-ServiceCommand')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "missing function $name" }
@@ -51,7 +51,7 @@ foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Cle
 }
 $parts += @'
 $Project = $PSScriptRoot
-$OpsSource = $PSScriptRoot
+$OpsSource = if ($env:OPS_TEST_SOURCE) { $env:OPS_TEST_SOURCE } else { $PSScriptRoot }
 $Port = 1011
 $TaskName = 'fixture'
 $DeployedWorkspaceRoot = ''
@@ -63,20 +63,15 @@ function Test-ModelConfiguration($project) {
     return $LASTEXITCODE -eq 0
 }
 $AppBotFile = Join-Path $PSScriptRoot 'data\config\app-bot.json'
-# Stands in for "bun run ops\tools\directory-admin.ts doctor" (the service's Stream and directory rows: status, name, detail)
-# and "bun run ops\tools\version-info.ts" (name, value).
-# The rows come from the environment: Bun's transpiler escapes non-ASCII text, which String.raw would keep as "\uXXXX".
-function Get-BunPath { return {
-    $global:LASTEXITCODE = 0
-    if ($args -contains 'ops\tools\version-info.ts') { $env:OPS_TEST_VERSION -split [char]10 } else { $env:OPS_TEST_STREAM -split [char]10 }
-} }
+# The real Bun: doctor hands its facts to the real core (ops/core/doctor.ts in the repository); every other use goes through
+# the Invoke-ConsoleProcess stand-in below. OPS_TEST_NO_BUN: a host without Bun.
+function Get-BunPath { if ($env:OPS_TEST_NO_BUN -ne '1') { if ($env:OPS_TEST_BUN) { return $env:OPS_TEST_BUN }; return 'bun' } }
 function Test-Local { if ($env:OPS_TEST_HEALTH -eq 'fail') { return 0 }; if ($env:OPS_TEST_HEALTH -eq 'verification') { return 503 }; return 200 }
 function Get-BotPids { if ($env:OPS_TEST_HEALTH -ne 'fail') { return 42 } }
 function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction)
     if ($env:OPS_TEST_HEALTH -ne 'fail') { return [pscustomobject]@{ OwningProcess = 42 } }
 }
 function Get-ScheduledTask { param($TaskName, $ErrorAction) }
-function Get-RelayDoctorRows { }
 function Err($message) { [Console]::Error.WriteLine($message) }
 function Invoke-ConsoleProcess([string]$FilePath, [string[]]$Arguments) {
     if ($Arguments[2] -ceq 'maintenance') { Write-Captured 'ops-core' @($Arguments[3..($Arguments.Length-3)]); return 0 }
@@ -128,9 +123,7 @@ async function fixtureWrapper() {
     const child = Bun.spawn(argv, {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
       env: { ...process.env, OPS_TEST_HEALTH: health, OPS_TEST_BUN: process.execPath, OPS_TEST_VALIDATOR: join(PROJECT_DIR, "ops/config/validate-models.ts"),
-        OPS_TEST_PROGRESS: "正在启动机器人", OPS_TEST_DIAGNOSTIC: "测试诊断：Stream 信息",
-        OPS_TEST_STREAM: "pass\t事件 Stream\t已连接 3 分钟\nwarn\t通讯录同步\t范围状态：正在应用，完成前之前的范围（整个通讯录）仍然生效",
-        OPS_TEST_VERSION: "应用机器人\tv1.0.0\n构建\tabc1234\n数据格式\t1", ...env },
+        OPS_TEST_SOURCE: PROJECT_DIR, OPS_TEST_PROGRESS: "正在启动机器人", OPS_TEST_DIAGNOSTIC: "测试诊断：Stream 信息", ...env },
     });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -164,7 +157,7 @@ test("Windows 规范化参数保留群名中的空格，Linux 把取值并入参
   }
 });
 
-windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非零，修复不会混入只读接口", async () => {
+windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非零，修复不会混入只读接口；核心不可用时仍是同一结构", async () => {
   const fixture = await fixtureWrapper();
   try {
     for (const command of ["doctor", "status"]) {
@@ -185,25 +178,35 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
         const names = payload.checks.map((check: { name: string }) => check.name);
         expect(names).toContain("data/config/app-bot.json");
         expect(names.includes("事件 Stream")).toBe(state === "pass");
-        expect(Object.keys(payload).sort()).toEqual(["checks", "fail", "pass", "port", "warn"]);
-        if (state === "pass") {
-          expect(payload.checks.find((check: { name: string }) => check.name === "事件 Stream")).toMatchObject({ status: "pass", detail: "已连接 3 分钟", fix: "" });
-          expect(payload.checks.find((check: { name: string }) => check.name === "通讯录同步")).toMatchObject({ status: "warn", detail: "范围状态：正在应用，完成前之前的范围（整个通讯录）仍然生效" });
-          expect(payload.warn).toBeGreaterThan(0);
-          expect(payload.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "pass", detail: "v1.0.0" });
-          expect(payload.checks.find((check: { name: string }) => check.name === "数据格式")).toMatchObject({ status: "pass", detail: "1" });
-        }
+        expect(Object.keys(payload)).toEqual(["pass", "warn", "fail", "port", "checks"]);
+        expect(payload.port).toBe(1011);
+        // The facts this entry collects reach the core: no scheduled task, the bot's own process on the port, a valid model configuration.
+        const row = (name: string) => payload.checks.find((check: { name: string }) => check.name === name);
+        expect(row("计划任务")).toMatchObject(state === "pass" ? { status: "warn", detail: "未安装；机器人当前以前台方式运行" } : { status: "fail", detail: "缺少，且没有健康的前台机器人" });
+        expect(row("机器人监听 :1011")).toMatchObject(state === "fail" ? { status: "fail", detail: "没有监听" } : { status: "pass", detail: "pid 42（mixin-bot）" });
+        expect(row("模型配置（models.json + Pi 设置）")).toMatchObject({ status: "pass", detail: "有效" });
+        expect(row("共享资料目录")).toMatchObject({ status: "pass", detail: `${join(fixture.root, "workspace")}（默认）` });
+        // The fixture has no service to read: the rows of a running service are covered in doctor.test.ts.
+        if (state === "pass") expect(row("事件 Stream")).toMatchObject({ status: "warn", detail: "无法读取服务状态" });
       }
     }
-    // An unreadable deployment record fails the check and warns against deploying over it.
-    const unknown = JSON.parse((await fixture.run(["doctor", "--json"], "pass", { OPS_TEST_VERSION: "应用机器人\t未知：部署记录没有程序版本" })).stdout);
-    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "fail", detail: "未知：部署记录没有程序版本" });
-    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人").fix).toContain("不要在此目录覆盖部署");
     const repair = await fixture.native(["doctor", "-Json", "-Repair"]);
     expect(repair.code).toBe(2);
     expect(repair.stdout).toBe("");
+    // Without Bun, or when the core gives no result, the same structure reports that one failure.
+    for (const env of [{ OPS_TEST_NO_BUN: "1" }, { OPS_TEST_SOURCE: join(fixture.root, "absent") }] as Record<string, string>[]) {
+      const broken = await fixture.run(["doctor", "--json"], "pass", env);
+      expect(broken.code).toBe(1);
+      const payload = JSON.parse(broken.stdout);
+      expect(Object.keys(payload)).toEqual(["pass", "warn", "fail", "port", "checks"]);
+      expect(payload).toMatchObject({ pass: 0, warn: 0, fail: 1, port: 1011 });
+      expect(payload.checks).toEqual([{ name: "体检", status: "fail", detail: expect.stringContaining("未体检"), fix: expect.any(String) }]);
+      const printed = await fixture.run(["doctor"], "pass", env);
+      expect(printed.code).toBe(1);
+      expect(printed.stdout).toContain("未体检");
+    }
   } finally { await fixture.cleanup(); }
-}, 30000);
+}, 120000);
 
 windowsTest("Windows 管理入口调用部署脚本并保留失败退出码", async () => {
   const fixture = await fixtureWrapper();
@@ -226,8 +229,8 @@ windowsTest("控制台体检与修复输出使用控制台页面，直接调用�
     for (const ui of ["console", "cli"]) {
       const web = ui === "console", env = { MIXIN_OPS_UI: ui };
       const passing = JSON.parse((await fixture.run(["doctor", "--json"], "pass", env)).stdout);
-      expect(passing.checks.find((check: { name: string }) => check.name === "通讯录同步").fix)
-        .toContain(web ? "「通讯录」" : "scripts\\ops.ps1 directory");
+      expect(passing.checks.find((check: { name: string }) => check.name === "事件 Stream").fix)
+        .toContain(web ? "「日志」" : "scripts\\ops.ps1 logs");
       const result = await fixture.run(["doctor", "--json"], "fail", env);
       expect(result.code, result.stderr).toBe(1);
       const health = JSON.parse(result.stdout);
@@ -241,7 +244,7 @@ windowsTest("控制台体检与修复输出使用控制台页面，直接调用�
       if (web) expect(printed.stdout).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
     }
   } finally { await fixture.cleanup(); }
-}, 30000);
+}, 90000);
 
 windowsTest("Windows 管理入口在中文代码页下通过 UTF-8 输出普通进度、诊断和错误", async () => {
   const fixture = await fixtureWrapper();

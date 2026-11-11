@@ -98,22 +98,13 @@ export function versionRows(facts: VersionFacts): [string, string][] {
 }
 
 /** The program of this checkout's ready service on `port`, checked against data/state/instance.json like the health check. */
-async function probeProgram(project: string, port: number): Promise<ProgramVersion | undefined> {
+export async function probeProgram(project: string, port: number): Promise<ProgramVersion | undefined> {
   try {
+    // The record first: without one nothing here is this checkout's service, and no request is made.
+    const expected = JSON.parse(readFileSync(join(project, "data", "state", "instance.json"), "utf8"));
     const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2500), redirect: "error" });
     const body: unknown = await response.json();
-    const expected = JSON.parse(readFileSync(join(project, "data", "state", "instance.json"), "utf8"));
     return response.ok && matchesInstance(body, expected, port) ? healthProgram(body) : undefined;
   } catch { return undefined; }
 }
 
-if (import.meta.main) {
-  // ops doctor: one tab-separated row per line. The running program comes from the /health body on stdin (ops.sh, which
-  // may run this inside the container) or from this checkout's service on --port (ops.ps1).
-  let running: ProgramVersion | undefined;
-  const port = process.argv.indexOf("--port");
-  if (process.argv.includes("--health-stdin")) {
-    try { running = healthProgram(JSON.parse(await Bun.stdin.text())); } catch { running = undefined; }
-  } else if (port > 0) running = await probeProgram(process.cwd(), Number(process.argv[port + 1]));
-  for (const [name, value] of versionRows(versionFacts(process.cwd(), running))) console.log(`${name}\t${value}`);
-}

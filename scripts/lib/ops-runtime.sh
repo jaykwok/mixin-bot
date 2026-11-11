@@ -90,6 +90,23 @@ ops_bun() (
     printf '%s\n' "$final/bun"
 )
 
+# The runtime this host already has, for read-only commands: the task's, the one on PATH, or the pinned one a deployment
+# saved. Nothing is downloaded or created.
+ops_bun_present() (
+    local candidate choice asset sha final
+    if [ -n "${MIXIN_OPS_BUN:-}" ]; then
+        ops_bun_usable "$MIXIN_OPS_BUN" || exit 1
+        printf '%s\n' "$MIXIN_OPS_BUN"; exit 0
+    fi
+    candidate="$(command -v bun || true)"
+    if [ -n "$candidate" ] && ops_bun_usable "$candidate"; then printf '%s\n' "$candidate"; exit 0; fi
+    choice="$(ops_bun_asset 2>/dev/null)" || exit 1
+    read -r asset sha <<< "$choice" || exit 1
+    final="$PROJECT_DIR/.console/bun/1.4.4-$asset"
+    [ -d "$final" ] && [ ! -L "$final" ] && ops_bun_cache_valid "$final" "$asset $sha" 2>/dev/null || exit 1
+    printf '%s\n' "$final/bun"
+)
+
 ops_core() {
     local runtime
     runtime="$(ops_bun)" || return 1
