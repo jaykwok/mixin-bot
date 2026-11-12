@@ -5,7 +5,8 @@
 export type SnapshotPlatform = "docker" | "windows" | "macos";
 /**
  * configuration: the wizards and the console, through the configuration transaction; pi: Pi itself (model selection and
- * catalogue); deployment: the deployment core; console: the console's directory-scope change; operator: edited by hand.
+ * catalogue); deployment: the deployment core; console: the console through the running service (the directory scope,
+ * the materials exclusions); operator: edited by hand.
  */
 export type SettingsWriter = "configuration" | "pi" | "deployment" | "console" | "operator";
 
@@ -36,7 +37,7 @@ export const SETTINGS_FILES: readonly SettingsFile[] = [
   { path: "data/config/mcp.json", writers: ["operator"], secret: true, check: "readMcpConfig", required: false, snapshot: ALL },
   { path: "data/config/directory.json", writers: ["deployment", "console"], secret: false, check: "readDirectoryScope", required: false, snapshot: ALL },
   { path: "data/config/task-deployment.json", writers: ["deployment"], secret: false, check: "Linux task isolation: the Docker host reads it", required: false, snapshot: ALL },
-  { path: "data/config/materials-ignore.txt", writers: ["operator"], secret: false, check: "none: the materials index reads it as exclusion rules", required: false, snapshot: ALL },
+  { path: "data/config/materials-ignore.txt", writers: ["operator", "console"], secret: false, check: "none: the materials index reads it as exclusion rules", required: false, snapshot: ALL },
   { path: "data/runtime/pi/settings.json", writers: ["pi"], secret: false, check: "resolveModelSelection", required: true, snapshot: ALL },
   { path: "data/runtime/models-store.json", writers: ["pi"], secret: false, check: "Pi catalogue cache; may be absent", required: false, snapshot: ALL },
   { path: "data/runtime/bot-launcher.ps1", writers: ["deployment"], secret: false, check: "none: generated from the recorded tools", required: false, snapshot: ["windows"] },

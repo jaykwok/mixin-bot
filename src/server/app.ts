@@ -25,6 +25,8 @@ import { platformOutbound } from "../durable/outbound.ts";
 import { downloadFile } from "../integrations/open-platform/files.ts";
 import { InboundRouter } from "./inbound.ts";
 import { loadModuleDefinitions } from "../agent/modules.ts";
+import { materialExclusions, materialFolders, parseExclusionRules, saveExclusionRules } from "../agent/materials-exclusions.ts";
+import { ensureMaterialsIndex } from "../agent/materials-index.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { openModelSelection } from "../durable/models.ts";
@@ -136,6 +138,7 @@ try {
   const directory = new IdentityDirectory(stateDatabase(), applicationBinding(appBot), { scope: readDirectoryScope() });
   // The host console's reads: a thread and read-only connections of their own, never the service's SQL queue.
   reads = new ReadChannel({ conversations: resolve(LAYOUT.conversations), state: resolve(STATE_DATABASE_PATH) });
+  const materialPaths = { workspaceDir: resolve(LAYOUT.workspace), indexPath: resolve(LAYOUT.materialsIndex), ignorePath: resolve(LAYOUT.materialsIgnore) };
   const app = createApp({ isStopping: () => stopping, adminToken, instanceId, startedAt, shutdown: () => void shutdown("local control"),
     read: reads,
     health: () => ({ stream: stream?.status(), directory: directory.status(), attention: messages?.attention() }),
@@ -152,6 +155,16 @@ try {
       checking.throwIfAborted();
       const status = await directory.changeScope(scope, directoryClient, application.signal, writeDirectoryScope);
       return status === "unchanged" ? { status } : { status, departments: checked };
+    },
+    materials: {
+      exclusions: () => materialExclusions(materialPaths.ignorePath, materialPaths.indexPath),
+      save: async (rules) => {
+        await saveExclusionRules(materialPaths.ignorePath, parseExclusionRules(rules));
+        // The index follows at once rather than with the next conversation; a failure is the index's own to report.
+        void ensureMaterialsIndex(materialPaths);
+        return materialExclusions(materialPaths.ignorePath, materialPaths.indexPath);
+      },
+      folders: path => materialFolders(materialPaths.workspaceDir, path),
     },
     // The server listens only once everything below exists.
     takeover: { stop: (space, phone) => takeover!.stop(space, phone), say: (space, phone, text) => takeover!.say(space, phone, text) },

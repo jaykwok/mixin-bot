@@ -6,6 +6,7 @@ import { api } from "./api.ts";
 import type { ReadPage } from "./contract.ts";
 import { clock } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
+import { MaterialExclusionsForm } from "./materials.tsx";
 import type { Tint } from "./nav.ts";
 import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
 import { Banner, Field, PageHeader, Row, Section, Segmented, Skeleton, Spinner, Toggle } from "./ui.tsx";
@@ -256,6 +257,7 @@ export function SettingsPage() {
         {mcp.map(([name, value]) => <Row key={name} class="value" icon="layers" tint="gray" title={name === "MCP" ? "MCP" : name!.slice("MCP · ".length)}>{value}</Row>)}
       </Section>}
     </>}
+    <MaterialExclusionsForm />
     <RuntimeForm key={runtimeEnded} />
     {data && <p class="footnote">读取于 {clock(data.checkedAt)} · {data.note}</p>}
   </>;

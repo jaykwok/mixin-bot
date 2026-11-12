@@ -13,7 +13,7 @@ import { log } from "../core/log.ts";
 import { application } from "../core/lifecycle.ts";
 
 /** 与具体群无关的噪声目录；点开头的目录（.git/.venv/.cache）一律跳过。 */
-const ALWAYS_SKIPPED = new Set(["node_modules", "__pycache__", "$RECYCLE.BIN"]);
+export const ALWAYS_SKIPPED = new Set(["node_modules", "__pycache__", "$RECYCLE.BIN"]);
 
 export interface MaterialsIndexSummary {
   /** 清单文件的绝对路径，直接写进提示词供模型 grep。 */
@@ -53,15 +53,15 @@ function formatDateTime(ms: number): string {
 // 以 ANYWHERE 开头的规则匹配任意层级，其余规则从资料根目录起按前缀匹配。
 const ANYWHERE = "**/";
 
-const IGNORE_TEMPLATE = [
-  "# 共享资料索引的排除规则（手工维护；首次运行时自动生成，之后不会覆盖）",
+export const IGNORE_TEMPLATE = [
+  "# 共享资料索引的排除规则（首次运行时自动生成；可以手工编辑，也可以在控制台「设置」页修改，注释行会保留）",
   "#",
   "# 每行一条，# 开头为注释，不区分大小写，路径分隔符用 /。例如：",
   "#   归档/2023        排除资料根目录下的 归档/2023/ 及其全部内容",
   "#   **/#recycle      排除任意层级名为 #recycle 的目录或文件",
   "# 除开头的 **/ 外不支持其他通配符。",
   "#",
-  "# 只影响资料索引 materials.md，不限制机器人直接查找或读取这些文件。",
+  "# 影响资料索引 materials.md 和资料搜索，不限制机器人按路径直接读取这些文件。",
   `# 已默认跳过、无需填写：点开头的目录和文件、${[...ALWAYS_SKIPPED].join("、")}、软链接。`,
   "# 修改后下一轮对话自动重建索引；跨版本重置升级时本文件原位保留。",
   "",
@@ -305,6 +305,10 @@ async function readManifest(options: EnsureOptions): Promise<Manifest | null> {
 const cache = new Map<string, CacheEntry>();
 const building = new Map<string, Promise<MaterialsIndexSummary | null>>();
 const retryAt = new Map<string, number>();
+/** The index as last built or checked in this process, without scanning; undefined before the first use. */
+export function indexedSummary(indexPath: string): MaterialsIndexSummary | undefined {
+  return cache.get(resolve(indexPath))?.summary;
+}
 function rememberSummary(key: string, entry: CacheEntry): void {
   cache.delete(key);
   if (cache.size >= 128) cache.delete(cache.keys().next().value!);

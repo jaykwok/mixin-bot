@@ -18,6 +18,7 @@ import { operationObserver } from "../../ops/core/operations.ts";
 import { operationPreparer } from "./prepare-operation.ts";
 import { FormRoutes } from "./form-routes.ts";
 import { PushPage } from "./push-page.ts";
+import { materialsRoutes } from "./materials-routes.ts";
 import { PushRoutes } from "./push-routes.ts";
 import { UploadStore } from "./uploads.ts";
 import { BackupForms } from "./backup-forms.ts";
@@ -148,7 +149,7 @@ async function main(argv: string[]): Promise<number | undefined> {
   const server = startServer({
     port: choice.port, guard: guardConfig(choice.port, forwarded === undefined ? [] : [forwarded]),
     bundle, auth, instanceId, current: read => fence.current(read ? CODE_CHECK_MS : 0), dataSignal: dataReads.signal, overview: () => loadOverview(info),
-    routes: { ...conversationRoutes({ bot, audit, views, takeover: bot }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...setup.routes(), ...fileRoutes(PROJECT_DIR),
+    routes: { ...conversationRoutes({ bot, audit, views, takeover: bot }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...materialsRoutes(PROJECT_DIR, audit), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...setup.routes(), ...fileRoutes(PROJECT_DIR),
       ...taskRoutes({ tasks, plans, observers, audit, hosting: hostingCheck, current: () => fence.current(), prepare: operationPreparer(PROJECT_DIR, views, undefined, uploads, backups, forms, configurations, deploymentDirectory),
         created: request => { uploads.bind(request); backups.bind(request); for (const { draft, digest } of taskDrafts(request)) configurations.bind(draft, digest, request.id); },
         launch: id => launchTask(tasks, id, executorBundle) }) },

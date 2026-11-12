@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
+import type { MaterialExclusions, MaterialFolders } from "../agent/materials-exclusions.ts";
 import { log } from "../core/log.ts";
 import { APP_BUILD, APP_VERSION } from "../core/version.ts";
 import type { DepartmentDescription, DepartmentInfo } from "../integrations/open-platform/directory.ts";
@@ -43,6 +44,12 @@ export interface AppOptions {
    * list, one push, 补推送, the CCs, deleting, and the package download.
    */
   push?: PushAdmin;
+  /**
+   * The materials exclusion rules for the console (src/agent/materials-exclusions.ts): the saved rules with the index they
+   * produced, a save of the whole list (the next index follows it), and the workspace's folders one level at a time. A rule or
+   * a folder path that cannot be used throws ExclusionInput with the reason.
+   */
+  materials?: { exclusions(): Promise<MaterialExclusions>; save(rules: unknown): Promise<MaterialExclusions>; folders(path: unknown): Promise<MaterialFolders> };
   /** The console's takeover of a conversation (src/durable/takeover.ts): stop the bot's work for a member, answer in its place. */
   takeover?: Pick<Takeover, "stop" | "say">;
   /** How long a route may wait on the platform (default PLATFORM_WAIT_MS); tests shorten it. */
@@ -199,6 +206,20 @@ export function createApp(options: AppOptions): Hono {
       }
     });
   }
+  const materialsRoute = (name: string, handle: (materials: NonNullable<AppOptions["materials"]>, body: Record<string, unknown>) => Promise<object>) =>
+    app.post(`/_admin/materials/${name}`, async (c) => {
+      if (!authorized(c.req.header("Authorization")) || !options.materials) return c.notFound();
+      const body = await c.req.json().catch(() => undefined) as Record<string, unknown> | undefined;
+      try { return c.json({ status: "ok", ...await handle(options.materials, body ?? {}) }); }
+      catch (error) {
+        if ((error as Error).name === "ExclusionInput") return c.json({ status: "error", message: (error as Error).message }, 400);
+        log.warn(`控制台的资料排除规则请求失败（${name}）: ${String(error)}`);
+        return c.json({ status: "error", message: (error as Error).message }, 500);
+      }
+    });
+  materialsRoute("exclusions", materials => materials.exclusions());
+  materialsRoute("exclusions/save", (materials, body) => materials.save(body.rules));
+  materialsRoute("folders", (materials, body) => materials.folders(body.path ?? ""));
   app.post("/_admin/push/settings", (c) => {
     if (!authorized(c.req.header("Authorization")) || !options.push) return c.notFound();
     return c.json({ status: "ok", ...options.push.settings() as object });

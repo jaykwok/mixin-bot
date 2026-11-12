@@ -1294,6 +1294,23 @@ button.bar-row:hover, div.bar-row:hover { background: var(--hover); }
 .push-add { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .push-add input { width: 220px; }
 
+/* ---------- Materials exclusions ---------- */
+
+.materials-rules { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 4px 16px 12px; font-size: 12.5px; }
+.materials-warn { color: var(--warn); }
+.materials-browser { margin: 0 16px 12px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); }
+.materials-crumb { display: inline-flex; align-items: center; }
+.materials-folders { list-style: none; margin: 6px 0 0; padding: 0; max-height: 320px; overflow-y: auto; font-size: 13px; }
+.materials-folders li { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 2px 4px; border-radius: 8px; }
+.materials-folders li:hover { background: var(--fill); }
+.materials-folders[aria-busy="true"] { opacity: 0.6; }
+.materials-folder { display: inline-flex; align-items: center; gap: 7px; min-width: 0; padding: 4px 6px; font: inherit; color: var(--text); background: none; border: 0; border-radius: 7px; cursor: pointer; }
+.materials-folder span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.materials-folder .icon { flex: none; color: var(--accent); }
+.materials-folder:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent); }
+.materials-size { flex: none; font-size: 12px; }
+.push-add input.materials-input { width: 340px; max-width: 100%; font-family: var(--font-mono); font-size: 12.5px; }
+
 /* ---------- Department tree ---------- */
 
 .department-tree { list-style: none; margin: 4px 0; padding-left: 18px; border-left: 1.5px solid var(--separator); }

@@ -232,7 +232,7 @@ data/
 │   ├── mcp.json               可选 MCP 服务器、传输与工具白名单
 │   ├── directory.json         通讯录同步范围（整个通讯录或选定的部门，部署时选择）
 │   ├── task-deployment.json   Linux 任务隔离部署清单（私有，由部署维护）
-│   └── materials-ignore.txt   资料索引排除规则（自动生成模板，手工维护）
+│   └── materials-ignore.txt   资料索引排除规则（自动生成模板；在控制台设置或手工编辑）
 ├── index/                     资料索引 materials.md、扫描 manifest 与 parsed/ 解析缓存，可重建
 ├── conversations/
 │   ├── direct/durable.sqlite  单聊空间库（Pi Durable）：全部单聊成员的会话、排队消息、控制命令、待交付内容与附件登记

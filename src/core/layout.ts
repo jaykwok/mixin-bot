@@ -10,7 +10,7 @@ import { DATA_DIR } from "./storage.ts";
  *
  *   <project>/workspace                      默认共享资料（data 的同级目录；WORKSPACE_ROOT 可指向外置目录），模型只读
  *   <data>/index/                            公共资料索引、manifest 与公共解析缓存（可重建）
- *   <data>/config/materials-ignore.txt       管理员维护的索引排除规则
+ *   <data>/config/materials-ignore.txt       索引排除规则（控制台或手工维护）
  *   <data>/runtime/document-env              原生部署共享的文档解析环境
  *   <data>/state/stats.sqlite                统计账本
  *   <data>/state/reclamation/                离线回收计划、快照与归档

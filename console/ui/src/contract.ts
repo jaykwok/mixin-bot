@@ -235,6 +235,18 @@ export interface PushDepartmentView { key: string; path: string; gone?: true }
 export interface PushSettingsResponse { view: string; departments: PushDepartmentView[]; roles: PushRoleView[] }
 
 /**
+ * The folders the materials index leaves out. `rules`: one path from the workspace per rule, or a name after the any-level
+ * prefix (two asterisks and a slash) for that name at any level. `index`: the index the service last built (null until it has built one since it started); `truncated`: it
+ * stopped at `limit` files or could not read something.
+ */
+export interface MaterialExclusionsResponse {
+  rules: string[];
+  index: { files: number; bytes: number; generatedAt: number; truncated: boolean; limit: number; topLevel: { name: string; files: number; bytes: number }[] } | null;
+}
+/** The folders of one workspace folder (`path` from the workspace, `""` for the workspace itself). */
+export interface MaterialFoldersResponse { path: string; folders: string[]; more: boolean }
+
+/**
  * A group chat the bot has been @ in, by key within this read: `seen` until an admin registers it, then pushable by name
  * until disabled. `registeredBy`: name and masked phone, 控制台, or null.
  */
