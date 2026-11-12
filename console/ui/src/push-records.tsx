@@ -178,6 +178,7 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
           <dt>对象</dt><dd>{push.target.map(line => <div key={line}>{line}</div>)}</dd>
           <dt>要求</dt><dd>{MODE[push.mode]}{push.options.length ? `：${push.options.join(" / ")}` : ""}</dd>
           {push.files.length > 0 && <><dt>附件</dt><dd>{push.files.map(file => `${file.name}（${bytes(file.size)}）`).join("、")}</dd></>}
+          {push.fields.length > 0 && <><dt>每人内容</dt><dd>{push.fields.join("、")}（每个接收人的卡片上只有自己的，见下面名单）</dd></>}
           <dt>时间</dt><dd>{dateTime(push.createdAt)} 准备{push.confirmedAt ? `，${dateTime(push.confirmedAt)} 发出` : ""}，截止 {dateTime(push.deadline)}{push.defaultDeadline ? "（未指定，默认 3 天）" : ""}
             {push.closedAt ? `，${dateTime(push.closedAt)} ${push.closeReason === "complete" ? "全部答复" : "结束"}` : ""}</dd>
           <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}</dd>
@@ -222,7 +223,8 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
         <tbody>{shown.map(recipient => <tr key={recipient.key}>
           <td>{canRemind && selectable(recipient) && <input type="checkbox" aria-label={`选择 ${recipient.name}`} checked={chosen.has(recipient.key)} disabled={busy}
             onChange={() => toggle(recipient.key)} />}</td>
-          <td>{recipient.name}{recipient.forwardedBy ? <div class="muted">{recipient.forwardedBy} 转来</div> : null}</td>
+          <td>{recipient.name}{recipient.forwardedBy ? <div class="muted">{recipient.forwardedBy} 转来</div> : null}
+            {push.fields.length > 0 && recipient.values.length > 0 && <div class="muted">{push.fields.map((field, index) => `${field} ${recipient.values[index] ?? ""}`).join("；")}</div>}</td>
           <td class="mono">{recipient.phone}</td>
           <td>{SEND[recipient.sendState]}{recipient.sentAt ? <div class="muted">{dateTime(recipient.sentAt)}</div> : null}</td>
           <td class="push-answer">{answerOf(push, recipient)}{recipient.repliedAt ? <div class="muted">{dateTime(recipient.repliedAt)}</div> : null}</td>

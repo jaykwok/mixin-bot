@@ -78,6 +78,17 @@ async function located(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): P
 type Entry = { name: string; size: number } & ({ path: string } | { data: Uint8Array });
 const entrySize = (entry: Entry) => ENTRY_OVERHEAD + 2 * Buffer.byteLength(entry.name) + entry.size;
 
+/**
+ * The check sheet of a push whose recipients each get their own values: every recipient with theirs, written into `dir`,
+ * for the pusher to go through before confirming. Phones masked as in the summary.
+ */
+export async function writeCheckSheet(push: Pick<Push, "id" | "subject" | "fields">, recipients: readonly Recipient[], dir: string, now: number): Promise<SummaryPart> {
+  const name = `${safeFileName(`推送核对-${push.subject}-${push.id}`)}.xlsx`, path = join(dir, name);
+  await writeWorkbook(path, { name: "核对", columns: [{ title: "姓名", width: 12 }, { title: "手机号", width: 15 }, ...push.fields.map(title => ({ title, width: 24 }))],
+    rows: recipients.map(recipient => [recipient.name, maskPhone(recipient.member), ...push.fields.map((_, at) => recipient.values[at] ?? null)]) }, now);
+  return { path, name, size: (await stat(path)).size };
+}
+
 export async function buildSummary(input: SummaryInput): Promise<SummaryPackage> {
   const { push, recipients, items, now } = input, phone = maskPhone;
   const limit = Math.min(input.partBytes, ZIP_MAX);
@@ -91,7 +102,8 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   const handed = (member: string) => [...forwards.filter(forward => forward.to === member).map(forward => `由 ${nameOf(forward.from)} 转来`),
     ...(forwards.some(forward => forward.from === member) ? [`转给 ${forwards.filter(forward => forward.from === member).map(forward => forward.toName).join("、")}`] : [])].join("；");
   const columns: Sheet["columns"] = [
-    { title: groups ? "姓名或群" : "姓名", width: 12 }, { title: "手机号", width: 15 }, { title: "发送", width: 10 }, { title: groups ? "确认时间（群为首次）" : "确认时间", width: 13 },
+    { title: groups ? "姓名或群" : "姓名", width: 12 }, { title: "手机号", width: 15 },
+    ...push.fields.map(title => ({ title, width: 18 })), { title: "发送", width: 10 }, { title: groups ? "确认时间（群为首次）" : "确认时间", width: 13 },
     ...(groups ? [{ title: "群里点击次数", width: 8 }] : []),
     ...(push.mode === "options" ? [{ title: "选择", width: 14 }, { title: "选择时间", width: 13 }] : []),
     ...(push.mode === "reply" ? [{ title: "回复时间", width: 13 }, { title: "回复文字", width: 60 }, { title: "附件", width: 40 }] : []),
@@ -103,7 +115,8 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   for (const recipient of recipients) {
     index++;
     const own = replyItems(recipient, items), group = memberGroup(recipient.member) !== undefined;
-    const row: (string | number | null)[] = [recipient.name, group ? "群" : phone(recipient.member), SEND_LABEL[recipient.sendState], time(recipient.ackedAt)];
+    const row: (string | number | null)[] = [recipient.name, group ? "群" : phone(recipient.member), ...push.fields.map((_, at) => recipient.values[at] ?? null),
+      SEND_LABEL[recipient.sendState], time(recipient.ackedAt)];
     if (groups) row.push(group ? recipient.clicks : null);
     if (push.mode === "options") row.push(recipient.choice === null ? null : push.options[recipient.choice] ?? null, time(recipient.choiceAt));
     if (push.mode === "reply") {

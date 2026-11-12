@@ -73,10 +73,11 @@ export function clickData(content: unknown): ClickData | undefined {
 }
 
 /**
- * A push file's name on a card. It is the pusher's text like the body, one line already: only what would open emphasis,
- * code or a link is escaped, so an ordinary name (dots, dashes, underscores, brackets) reads as it is.
+ * A line of the pusher's own on a card: a file's name, a field's title, a recipient's value. It is the pusher's text like
+ * the body, one line already: only what would open emphasis, code or a link is escaped, so an ordinary name or number
+ * (dots, dashes, underscores, brackets) reads as it is.
  */
-const fileName = (name: string) => name.replace(/[\\`*[\]<>~]/g, "\\$&");
+const ownText = (name: string) => name.replace(/[\\`*[\]<>~]/g, "\\$&");
 
 export type Counts = { texts: number; files: number };
 
@@ -109,8 +110,8 @@ const FORWARD_HINT = "这件事该由别人处理的话，告诉我转给谁。"
 
 export type PreviewView = {
   push: Push;
-  /** Recipients in list order (people and groups). */
-  people: readonly { name: string; member: string }[];
+  /** Recipients in list order (people and groups); `values`: a person's own under the push's fields. */
+  people: readonly { name: string; member: string; values?: readonly string[] }[];
   /** Once confirmed: how the sends went. */
   sent?: { done: number; total: number; delivered: Reach; failed: Reach };
 };
@@ -150,17 +151,51 @@ function progressLine(push: Push, now: number): string[] {
   return [`**提醒**：${when}把进度发给你${push.remind ? "，并把卡片再发一次给还没有答复的人" : "；不自动提醒没有答复的人"}`];
 }
 
-export function previewCard(view: PreviewView, now = Date.now()): CardContent {
+/** Characters the preview spends on the recipients' own values, and what it keeps free for its last lines. */
+const PREVIEW_VALUE_CHARS = 1200, PREVIEW_TAIL_CHARS = 300;
+
+/** The preview's lines before the body's rule, without the recipients' own values. */
+function previewHead(view: PreviewView, now: number): string[] {
   const { push } = view;
   const deadline = `${shortTime(push.deadline, now)}${push.defaultDeadline ? "（未指定，默认发出后 3 天）" : ""}`;
   const cc = push.cc.length ? push.cc.map(person => `${escapeInline(person.name)}（尾号 ${phoneTail(person.phone)}）`).join("、") : "无抄送";
-  const lines = [
+  return [
     ...targetLines(push, view.people),
     `**抄送**：${cc}`,
     `**要求**：${escapeInline(requirementText(push))}`,
     `**截止**：${deadline}`,
-    ...(push.files.length ? [`**附件**：${push.files.map(file => `${fileName(file.name)}（${formatSize(file.size)}）`).join("、")}；在卡片之前单独发给每个接收人`] : []),
+    ...(push.files.length ? [`**附件**：${push.files.map(file => `${ownText(file.name)}（${formatSize(file.size)}）`).join("、")}；在卡片之前单独发给每个接收人`] : []),
     ...progressLine(push, now),
+  ];
+}
+
+/**
+ * The recipients' own values as the preview lists them, one line a person in list order: as many as fit beside the rest of
+ * the card. All of them are in the check sheet the service sends after the card (./service.ts).
+ */
+function valueLines(view: PreviewView, now: number): string[] {
+  const { push } = view;
+  if (!push.fields.length) return [];
+  const rest = [...previewHead(view, now), push.body].join("\n").length + PREVIEW_TAIL_CHARS;
+  const budget = Math.min(PREVIEW_VALUE_CHARS, CARD_MAX_CHARS - rest);
+  const lines: string[] = [];
+  let used = 0;
+  for (const person of view.people) {
+    const line = `- ${escapeInline(person.name)}（尾号 ${phoneTail(person.member)}）：${push.fields.map((field, index) => `${ownText(field)} ${ownText(person.values?.[index] ?? "")}`).join("；")}`;
+    if (used + line.length + 1 > budget) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  return lines;
+}
+
+export function previewCard(view: PreviewView, now = Date.now()): CardContent {
+  const { push } = view;
+  const listed = valueLines(view, now);
+  const lines = [
+    ...previewHead(view, now),
+    ...(push.fields.length ? [`**每人不同的内容**：${push.fields.map(ownText).join("、")}；每人的卡片上只有自己的。全部内容在随后发给你的核对表里，请逐人核对`, ...listed,
+      ...(listed.length < view.people.length ? [`……共 ${view.people.length} 人`] : [])] : []),
     "",
     "---",
     "",
@@ -212,11 +247,14 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   const { push, recipient } = view;
   const group = memberGroup(recipient.member) !== undefined;
   const title = `推送：${push.subject}`;
+  // What the push says for this recipient alone; one it was handed on to sees what it said for who handed it on.
+  const own = push.fields.flatMap((field, index) => recipient.values[index] ? [`**${ownText(field)}**：${ownText(recipient.values[index]!)}`] : []);
   const head = [`**${escapeInline(push.pusherName)}** 于 ${shortTime(push.confirmedAt ?? push.createdAt, now)} 推送${group ? "到本群" : ""}`
     + (view.forwardedBy ? `，**${escapeInline(view.forwardedBy)}** 转给你` : "")
-    + (push.target.of ? `（补推送：之前的推送还没有收到${group ? "本群" : "你"}的答复）` : ""), "", push.body, "", "---", "",
+    + (push.target.of ? `（补推送：之前的推送还没有收到${group ? "本群" : "你"}的答复）` : ""), "", push.body,
+    ...(own.length ? ["", ...(view.forwardedBy ? [`给 ${escapeInline(view.forwardedBy)} 的内容：`] : []), ...own] : []), "", "---", "",
     `**要求**：${escapeInline(group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push))}`, `**截止**：${shortTime(push.deadline, now)}`,
-    ...(push.files.length ? [`**附件**：${push.files.map(file => fileName(file.name)).join("、")}（已单独发${group ? "到本群" : "给你"}）`] : [])];
+    ...(push.files.length ? [`**附件**：${push.files.map(file => ownText(file.name)).join("、")}（已单独发${group ? "到本群" : "给你"}）`] : [])];
   const tail = ["", `推送编号 ${push.id}`];
   const make = (status: { name: string; color: string }, extra: string[], buttons: CardButton[], invalid = false) =>
     card(title, [...head, ...extra, ...tail].join("\n"), status, buttons, recipient.card, invalid);
@@ -306,7 +344,8 @@ export function forwardCard(view: ForwardView, now = Date.now()): CardContent {
   if (forward.state === "cancelled") {
     return card(title, [`${subject}没有转给 ${who}。`, ...tail].join("\n"), { name: "没有转派", color: COLOR.closed }, [], forward.card, true);
   }
-  const lines = [`把${subject}转给 ${who}？`, "", "点「确认转派」后，这条推送的卡片会发给对方，推送人也会知道是你转的；发出后收不回来。", ...tail];
+  const lines = [`把${subject}转给 ${who}？`, "", "点「确认转派」后，这条推送的卡片会发给对方，推送人也会知道是你转的；发出后收不回来。",
+    ...(push.fields.length ? [`卡片上写给你的内容（${push.fields.map(ownText).join("、")}）也会一起发给对方。`] : []), ...tail];
   return card(title, lines.join("\n"), { name: "待确认", color: COLOR.waiting },
     [button(push, forward.version, 1, "确认转派", "forward", 1, { forward: forward.id }), button(push, forward.version, 2, "取消", "keep", 2, { forward: forward.id })], forward.card);
 }

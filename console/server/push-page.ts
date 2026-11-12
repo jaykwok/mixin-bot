@@ -133,10 +133,10 @@ export class PushPage {
     const recipients: PushRecipientView[] = detail.recipients.map(recipient => ({ ...person(recipient.member, recipient.name),
       group: memberGroup(recipient.member) !== undefined, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
       ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice, choiceAt: recipient.choiceAt,
-      repliedAt: recipient.repliedAt, answered: recipient.answered, reply: recipient.reply, forwardedBy: recipient.forwardedBy, forwardedTo: recipient.forwardedTo }));
+      repliedAt: recipient.repliedAt, answered: recipient.answered, reply: recipient.reply, forwardedBy: recipient.forwardedBy, forwardedTo: recipient.forwardedTo, values: recipient.values }));
     return { view: key, recipients, push: { ...this.#listItem(push), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: lines,
       cc: push.cc.map(each => person(each.phone, each.name)), summaryError: push.summaryError, summaryAt: push.summaryAt,
-      files: push.files.map(({ name, size }) => ({ name, size })),
+      files: push.files.map(({ name, size }) => ({ name, size })), fields: push.fields,
       reminders: { recipients: push.remind, sent: push.reminded, next: push.checkpoints[0] ?? null } } };
   }
 

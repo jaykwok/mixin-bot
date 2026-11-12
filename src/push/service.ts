@@ -68,7 +68,7 @@ import { checkpoints } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
-import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage } from "./summary.ts";
+import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage, writeCheckSheet } from "./summary.ts";
 import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
   type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
 
@@ -121,6 +121,10 @@ export const PUSH_LIMITS = {
   /** The copies of a closed push's files stay this long (a follow-up push takes them); the directory is looked through this often. */
   filesKeepMs: 30 * 24 * 3600_000,
   filesSweepMs: 3600_000,
+  /** What differs by recipient: titles here, each recipient's values under `recipients` (people only). */
+  fields: 6,
+  fieldChars: 12,
+  valueChars: 100,
   subjectChars: 40,
   bodyChars: 3000,
   options: [2, 6] as readonly [number, number],
@@ -159,7 +163,8 @@ export interface PushOptions {
 
 /** What push_prepare passes on (./tools.ts). */
 export type PrepareInput = {
-  recipients?: readonly { name: string; phone: string }[];
+  /** `values`: what the push's `fields` say for this person, in their order. */
+  recipients?: readonly { name: string; phone: string; values?: readonly string[] }[];
   /** By name or path; `children: false` leaves the sub-departments out. */
   departments?: readonly { name: string; children?: boolean }[];
   everyone?: boolean;
@@ -175,6 +180,8 @@ export type PrepareInput = {
   remind?: boolean;
   /** Files to send along: local files the tool resolved (./tools.ts), with their sizes. */
   attachments?: readonly { path: string; size: number }[];
+  /** Titles of what differs by recipient; then the push goes to people only, each with `values`. */
+  fields?: readonly string[];
 };
 
 /** What directory_lookup passes on (./tools.ts): at least one of names, phone and department; together they narrow down. */
@@ -221,7 +228,7 @@ export type PushCounts = Omit<RecipientCounts, "unsettled" | "repliedAt">;
 export type PushCursor = Pick<Push, "createdAt" | "id">;
 export type PushListItem = Pick<Push, "id" | "subject" | "mode" | "state" | "pusher" | "pusherName" | "createdAt" | "confirmedAt" | "deadline" | "closedAt"
   | "closeReason" | "summaryState" | "followUp"> & { of: string | null; counts: PushCounts };
-export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "repliedAt"> & {
+export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "values" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "repliedAt"> & {
   choice: string | null;
   /** Answered, or handed the push on. */
   answered: boolean;
@@ -231,7 +238,7 @@ export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState
   forwardedBy: string | null;
   forwardedTo: string[];
 };
-export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "files" | "summaryError" | "summaryAt" | "remind" | "reminded" | "checkpoints">;
+export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "files" | "fields" | "summaryError" | "summaryAt" | "remind" | "reminded" | "checkpoints">;
   recipients: PushRecipientDetail[] };
 
 /** A group as the console lists it: who registered it by name (null: the console did, or nobody yet). */
@@ -252,6 +259,9 @@ const quoted = (text: string) => text.replaceAll("「", "『").replaceAll("」",
 /** A note's part on the push's files; `to`: they went to this recipient as file messages. */
 const filesNote = (push: Pick<Push, "files">, to?: string) => !push.files.length ? ""
   : `；附件：${push.files.map(each => quoted(each.name)).join("、")}${to ? `（已作为文件单独发给${to}）` : ""}`;
+/** A note's part on what a push says for one recipient alone: `；<label>：指标 120；完成率 85%`. */
+const valuesNote = (push: Pick<Push, "fields">, values: readonly string[], label: string) => !push.fields.length || !values.length ? ""
+  : `；${label}：${push.fields.map((field, index) => `${quoted(field)} ${quoted(values[index] ?? "")}`).join("；")}`;
 const NO_DEPARTMENT_GRANT = "你没有按部门推送的权限，请联系管理员在控制台授权";
 const NO_GROUP_GRANT = "你没有推送到群的权限，请联系管理员在控制台授权";
 const PREVIEW_GONE = "这张预览已经作废，什么都没有发出：确认了后面准备的推送，之前没确认的预览就一起清掉了。还要发的话请再提一次。";
@@ -261,8 +271,8 @@ const GROUP_ID = /^[0-9]{1,64}$/;
 /** The console's packages, each in its own directory directly under data/tmp (`package`). */
 const PACKAGE_DIR = "push-console-";
 
-/** Who a push reaches: a person (by phone) or a group (`group:<ID>`), with the name and where the card goes. */
-type Reached = { member: string; name: string; receiveId: string };
+/** Who a push reaches: a person (by phone) or a group (`group:<ID>`), with the name and where the card goes; `values`: the person's own under the push's fields. */
+type Reached = { member: string; name: string; receiveId: string; values?: string[] };
 const personReached = (person: DirectoryIdentity): Reached => ({ member: person.phone, name: person.name, receiveId: person.imUserId });
 const groupReached = (group: TargetGroup): Reached => ({ member: groupMember(group.id), name: group.name, receiveId: group.id });
 const reachOf = (rows: readonly { member: string }[]): Reach => {
@@ -526,10 +536,17 @@ export class PushService {
       else if (parsed > now + limits.maxDeadlineMs) problems.push("截止时间不能超过 30 天之后");
       else { deadline = parsed; defaultDeadline = false; }
     }
+    const fields = (input.fields ?? []).map(field => oneLine(String(field ?? "")));
+    if (fields.length) {
+      if (fields.length > limits.fields) problems.push(`每人不同的内容最多 ${limits.fields} 栏`);
+      if (fields.some(field => !field || chars(field) > limits.fieldChars)) problems.push(`每个栏目名必须是 1 到 ${limits.fieldChars} 个字`);
+      if (new Set(fields).size !== fields.length) problems.push("栏目名不能重复");
+      if (input.departments?.length || input.everyone || input.groups?.length) problems.push("每人不同的内容只能按人推送，不能和部门、全员、群一起用");
+    }
     const before = problems.length;
     // People who do not match are left out and named, as long as someone is left to push to.
     const unmatched: Unmatched[] = [];
-    const target = this.#checkTarget(role, input, problems, unmatched);
+    const target = this.#checkTarget(role, input, fields, problems, unmatched);
     const people = problems.length > before ? [] : this.#expand(target, caller.phone);
     if (problems.length === before && !people.length && !unmatched.length) {
       problems.push(target.departments.length || target.everyone ? "按部门或全员展开后没有可以接收的人（不含你自己）" : "至少要有一个推送对象");
@@ -551,7 +568,7 @@ export class PushService {
     this.#checkLimit(role, now);
     const pusher = this.#directory.byPhone(caller.phone);
     const push = this.#newPush({ pusher: caller.phone, pusherName: pusher?.name ?? caller.reply.name ?? caller.phone, pusherIm: pusher?.imUserId ?? caller.reply.receiveId,
-      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })), remind: input.remind !== false, files: [] });
+      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })), remind: input.remind !== false, files: [], fields });
     const earlier = this.#store.pushesOf(caller.phone, 50).filter(each => each.state === "preview" && !each.target.of).length;
     let outcome;
     try {
@@ -561,9 +578,12 @@ export class PushService {
       if (attachments.length) await rm(join(this.options.layout.pushFiles, push.id), { recursive: true, force: true }).catch(() => {});
       throw error;
     } finally { this.#preparing.delete(push.id); }
+    const sheet = push.fields.length ? await this.#sendCheckSheet(push) : true;
     log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}${push.files.length ? `，附件 ${push.files.length} 个` : ""}，等待推送人确认`);
     return `已把推送预览卡片发给你（推送编号 ${push.id}，${reachText(reachOf(people))}${cc.length ? `，抄送 ${cc.length} 人` : ""}${push.files.length ? `，附件 ${push.files.length} 个` : ""}，`
       + `截止 ${defaultDeadline ? "确认发出后 3 天（未指定截止时间）" : shortTime(deadline, now)}）。`
+      + (!fields.length ? "" : sheet ? `每人不同的内容（${fields.join("、")}）列在随预览发去的核对表里：提醒成员确认前逐人核对，发出后改不了。`
+        : `每人不同的内容（${fields.join("、")}）的核对表没有发出：把每个人的内容列给成员核对，再请成员确认。`)
       + (unmatched.length ? `名单里有 ${unmatched.length} 人没有对上，没有放进这次推送：\n- ${unmatched.map(each => each.why).join("\n- ")}\n把这几个人告诉成员：先发给其余的人就在卡片上确认；要补上他们，核对后带着完整名单重新准备。\n` : "")
       + "请在卡片上核对，点「确认推送」才会发出；点之前不会发给任何人。"
       + (target.departments.length || target.everyone ? "部门和全员的名单在点「确认推送」时按当时的通讯录重新展开。" : "")
@@ -572,14 +592,14 @@ export class PushService {
   }
 
   /** A push in `preview`, with nothing confirmed, sent or summarised yet. */
-  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc" | "remind" | "files">): Push {
+  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc" | "remind" | "files" | "fields">): Push {
     return { id: this.#newId(), ...fields, state: "preview", createdAt: this.#now(), confirmedAt: null, closedAt: null, closeReason: null, previewCard: null,
       previewVersion: 0, summaryState: null, summaryAttempts: 0, summaryAt: null, summaryError: null, summaryDone: [], summaryText: null, summaryCard: null,
       summaryVersion: 0, followUp: null, checkpoints: [], reminded: 0, released: false };
   }
 
   #recipientRow(pushId: string, reached: Reached): Recipient {
-    return { pushId, ...reached, sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, filesSent: 0, card: null, version: 0, ackedAt: null,
+    return { pushId, ...reached, values: reached.values ?? [], sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, filesSent: 0, card: null, version: 0, ackedAt: null,
       clicks: 0, choice: null, choiceAt: null, repliedAt: null };
   }
 
@@ -646,8 +666,10 @@ export class PushService {
    */
   async #createPreview(push: Push, people: readonly Reached[], also?: () => void): Promise<"sent" | "uncertain"> {
     const recipients = people.map(person => this.#recipientRow(push.id, person));
-    // The card must fit (measured ~5000 characters).
-    const sample = recipientCard({ push, recipient: recipients[0]!, reply: { texts: 0, files: 0 } }, this.#now());
+    // The card must fit (measured ~5000 characters): the one with the longest values of its own.
+    const size = (recipient: Recipient) => recipient.values.reduce((sum, value) => sum + value.length, 0);
+    const longest = recipients.reduce((most, each) => size(each) > size(most) ? each : most, recipients[0]!);
+    const sample = recipientCard({ push, recipient: longest, reply: { texts: 0, files: 0 } }, this.#now());
     if (chars(sample.content) > CARD_MAX_CHARS) throw new PushRefused("正文太长，卡片放不下，请精简或改为附件");
     this.#store.transaction(() => { this.#store.create(push, recipients); also?.(); });
     const outcome = await this.#outbound.send(this.#pusherTarget(push), cardMessage(this.#previewCard(push)), { signal: this.#signal });
@@ -658,9 +680,39 @@ export class PushService {
     return outcome.status;
   }
 
-  /** The target as asked: people checked against the address book, departments found by name or path, all within the grants. */
-  #checkTarget(role: PushRole, input: PrepareInput, problems: string[], unmatched: Unmatched[]): PushTarget {
+  /**
+   * After the preview of a push whose recipients each get their own values: a workbook with everyone's, to the pusher, to
+   * check before confirming (the card lists only as many as fit). False when it did not go out.
+   */
+  async #sendCheckSheet(push: Push): Promise<boolean> {
+    const dir = join(userTmp(this.options.layout, DIRECT_SCOPE, push.pusher), `push-${push.id}-check`);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const sheet = await writeCheckSheet(push, this.#store.recipients(push.id), dir, this.#now());
+      const fileId = await this.#outbound.upload(fileUpload(sheet), this.#signal);
+      const outcome = await this.#outbound.send(this.#pusherTarget(push), uploadedFile(fileId, sheet), { signal: this.#signal });
+      if (outcome.status === "failed") throw new Error(outcome.reason);
+      return true;
+    } catch (error) {
+      if (!this.#signal.aborted) log.warn(`推送 ${push.id} 的核对表没有发出：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+  }
+
+  /**
+   * The target as asked: people checked against the address book, departments found by name or path, all within the grants.
+   * With `fields`, each person has their values for them.
+   */
+  #checkTarget(role: PushRole, input: PrepareInput, fields: readonly string[], problems: string[], unmatched: Unmatched[]): PushTarget {
     const people = this.#checkPeople(input.recipients ?? [], "对象", problems, unmatched);
+    const given = new Map((input.recipients ?? []).map(entry => [String(entry?.phone ?? "").replace(/[\s-]/g, ""), (entry?.values ?? []).map(value => oneLine(String(value ?? "")))]));
+    if (!fields.length && [...given.values()].some(values => values.length)) problems.push("给了每人的内容（values），却没有写栏目名（fields）");
+    const incomplete = !fields.length ? [] : people.filter(person => given.get(person.phone)?.length !== fields.length || given.get(person.phone)!.some(value => !value));
+    if (incomplete.length) {
+      problems.push(`每人的内容要有 ${fields.length} 项，依次对应 ${fields.join("、")}，不能空着；这些人不全：${incomplete.slice(0, 10).map(person => person.name).join("、")}${incomplete.length > 10 ? ` 等 ${incomplete.length} 人` : ""}`);
+    }
+    const long = !fields.length ? [] : people.filter(person => given.get(person.phone)?.some(value => chars(value) > this.#limits.valueChars));
+    if (long.length) problems.push(`每人的内容每项不能超过 ${this.#limits.valueChars} 个字；超过的有：${long.slice(0, 10).map(person => person.name).join("、")}${long.length > 10 ? ` 等 ${long.length} 人` : ""}`);
     if (people.length > this.#limits.people) problems.push(`一次最多列出 ${this.#limits.people} 个人；更多的人请按部门推送`);
     const asked = input.departments ?? [], tree = this.#directory.departments;
     const departments: TargetDepartment[] = [];
@@ -678,7 +730,7 @@ export class PushService {
       }
     }
     const groups = this.#checkGroups(role, input, problems);
-    const target: PushTarget = { people: people.map(({ phone, name }) => ({ phone, name })), departments, everyone: input.everyone === true,
+    const target: PushTarget = { people: people.map(({ phone, name }) => ({ phone, name, ...(fields.length ? { values: given.get(phone) ?? [] } : {}) })), departments, everyone: input.everyone === true,
       ...(groups.length ? { groups } : {}), ...(unmatched.length ? { unmatched: unmatched.map(each => each.who) } : {}) };
     problems.push(...this.#grantProblems(role, target));
     return target;
@@ -736,7 +788,8 @@ export class PushService {
     for (const department of target.departments) add(tree.members([department.id], department.children));
     if (target.everyone) add(tree.everyone());
     const groups = (target.groups ?? []).map(group => groupReached({ id: group.id, name: this.#store.group(group.id)?.name ?? group.name }));
-    return [...[...list.values()].map(personReached), ...groups];
+    const values = new Map(target.people.map(person => [person.phone, person.values]));
+    return [...[...list.values()].map(person => ({ ...personReached(person), ...(values.get(person.phone) ? { values: values.get(person.phone)! } : {}) })), ...groups];
   }
 
   /**
@@ -787,7 +840,7 @@ export class PushService {
         const who = memberGroup(recipient.member) === undefined ? `${recipient.name}（尾号 ${phoneTail(recipient.member)}）` : `群 ${recipient.name}`;
         const by = forwards.find(forward => forward.to === recipient.member), to = forwards.filter(forward => forward.from === recipient.member);
         lines.push(`- ${who}${by ? `（${recipients.find(each => each.member === by.from)?.name ?? "别人"} 转来）` : ""}：${this.#personState(push, recipient, items)}`
-          + (to.length ? `；已转给 ${to.map(forward => forward.toName).join("、")}` : ""));
+          + (to.length ? `；已转给 ${to.map(forward => forward.toName).join("、")}` : "") + valuesNote(push, recipient.values, by ? "转来的内容" : "内容"));
       }
       if (recipients.length > 100) lines.push(`……共 ${reachText(reachOf(recipients))}，其余见控制台推送页。`);
       return lines.join("\n");
@@ -1037,16 +1090,19 @@ export class PushService {
       const group = this.#store.group(memberGroup(recipient.member) ?? "");
       return group?.state === "registered" && group.name !== null ? [{ id: group.id, name: group.name }] : [];
     });
-    const reached = [...people.map(personReached), ...groups.map(groupReached)];
+    // Each keeps what the push said for them (one it was handed on to: what it said for who handed it on).
+    const valuesOf = (phone: string) => original.fields.length ? { values: chosen.find(recipient => recipient.member === phone)?.values ?? [] } : {};
+    const reached = [...people.map(person => ({ ...personReached(person), ...valuesOf(person.phone) })), ...groups.map(groupReached)];
     if (!reached.length) throw new PushRefused(`「${original.subject}」没有需要补推送的对象：没有答复的人都已不在同步的通讯录里（群已停用），或已经全部答复。`);
     const pusher = this.#directory.byPhone(original.pusher), now = this.#now();
     const push = this.#newPush({ pusher: original.pusher, pusherName: pusher?.name ?? original.pusherName, pusherIm: pusher?.imUserId ?? original.pusherIm,
       subject: original.subject, body: original.body, mode: original.mode, options: original.options, deadline: now + this.#limits.defaultDeadlineMs,
-      defaultDeadline: true, target: { people: people.map(({ phone, name }) => ({ phone, name })), departments: [], everyone: false, ...(groups.length ? { groups } : {}),
-        of: original.id }, cc: original.cc, remind: original.remind, files: [] });
+      defaultDeadline: true, target: { people: people.map(({ phone, name }) => ({ phone, name, ...valuesOf(phone) })), departments: [], everyone: false, ...(groups.length ? { groups } : {}),
+        of: original.id }, cc: original.cc, remind: original.remind, files: [], fields: original.fields });
     push.files = this.#linkFiles(original, push.id);
     await this.#createPreview(push, reached, () => this.#store.updatePush(original.id, { followUp: push.id, summaryVersion: original.summaryVersion + 1 }));
     if (original.files.length && !push.files.length) this.#text(this.#pusherTarget(original), `「${original.subject}」的附件已经清理，这条补推送不带附件；要带附件请重新准备一条推送。`);
+    if (push.fields.length && !await this.#sendCheckSheet(push)) this.#text(this.#pusherTarget(original), `「${original.subject}」补推送的核对表没有发出；每个人的内容和原来那条推送里的一样。`);
     log.info(`推送 ${original.id} 的补推送 ${push.id} 已准备：${reachText(reachOf(reached))}`);
     return push.id;
   }
@@ -1160,10 +1216,10 @@ export class PushService {
     const handed = new Set(forwards.map(forward => forward.from));
     return {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
-        files: push.files, summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
+        files: push.files, fields: push.fields, summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
       recipients: recipients.map(recipient => {
         const own = replyItems(recipient, items), text = replyText(own);
-        return { member: recipient.member, name: recipient.name, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
+        return { member: recipient.member, name: recipient.name, values: recipient.values, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
           ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice === null ? null : push.options[recipient.choice] ?? null, choiceAt: recipient.choiceAt,
           repliedAt: recipient.repliedAt,
           answered: (recipient.sendState === "sent" || recipient.sendState === "uncertain") && this.#answered(push, recipient, handed),
@@ -1334,7 +1390,7 @@ export class PushService {
         this.#store.updateForward(forward.id, { state: "confirmed", decidedAt: now, version: forward.version + 1 });
         // A card that could not be delivered before is tried afresh.
         if (this.#store.recipient(push.id, forward.to)) this.#store.updateRecipient(push.id, forward.to, { sendState: "pending", sendAttempts: 0, sendError: null, retryAt: null });
-        else this.#store.addRecipient(this.#recipientRow(push.id, personReached(target)));
+        else this.#store.addRecipient(this.#recipientRow(push.id, { ...personReached(target), values: recipient.values }));
         const data = { push: push.id, event: "forward", forward: forward.id };
         this.#note(DIRECT_SCOPE, forward.from, `forward:${forward.id}`, `[推送转派] 已把 ${push.pusherName} 推送的「${quoted(push.subject)}」转给 ${target.name}。推送编号 ${push.id}`, data);
         this.#note(DIRECT_SCOPE, push.pusher, `forwarded:${forward.id}`, `[推送转派] ${recipient.name} 把「${quoted(push.subject)}」转给了 ${target.name}。推送编号 ${push.id}`, data);
@@ -1644,7 +1700,7 @@ export class PushService {
     const by = group ? undefined : this.#forwardedBy(push.id, phone);
     this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」`
       + `${by ? `（${by.name} 转来）` : ""}，正文（引用）：`
-      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}${filesNote(push, group ? "本群" : "成员")}；要求：${group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push)}；`
+      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}${filesNote(push, group ? "本群" : "成员")}${valuesNote(push, group ? [] : this.#store.recipient(push.id, phone)?.values ?? [], by ? `给 ${by.name} 的内容` : "给这位成员的内容")}；要求：${group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push)}；`
       + `截止 ${shortTime(push.deadline, now)}。推送编号 ${push.id}`,
     { push: push.id, event: "card" });
   }
@@ -1799,7 +1855,7 @@ export class PushService {
     log.info(`推送 ${pushId} 已发出：${recipients.length - failed} 张，失败 ${failed} 张`);
     const cc = push.cc.length ? `，抄送 ${push.cc.map(person => person.name).join("、")}` : "";
     this.#note(DIRECT_SCOPE, push.pusher, `sent:${pushId}`, `[推送已发出]「${quoted(push.subject)}」${shortTime(push.confirmedAt!, this.#now())} 发出，`
-      + `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed} 个）` : ""}${cc}${filesNote(push)}；要求：${requirementText(push)}；截止 ${shortTime(push.deadline, this.#now())}。推送编号 ${pushId}`,
+      + `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed} 个）` : ""}${cc}${filesNote(push)}${push.fields.length ? `；每人不同的内容：${push.fields.map(quoted).join("、")}` : ""}；要求：${requirementText(push)}；截止 ${shortTime(push.deadline, this.#now())}。推送编号 ${pushId}`,
     { push: pushId, event: "sent" });
     this.#refreshPreview(pushId);
     this.#checkComplete(pushId);
@@ -2082,7 +2138,7 @@ export class PushService {
     const done = recipients.filter(recipient => recipient.sendState !== "pending" && recipient.sendState !== "sending").length;
     const failed = recipients.filter(recipient => recipient.sendState === "failed");
     const delivered = recipients.filter(recipient => recipient.sendState === "sent" || recipient.sendState === "uncertain");
-    return previewCard({ push, people: recipients.map(recipient => ({ name: recipient.name, member: recipient.member })),
+    return previewCard({ push, people: recipients.map(recipient => ({ name: recipient.name, member: recipient.member, values: recipient.values })),
       ...(push.state === "preview" || push.state === "cancelled" || push.state === "expired" ? {}
         : { sent: { done, total: recipients.length, delivered: reachOf(delivered), failed: reachOf(failed) } }) }, this.#now());
   }

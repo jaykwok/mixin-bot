@@ -2069,3 +2069,104 @@ test("files: a process that ended while a recipient's files were going out sends
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
+
+// ---- what a push says for each recipient alone -----------------------------------------------------------------------
+
+/** The sheet of an uploaded workbook, as text. */
+async function sheetOf(upload: { data: Buffer }): Promise<string> {
+  const workbook = join(fixture.root, `sheet-${++counter}.xlsx`);
+  await writeFile(workbook, upload.data);
+  return readZip(workbook).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8");
+}
+
+test("fields: each recipient's card shows their own values; the preview lists them and a check sheet follows; notes, the status, a push handed on, the summary and a follow-up carry them", async () => {
+  const h = harness();
+  try {
+    const recipients = [{ name: "张三", phone: ZHANG, values: ["120 万", " 85.5% "] }, { name: "李四", phone: LI, values: ["80 万", "92%"] }];
+    const answer = await h.prepare({ recipients, fields: ["本月指标", "完成率"], deadline: "2026-11-04 18:00" });
+    const id = h.pushId(answer);
+    expect(answer).toContain("每人不同的内容（本月指标、完成率）列在随预览发去的核对表里：提醒成员确认前逐人核对，发出后改不了。");
+    expect(h.card(PUSHER, id).content).toContain("**每人不同的内容**：本月指标、完成率；每人的卡片上只有自己的。全部内容在随后发给你的核对表里，请逐人核对\n"
+      + "- 张三（尾号 0001）：本月指标 120 万；完成率 85.5%\n- 李四（尾号 0002）：本月指标 80 万；完成率 92%\n\n---");
+    // The check sheet: a workbook to the pusher after the card, everyone with their values, phones masked.
+    expect(h.files(PUSHER)).toEqual([`推送核对-机房盘点-${id}.xlsx`]);
+    const check = await sheetOf(h.uploads[0]!);
+    for (const text of ["本月指标", "完成率", "张三", "138****0001", "120 万", "85.5%", "李四", "92%"]) expect(check).toContain(text);
+    expect(check).not.toContain(ZHANG);
+    expect(h.cards(ZHANG)).toEqual([]);
+    h.click(PUSHER, h.card(PUSHER, id), "确认推送", `preview-${id}`);
+    await h.settle();
+    // Each card: the common body, then this recipient's own lines, and nobody else's.
+    expect(h.card(ZHANG).content).toContain("请回复本周机房盘点结果。\n\n**本月指标**：120 万\n**完成率**：85.5%\n\n---");
+    expect(h.card(LI).content).toContain("**本月指标**：80 万\n**完成率**：92%");
+    expect(h.card(LI).content).not.toContain("120 万");
+    expect(noteOf(h, ZHANG, `push-note:card:${id}`)).toContain("；给这位成员的内容：本月指标 120 万；完成率 85.5%；要求：确认收到；");
+    expect(noteOf(h, PUSHER, `push-note:sent:${id}`)).toContain("共 2 人；每人不同的内容：本月指标、完成率；要求：");
+    expect(h.service.status(PUSHER, id)).toContain("- 张三（尾号 0001）：未确认；内容：本月指标 120 万；完成率 85.5%");
+    expect(h.service.detail(id).recipients.map(each => each.values)).toEqual([["120 万", "85.5%"], ["80 万", "92%"]]);
+    // Handed on: the card that asks says the values go along; the one it goes to sees whose they are.
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "王五", phone: WANG } });
+    expect(h.card(ZHANG).content).toContain("卡片上写给你的内容（本月指标、完成率）也会一起发给对方。");
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "ask-1");
+    await h.settle();
+    expect(h.card(WANG).content).toContain("**张三** 转给你\n\n请回复本周机房盘点结果。\n\n给 张三 的内容：\n**本月指标**：120 万\n**完成率**：85.5%\n\n---");
+    expect(noteOf(h, WANG, `push-note:card:${id}`)).toContain("；给 张三 的内容：本月指标 120 万；完成率 85.5%；要求：");
+    expect(h.service.status(PUSHER, id)).toContain("- 王五（尾号 0003）（张三 转来）：未确认；转来的内容：本月指标 120 万；完成率 85.5%");
+    // The summary's workbook has the fields as columns.
+    h.click(LI, h.card(LI), "已收到", "card-li");
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    const summary = await sheetOf(h.uploads.find(upload => upload.name.startsWith("推送汇总"))!);
+    for (const text of ["本月指标", "完成率", "120 万", "92%"]) expect(summary).toContain(text);
+    // 「提醒未回复」: 王五 (handed 张三's) keeps those values in the follow-up, with a check sheet of its own.
+    h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-card");
+    await h.settle();
+    const followUp = h.store.push(id)!.followUp!;
+    expect(h.store.push(followUp)!.fields).toEqual(["本月指标", "完成率"]);
+    expect(previewOf(h, followUp).content).toContain("- 王五（尾号 0003）：本月指标 120 万；完成率 85.5%");
+    expect(h.files(PUSHER).at(-1)).toBe(`推送核对-机房盘点-${followUp}.xlsx`);
+    h.click(PUSHER, previewOf(h, followUp), "确认推送", `preview-${followUp}`);
+    await h.settle();
+    expect(h.card(WANG).content).toContain("**本月指标**：120 万\n**完成率**：85.5%");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("fields: refused without values for everyone, with departments or groups, or beyond the limits; the preview lists as many people as fit; a sheet that fails is said", async () => {
+  const h = harness({ people: Array.from({ length: 40 }, (_, index) => ({ phone: `139000000${String(index).padStart(2, "0")}`, name: `员工${index}`, imUserId: `im-139000000${String(index).padStart(2, "0")}` })) });
+  try {
+    const two = (values: (string[] | undefined)[]) => [{ name: "张三", phone: ZHANG, ...(values[0] ? { values: values[0] } : {}) }, { name: "李四", phone: LI, ...(values[1] ? { values: values[1] } : {}) }];
+    await expect(h.prepare({ recipients: two([["1"], undefined]), fields: ["座位"] })).rejects.toThrow("每人的内容要有 1 项，依次对应 座位，不能空着；这些人不全：李四");
+    await expect(h.prepare({ recipients: two([["1", "2"], [" "]]), fields: ["座位"] })).rejects.toThrow("这些人不全：张三、李四");
+    await expect(h.prepare({ recipients: two([["1"], ["2"]]) })).rejects.toThrow("给了每人的内容（values），却没有写栏目名（fields）");
+    await expect(h.prepare({ recipients: two([["1"], ["长".repeat(101)]]), fields: ["座位"] })).rejects.toThrow("每人的内容每项不能超过 100 个字；超过的有：李四");
+    await expect(h.prepare({ recipients: two([["1"], ["2"]]), fields: ["座位", "座位"] })).rejects.toThrow("栏目名不能重复");
+    await expect(h.prepare({ recipients: two([["1"], ["2"]]), fields: ["一二三四五六七八九十一二三"] })).rejects.toThrow("每个栏目名必须是 1 到 12 个字");
+    await expect(h.prepare({ recipients: two([Array(7).fill("1"), Array(7).fill("2")]), fields: ["a", "b", "c", "d", "e", "f", "g"] })).rejects.toThrow("每人不同的内容最多 6 栏");
+    h.grant({ department: { any: true } });
+    h.tree({ "2": [ZHANG] });
+    await expect(h.prepare({ recipients: two([["1"], ["2"]]), departments: [{ name: "技术部" }], fields: ["座位"] })).rejects.toThrow("每人不同的内容只能按人推送，不能和部门、全员、群一起用");
+    expect(h.cards(PUSHER)).toEqual([]);
+    // Someone who does not match is left out as always; the rest keep their values.
+    const partial = h.pushId(await h.prepare({ recipients: [...two([["A-1"], ["A-2"]]), { name: "外人", phone: "13900009999", values: ["A-3"] }], fields: ["座位"] }));
+    expect(h.store.recipients(partial).map(each => each.values)).toEqual([["A-1"], ["A-2"]]);
+    // Forty people with long values: the card lists those that fit, the sheet has them all.
+    const many = Array.from({ length: 40 }, (_, index) => ({ name: `员工${index}`, phone: `139000000${String(index).padStart(2, "0")}`, values: [`${index} 号楼 ${"甲".repeat(60)}`] }));
+    const id = h.pushId(await h.prepare({ recipients: many, fields: ["办公地点"] }));
+    const preview = h.card(PUSHER, id).content;
+    const listed = preview.split("\n").filter(line => line.startsWith("- 员工")).length;
+    expect(listed).toBeGreaterThan(5);
+    expect(listed).toBeLessThan(40);
+    expect(preview).toContain("……共 40 人\n\n---");
+    expect([...preview].length).toBeLessThan(5000);
+    const sheet = await sheetOf(h.uploads.at(-1)!);
+    for (const index of [0, 17, 39]) expect(sheet).toContain(`${index} 号楼 `);
+    // The sheet cannot be sent: the answer says so, the preview stands.
+    h.failing.when = item => item.message.msgType === "file" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const answer = await h.prepare({ recipients: two([["1"], ["2"]]), fields: ["座位"] });
+    expect(answer).toContain("每人不同的内容（座位）的核对表没有发出：把每个人的内容列给成员核对，再请成员确认。");
+    expect(h.store.push(h.pushId(answer))!.state).toBe("preview");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});

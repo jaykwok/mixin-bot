@@ -282,6 +282,8 @@ export interface PushRecipientView extends PushPersonView {
   answered: boolean;
   reply: { text: string; files: { name: string; size: number | null; kind: string }[]; senders: string[] } | null;
   forwardedBy: string | null; forwardedTo: string[];
+  /** This recipient's own values under the push's fields. */
+  values: string[];
 }
 export interface PushDetailView extends PushListItemView {
   body: string; options: string[]; defaultDeadline: boolean;
@@ -290,6 +292,8 @@ export interface PushDetailView extends PushListItemView {
   cc: PushPersonView[]; summaryError: string | null; summaryAt: number | null;
   /** The files sent to every recipient ahead of the card. */
   files: { name: string; size: number }[];
+  /** Titles of what differs by recipient; each recipient's `values` are theirs, in this order. */
+  fields: string[];
   /** On the way: whether the card goes again to those who have not answered, how often it did, and the next progress moment. */
   reminders: { recipients: boolean; sent: number; next: number | null };
 }

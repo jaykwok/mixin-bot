@@ -37,6 +37,8 @@ export type PushRole = {
 };
 
 export type Person = { phone: string; name: string };
+/** A person a push names, with what the push's fields say for this person (in the fields' order). */
+export type TargetPerson = Person & { values?: string[] };
 
 /** A file that goes out with a push: its name as sent, and its size. The bytes are the push's own copy (src/core/layout.ts pushFile). */
 export type PushFile = { name: string; size: number };
@@ -54,7 +56,7 @@ export type TargetGroup = { id: string; name: string };
  * button on its summary). `unmatched`: people the pusher named who are not in the address book as named; they are not on
  * the list, and the preview says so.
  */
-export type PushTarget = { people: Person[]; departments: TargetDepartment[]; everyone: boolean; groups?: TargetGroup[]; of?: string; unmatched?: string[] };
+export type PushTarget = { people: TargetPerson[]; departments: TargetDepartment[]; everyone: boolean; groups?: TargetGroup[]; of?: string; unmatched?: string[] };
 
 /** A group's recipient row: one per group, answered by anyone in it (`member` is `group:<group ID>`). */
 export const groupMember = (groupId: string) => `group:${groupId}`;
@@ -94,6 +96,8 @@ export type Push = {
   cc: Person[];
   /** The files sent to every recipient ahead of the card, in order. */
   files: PushFile[];
+  /** Titles of what differs by recipient: each recipient's card shows their own values under them. Empty: the same card for all. */
+  fields: string[];
   state: PushState;
   createdAt: number;
   confirmedAt: number | null;
@@ -139,6 +143,8 @@ export type Recipient = {
   retryAt: number | null;
   /** How many of the push's files went out to this recipient (they go in order, ahead of the card). */
   filesSent: number;
+  /** This recipient's values of the push's fields, in their order; one handed the push has those of who handed it on. */
+  values: string[];
   /** The card's ID, known from the first click on it. */
   card: string | null;
   version: number;
@@ -211,7 +217,7 @@ CREATE TABLE IF NOT EXISTS chat_groups (
 CREATE TABLE IF NOT EXISTS pushes (
   id TEXT PRIMARY KEY, pusher TEXT NOT NULL, pusher_name TEXT NOT NULL, pusher_im TEXT NOT NULL, subject TEXT NOT NULL,
   body TEXT NOT NULL, mode TEXT NOT NULL, options TEXT NOT NULL, deadline INTEGER NOT NULL, default_deadline INTEGER NOT NULL,
-  target TEXT NOT NULL, cc TEXT NOT NULL, files TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER,
+  target TEXT NOT NULL, cc TEXT NOT NULL, files TEXT NOT NULL, fields TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER,
   closed_at INTEGER, close_reason TEXT, preview_card TEXT, preview_version INTEGER NOT NULL, summary_state TEXT,
   summary_attempts INTEGER NOT NULL, summary_at INTEGER, summary_error TEXT, summary_done TEXT NOT NULL, summary_text TEXT, summary_card TEXT,
   summary_version INTEGER NOT NULL, follow_up TEXT, remind INTEGER NOT NULL, checkpoints TEXT NOT NULL, reminded INTEGER NOT NULL,
@@ -220,7 +226,7 @@ CREATE INDEX IF NOT EXISTS pushes_by_pusher ON pushes (pusher, created_at);
 CREATE INDEX IF NOT EXISTS pushes_by_state ON pushes (state);
 CREATE TABLE IF NOT EXISTS push_recipients (
   push_id TEXT NOT NULL, member TEXT NOT NULL, name TEXT NOT NULL, receive_id TEXT NOT NULL, send_state TEXT NOT NULL,
-  send_attempts INTEGER NOT NULL, send_error TEXT, sent_at INTEGER, retry_at INTEGER, files_sent INTEGER NOT NULL, card TEXT, version INTEGER NOT NULL,
+  send_attempts INTEGER NOT NULL, send_error TEXT, sent_at INTEGER, retry_at INTEGER, files_sent INTEGER NOT NULL, field_values TEXT NOT NULL, card TEXT, version INTEGER NOT NULL,
   acked_at INTEGER, clicks INTEGER NOT NULL, choice INTEGER, choice_at INTEGER, replied_at INTEGER,
   PRIMARY KEY (push_id, member)) STRICT;
 CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member);
@@ -245,7 +251,7 @@ type Row = Record<string, string | number | null>;
 
 const PUSH_COLUMNS = {
   id: "id", pusher: "pusher", pusherName: "pusher_name", pusherIm: "pusher_im", subject: "subject", body: "body", mode: "mode",
-  options: "options", deadline: "deadline", defaultDeadline: "default_deadline", target: "target", cc: "cc", files: "files", state: "state",
+  options: "options", deadline: "deadline", defaultDeadline: "default_deadline", target: "target", cc: "cc", files: "files", fields: "fields", state: "state",
   createdAt: "created_at", confirmedAt: "confirmed_at", closedAt: "closed_at", closeReason: "close_reason", previewCard: "preview_card",
   previewVersion: "preview_version", summaryState: "summary_state", summaryAttempts: "summary_attempts", summaryAt: "summary_at",
   summaryError: "summary_error", summaryDone: "summary_done", summaryText: "summary_text", summaryCard: "summary_card", summaryVersion: "summary_version", followUp: "follow_up",
@@ -254,11 +260,11 @@ const PUSH_COLUMNS = {
 
 const RECIPIENT_COLUMNS = {
   pushId: "push_id", member: "member", name: "name", receiveId: "receive_id", sendState: "send_state", sendAttempts: "send_attempts",
-  sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", filesSent: "files_sent", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
+  sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", filesSent: "files_sent", values: "field_values", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
   choice: "choice", choiceAt: "choice_at", repliedAt: "replied_at",
 } as const satisfies Record<keyof Recipient, string>;
 
-const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "files", "summaryDone", "checkpoints"]);
+const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "files", "fields", "summaryDone", "checkpoints"]);
 const BOOLEAN_PUSH_FIELDS = new Set<keyof Push>(["defaultDeadline", "remind", "released"]);
 
 function encodePush<K extends keyof Push>(key: K, value: Push[K]): string | number | null {
@@ -276,9 +282,11 @@ function decodePush(row: Row): Push {
   return push as Push;
 }
 
+const encodeRecipient = (key: keyof Recipient, value: unknown): SQLQueryBindings => key === "values" ? JSON.stringify(value) : value as SQLQueryBindings;
+
 function decodeRecipient(row: Row): Recipient {
   const recipient = {} as Record<string, unknown>;
-  for (const [key, column] of Object.entries(RECIPIENT_COLUMNS)) recipient[key] = row[column];
+  for (const [key, column] of Object.entries(RECIPIENT_COLUMNS)) recipient[key] = key === "values" ? JSON.parse(String(row[column])) : row[column];
   return recipient as Recipient;
 }
 
@@ -501,14 +509,14 @@ export class PushStore {
 
   /** One more recipient of a push (the list at its creation and confirmation, then people it is handed on to). */
   addRecipient(recipient: Recipient): void {
-    this.db.query(RECIPIENT_INSERT).run(...RECIPIENT_KEYS.map(key => recipient[key]));
+    this.db.query(RECIPIENT_INSERT).run(...RECIPIENT_KEYS.map(key => encodeRecipient(key, recipient[key])));
   }
 
   updateRecipient(pushId: string, member: string, change: Partial<Omit<Recipient, "pushId" | "member">>): void {
     const keys = Object.keys(change) as (keyof typeof change)[];
     if (!keys.length) return;
     this.db.query(`UPDATE push_recipients SET ${keys.map(key => `${RECIPIENT_COLUMNS[key]} = ?`).join(", ")} WHERE push_id = ? AND member = ?`)
-      .run(...keys.map(key => change[key] as SQLQueryBindings), pushId, member);
+      .run(...keys.map(key => encodeRecipient(key, change[key])), pushId, member);
   }
 
   /** Every card of the push is out of date (the push ended): clicks on the buttons as sent no longer count. */

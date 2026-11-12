@@ -35,8 +35,14 @@ const department = obj({
   children: opt(bool({ description: "是否包括下级部门；默认包括，成员明确说不含下级时写 false" })),
 }, { open: true });
 
+const recipient = obj({
+  name: str({ description: "姓名，与通讯录一致" }),
+  phone: str({ description: "手机号" }),
+  values: opt(arr(str(), { description: "写了 fields 时必填：这个人各栏的内容，个数和顺序与 fields 一致" })),
+}, { open: true });
+
 const prepareParams = obj({
-  recipients: opt(arr(person, { description: `按人推送：每人姓名和手机号都要有（不知道手机号先用 directory_lookup 查），最多 ${PUSH_LIMITS.people} 人` })),
+  recipients: opt(arr(recipient, { description: `按人推送：每人姓名和手机号都要有（不知道手机号先用 directory_lookup 查），最多 ${PUSH_LIMITS.people} 人` })),
   departments: opt(arr(department, { description: `按部门推送，最多 ${PUSH_LIMITS.departments} 个部门；需要管理员授权` })),
   everyone: opt(bool({ description: "推送给全员（机器人同步的通讯录范围内的所有人）；需要管理员授权" })),
   groups: opt(arr(obj({ name: str({ description: "登记的群名" }) }, { open: true }),
@@ -50,6 +56,7 @@ const prepareParams = obj({
   cc: opt(arr(person, { description: `抄送人，只收到汇总；默认没有，最多 ${PUSH_LIMITS.cc} 人` })),
   remind: opt(bool({ description: "是否自动提醒没有答复的人；默认提醒，成员说不用提醒时写 false" })),
   attachments: opt(arr(str(), { description: `随推送发给每个接收人的附件：文件路径（成员发来的文件、共享资料里的文件，或这次任务生成的文件），最多 ${PUSH_LIMITS.files} 个，每个不超过 30 MB` })),
+  fields: opt(arr(str(), { description: `每个接收人内容不同时的栏目名（如 本月指标、完成率），最多 ${PUSH_LIMITS.fields} 栏，每个不超过 ${PUSH_LIMITS.fieldChars} 个字；写了它就只能按人推送，recipients 里每人要有 values（每项不超过 ${PUSH_LIMITS.valueChars} 个字）` })),
 }, { open: true });
 
 const statusParams = obj({
@@ -82,6 +89,7 @@ const PROMPT = `你可以替当前成员发起推送：把一条通知以卡片�
 - 成员只说了姓名或部门、没给手机号时，先用 directory_lookup 查通讯录（成员说了几个人，就在一次调用里把名字都写上）：按姓名只查到一个人，就用查到的姓名和手机号；查到几个人，或成员只说了部门（如 某某分公司）而要推送给其中某些人，把查到的人（姓名和部门）列给成员，由成员指定推送给谁，不要替成员挑。查不到就告诉成员没有查到。成员不推送、只想查某人的手机号或部门，也用 directory_lookup。
 - 群推送在群里发一张卡片，群里谁确认、谁回复都算这个群的；群里只收文字回复，不能用选项（options）。需要按人收集附件或选项时，请推送给个人或部门。群要先由管理员在群里发“@机器人 /登记群 群名”登记，没有登记的群不能推送。
 - 成员要随推送带文件（通知的附件、要填的表）：把文件路径写进 attachments，可以是成员发来的文件、共享资料里的文件，或你这次生成的文件。接收人先收到这些文件，再收到卡片。文件在准备时就定下来，之后再改文件要重新准备。
+- 每个接收人要看到不同的内容时（各自的指标、分工、座位、结果）：正文写大家都一样的部分，fields 写栏目名，recipients 里每个人的 values 按栏目顺序写这个人的内容；每个人的卡片在正文后面只显示自己的那几项。只能按人推送。每一项都必须出自成员给的材料（成员的话、发来的表），原样抄写，不换算、不补全、不推测；哪个人缺一项、对不上，先问成员。准备后预览卡片和随后的核对表会列出每个人的内容，提醒成员逐人核对后再确认。
 - 信息齐了调用 push_prepare。它只把预览卡片发给成员本人，不会发给任何接收人；成员在预览卡片上点「确认推送」才会发出。不要说已经推送，也不要替成员确认。
 - push_prepare 拒绝时，把原因告诉成员，按成员的修改重新调用。它说名单里有人没有对上时，预览里是其余的人：把没对上的人和原因告诉成员，由成员决定先发给其余的人，还是改正后重新准备；不要自己换成别的人。
 - 成员问推送的情况（谁确认了、谁没回复、回复了什么、转给了谁），用 push_status 查；只能查成员自己发起的推送。
