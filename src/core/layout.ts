@@ -14,6 +14,7 @@ import { DATA_DIR } from "./storage.ts";
  *   <data>/runtime/document-env              原生部署共享的文档解析环境
  *   <data>/state/stats.sqlite                统计账本
  *   <data>/state/reclamation/                离线回收计划、快照与归档
+ *   <data>/state/push-files/<推送>/          推送附件的副本（随推送发给接收人）
  *   <data>/conversations/direct/durable.sqlite
  *   <data>/conversations/groups/<群>/durable.sqlite
  *   <data>/tmp/direct/<用户>/                单聊用户 tmp（received/ 附件，tasks/<请求>/ 产物）
@@ -31,6 +32,7 @@ export interface Layout {
   readonly state: string;
   readonly stats: string;
   readonly reclamation: string;
+  readonly pushFiles: string;
   readonly conversations: string;
   readonly tmp: string;
 }
@@ -121,9 +123,15 @@ export function appLayout(data: string = DATA_DIR, workspaceRoot?: string): Layo
     state: join(data, "state"),
     stats: join(data, "state", "stats.sqlite"),
     reclamation: join(data, "state", "reclamation"),
+    pushFiles: join(data, "state", "push-files"),
     conversations: join(data, "conversations"),
     tmp: join(data, "tmp"),
   };
+}
+
+/** The service's own copy of file `index` of a push (src/push/service.ts): it stays while the push may still send it. */
+export function pushFile(layout: Pick<Layout, "pushFiles">, pushId: string, index: number): string {
+  return join(layout.pushFiles, pushId, String(index));
 }
 
 /** The default workspace: `workspace` beside the data directory, at the project root. */

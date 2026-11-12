@@ -6,7 +6,7 @@ import { api } from "./api.ts";
 import type {
   PushDetailResponse, PushGroupKey, PushListCursor, PushListItemView, PushListResponse, PushRecipientView, PushState, PushTicket, PushTotalsView,
 } from "./contract.ts";
-import { dateTime } from "./format.ts";
+import { bytes, dateTime } from "./format.ts";
 import { Icon } from "./icons.tsx";
 import { Chip, Section, Segmented, Skeleton, type Tone } from "./ui.tsx";
 
@@ -177,6 +177,7 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
           <dt>推送人</dt><dd>{push.pusher}</dd>
           <dt>对象</dt><dd>{push.target.map(line => <div key={line}>{line}</div>)}</dd>
           <dt>要求</dt><dd>{MODE[push.mode]}{push.options.length ? `：${push.options.join(" / ")}` : ""}</dd>
+          {push.files.length > 0 && <><dt>附件</dt><dd>{push.files.map(file => `${file.name}（${bytes(file.size)}）`).join("、")}</dd></>}
           <dt>时间</dt><dd>{dateTime(push.createdAt)} 准备{push.confirmedAt ? `，${dateTime(push.confirmedAt)} 发出` : ""}，截止 {dateTime(push.deadline)}{push.defaultDeadline ? "（未指定，默认 3 天）" : ""}
             {push.closedAt ? `，${dateTime(push.closedAt)} ${push.closeReason === "complete" ? "全部答复" : "结束"}` : ""}</dd>
           <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}</dd>

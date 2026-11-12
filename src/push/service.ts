@@ -37,24 +37,30 @@
 // Lookup (directory_lookup): a pusher, or a recipient of a live push, finds people in the synced address book by part of
 // the name, phone or department, with their full phones and departments.
 //
+// Files (push_prepare's attachments): the service copies them when the push is prepared (data/state/push-files/<push>),
+// so what the pusher confirmed is what goes out. Each recipient gets them as file messages ahead of the card, in the same
+// send: a card that went out means its files did; a file that fails is the card's failure, and the next try goes on with
+// the file that failed. A reminder's card goes alone. The copies stay until the push is void, or `filesKeepMs` after its end.
+//
 // All state is in the state database (./store.ts); what runs in the background (sends, card updates, notes, the summary)
 // picks up from there after a restart.
 import { randomBytes } from "node:crypto";
-import { readdirSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { copyFileSync, linkSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { chmod, copyFile, mkdir, rm, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { formatSize } from "@earendil-works/pi-coding-agent";
 import type { EntryDraft } from "@earendil-works/pi-durable";
 import { canonicalCommand, isSlashCommandMessage } from "../agent/commands.ts";
 import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
-import { DIRECT_SCOPE, groupScope, parseScopeKey, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
+import { DIRECT_SCOPE, groupScope, parseScopeKey, pushFile, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
 import { log } from "../core/log.ts";
 import { NATIVE_FILE_MAX_BYTES } from "../core/transfer-limits.ts";
-import { type Outbound, sendNotice } from "../durable/outbound.ts";
+import { fileUpload, type Outbound, sendNotice, uploadedFile } from "../durable/outbound.ts";
 import type { Attachment, MemberRecords, ReplyContext } from "../durable/records.ts";
 import { sendChannel } from "../durable/send.ts";
 import type { DepartmentTree } from "../integrations/open-platform/department-tree.ts";
 import type { DirectoryIdentity } from "../integrations/open-platform/identity-directory.ts";
-import { cardMessage, type CardContent, splitText, type Target, textMessage } from "../integrations/open-platform/messages.ts";
+import { cardMessage, type CardContent, type SendOutcome, splitText, type Target, textMessage } from "../integrations/open-platform/messages.ts";
 import type { StreamEvent } from "../integrations/open-platform/stream.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
@@ -63,7 +69,7 @@ import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
 import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage } from "./summary.ts";
-import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushMode, type PushRole, type PushState, type PushStore,
+import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
   type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
 
 export const PUSH_LIMITS = {
@@ -107,6 +113,14 @@ export const PUSH_LIMITS = {
   /** People one directory_lookup answer lists, and the names one call asks for. */
   lookup: 50,
   lookupNames: 20,
+  /** Files one push sends along (each at most the native file size), and the characters of a file's name. */
+  files: 5,
+  fileNameChars: 80,
+  /** An uploaded file's ID is used for this long; then the file is uploaded again (the platform answers at once for bytes it has). */
+  fileIdMs: 3600_000,
+  /** The copies of a closed push's files stay this long (a follow-up push takes them); the directory is looked through this often. */
+  filesKeepMs: 30 * 24 * 3600_000,
+  filesSweepMs: 3600_000,
   subjectChars: 40,
   bodyChars: 3000,
   options: [2, 6] as readonly [number, number],
@@ -134,7 +148,7 @@ export interface PushOptions {
   store: PushStore;
   directory: PushDirectory;
   outbound: Outbound;
-  layout: Pick<Layout, "tmp">;
+  layout: Pick<Layout, "tmp" | "pushFiles">;
   relay: RelayConfig | null;
   signal: AbortSignal;
   limits?: Partial<PushLimits>;
@@ -159,6 +173,8 @@ export type PrepareInput = {
   cc?: readonly { name: string; phone: string }[];
   /** False: the card does not go again to those who have not answered. */
   remind?: boolean;
+  /** Files to send along: local files the tool resolved (./tools.ts), with their sizes. */
+  attachments?: readonly { path: string; size: number }[];
 };
 
 /** What directory_lookup passes on (./tools.ts): at least one of names, phone and department; together they narrow down. */
@@ -215,7 +231,7 @@ export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState
   forwardedBy: string | null;
   forwardedTo: string[];
 };
-export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "summaryError" | "summaryAt" | "remind" | "reminded" | "checkpoints">;
+export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "files" | "summaryError" | "summaryAt" | "remind" | "reminded" | "checkpoints">;
   recipients: PushRecipientDetail[] };
 
 /** A group as the console lists it: who registered it by name (null: the console did, or nobody yet). */
@@ -233,6 +249,9 @@ const truncate = (text: string, max: number) => chars(text) > max ? [...text].sl
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 /** Text to go between 「 and 」 in a note: its own corner brackets become the double ones, so it cannot end the quotation. */
 const quoted = (text: string) => text.replaceAll("「", "『").replaceAll("」", "』");
+/** A note's part on the push's files; `to`: they went to this recipient as file messages. */
+const filesNote = (push: Pick<Push, "files">, to?: string) => !push.files.length ? ""
+  : `；附件：${push.files.map(each => quoted(each.name)).join("、")}${to ? `（已作为文件单独发给${to}）` : ""}`;
 const NO_DEPARTMENT_GRANT = "你没有按部门推送的权限，请联系管理员在控制台授权";
 const NO_GROUP_GRANT = "你没有推送到群的权限，请联系管理员在控制台授权";
 const PREVIEW_GONE = "这张预览已经作废，什么都没有发出：确认了后面准备的推送，之前没确认的预览就一起清掉了。还要发的话请再提一次。";
@@ -317,6 +336,11 @@ export class PushService {
   readonly #seenAt = new Map<string, number>();
   /** `<push>|<group>|<phone>`: the member's group conversation has the push's note queued (a restart queues it again; the write is deduplicated). */
   readonly #groupNoted = new Set<string>();
+  /** `<push>/<index>`: the platform's ID of an uploaded push file (the upload under way, or done), and when it began. */
+  readonly #fileIds = new Map<string, { id: Promise<string>; at: number }>();
+  /** Pushes whose files are being copied: their directories have no record yet. */
+  readonly #preparing = new Set<string>();
+  #filesSweptAt: number | undefined;
   #host?: PushHost;
   #timer?: ReturnType<typeof setInterval>;
   #pumping = false;
@@ -366,6 +390,28 @@ export class PushService {
     try { names = readdirSync(tmp); } catch { return; }
     const left = names.filter(name => name.startsWith(PACKAGE_DIR)).map(name => rm(join(tmp, name), { recursive: true, force: true }));
     if (left.length) this.#track(Promise.all(left));
+  }
+
+  /**
+   * The copies of push files nobody sends any more go, every `filesSweepMs`: of pushes that are void or deleted, and of
+   * those closed for `filesKeepMs`. Uploaded file IDs past their time go with them.
+   */
+  #sweepFiles(): void {
+    const now = this.#now(), root = this.options.layout.pushFiles;
+    if (this.#filesSweptAt !== undefined && now - this.#filesSweptAt < this.#limits.filesSweepMs) return;
+    this.#filesSweptAt = now;
+    for (const [key, upload] of this.#fileIds) if (now - upload.at >= this.#limits.fileIdMs) this.#fileIds.delete(key);
+    let names: string[] = [];
+    try { names = readdirSync(root); } catch { return; }
+    const gone = names.filter(name => {
+      if (this.#preparing.has(name)) return false;
+      const push = this.#store.push(name);
+      return !push || !push.files.length || push.state === "cancelled" || push.state === "expired"
+        || (push.state === "closed" && now - (push.closedAt ?? 0) >= this.#limits.filesKeepMs);
+    });
+    if (!gone.length) return;
+    log.info(`推送：清理 ${gone.length} 条推送的附件副本`);
+    this.#track(Promise.all(gone.map(name => rm(join(root, name), { recursive: true, force: true }))).catch(error => this.#report(error)));
   }
 
   // ---- permissions ----------------------------------------------------------------------------------------------------
@@ -494,16 +540,30 @@ export class PushService {
     // The pusher gets the summary anyway.
     const cc = this.#checkPeople(input.cc ?? [], "抄送人", problems).filter(person => person.phone !== caller.phone);
     if (cc.length > limits.cc) problems.push(`抄送人最多 ${limits.cc} 个`);
+    const attachments = input.attachments ?? [];
+    if (attachments.length > limits.files) problems.push(`附件最多 ${limits.files} 个，现在是 ${attachments.length} 个`);
+    for (const file of attachments) {
+      if (!(file.size > 0)) problems.push(`附件「${basename(file.path)}」是空文件`);
+      else if (file.size > NATIVE_FILE_MAX_BYTES) problems.push(`附件「${basename(file.path)}」（${formatSize(file.size)}）超过单个附件的上限 ${formatSize(NATIVE_FILE_MAX_BYTES)}`);
+    }
     // Refused for another reason, or nobody is left: the people who do not match are named with the rest.
     if (problems.length || !people.length) throw new PushRefused(`推送未准备：\n- ${[...problems, ...unmatched.map(each => each.why)].join("\n- ")}`);
     this.#checkLimit(role, now);
     const pusher = this.#directory.byPhone(caller.phone);
     const push = this.#newPush({ pusher: caller.phone, pusherName: pusher?.name ?? caller.reply.name ?? caller.phone, pusherIm: pusher?.imUserId ?? caller.reply.receiveId,
-      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })), remind: input.remind !== false });
+      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })), remind: input.remind !== false, files: [] });
     const earlier = this.#store.pushesOf(caller.phone, 50).filter(each => each.state === "preview" && !each.target.of).length;
-    const outcome = await this.#createPreview(push, people);
-    log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}，等待推送人确认`);
-    return `已把推送预览卡片发给你（推送编号 ${push.id}，${reachText(reachOf(people))}${cc.length ? `，抄送 ${cc.length} 人` : ""}，截止 ${defaultDeadline ? "确认发出后 3 天（未指定截止时间）" : shortTime(deadline, now)}）。`
+    let outcome;
+    try {
+      if (attachments.length) push.files = await this.#takeFiles(push.id, await this.#named(caller.phone, attachments));
+      outcome = await this.#createPreview(push, people);
+    } catch (error) {
+      if (attachments.length) await rm(join(this.options.layout.pushFiles, push.id), { recursive: true, force: true }).catch(() => {});
+      throw error;
+    } finally { this.#preparing.delete(push.id); }
+    log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}${push.files.length ? `，附件 ${push.files.length} 个` : ""}，等待推送人确认`);
+    return `已把推送预览卡片发给你（推送编号 ${push.id}，${reachText(reachOf(people))}${cc.length ? `，抄送 ${cc.length} 人` : ""}${push.files.length ? `，附件 ${push.files.length} 个` : ""}，`
+      + `截止 ${defaultDeadline ? "确认发出后 3 天（未指定截止时间）" : shortTime(deadline, now)}）。`
       + (unmatched.length ? `名单里有 ${unmatched.length} 人没有对上，没有放进这次推送：\n- ${unmatched.map(each => each.why).join("\n- ")}\n把这几个人告诉成员：先发给其余的人就在卡片上确认；要补上他们，核对后带着完整名单重新准备。\n` : "")
       + "请在卡片上核对，点「确认推送」才会发出；点之前不会发给任何人。"
       + (target.departments.length || target.everyone ? "部门和全员的名单在点「确认推送」时按当时的通讯录重新展开。" : "")
@@ -512,15 +572,72 @@ export class PushService {
   }
 
   /** A push in `preview`, with nothing confirmed, sent or summarised yet. */
-  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc" | "remind">): Push {
+  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc" | "remind" | "files">): Push {
     return { id: this.#newId(), ...fields, state: "preview", createdAt: this.#now(), confirmedAt: null, closedAt: null, closeReason: null, previewCard: null,
       previewVersion: 0, summaryState: null, summaryAttempts: 0, summaryAt: null, summaryError: null, summaryDone: [], summaryText: null, summaryCard: null,
       summaryVersion: 0, followUp: null, checkpoints: [], reminded: 0, released: false };
   }
 
   #recipientRow(pushId: string, reached: Reached): Recipient {
-    return { pushId, ...reached, sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, card: null, version: 0, ackedAt: null,
+    return { pushId, ...reached, sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, filesSent: 0, card: null, version: 0, ackedAt: null,
       clicks: 0, choice: null, choiceAt: null, repliedAt: null };
+  }
+
+  /**
+   * The names the files go out under: a file the pusher sent to the bot keeps the name it came with (its stored name
+   * starts with the attachment's ID), any other its own. One line, at most `fileNameChars` characters, the extension kept.
+   */
+  async #named(phone: string, files: readonly { path: string; size: number }[]): Promise<{ path: string; name: string }[]> {
+    const received = new Map<string, string>();
+    for (const attachment of Object.values((await this.#host?.records(DIRECT_SCOPE, phone))?.attachments ?? {})) {
+      if (attachment.path) received.set(basename(attachment.path), attachment.name);
+    }
+    const max = this.#limits.fileNameChars;
+    return files.map(file => {
+      const name = oneLine((received.get(basename(file.path)) ?? basename(file.path)).replace(/[\x00-\x1f\x7f\\/]+/g, " ")) || "附件";
+      const extension = /\.[A-Za-z0-9]{1,10}$/.exec(name)?.[0] ?? "";
+      return { path: file.path, name: chars(name) > max ? [...name.slice(0, name.length - extension.length)].slice(0, max - extension.length).join("") + extension : name };
+    });
+  }
+
+  /** Copy the files into the push's own directory, in order; what was copied is what goes out. */
+  async #takeFiles(pushId: string, files: readonly { path: string; name: string }[]): Promise<PushFile[]> {
+    this.#preparing.add(pushId);
+    const taken: PushFile[] = [];
+    try {
+      await mkdir(join(this.options.layout.pushFiles, pushId), { recursive: true, mode: 0o700 });
+      for (const [index, file] of files.entries()) {
+        const copy = pushFile(this.options.layout, pushId, index);
+        await copyFile(file.path, copy);
+        await chmod(copy, 0o600);
+        const { size } = await stat(copy);
+        if (!size || size > NATIVE_FILE_MAX_BYTES) throw new PushRefused(`附件「${file.name}」在准备推送时被改动了，推送未准备，请重新提出。`);
+        taken.push({ name: file.name, size });
+      }
+    } catch (error) {
+      throw error instanceof PushRefused ? error : new PushRefused(`推送未准备：附件没有读到（${error instanceof Error ? error.message : String(error)}）。`);
+    }
+    return taken;
+  }
+
+  /**
+   * A follow-up push takes the files of the push it reminds: links to the same bytes (copies where the file system has
+   * no links). Empty when they are gone (the push ended `filesKeepMs` ago). Synchronous, as its caller has to be.
+   */
+  #linkFiles(from: Push, pushId: string): PushFile[] {
+    if (!from.files.length) return [];
+    const dir = join(this.options.layout.pushFiles, pushId);
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      for (const index of from.files.keys()) {
+        const source = pushFile(this.options.layout, from.id, index), copy = pushFile(this.options.layout, pushId, index);
+        try { linkSync(source, copy); } catch { copyFileSync(source, copy); }
+      }
+      return from.files;
+    } catch {
+      rmSync(dir, { recursive: true, force: true });
+      return [];
+    }
   }
 
   /**
@@ -926,8 +1043,10 @@ export class PushService {
     const push = this.#newPush({ pusher: original.pusher, pusherName: pusher?.name ?? original.pusherName, pusherIm: pusher?.imUserId ?? original.pusherIm,
       subject: original.subject, body: original.body, mode: original.mode, options: original.options, deadline: now + this.#limits.defaultDeadlineMs,
       defaultDeadline: true, target: { people: people.map(({ phone, name }) => ({ phone, name })), departments: [], everyone: false, ...(groups.length ? { groups } : {}),
-        of: original.id }, cc: original.cc, remind: original.remind });
+        of: original.id }, cc: original.cc, remind: original.remind, files: [] });
+    push.files = this.#linkFiles(original, push.id);
     await this.#createPreview(push, reached, () => this.#store.updatePush(original.id, { followUp: push.id, summaryVersion: original.summaryVersion + 1 }));
+    if (original.files.length && !push.files.length) this.#text(this.#pusherTarget(original), `「${original.subject}」的附件已经清理，这条补推送不带附件；要带附件请重新准备一条推送。`);
     log.info(`推送 ${original.id} 的补推送 ${push.id} 已准备：${reachText(reachOf(reached))}`);
     return push.id;
   }
@@ -1041,7 +1160,7 @@ export class PushService {
     const handed = new Set(forwards.map(forward => forward.from));
     return {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
-        summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
+        files: push.files, summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
       recipients: recipients.map(recipient => {
         const own = replyItems(recipient, items), text = replyText(own);
         return { member: recipient.member, name: recipient.name, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
@@ -1070,6 +1189,7 @@ export class PushService {
       if (!this.#store.push(id)?.released) throw new PushRefused("回复附件的占用没有解除（可能还在接收或下载），请稍后再删除");
     }
     this.#store.remove(id);
+    await rm(join(this.options.layout.pushFiles, id), { recursive: true, force: true }).catch(error => this.#report(error));
     log.info(`推送 ${id} 已在控制台删除`);
   }
 
@@ -1524,7 +1644,7 @@ export class PushService {
     const by = group ? undefined : this.#forwardedBy(push.id, phone);
     this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」`
       + `${by ? `（${by.name} 转来）` : ""}，正文（引用）：`
-      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}；要求：${group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push)}；`
+      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}${filesNote(push, group ? "本群" : "成员")}；要求：${group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push)}；`
       + `截止 ${shortTime(push.deadline, now)}。推送编号 ${push.id}`,
     { push: push.id, event: "card" });
   }
@@ -1549,6 +1669,7 @@ export class PushService {
         if (push.mode === "reply") this.#checkComplete(push.id);
       }
       this.#store.forgetHeard(now - this.#limits.heardMs);
+      this.#sweepFiles();
       this.#pump();
       this.#track(this.#drainNotes());
       for (const push of this.#store.summariesDue()) this.#track(this.#summarize(push.id));
@@ -1588,9 +1709,11 @@ export class PushService {
     if (this.#closeIfDue(push)) return;
     const attempts = recipient.sendAttempts + 1;
     this.#store.updateRecipient(push.id, recipient.member, { sendState: "sending", sendAttempts: attempts, retryAt: null });
-    let outcome;
+    let outcome: SendOutcome;
     try {
-      outcome = await this.#outbound.send(this.#memberTarget(recipient), cardMessage(this.#recipientCard(push.id, recipient.member)!), { signal: this.#signal });
+      // The files first: a card that went out means they did.
+      outcome = await this.#sendFiles(push, recipient)
+        ?? await this.#outbound.send(this.#memberTarget(recipient), cardMessage(this.#recipientCard(push.id, recipient.member)!), { signal: this.#signal });
     } catch (error) { outcome = { status: "failed" as const, reason: String(error) }; }
     // The summary stopped waiting and reported this card as unknown: what it said stays true.
     if (this.#store.recipient(push.id, recipient.member)?.sendState !== "sending") return;
@@ -1618,6 +1741,45 @@ export class PushService {
     if (!live) this.#settled(push.id);
   }
 
+  /**
+   * The push's files this recipient does not have yet, in order, as file messages. Undefined once all are out (an
+   * uncertain send counts as out, as for cards); else the failure, which is the card's: the next try goes on with that
+   * file. Stops when the push ended or the summary stopped waiting for this send.
+   */
+  async #sendFiles(push: Push, recipient: Recipient): Promise<SendOutcome | undefined> {
+    for (let index = recipient.filesSent; index < push.files.length; index++) {
+      const file = push.files[index]!, key = `${push.id}/${index}`;
+      const upload = this.#fileId(push, index, key);
+      let outcome: SendOutcome;
+      try {
+        const fileId = await upload;
+        this.#signal.throwIfAborted();
+        outcome = await this.#outbound.send(this.#memberTarget(recipient), uploadedFile(fileId, file), { signal: this.#signal });
+      } catch (error) { outcome = { status: "failed", reason: error instanceof Error ? error.message : String(error) }; }
+      if (outcome.status === "failed") {
+        // The platform may no longer have the uploaded file: the next try uploads it again.
+        if (this.#fileIds.get(key)?.id === upload) this.#fileIds.delete(key);
+        return { status: "failed", reason: `附件「${file.name}」没有发出：${outcome.reason}` };
+      }
+      if (this.#store.recipient(push.id, recipient.member)?.sendState !== "sending") return { status: "failed", reason: "截止后一直没有得到发送结果" };
+      this.#store.updateRecipient(push.id, recipient.member, { filesSent: index + 1 });
+      if (!LIVE_STATES.includes(this.#store.push(push.id)?.state ?? "closed")) return { status: "failed", reason: "截止前没有发完附件" };
+    }
+    return undefined;
+  }
+
+  /** The platform's ID of a push file: uploaded once, then used for every recipient until `fileIdMs` passed. */
+  #fileId(push: Push, index: number, key: string): Promise<string> {
+    const now = this.#now(), known = this.#fileIds.get(key);
+    if (known && now - known.at < this.#limits.fileIdMs) return known.id;
+    const file = push.files[index]!;
+    const id = this.#outbound.upload(fileUpload({ path: pushFile(this.options.layout, push.id, index), name: file.name, size: file.size }), this.#signal);
+    this.#fileIds.set(key, { id, at: now });
+    // A failed upload is not kept; whoever waits for it gets the failure.
+    id.catch(() => { if (this.#fileIds.get(key)?.id === id) this.#fileIds.delete(key); });
+    return id;
+  }
+
   /** The preview card's sending progress, at most every `progressMs`: a large push spends its sends on the cards. */
   #progress(pushId: string): void {
     const now = this.#now(), last = this.#progressAt.get(pushId);
@@ -1637,7 +1799,7 @@ export class PushService {
     log.info(`推送 ${pushId} 已发出：${recipients.length - failed} 张，失败 ${failed} 张`);
     const cc = push.cc.length ? `，抄送 ${push.cc.map(person => person.name).join("、")}` : "";
     this.#note(DIRECT_SCOPE, push.pusher, `sent:${pushId}`, `[推送已发出]「${quoted(push.subject)}」${shortTime(push.confirmedAt!, this.#now())} 发出，`
-      + `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed} 个）` : ""}${cc}；要求：${requirementText(push)}；截止 ${shortTime(push.deadline, this.#now())}。推送编号 ${pushId}`,
+      + `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed} 个）` : ""}${cc}${filesNote(push)}；要求：${requirementText(push)}；截止 ${shortTime(push.deadline, this.#now())}。推送编号 ${pushId}`,
     { push: pushId, event: "sent" });
     this.#refreshPreview(pushId);
     this.#checkComplete(pushId);

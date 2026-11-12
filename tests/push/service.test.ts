@@ -4,7 +4,7 @@
 // restarts. A recording platform, a fake address book and a fake message service; no network.
 import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EntryDraft } from "@earendil-works/pi-durable";
@@ -111,7 +111,7 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   };
   const abort = new AbortController();
   const make = () => {
-    const service = new PushService({ store, directory, outbound, layout: { tmp: join(root, "tmp") }, relay: null, signal: abort.signal,
+    const service = new PushService({ store, directory, outbound, layout: { tmp: join(root, "tmp"), pushFiles: join(root, "push-files") }, relay: null, signal: abort.signal,
       now: () => clock.now, limits: { tickMs: 3_600_000, ...options.limits }, onReport: error => reports.push(error) });
     service.bind(host);
     service.start();
@@ -1907,6 +1907,165 @@ test("deadline: past it, the console's 补推送 ends the push instead of sendin
     expect([h.service.pending(DIRECT_SCOPE, ZHANG), h.service.attachmentAsk(ZHANG)]).toEqual([undefined, undefined]);
     await h.settle();
     expect(h.texts(ZHANG)).toEqual([]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+// ---- files sent along with a push ------------------------------------------------------------------------------------
+
+const kindsTo = (h: Harness, to: string) => h.sent.filter(item => item.to === to).map(item => item.message.msgType);
+const fileIdsTo = (h: Harness, to: string) => h.sent.filter(item => item.to === to && item.message.msgType === "file").map(item => (item.message.content as { fileId: string }).fileId);
+const noteOf = (h: Harness, phone: string, requestId: string) =>
+  (h.notes.find(note => note.phone === phone && note.requestId === requestId)!.entry.model![0] as { content: { text: string }[] }).content[0]!.text;
+/** A file for a push: written under the harness's root; `{ path, size }` as push_prepare passes it on. */
+const pushSource = (h: Harness, name: string, data: string) => {
+  const path = join(h.root, "work", name);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, data);
+  return { path, size: Buffer.byteLength(data) };
+};
+
+test("files: copied when the push is prepared, sent ahead of the card from one upload each; cards and notes name them; a reminder's card goes alone; a follow-up takes them", async () => {
+  const h = harness();
+  try {
+    // One file the pusher sent to the bot (it keeps the name it came with), one from elsewhere.
+    h.say(PUSHER, "把这个通知推送给张三和李四", ["值班通知.pdf"]);
+    const received = Object.values(h.records.get(PUSHER)!.attachments)[0]!.path!;
+    const sheet = pushSource(h, "排班表.xlsx", "sheet v1");
+    const answer = await h.prepare({ deadline: "2026-11-04 18:00", attachments: [{ path: received, size: Buffer.byteLength("content of 值班通知.pdf") }, sheet] });
+    const id = h.pushId(answer);
+    expect(answer).toContain("2 人，附件 2 个，截止");
+    expect(h.card(PUSHER, id).content).toContain(`**附件**：值班通知.pdf（${Buffer.byteLength("content of 值班通知.pdf")}B）、排班表.xlsx（8B）；在卡片之前单独发给每个接收人`);
+    expect([h.files(ZHANG), h.uploads]).toEqual([[], []]);
+    // What was copied goes out, whatever happens to the pusher's files afterwards.
+    writeFileSync(sheet.path, "sheet v2, changed after the preview");
+    rmSync(received);
+    h.click(PUSHER, h.card(PUSHER, id), "确认推送", `preview-${id}`);
+    await h.settle();
+    expect([kindsTo(h, im(ZHANG)), kindsTo(h, im(LI))]).toEqual([["file", "file", "card"], ["file", "file", "card"]]);
+    expect(h.files(LI)).toEqual(["值班通知.pdf", "排班表.xlsx"]);
+    // One upload per file, whoever it goes to.
+    expect(h.uploads.map(upload => [upload.name, upload.data.toString()])).toEqual([["值班通知.pdf", "content of 值班通知.pdf"], ["排班表.xlsx", "sheet v1"]]);
+    expect([fileIdsTo(h, im(ZHANG)), fileIdsTo(h, im(LI))]).toEqual([["file-1", "file-2"], ["file-1", "file-2"]]);
+    expect(h.card(ZHANG).content).toContain("**附件**：值班通知.pdf、排班表.xlsx（已单独发给你）");
+    expect([h.store.recipient(id, ZHANG)!.filesSent, h.store.recipient(id, ZHANG)!.sendState]).toEqual([2, "sent"]);
+    expect(noteOf(h, ZHANG, `push-note:card:${id}`)).toContain("」；附件：值班通知.pdf、排班表.xlsx（已作为文件单独发给成员）；要求：确认收到；");
+    expect(noteOf(h, PUSHER, `push-note:sent:${id}`)).toContain("共 2 人；附件：值班通知.pdf、排班表.xlsx；要求：确认收到；");
+    expect(h.service.detail(id).push.files).toEqual([{ name: "值班通知.pdf", size: Buffer.byteLength("content of 值班通知.pdf") }, { name: "排班表.xlsx", size: 8 }]);
+    // 补推送 of the live push: the card again, the files not.
+    h.click(ZHANG, h.card(ZHANG), "已收到", "card-zhang");
+    await h.settle();
+    await expect(h.service.remind(id)).resolves.toEqual({ resent: 1 });
+    await h.settle();
+    expect([kindsTo(h, im(LI)), h.uploads.length]).toEqual([["file", "file", "card", "card"], 2]);
+    // The deadline; 「提醒未回复」: the follow-up has the files, and its recipient gets them again, uploaded for that push.
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-card");
+    await h.settle();
+    const followUp = h.store.push(id)!.followUp!;
+    expect(previewOf(h, followUp).content).toContain("**附件**：值班通知.pdf（");
+    expect(h.store.push(followUp)!.files).toEqual(h.store.push(id)!.files);
+    // The first push deleted in the console: its copies go, the follow-up's stay.
+    await h.service.remove(id);
+    expect([existsSync(join(h.root, "push-files", id)), readFileSync(join(h.root, "push-files", followUp, "1"), "utf8")]).toEqual([false, "sheet v1"]);
+    const before = kindsTo(h, im(LI)).length;
+    h.click(PUSHER, previewOf(h, followUp), "确认推送", `preview-${followUp}`);
+    await h.settle();
+    expect(kindsTo(h, im(LI)).slice(before)).toEqual(["file", "file", "card"]);
+    expect(h.uploads.filter(upload => !upload.name.startsWith("推送汇总")).map(upload => upload.data.toString())).toEqual(["content of 值班通知.pdf", "sheet v1", "content of 值班通知.pdf", "sheet v1"]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("files: one that fails is the card's failure, and the next try goes on with it; limits; a group gets them; copies nobody sends any more are removed", async () => {
+  const h = harness();
+  try {
+    roles(h, { group: true });
+    h.groupText(G1, WANG, "你好");
+    h.service.saveGroup(G1, { name: "销售一部", state: "registered" });
+    const a = pushSource(h, "a.txt", "first"), b = pushSource(h, "b.txt", "second");
+    // A name on a card: what would open emphasis, code or a link is escaped, the rest reads as it is.
+    h.say(PUSHER, "推送这个", ["报表_2026-11 (终稿)[1]*.txt"]);
+    const named = Object.values(h.records.get(PUSHER)!.attachments)[0]!;
+    const odd = h.pushId(await h.prepare({ attachments: [{ path: named.path!, size: named.size! }] }));
+    expect(h.card(PUSHER, odd).content).toContain(`**附件**：报表_2026-11 (终稿)\\[1\\]\\*.txt（${named.size}B）`);
+    h.click(PUSHER, h.card(PUSHER, odd), "取消", `preview-${odd}`);
+    await h.settle();
+    rmSync(join(h.root, "push-files", odd), { recursive: true });
+    // Refused: too many, an empty one, one above the size of a file message. Nothing is copied.
+    await expect(h.prepare({ attachments: Array.from({ length: 6 }, () => a) })).rejects.toThrow("附件最多 5 个，现在是 6 个");
+    await expect(h.prepare({ attachments: [pushSource(h, "空.txt", "")] })).rejects.toThrow("附件「空.txt」是空文件");
+    await expect(h.prepare({ attachments: [{ path: a.path, size: 31 * 1024 * 1024 }] })).rejects.toThrow("附件「a.txt」（31.0MB）超过单个附件的上限 30.0MB");
+    await expect(h.prepare({ attachments: [{ path: join(h.root, "work", "没有.txt"), size: 3 }] })).rejects.toThrow("推送未准备：附件没有读到");
+    expect(existsSync(join(h.root, "push-files")) ? readdirSync(join(h.root, "push-files")) : []).toEqual([]);
+    // The second file to 张三 is refused once.
+    let refusals = 0;
+    h.failing.when = item => item.to === im(ZHANG) && item.message.msgType === "file" && (item.message.content as { fileName: string }).fileName === "b.txt" && refusals++ === 0
+      ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const id = await confirmed(h, { recipients: [{ name: "张三", phone: ZHANG }], groups: [{ name: "销售一部" }], attachments: [a, b], deadline: "2026-11-03 10:30" });
+    const zhang = () => h.store.recipient(id, ZHANG)!;
+    expect([zhang().sendState, zhang().filesSent, zhang().sendError, zhang().retryAt]).toEqual(["failed", 1, "附件「b.txt」没有发出：HTTP 500", h.clock.now + 60_000]);
+    expect(kindsTo(h, im(ZHANG))).toEqual(["file", "file"]);
+    // The group has both and its card, which says so.
+    expect(kindsTo(h, G1).slice(-3)).toEqual(["file", "file", "card"]);
+    expect(h.groupCards(G1).at(-1)!.content).toContain("**附件**：a.txt、b.txt（已单独发到本群）");
+    expect(h.uploads).toHaveLength(2);
+    // The retry: the file that failed (uploaded again: the platform may have dropped it), then the card. The first is not sent twice.
+    h.clock.now += 60_000;
+    h.service.tick();
+    await h.settle();
+    expect([zhang().sendState, zhang().filesSent, zhang().sendError]).toEqual(["sent", 2, null]);
+    expect(kindsTo(h, im(ZHANG))).toEqual(["file", "file", "file", "card"]);
+    expect([h.files(ZHANG), h.uploads.map(upload => upload.name)]).toEqual([["a.txt", "b.txt", "b.txt"], ["a.txt", "b.txt", "b.txt"]]);
+    // A preview that is cancelled, and a push that ended long ago: their copies go when the directory is next looked through.
+    const dropped = h.pushId(await h.prepare({ attachments: [a] }));
+    h.click(PUSHER, h.card(PUSHER, dropped), "取消", `preview-${dropped}`);
+    await h.settle();
+    const dirs = () => readdirSync(join(h.root, "push-files")).sort();
+    expect(dirs()).toEqual([dropped, id].sort());
+    h.clock.now = new Date(2026, 10, 3, 10, 30, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    expect([h.store.push(id)!.state, dirs()]).toEqual(["closed", [id]]);
+    h.clock.now += 30 * 24 * 3600_000 - 60_000;
+    h.service.tick();
+    await h.settle();
+    expect(dirs()).toEqual([id]);
+    h.clock.now += 3600_000;
+    h.service.tick();
+    await h.settle();
+    expect(dirs()).toEqual([]);
+    // 「提醒未回复」 after that: a follow-up without the files, and the pusher is told.
+    await expect(h.service.remind(id)).resolves.toEqual({ followUp: expect.any(String) });
+    await h.settle();
+    expect(h.store.push(h.store.push(id)!.followUp!)!.files).toEqual([]);
+    expect(h.texts(PUSHER).at(-1)).toBe("「机房盘点」的附件已经清理，这条补推送不带附件；要带附件请重新准备一条推送。");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("files: a process that ended while a recipient's files were going out sends the rest and the card at the next start; with every file out the card is uncertain", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { attachments: [pushSource(h, "a.txt", "first"), pushSource(h, "b.txt", "second")], recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
+    // As an ended process leaves them: one between the two files, one with both out and the card under way.
+    h.store.updateRecipient(id, ZHANG, { sendState: "sending", filesSent: 1 });
+    h.store.updateRecipient(id, LI, { sendState: "sending" });
+    const zhang = kindsTo(h, im(ZHANG)).length, li = kindsTo(h, im(LI)).length;
+    await h.restart();
+    await h.settle();
+    expect([h.store.recipient(id, ZHANG)!.sendState, h.store.recipient(id, ZHANG)!.filesSent, h.files(ZHANG).at(-1)]).toEqual(["sent", 2, "b.txt"]);
+    expect(kindsTo(h, im(ZHANG)).slice(zhang)).toEqual(["file", "card"]);
+    expect([h.store.recipient(id, LI)!.sendState, kindsTo(h, im(LI)).length]).toEqual(["uncertain", li]);
+    // The push has ended meanwhile: the card that never went counts as not sent.
+    h.store.updateRecipient(id, WANG, { sendState: "sending", filesSent: 0 });
+    h.store.updatePush(id, { state: "closed", closedAt: h.clock.now, closeReason: "deadline", summaryState: "sent", released: true });
+    const wang = kindsTo(h, im(WANG)).length;
+    await h.restart();
+    await h.settle();
+    expect([h.store.recipient(id, WANG)!.sendState, h.store.recipient(id, WANG)!.retryAt, kindsTo(h, im(WANG)).length]).toEqual(["failed", null, wang]);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });

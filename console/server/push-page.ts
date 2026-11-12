@@ -136,6 +136,7 @@ export class PushPage {
       repliedAt: recipient.repliedAt, answered: recipient.answered, reply: recipient.reply, forwardedBy: recipient.forwardedBy, forwardedTo: recipient.forwardedTo }));
     return { view: key, recipients, push: { ...this.#listItem(push), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: lines,
       cc: push.cc.map(each => person(each.phone, each.name)), summaryError: push.summaryError, summaryAt: push.summaryAt,
+      files: push.files.map(({ name, size }) => ({ name, size })),
       reminders: { recipients: push.remind, sent: push.reminded, next: push.checkpoints[0] ?? null } } };
   }
 

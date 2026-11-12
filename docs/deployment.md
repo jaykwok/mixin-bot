@@ -249,6 +249,7 @@ data/
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   ├── workspace-root         Linux 部署保存的外置资料目录（空为默认）
 │   ├── reclamation/           tmp 离线回收的清单、快照与归档（backup/rm）
+│   ├── push-files/<推送>/     推送附件的副本；推送作废或删除后清理，结束满 30 天后清理
 │   └── ...                    部署状态与维护租约
 └── runtime/
     ├── pi/settings.json       Pi 选型与 Durable 原生运行策略（需备份）

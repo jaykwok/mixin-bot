@@ -38,6 +38,9 @@ export type PushRole = {
 
 export type Person = { phone: string; name: string };
 
+/** A file that goes out with a push: its name as sent, and its size. The bytes are the push's own copy (src/core/layout.ts pushFile). */
+export type PushFile = { name: string; size: number };
+
 /** A department the push goes to, as the pusher named it; `children`: with its sub-departments. */
 export type TargetDepartment = { id: string; path: string; children: boolean };
 
@@ -89,6 +92,8 @@ export type Push = {
   defaultDeadline: boolean;
   target: PushTarget;
   cc: Person[];
+  /** The files sent to every recipient ahead of the card, in order. */
+  files: PushFile[];
   state: PushState;
   createdAt: number;
   confirmedAt: number | null;
@@ -132,6 +137,8 @@ export type Recipient = {
   sendError: string | null;
   sentAt: number | null;
   retryAt: number | null;
+  /** How many of the push's files went out to this recipient (they go in order, ahead of the card). */
+  filesSent: number;
   /** The card's ID, known from the first click on it. */
   card: string | null;
   version: number;
@@ -204,7 +211,7 @@ CREATE TABLE IF NOT EXISTS chat_groups (
 CREATE TABLE IF NOT EXISTS pushes (
   id TEXT PRIMARY KEY, pusher TEXT NOT NULL, pusher_name TEXT NOT NULL, pusher_im TEXT NOT NULL, subject TEXT NOT NULL,
   body TEXT NOT NULL, mode TEXT NOT NULL, options TEXT NOT NULL, deadline INTEGER NOT NULL, default_deadline INTEGER NOT NULL,
-  target TEXT NOT NULL, cc TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER,
+  target TEXT NOT NULL, cc TEXT NOT NULL, files TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER,
   closed_at INTEGER, close_reason TEXT, preview_card TEXT, preview_version INTEGER NOT NULL, summary_state TEXT,
   summary_attempts INTEGER NOT NULL, summary_at INTEGER, summary_error TEXT, summary_done TEXT NOT NULL, summary_text TEXT, summary_card TEXT,
   summary_version INTEGER NOT NULL, follow_up TEXT, remind INTEGER NOT NULL, checkpoints TEXT NOT NULL, reminded INTEGER NOT NULL,
@@ -213,7 +220,7 @@ CREATE INDEX IF NOT EXISTS pushes_by_pusher ON pushes (pusher, created_at);
 CREATE INDEX IF NOT EXISTS pushes_by_state ON pushes (state);
 CREATE TABLE IF NOT EXISTS push_recipients (
   push_id TEXT NOT NULL, member TEXT NOT NULL, name TEXT NOT NULL, receive_id TEXT NOT NULL, send_state TEXT NOT NULL,
-  send_attempts INTEGER NOT NULL, send_error TEXT, sent_at INTEGER, retry_at INTEGER, card TEXT, version INTEGER NOT NULL,
+  send_attempts INTEGER NOT NULL, send_error TEXT, sent_at INTEGER, retry_at INTEGER, files_sent INTEGER NOT NULL, card TEXT, version INTEGER NOT NULL,
   acked_at INTEGER, clicks INTEGER NOT NULL, choice INTEGER, choice_at INTEGER, replied_at INTEGER,
   PRIMARY KEY (push_id, member)) STRICT;
 CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member);
@@ -238,7 +245,7 @@ type Row = Record<string, string | number | null>;
 
 const PUSH_COLUMNS = {
   id: "id", pusher: "pusher", pusherName: "pusher_name", pusherIm: "pusher_im", subject: "subject", body: "body", mode: "mode",
-  options: "options", deadline: "deadline", defaultDeadline: "default_deadline", target: "target", cc: "cc", state: "state",
+  options: "options", deadline: "deadline", defaultDeadline: "default_deadline", target: "target", cc: "cc", files: "files", state: "state",
   createdAt: "created_at", confirmedAt: "confirmed_at", closedAt: "closed_at", closeReason: "close_reason", previewCard: "preview_card",
   previewVersion: "preview_version", summaryState: "summary_state", summaryAttempts: "summary_attempts", summaryAt: "summary_at",
   summaryError: "summary_error", summaryDone: "summary_done", summaryText: "summary_text", summaryCard: "summary_card", summaryVersion: "summary_version", followUp: "follow_up",
@@ -247,11 +254,11 @@ const PUSH_COLUMNS = {
 
 const RECIPIENT_COLUMNS = {
   pushId: "push_id", member: "member", name: "name", receiveId: "receive_id", sendState: "send_state", sendAttempts: "send_attempts",
-  sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
+  sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", filesSent: "files_sent", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
   choice: "choice", choiceAt: "choice_at", repliedAt: "replied_at",
 } as const satisfies Record<keyof Recipient, string>;
 
-const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "summaryDone", "checkpoints"]);
+const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "files", "summaryDone", "checkpoints"]);
 const BOOLEAN_PUSH_FIELDS = new Set<keyof Push>(["defaultDeadline", "remind", "released"]);
 
 function encodePush<K extends keyof Push>(key: K, value: Push[K]): string | number | null {
@@ -529,9 +536,19 @@ export class PushStore {
       ORDER BY p.created_at, r.rowid`).all(now) as Row[]).map(decodeRecipient);
   }
 
-  /** At startup: sends an ended process left `sending` may have reached the platform. */
+  /**
+   * At startup: sends an ended process left `sending` may have reached the platform. A row with files still to go is not
+   * one of them: its card follows the files, so it was not sent. It is sent again while the push is on (the file that was
+   * under way may arrive twice), and failed once the push has ended.
+   */
   settleInterruptedSends(): number {
-    return this.db.query("UPDATE push_recipients SET send_state = 'uncertain', send_error = '发送过程中服务中断，结果未知' WHERE send_state = 'sending'").run().changes;
+    return this.transaction(() => {
+      const unsent = "send_state = 'sending' AND files_sent < (SELECT json_array_length(p.files) FROM pushes p WHERE p.id = push_recipients.push_id)";
+      this.db.query(`UPDATE push_recipients SET send_state = 'failed', retry_at = NULL, send_error = '截止前没有发完附件'
+        WHERE ${unsent} AND push_id NOT IN (SELECT id FROM pushes WHERE state IN ('sending', 'open'))`).run();
+      this.db.query(`UPDATE push_recipients SET send_state = 'pending' WHERE ${unsent}`).run();
+      return this.db.query("UPDATE push_recipients SET send_state = 'uncertain', send_error = '发送过程中服务中断，结果未知' WHERE send_state = 'sending'").run().changes;
+    });
   }
 
   // ---- reply items ----------------------------------------------------------------------------------------------------

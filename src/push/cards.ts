@@ -5,6 +5,7 @@
 // update of a card raises its version, so a redelivered click or one on a button the card no longer shows names an older
 // version: the service then only refreshes the card to its current state (./service.ts). Replies have no buttons: the
 // recipient writes to the bot and the conversation records the reply (./tools.ts push_reply).
+import { formatSize } from "@earendil-works/pi-coding-agent";
 import type { CardButton, CardContent } from "../integrations/open-platform/messages.ts";
 import { escapeInline } from "../durable/outbound.ts";
 import { checkpoints } from "./reminders.ts";
@@ -70,6 +71,12 @@ export function clickData(content: unknown): ClickData | undefined {
   if ((action === "forward" || action === "keep") && data.f === undefined) return undefined;
   return { push: data.p, action, version, ...(option === undefined ? {} : { option }), ...(data.f === undefined ? {} : { forward: data.f }) };
 }
+
+/**
+ * A push file's name on a card. It is the pusher's text like the body, one line already: only what would open emphasis,
+ * code or a link is escaped, so an ordinary name (dots, dashes, underscores, brackets) reads as it is.
+ */
+const fileName = (name: string) => name.replace(/[\\`*[\]<>~]/g, "\\$&");
 
 export type Counts = { texts: number; files: number };
 
@@ -152,6 +159,7 @@ export function previewCard(view: PreviewView, now = Date.now()): CardContent {
     `**抄送**：${cc}`,
     `**要求**：${escapeInline(requirementText(push))}`,
     `**截止**：${deadline}`,
+    ...(push.files.length ? [`**附件**：${push.files.map(file => `${fileName(file.name)}（${formatSize(file.size)}）`).join("、")}；在卡片之前单独发给每个接收人`] : []),
     ...progressLine(push, now),
     "",
     "---",
@@ -207,7 +215,8 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   const head = [`**${escapeInline(push.pusherName)}** 于 ${shortTime(push.confirmedAt ?? push.createdAt, now)} 推送${group ? "到本群" : ""}`
     + (view.forwardedBy ? `，**${escapeInline(view.forwardedBy)}** 转给你` : "")
     + (push.target.of ? `（补推送：之前的推送还没有收到${group ? "本群" : "你"}的答复）` : ""), "", push.body, "", "---", "",
-    `**要求**：${escapeInline(group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push))}`, `**截止**：${shortTime(push.deadline, now)}`];
+    `**要求**：${escapeInline(group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push))}`, `**截止**：${shortTime(push.deadline, now)}`,
+    ...(push.files.length ? [`**附件**：${push.files.map(file => fileName(file.name)).join("、")}（已单独发${group ? "到本群" : "给你"}）`] : [])];
   const tail = ["", `推送编号 ${push.id}`];
   const make = (status: { name: string; color: string }, extra: string[], buttons: CardButton[], invalid = false) =>
     card(title, [...head, ...extra, ...tail].join("\n"), status, buttons, recipient.card, invalid);

@@ -67,14 +67,14 @@ test("the workbook: the parts a spreadsheet needs, a frozen bold header, escaped
 
 function push(mode: Push["mode"], options: string[] = []): Push {
   return { id: "abcd2345", pusher: "13800000009", pusherName: "推送人", pusherIm: "im-9", subject: "机房盘点", body: "请回复", mode, options,
-    deadline: 2_000_000_000_000, defaultDeadline: false, target: { people: [], departments: [], everyone: false }, cc: [], state: "closed", createdAt: 1, confirmedAt: 1,
+    deadline: 2_000_000_000_000, defaultDeadline: false, target: { people: [], departments: [], everyone: false }, cc: [], files: [], state: "closed", createdAt: 1, confirmedAt: 1,
     closedAt: 2, closeReason: "deadline", previewCard: null, previewVersion: 0, summaryState: "pending", summaryAttempts: 0, summaryAt: null,
     summaryError: null, summaryDone: [], summaryText: null, summaryCard: null, summaryVersion: 0, followUp: null, remind: true, checkpoints: [], reminded: 0, released: false };
 }
 
 function recipient(member: string, name: string, change: Partial<Recipient> = {}): Recipient {
   return { pushId: "abcd2345", member, name, receiveId: `im-${member}`, sendState: "sent", sendAttempts: 1, sendError: null, sentAt: 1, retryAt: null,
-    card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, repliedAt: null, ...change };
+    filesSent: 0, card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, repliedAt: null, ...change };
 }
 
 let itemId = 0;

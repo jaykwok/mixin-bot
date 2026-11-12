@@ -17,7 +17,7 @@ const ITEM: PushListItem = { id: "abcd2345", subject: "机房盘点", mode: "rep
 const TOTALS = { sent: 3, followUps: 1, live: 1, delivered: 4, acked: 3, replyDelivered: 2, replied: 1 };
 const DETAIL: PushDetail = {
   push: { ...ITEM, body: "请回复", options: [], defaultDeadline: true, target: { people: [{ phone: ZHANG, name: "张三" }], departments: [{ id: "10", path: "技术部", children: true }],
-    everyone: false, unmatched: ["外人（尾号 0000）"] }, cc: [{ phone: WANG, name: "王五" }], summaryError: null, summaryAt: null, remind: true, reminded: 1, checkpoints: [7] },
+    everyone: false, unmatched: ["外人（尾号 0000）"] }, cc: [{ phone: WANG, name: "王五" }], files: [{ name: "notice.pdf", size: 2048 }], summaryError: null, summaryAt: null, remind: true, reminded: 1, checkpoints: [7] },
   recipients: [ZHANG, LI].map((member, index) => ({ member, name: index ? "李四" : "张三", sendState: "sent", sendError: null, sentAt: 2, ackedAt: index ? null : 2, clicks: 0,
     choice: null, choiceAt: null, repliedAt: index ? null : 3, answered: !index,
     reply: index ? null : { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] }, forwardedBy: index ? "张三" : null, forwardedTo: index ? [] : ["李四"] })),
@@ -53,13 +53,14 @@ test("推送页：经本机控制接口读列表和详情，页面只见打码�
     for (const before of [5, { createdAt: 5 }, { createdAt: 5, id: "../x" }, { createdAt: 5, id: ITEM.id, more: 1 }]) {
       await expect(run("POST /api/push/list", { before })).rejects.toThrow("翻页位置无效");
     }
-    const detail = await run("POST /api/push/detail", { id: ITEM.id }) as { view: string; push: { target: string[]; cc: { key: string; phone: string }[]; reminders: unknown };
+    const detail = await run("POST /api/push/detail", { id: ITEM.id }) as { view: string; push: { target: string[]; cc: { key: string; phone: string }[]; reminders: unknown; files: unknown };
       recipients: { key: string; name: string; phone: string }[] };
     const text = JSON.stringify(detail);
     for (const phone of [ZHANG, LI, WANG, PUSHER]) expect(text).not.toContain(phone);
     expect(detail.push.target).toEqual(["部门 技术部（含下级）", "个人 张三 · 138****0001", "没有对上、未包含：外人（尾号 0000）"]);
     // On the way: whether recipients are reminded, how often they were, and the next progress moment.
     expect(detail.push.reminders).toEqual({ recipients: true, sent: 1, next: 7 });
+    expect(detail.push.files).toEqual([{ name: "notice.pdf", size: 2048 }]);
     expect(detail.recipients.map(each => [each.name, each.phone])).toEqual([["张三", "138****0001"], ["李四", "138****0002"]]);
     // A push the bot does not have: its refusal reaches the page.
     await expect(run("POST /api/push/detail", { id: "zzzzzzzz" })).rejects.toMatchObject({ status: 409, message: "推送不存在" });

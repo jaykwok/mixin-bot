@@ -21,8 +21,8 @@ import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { DIRECT_SPACE, type Recording, recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { tmpOf } from "../helpers/layout.ts";
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readdir, realpath, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import "../helpers/restore-spies.ts";
 
 const fixture = await tempFixture("durable-push-host-");
@@ -213,7 +213,7 @@ function fakePushes() {
   const calls: unknown[][] = [];
   const key = (scope: { kind: string; groupId?: string }, phone: string) => scope.kind === "group" ? `group:${scope.groupId}` : phone;
   const push: PushTools = {
-    prepare: async () => "预览已发出",
+    prepare: async (caller, input) => { calls.push(["prepare", caller.phone, input.attachments]); return "预览已发出"; },
     status: phone => { calls.push(["status", phone]); return "没有推送"; },
     lookup: (phone, input) => { calls.push(["lookup", phone, input]); return "找到 1 人"; },
     reply: async (speaker: Speaker, input: ReplyInput) => { calls.push(["reply", speaker, input]); return "已记入回复"; },
@@ -258,6 +258,28 @@ test("a pusher's conversation selects the push tools and section and the address
     await until(() => replyTexts(out.sent).length === 3, "Alice's answer after the revocation");
     const revoked = declared(m.requests[3]!);
     expect([pushTools(revoked.tools), pushSections(revoked.sections)]).toEqual([[], []]);
+  } finally { await service.close(); }
+});
+
+test("push_prepare's attachments are files of the shared materials or the member's own tmp, passed on by real path and size; another file is refused before the push service hears of it", async () => {
+  const where = root(), out = recordingOutbound(), fake = fakePushes();
+  fake.pushers.add(ALICE);
+  const own = join(tmpOf(where, DIRECT_SPACE, ALICE), "notice.txt"), outside = join(where, "secret.txt");
+  await mkdir(dirname(own), { recursive: true });
+  await writeFile(own, "notice");
+  await writeFile(outside, "secret");
+  const prepare = (path: string, id: string) => () => fauxAssistantMessage([fauxToolCall("push_prepare", { subject: "notice", body: "please read", mode: "ack",
+    recipients: [{ name: "Carol", phone: "13800000003" }], attachments: [path] }, { id })], { stopReason: "toolUse" });
+  const m = model([prepare(own, "prepare-1"), () => fauxAssistantMessage("sent the preview"), prepare(outside, "prepare-2")]);
+  const service = open(where, m, out.outbound, withPushes(where, fake));
+  try {
+    await service.admit(ask(out, ALICE, "push this file to Carol"));
+    await until(() => replyTexts(out.sent).length === 1, "the answer after the preview");
+    expect(fake.calls).toEqual([["prepare", ALICE, [{ path: await realpath(own), size: 6 }]]]);
+    await service.admit(ask(out, ALICE, "and this one"));
+    await until(() => replyTexts(out.sent).length === 2, "the answer after the refusal");
+    expect(fake.calls).toHaveLength(1);
+    expect(m.requests.at(-1)!.some(message => message.role === "toolResult" && text(message).includes("只能发送共享资料 workspace 或当前调用用户 tmp 目录内的文件"))).toBe(true);
   } finally { await service.close(); }
 });
 

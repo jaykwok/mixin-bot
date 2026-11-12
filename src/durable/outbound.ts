@@ -98,12 +98,20 @@ const IMAGE_TYPES: Record<string, string> = { png: "png", jpg: "jpg", jpeg: "jpg
 /** Upload and send one local file as a file message. `dispatched` marks the irreversible send call. */
 export async function sendFileMessage(outbound: Outbound, reply: ReplyContext, file: { path: string; name: string; size: number },
   signal: AbortSignal | undefined, dispatched: () => void): Promise<SendOutcome> {
-  const extension = extensionOf(file.name);
-  const fileId = await outbound.upload({ path: file.path, fileName: file.name, size: file.size, mimeType: mimeOf(extension) }, signal);
+  const fileId = await outbound.upload(fileUpload(file), signal);
   signal?.throwIfAborted();
   dispatched();
-  return outbound.send(targetOf(reply), fileMessage({ fileId, fileName: file.name, size: file.size, mimeType: extension || "bin" }),
-    { replyMsgId: reply.msgUid, ...(signal ? { signal } : {}) });
+  return outbound.send(targetOf(reply), uploadedFile(fileId, file), { replyMsgId: reply.msgUid, ...(signal ? { signal } : {}) });
+}
+
+/** What the upload of a local file needs. */
+export function fileUpload(file: { path: string; name: string; size: number }): UploadSource {
+  return { path: file.path, fileName: file.name, size: file.size, mimeType: mimeOf(extensionOf(file.name)) };
+}
+
+/** The file message of an uploaded file. */
+export function uploadedFile(fileId: string, file: { name: string; size: number }): OutboundMessage {
+  return fileMessage({ fileId, fileName: file.name, size: file.size, mimeType: extensionOf(file.name) || "bin" });
 }
 
 export async function sendImageMessage(outbound: Outbound, reply: ReplyContext, image: { path: string; name: string; size: number; width: number; height: number; format: string },
