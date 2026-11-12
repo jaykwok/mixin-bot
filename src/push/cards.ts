@@ -44,10 +44,15 @@ export function requirementText(push: Pick<Push, "mode" | "options">): string {
   return push.mode === "ack" ? "确认收到" : push.mode === "options" ? `选择：${push.options.join(" / ")}` : "需要回复（文字或附件）";
 }
 
+/**
+ * A button and what its click brings back. Every value is a text: a client that keeps a button's data as texts sends
+ * none of it once a number is among them (seen on the real platform: the click arrived with `data: null`).
+ */
 function button(push: Pick<Push, "id">, version: number, index: number, name: string, action: CardAction, style: 1 | 2,
   extra: { option?: number; forward?: string } = {}): CardButton {
   return { name, type: "button", index, show: true, disabled: false, value: { placeholder: "action", value: action, style, url: "", method: "POST",
-    data: { k: "push", p: push.id, a: action, v: version, ...(extra.option === undefined ? {} : { o: extra.option }), ...(extra.forward === undefined ? {} : { f: extra.forward }) } } };
+    data: { k: "push", p: push.id, a: action, v: String(version), ...(extra.option === undefined ? {} : { o: String(extra.option) }),
+      ...(extra.forward === undefined ? {} : { f: extra.forward }) } } };
 }
 
 function card(title: string, content: string, status: { name: string; color: string }, buttons: CardButton[], msgUid: string | null, invalid = false): CardContent {

@@ -51,6 +51,12 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
     async send(target, message, sendOptions) {
       const item: Sent = { to: target.receiveId, kind: target.kind, message, ...(sendOptions ? { options: sendOptions } : {}) };
       sent.push(item);
+      // Every card of every test: a button's click data is texts only (a client that keeps it as texts sends none of it otherwise).
+      if (message.msgType === "card") {
+        for (const each of (message.content as CardContent).tailFields) {
+          if (Object.values(each.value.data as Record<string, unknown>).some(value => typeof value !== "string")) reports.push(new Error(`button data with a value that is not a text: ${each.name}`));
+        }
+      }
       if (message.msgType === "card" && target.receiveId !== im(PUSHER) && gate.delayMs) {
         gate.max = Math.max(gate.max, ++gate.inFlight);
         await Bun.sleep(gate.delayMs);
@@ -1265,7 +1271,26 @@ test("a deadline ten minutes away can be asked for: it is checked by the minute 
   } finally { await h.close(); }
 });
 
-test("clicks that are not a push card's are ignored, and their shape reads without their values", () => {
+test("a button's click data is texts only, in every kind of card; a click whose data did not arrive is ignored and its shape logged without values", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "options", options: ["参加", "不参加"], recipients: [{ name: "张三", phone: ZHANG }] });
+    const data = h.buttonOf(h.card(ZHANG, id), "不参加").value.data;
+    expect(data).toEqual({ k: "push", p: id, a: "choose", v: "0", o: "1" });
+    // As the text it is, and as a number an earlier card carried: both are read.
+    expect(clickData({ data })).toEqual({ push: id, action: "choose", version: 0, option: 1 });
+    expect(clickData({ data: { ...data, v: 0, o: 1 } })).toEqual({ push: id, action: "choose", version: 0, option: 1 });
+    h.click(ZHANG, h.card(ZHANG, id), "不参加", `card-${id}`);
+    await h.settle();
+    expect(h.store.recipient(id, ZHANG)!.choice).toBe(1);
+    // The same click as a client sent it that dropped the data: nothing changes.
+    h.service.click({ payload: { eventType: "callback:card_interaction", userId: im(ZHANG), msgUid: `card-${id}`, groupId: "", type: "api",
+      content: { url: "", method: "POST", headers: {}, data: null } }, sentAt: START + 999_999, receivedAt: h.clock.now });
+    await h.settle();
+    expect(h.store.recipient(id, ZHANG)!.choice).toBe(1);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+  expect(clickShape({ url: "", method: "POST", headers: {}, data: null })).toBe("{url=string method=string headers=object data=null}");
   expect(clickData({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack", v: 0 }) })).toEqual({ push: "abcd1234", action: "ack", version: 0 });
   expect(clickData({ data: { k: "push", p: "abcd1234", a: "ack" } })).toBeUndefined();
   expect(clickShape({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack" }) })).toBe("{url=string method=string headers=object data=text:{k=string p=string a=string}}");
