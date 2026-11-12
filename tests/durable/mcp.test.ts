@@ -41,14 +41,15 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
     } else throw new Error("unexpected RPC");
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
   } });
-  const manager = new McpTools({ format: 1, servers: [{ name: "reports", tools: ["report"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(root, "discovery"));
+  const manager = new McpTools({ servers: [{ name: "reports", tools: ["report"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(root, "discovery"));
   const { models, faux, model } = fauxModels(), holder: { harness?: Harness } = {};
   const door = spaceDoor(holder), members = { layout: appLayout(join(root, "data")), scope: groupScope("group-a") };
   let harness: Harness | undefined;
   try {
     await mkdir(members.layout.data); await manager.initialize(new AbortController().signal);
     const tools = mcpMemberTools(members, manager, door), registry = createRegistry();
-    expect(tools[0]!.registration).toMatchObject({ callers: ["tools"], deferred: true, replay: "unsafe" });
+    expect(tools[0]!.registration).toMatchObject({ name: "mcp__reports__report", callers: ["tools"], deferred: true, replay: "unsafe" });
+    expect(tools[0]!.namespace).toEqual({ name: "mcp__reports", description: "管理员批准的外部工具" });
     registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map((tool) => tool.registration) }));
     registry.install(codemodeExtension({ members, tools }));
     harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
@@ -71,9 +72,13 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
       if (isolated) expect(mapping.size).toBe(owned.length);
       const mcpDir = isolated ? join(tempDir, ".isolated-work", mapping.get(mcpName)!, "work") : join(tempDir, "codemode", mcpName);
       expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));
-      const full = JSON.parse(await readFile(join(mcpDir, "output.txt"), "utf8"));
-      expect(full.structuredContent).toEqual({ member: phone }); expect(full.content[0].text).toHaveLength(phone.length + 30000);
-      expect(JSON.stringify(output.content)).toContain(tempDir.replaceAll("\\", "\\\\"));
+      // The model gets the start and the end of the text (pi-mcp's limit) and where the whole of it is.
+      expect(await readFile(join(mcpDir, "output.txt"), "utf8")).toBe(phone + "x".repeat(30000));
+      const shown = JSON.stringify(output.content);
+      expect(shown).toContain("Warning: truncated output");
+      expect(shown).toContain("chars truncated");
+      expect(shown).toContain("[Full output: ");
+      expect(shown).toContain(tempDir.replaceAll("\\", "\\\\"));
       const policy = { registered: new Set(owned), protected: new Set(owned), isolated: mapping, expire: async () => {} };
       expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual([]);
       expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));

@@ -151,9 +151,10 @@ test("设置摘要读取模型选择、辅助模型和 MCP 文件；缺失表示
     expect((await settingsData.loadModelSummary(project))?.thinking).toEqual({ level: "low", source: "model" });
     await Bun.write(join(project, "data", "config", "auxiliary.json"), JSON.stringify({ format: 1, image: { provider: "openai", modelId: "gpt-image-1" } }));
     expect(await settingsData.loadAuxiliarySummary(project)).toEqual({ enabled: true, classifier: null, image: "openai/gpt-image-1", maxConcurrent: 2, classifierRetries: 1 });
-    await Bun.write(join(project, "data", "config", "mcp.json"), JSON.stringify({ format: 1, servers: [{
-      name: "documents", transport: "http", url: "https://mcp.example/mcp", tools: ["search"], headersEnv: { Authorization: "DOCS_SECRET_HEADER" },
-    }] }));
+    await Bun.write(join(project, "data", "config", "mcp.json"), JSON.stringify({ mcpServers: {
+      documents: { url: "https://mcp.example/mcp", tools: ["search"], headers: { Authorization: "Bearer ${DOCS_SECRET_HEADER}" } },
+      parked: { command: process.execPath, tools: ["x"], enabled: false },
+    } }));
     const servers = await settingsData.loadMcpSummary(project);
     expect(servers).toEqual([{ name: "documents", transport: "http", tools: 1, oauth: false }]);
     expect(JSON.stringify(servers)).not.toContain("DOCS_SECRET_HEADER");

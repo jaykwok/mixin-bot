@@ -49,44 +49,45 @@ Pi 1.5.2 接入只运行 Durable。修改以下配置前停止服务，使用升
 
 ## MCP 外部工具
 
-可选 `data/config/mcp.json`，只接受管理员配置的服务器与明确工具白名单，最多八台、每台最多 64 个工具。例如：
+可选 `data/config/mcp.json`，采用各 MCP 客户端通用的 `mcpServers` 写法：按名称列出服务器，本机程序写 `command`、`args`、`env`，HTTP 服务写 `url`、`headers`、`oauth`。在这之上只接受管理员明确允许的工具：每个服务器必须用 `tools` 列出允许成员调用的工具名，没有列出的不提供给模型。最多启用八个服务器，每个最多 64 个工具。例如：
 
 ```json
 {
-  "format": 1,
-  "servers": [{
-    "name": "documents",
-    "transport": "http",
-    "url": "https://your-server.example/mcp",
-    "tools": ["search_documents"],
-    "headersEnv": { "Authorization": "DOCUMENTS_AUTH_HEADER" }
-  }]
+  "mcpServers": {
+    "documents": {
+      "url": "https://your-server.example/mcp",
+      "headers": { "Authorization": "Bearer ${DOCUMENTS_TOKEN}" },
+      "description": "产品文档库",
+      "tools": ["search_documents"]
+    },
+    "localdocs": {
+      "command": "C:\\Tools\\mcp-server.exe",
+      "args": [],
+      "env": { "APP_MODE": "readonly" },
+      "tools": ["search_documents"]
+    }
+  }
 }
 ```
 
-`headersEnv` 的值是运行服务时已有的环境变量名，变量值是完整的请求头值，不写入模型可见目录。HTTP 要求 HTTPS，本机回环地址允许 HTTP；URL 不接受嵌入凭证。调用传递 `X-Mixin-Chat`（`direct` 或 `group`）和 URL 编码的 `X-Mixin-Member`，群聊另带 URL 编码的 `X-Mixin-Group`，单聊不带这个头；管理员配置的同名头会被覆盖。每次使用独立成员会话。外部服务需要自行验证身份和实施数据权限；这些头不能替代外部服务的鉴权。
+两种服务器都可以写的字段：
 
-stdio 示例：
+| 字段 | 说明 |
+| --- | --- |
+| `tools` | 必填，允许成员调用的工具名 |
+| `description` | 一句话说明这个服务器提供什么，模型查找工具时看得到 |
+| `timeout` | 一次工具调用的时限，秒，1 到 600；默认 120 |
+| `enabled` | 写 `false` 保留这一项但不启用 |
 
-```json
-{
-  "format": 1,
-  "servers": [{
-    "name": "localdocs",
-    "transport": "stdio",
-    "command": "C:\\Tools\\mcp-server.exe",
-    "args": [],
-    "env": { "APP_MODE": "readonly" },
-    "tools": ["search_documents"]
-  }]
-}
-```
+服务器名称以小写字母开头，只用小写字母、数字、`_` 和 `-`，最多 32 个字符；两个名称不能只差 `-` 和 `_`。模型看到的工具名是 `mcp__<服务器>__<工具>`，同一服务器的工具归在 `mcp__<服务器>` 下。
 
-`command` 必须为该主机的绝对路径，参数不经 shell 展开。子进程只继承必要的 PATH/系统/临时目录变量和显式配置的 `env`，另带 `MIXIN_CHAT_KIND / MIXIN_GROUP_ID / MIXIN_MEMBER_PHONE`（单聊时 `MIXIN_CHAT_KIND` 为 `direct`）；工作目录是成员 tmp。进程监督负责取消、stdin 关闭和父进程死亡后的后代回收。MCP roots 表达共享资料只读与成员 tmp 的使用约定，**不构成 OS 文件系统隔离**；stdio 程序仍具有服务用户权限，只配置可信程序。
+**HTTP 服务**：`url` 必须是 HTTPS，本机回环地址可以用 HTTP，不能带账号、口令。`headers` 的每个值都要用 `${变量名}` 引用运行服务时已有的环境变量（可以和固定文字拼在一起，如 `"Bearer ${DOCUMENTS_TOKEN}"`），凭证不写进配置文件；变量没有设置时服务启动失败并指出变量名。调用传递 `X-Mixin-Chat`（`direct` 或 `group`）和 URL 编码的 `X-Mixin-Member`，群聊另带 URL 编码的 `X-Mixin-Group`，单聊不带这个头；管理员配置的同名头会被覆盖。每次使用独立成员会话。外部服务需要自行验证身份和实施数据权限；这些头不能替代外部服务的鉴权。
 
-HTTP OAuth 可额外配置 `oauth: { "port": 43127, "clientId": "registered-client" }`，也可省略 clientId 采用官方动态注册流程；保密客户端用 `clientSecretEnv` 指定已有环境变量。停机后执行 `bun run mcp login documents`，按输出链接在浏览器授权；回调仅监听 `127.0.0.1`，登录期限两分钟，可取消。凭证按服务器名称和精确 URL 保存在 `data/runtime/mcp/`；备份应按秘密配置保护。服务启动不自动打开登录流程。
+**本机程序**：`command` 必须是该主机上的绝对路径，参数不经 shell 展开，不接受 `cwd`。子进程只继承必要的 PATH/系统/临时目录变量和显式配置的 `env`（值里可以用 `${变量名}` 引用服务的环境变量），另带 `MIXIN_CHAT_KIND / MIXIN_GROUP_ID / MIXIN_MEMBER_PHONE`（单聊时 `MIXIN_CHAT_KIND` 为 `direct`）；工作目录是成员 tmp。进程监督负责取消、stdin 关闭和父进程死亡后的后代回收。MCP roots 表达共享资料只读与成员 tmp 的使用约定，**不构成 OS 文件系统隔离**；stdio 程序仍具有服务用户权限，只配置可信程序。
 
-发现只读取工具目录；每次调用重查参数与结果 schema，目录变化会拒绝执行并要求管理员复核重启。工具经 codemode 按需发现，保持 unsafe、不自动重试、成员身份和取消边界，不能调用 model-only 的 `send_*`。长结果和图片按成员归属落盘，纳入现有 `/clear` 和保留清理。单条传输最多 8 MiB，活跃会话最多八个。
+**HTTP OAuth**：在服务器上加 `"oauth": { "callbackPort": 43127, "clientId": "registered-client" }`。`callbackPort` 必填，登录时在本机这个端口接收回调，回调地址是 `http://127.0.0.1:<端口>/callback`；省略 `clientId` 时采用官方动态注册流程；保密客户端用 `"clientSecret": "${变量名}"` 引用环境变量；还可以写 `scope`（要申请的权限，空格分隔）和 `clientName`（动态注册时的客户端名称）。停机后执行 `bun run mcp login documents`，按输出链接在浏览器授权；回调仅监听 `127.0.0.1`，登录期限两分钟，可取消。凭证按服务器名称和精确 URL 保存在 `data/runtime/mcp/`；备份应按秘密配置保护。服务启动不自动打开登录流程。
+
+发现只读取工具目录；每次调用重查参数与结果 schema，目录变化会拒绝执行并要求管理员复核重启。工具经 codemode 按需发现，保持 unsafe、不自动重试、成员身份和取消边界，不能调用 model-only 的 `send_*`。结果文字超过 20 KB 时模型看到开头和结尾，完整文字和图片按成员归属落盘，纳入现有 `/clear` 和保留清理。单条传输最多 8 MiB，活跃会话最多八个。
 
 ## 只读历史诊断
 

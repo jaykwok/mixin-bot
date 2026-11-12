@@ -1,7 +1,7 @@
 import { authorizeMcp, OAuthCallbackServer } from "@earendil-works/pi-mcp/oauth";
 import { readMcpConfig } from "../../src/core/mcp-config.ts";
 import { acquireLease } from "../../src/core/maintenance.ts";
-import { mcpOAuth } from "../../src/integrations/mcp-oauth.ts";
+import { mcpCallbackPath, mcpOAuth } from "../../src/integrations/mcp-oauth.ts";
 
 if (import.meta.main) {
   const [command, name, ...extra] = process.argv.slice(2);
@@ -16,7 +16,7 @@ if (import.meta.main) {
   let callback: OAuthCallbackServer | undefined;
   const close = () => { void callback?.close(); };
   try {
-    callback = await OAuthCallbackServer.listen({ host: "127.0.0.1", port: server.oauth.port, path: `/mcp/${server.name}/callback`, timeoutMs: 120000 });
+    callback = await OAuthCallbackServer.listen({ host: "127.0.0.1", port: server.oauth.callbackPort, path: mcpCallbackPath, timeoutMs: 120000 });
     signal.addEventListener("abort", close, { once: true });
     const { provider } = mcpOAuth(server, url => { console.log(`请在浏览器打开：${url.href}`); });
     const result = await authorizeMcp(provider, { serverUrl: server.url, signal });

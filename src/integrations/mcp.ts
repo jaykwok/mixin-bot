@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { McpClient, StdioTransport, StreamableHttpTransport, type AuthProvider, type CallToolResult, type McpTransport, type McpTransportSendOptions, type Tool } from "@earendil-works/pi-mcp";
-import type { McpConfig, McpServerConfig } from "../core/mcp-config.ts";
+import { McpClient, StdioTransport, StreamableHttpTransport, validateMcpServerConfig, type AuthProvider, type CallToolResult, type McpTransport, type McpTransportSendOptions,
+  type Tool } from "@earendil-works/pi-mcp";
+import { expandVariables, type McpConfig, type McpServerConfig } from "../core/mcp-config.ts";
 import { mcpOAuth } from "./mcp-oauth.ts";
 import type { Scope } from "../core/layout.ts";
 import { APP_VERSION } from "../core/version.ts";
@@ -17,6 +18,13 @@ export interface McpTimeouts { requestMs: number; callMs: number }
 const supervisor = fileURLToPath(new URL("../lib/process-supervisor.ts", import.meta.url));
 const sameSchema = (a: Tool, b: Tool) => JSON.stringify(a.inputSchema) === JSON.stringify(b.inputSchema) && JSON.stringify(a.outputSchema) === JSON.stringify(b.outputSchema);
 
+/** A server as pi-mcp's `mcpServers` shape has it (the administrator's file, without this service's `tools`). */
+export function officialEntry(server: McpServerConfig): Record<string, unknown> {
+  const common = { ...(server.description === undefined ? {} : { description: server.description }), ...(server.timeout === undefined ? {} : { timeout: server.timeout }) };
+  return server.transport === "stdio" ? { ...common, command: server.command, args: server.args ?? [], ...(server.env ? { env: server.env } : {}) }
+    : { ...common, url: server.url, ...(server.headers ? { headers: server.headers } : {}), ...(server.oauth ? { oauth: server.oauth } : {}) };
+}
+
 /** Official protocol/transports, short-lived member sessions, and a fixed administrator tool allowlist. */
 export class McpTools {
   readonly catalogue: McpCatalogueTool[] = [];
@@ -29,14 +37,25 @@ export class McpTools {
   constructor(private readonly config: McpConfig, private readonly discoveryDir = "data/runtime/mcp/discovery",
     timeouts: Partial<McpTimeouts> = {}) {
     this.#timeouts = { requestMs: 30000, callMs: 120000, ...timeouts };
-    for (const server of config.servers) if (server.oauth) this.#auth.set(server.name, mcpOAuth(server).auth);
+    for (const server of config.servers) {
+      // The file was checked by this service's rules (src/core/mcp-config.ts); pi-mcp's own check must agree on every entry.
+      const official = validateMcpServerConfig(server.name, officialEntry(server));
+      if (official.kind !== server.transport) throw new Error(`MCP ${server.name} 配置无效：${official.kind === "invalid" ? official.error : "传输方式不符"}`);
+      if (server.oauth) this.#auth.set(server.name, mcpOAuth(server).auth);
+    }
+  }
+
+  /** A server's time limits: its `timeout` bounds a tool call, and the other requests when it is the shorter. */
+  #limits(server: McpServerConfig): McpTimeouts {
+    const callMs = server.timeout === undefined ? this.#timeouts.callMs : server.timeout * 1000;
+    return { callMs, requestMs: Math.min(this.#timeouts.requestMs, callMs) };
   }
 
   async initialize(signal: AbortSignal): Promise<void> {
     try {
       await mkdir(this.discoveryDir, { recursive: true, mode: 0o700 });
       for (const server of this.config.servers) {
-        const tools = await this.#use(server, undefined, signal, undefined, client => client.listTools({ signal, timeoutMs: this.#timeouts.requestMs }));
+        const tools = await this.#use(server, undefined, signal, undefined, client => client.listTools({ signal, timeoutMs: this.#limits(server).requestMs }));
         const names = new Set<string>();
         for (const tool of tools) {
           if (names.has(tool.name)) throw new Error(`MCP ${server.name} 返回重复工具名称`);
@@ -49,12 +68,13 @@ export class McpTools {
   }
 
   async call(entry: McpCatalogueTool, member: McpMember, args: Record<string, unknown>, signal: AbortSignal, gate: ExternalGate): Promise<CallToolResult> {
+    const { requestMs, callMs } = this.#limits(entry.server);
     return this.#use(entry.server, member, signal, gate, async client => {
-      const current = (await client.listTools({ signal, timeoutMs: this.#timeouts.requestMs })).find(tool => tool.name === entry.tool.name);
+      const current = (await client.listTools({ signal, timeoutMs: requestMs })).find(tool => tool.name === entry.tool.name);
       if (!current || !sameSchema(current, entry.tool)) throw new Error("MCP 工具目录变化，请由管理员检查并重启后重新发现；本次工具未执行");
       signal.throwIfAborted();
-      const callSignal = AbortSignal.any([signal, this.#closing.signal, AbortSignal.timeout(this.#timeouts.callMs)]);
-      return this.#scope.run({ signal: callSignal, gate }, () => client.callTool(entry.tool.name, args, { signal: callSignal, timeoutMs: this.#timeouts.callMs }));
+      const callSignal = AbortSignal.any([signal, this.#closing.signal, AbortSignal.timeout(callMs)]);
+      return this.#scope.run({ signal: callSignal, gate }, () => client.callTool(entry.tool.name, args, { signal: callSignal, timeoutMs: callMs }));
     });
   }
 
@@ -64,7 +84,7 @@ export class McpTools {
     const requestSignal = AbortSignal.any([signal, this.#closing.signal]);
     return this.#scope.run({ signal: requestSignal, gate }, async () => {
       requestSignal.throwIfAborted();
-      const client = new McpClient({ name: "mixin-bot", version: APP_VERSION, requestTimeoutMs: this.#timeouts.requestMs,
+      const client = new McpClient({ name: "mixin-bot", version: APP_VERSION, requestTimeoutMs: this.#limits(server).requestMs,
         roots: member ? [{ uri: pathToFileURL(member.workspaceDir).href, name: "workspace (read only)" }, { uri: pathToFileURL(member.tempDir).href, name: "member tmp" }] : [],
       });
       this.#clients.add(client);
@@ -92,7 +112,7 @@ export class McpTools {
     if (server.transport === "stdio") {
       const env: Record<string, string> = {};
       for (const name of ["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT", "TEMP", "TMP", "LANG"]) if (process.env[name]) env[name] = process.env[name]!;
-      Object.assign(env, server.env, { MIXIN_CHAT_KIND: member?.scope.kind ?? "", MIXIN_GROUP_ID: member?.scope.kind === "group" ? member.scope.groupId : "",
+      Object.assign(env, this.#expanded(server, server.env), { MIXIN_CHAT_KIND: member?.scope.kind ?? "", MIXIN_GROUP_ID: member?.scope.kind === "group" ? member.scope.groupId : "",
         MIXIN_MEMBER_PHONE: member?.phone ?? "" });
       // The supervisor starts with its small JIT region (SUPERVISOR_ENV); the server gets the administrator's value, or none.
       const jit = server.env?.BUN_JSC_jitMemoryReservationSize;
@@ -117,12 +137,7 @@ export class McpTools {
         return typeof value === "function" ? value.bind(target) : value;
       } });
     }
-    const headers: Record<string, string> = {};
-    for (const [name, variable] of Object.entries(server.headersEnv ?? {})) {
-      const value = process.env[variable];
-      if (!value) throw new Error(`MCP ${server.name} 缺少管理员配置的请求凭证`);
-      headers[name] = value;
-    }
+    const headers = this.#expanded(server, server.headers);
     for (const name of Object.keys(headers)) if (["x-mixin-chat", "x-mixin-group", "x-mixin-member"].includes(name.toLowerCase())) delete headers[name];
     if (member) Object.assign(headers, { "x-mixin-chat": member.scope.kind, "x-mixin-member": encodeURIComponent(member.phone),
       ...(member.scope.kind === "group" ? { "x-mixin-group": encodeURIComponent(member.scope.groupId) } : {}) });
@@ -136,11 +151,17 @@ export class McpTools {
           try { method = JSON.parse(init.body).method; } catch { /* The official transport owns protocol validation. */ }
         }
         const signal = AbortSignal.any([this.#closing.signal, ...(scope ? [scope.signal] : []), ...(init?.signal ? [init.signal] : []),
-          ...(method === "tools/call" ? [] : [AbortSignal.timeout(this.#timeouts.requestMs)])]);
+          ...(method === "tools/call" ? [] : [AbortSignal.timeout(this.#limits(server).requestMs)])]);
         const dispatch = () => { signal.throwIfAborted(); return fetch(url, { ...init, signal }); };
         return init?.method === "DELETE" || method === "notifications/cancelled" ? fetch(url, { ...init, signal: AbortSignal.timeout(5000) }) : scope?.gate ? scope.gate(dispatch, signal) : dispatch();
       },
     });
+  }
+
+  /** The configured values with their variable references filled in from the service's environment. */
+  #expanded(server: McpServerConfig, values: Record<string, string> | undefined): Record<string, string> {
+    try { return Object.fromEntries(Object.entries(values ?? {}).map(([name, value]) => [name, expandVariables(value)])); }
+    catch (error) { throw new Error(`MCP ${server.name}：${(error as Error).message}`); }
   }
 
   async close(): Promise<void> {
