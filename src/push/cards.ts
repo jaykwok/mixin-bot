@@ -1,7 +1,8 @@
 // Push cards: the pusher's preview, each recipient's card in every state (a person's, or a group's that anyone in the
 // group answers), the card that asks a recipient before a push is handed on, and the button data a click brings back.
 //
-// Buttons carry `{ k: "push", p: <push ID>, a: <action>, v: <card version>, o?: <option index>, f?: <forward ID> }`. Every
+// Buttons carry `{ k: "push", p: <push ID>, a: <action>, v: <card version>, o?: <option index>, f?: <forward ID> }`, in
+// their data and again in their callback address, which some clients bring back when they drop the data. Every
 // update of a card raises its version, so a redelivered click or one on a button the card no longer shows names an older
 // version: the service then only refreshes the card to its current state (./service.ts). Replies have no buttons: the
 // recipient writes to the bot and the conversation records the reply (./tools.ts push_reply).
@@ -44,12 +45,27 @@ export function requirementText(push: Pick<Push, "mode" | "options">): string {
   return push.mode === "ack" ? "确认收到" : push.mode === "options" ? `选择：${push.options.join(" / ")}` : "需要回复（文字或附件）";
 }
 
-/** A button and what its click brings back: an object of texts (`clickData` reads a version or an option either way). */
+/**
+ * The button's callback address carries its data too: some clients send a click with `data: null` but the address whole
+ * (seen on 2026-11-12: the Android app on HarmonyOS 4). The reserved `.invalid` domain never resolves, so nothing is ever
+ * called at it.
+ */
+const CLICK_ORIGIN = "https://mixin-bot.invalid";
+
+type ButtonData = { k: "push"; p: string; a: CardAction; v: string; o?: string; f?: string };
+
+/** A button and what its click brings back: an object of texts, and the same in its callback address. */
 function button(push: Pick<Push, "id">, version: number, index: number, name: string, action: CardAction, style: 1 | 2,
   extra: { option?: number; forward?: string } = {}): CardButton {
-  return { name, type: "button", index, show: true, disabled: false, value: { placeholder: "action", value: action, style, url: "", method: "POST",
-    data: { k: "push", p: push.id, a: action, v: String(version), ...(extra.option === undefined ? {} : { o: String(extra.option) }),
-      ...(extra.forward === undefined ? {} : { f: extra.forward }) } } };
+  const data: ButtonData = { k: "push", p: push.id, a: action, v: String(version), ...(extra.option === undefined ? {} : { o: String(extra.option) }),
+    ...(extra.forward === undefined ? {} : { f: extra.forward }) };
+  return { name, type: "button", index, show: true, disabled: false, value: { placeholder: "action", value: action, style, url: clickAddress(data), method: "POST", data } };
+}
+
+/** `https://mixin-bot.invalid/push/<push>/<action>/<version>`, with `?o=<option>` or `?f=<forward>`. */
+function clickAddress(data: ButtonData): string {
+  const query = [data.o === undefined ? "" : `o=${data.o}`, data.f === undefined ? "" : `f=${data.f}`].filter(Boolean).join("&");
+  return `${CLICK_ORIGIN}/push/${data.p}/${data.a}/${data.v}${query ? `?${query}` : ""}`;
 }
 
 function card(title: string, content: string, status: { name: string; color: string }, buttons: CardButton[], msgUid: string | null, invalid = false): CardContent {
@@ -57,21 +73,42 @@ function card(title: string, content: string, status: { name: string; color: str
     ...(msgUid ? { msgUid } : {}) };
 }
 
-/** The part of a click event a push card sent: undefined for anything else. */
+/** The part of a click event a push card sent, from the button's data or else its callback address: undefined for anything else. */
 export function clickData(content: unknown): ClickData | undefined {
   const parse = (value: unknown): Record<string, unknown> | undefined => {
     if (typeof value === "string") { try { value = JSON.parse(value); } catch { return undefined; } }
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
   };
-  const data = parse(parse(content)?.data);
+  const body = parse(content);
+  return readButton(parse(body?.data)) ?? readButton(addressData(body?.url));
+}
+
+/** The button data an address of `clickAddress` carries, unchecked. */
+function addressData(url: unknown): Record<string, unknown> | undefined {
+  if (typeof url !== "string" || url.length > 200 || !url.startsWith(`${CLICK_ORIGIN}/push/`)) return undefined;
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return undefined; }
+  const parts = parsed.pathname.split("/"), keys = [...parsed.searchParams.keys()];
+  if (parsed.origin !== CLICK_ORIGIN || parsed.hash || parts.length !== 5 || keys.some(key => key !== "o" && key !== "f") || new Set(keys).size !== keys.length) return undefined;
+  const option = parsed.searchParams.get("o"), forward = parsed.searchParams.get("f");
+  return { k: "push", p: parts[2], a: parts[3], v: parts[4], ...(option === null ? {} : { o: option }), ...(forward === null ? {} : { f: forward }) };
+}
+
+function readButton(data: Record<string, unknown> | undefined): ClickData | undefined {
   if (!data || data.k !== "push" || typeof data.p !== "string" || !PUSH_ID.test(data.p)) return undefined;
   const action = data.a as CardAction;
-  const version = Number(data.v), option = data.o === undefined ? undefined : Number(data.o);
-  if (!ACTIONS.includes(action) || !Number.isSafeInteger(version) || version < 0) return undefined;
-  if (option !== undefined && (!Number.isSafeInteger(option) || option < 0 || option > 16)) return undefined;
+  const version = count(data.v), option = data.o === undefined ? undefined : count(data.o);
+  if (!ACTIONS.includes(action) || version === undefined) return undefined;
+  if (data.o !== undefined && (option === undefined || option > 16)) return undefined;
   if (data.f !== undefined && (typeof data.f !== "string" || !PUSH_ID.test(data.f))) return undefined;
   if ((action === "forward" || action === "keep") && data.f === undefined) return undefined;
   return { push: data.p, action, version, ...(option === undefined ? {} : { option }), ...(data.f === undefined ? {} : { forward: data.f }) };
+}
+
+/** A version or an option index as a button carries it: its digits as a text, or a number from a card sent before. */
+function count(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : typeof value === "string" && /^\d{1,9}$/.test(value) ? Number(value) : Number.NaN;
+  return Number.isSafeInteger(number) && number >= 0 ? number : undefined;
 }
 
 /**

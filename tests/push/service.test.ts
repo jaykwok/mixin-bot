@@ -51,10 +51,13 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
     async send(target, message, sendOptions) {
       const item: Sent = { to: target.receiveId, kind: target.kind, message, ...(sendOptions ? { options: sendOptions } : {}) };
       sent.push(item);
-      // Every card of every test: a button's click data is texts only (a client that keeps it as texts sends none of it otherwise).
+      // Every card of every test: a button's click data is an object of texts, and its callback address reads as the same
+      // click (some clients bring back the address only).
       if (message.msgType === "card") {
         for (const each of (message.content as CardContent).tailFields) {
           if (Object.values(each.value.data as Record<string, unknown>).some(value => typeof value !== "string")) reports.push(new Error(`button data with a value that is not a text: ${each.name}`));
+          const read = clickData({ data: each.value.data });
+          if (!read || !Bun.deepEquals(clickData({ url: each.value.url, data: null }), read)) reports.push(new Error(`button address that does not read as its data: ${each.name}`));
         }
       }
       if (message.msgType === "card" && target.receiveId !== im(PUSHER) && gate.delayMs) {
@@ -141,12 +144,20 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
     return found;
   };
   let stamp = 0;
+  /**
+   * What a click on the named button brings back, as the platform delivers it: every other click with the button's data
+   * and its address, the others with the address only (data null), as some clients send them.
+   */
+  const clicked = (content: CardContent, name: string, at: number) => {
+    const button = buttonOf(content, name);
+    return { url: button.value.url, method: "POST", headers: { "Content-Type": "application/json" }, data: at % 2 ? button.value.data : null };
+  };
   /** A click on the named button of `content`, by `phone`, on card `cardId`. */
-  const click = (phone: string, content: CardContent, name: string, cardId: string) => service.click({
-    payload: { eventType: "callback:card_interaction", userId: im(phone), msgUid: cardId, groupId: "", type: "api",
-      content: { url: "", method: "POST", headers: {}, data: JSON.stringify(buttonOf(content, name).value.data) } },
-    sentAt: START + ++stamp, receivedAt: clock.now,
-  });
+  const click = (phone: string, content: CardContent, name: string, cardId: string) => {
+    const at = ++stamp;
+    service.click({ payload: { eventType: "callback:card_interaction", userId: im(phone), msgUid: cardId, groupId: "", type: "api", content: clicked(content, name, at) },
+      sentAt: START + at, receivedAt: clock.now });
+  };
   const settle = async () => {
     for (let round = 0; round < 50; round++) { await Bun.sleep(5); }
     // Summaries write workbooks and archives: on a busy Windows runner they can outlast the rounds.
@@ -162,11 +173,11 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   // Texts the service sends, and notices answering a message (markdown with the message's excerpt in a group).
   const groupTexts = (groupId: string) => sent.filter(item => item.kind === "group" && item.to === groupId && ["text", "markdown"].includes(item.message.msgType))
     .map(item => (item.message.content as { content: string }).content);
-  const groupClick = (groupId: string, content: CardContent, name: string, cardId: string, userId = "group-clicker") => service.click({
-    payload: { eventType: "callback:card_interaction", userId, msgUid: cardId, groupId, type: "api",
-      content: { url: "", method: "POST", headers: {}, data: JSON.stringify(buttonOf(content, name).value.data) } },
-    sentAt: START + ++stamp, receivedAt: clock.now,
-  });
+  const groupClick = (groupId: string, content: CardContent, name: string, cardId: string, userId = "group-clicker") => {
+    const at = ++stamp;
+    service.click({ payload: { eventType: "callback:card_interaction", userId, msgUid: cardId, groupId, type: "api", content: clicked(content, name, at) },
+      sentAt: START + at, receivedAt: clock.now });
+  };
   /**
    * A member's direct message as the message service admits it: the text is a request (its record keeps the reply context)
    * that takes the files sent before it, and the push service hears it. `downloading`: the files have not arrived yet.
@@ -1271,25 +1282,38 @@ test("a deadline ten minutes away can be asked for: it is checked by the minute 
   } finally { await h.close(); }
 });
 
-test("a button's click data is texts only, in every kind of card; a click whose data did not arrive is ignored and its shape logged without values", async () => {
+test("a button carries its click in its data and in its address; a click with neither is ignored and its shape logged without values", async () => {
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "options", options: ["参加", "不参加"], recipients: [{ name: "张三", phone: ZHANG }] });
-    const data = h.buttonOf(h.card(ZHANG, id), "不参加").value.data;
+    const { data, url } = h.buttonOf(h.card(ZHANG, id), "不参加").value, other = h.buttonOf(h.card(ZHANG, id), "参加").value.url;
     expect(data).toEqual({ k: "push", p: id, a: "choose", v: "0", o: "1" });
-    // As the text it is, and as a number an earlier card carried: both are read.
-    expect(clickData({ data })).toEqual({ push: id, action: "choose", version: 0, option: 1 });
-    expect(clickData({ data: { ...data, v: 0, o: 1 } })).toEqual({ push: id, action: "choose", version: 0, option: 1 });
-    h.click(ZHANG, h.card(ZHANG, id), "不参加", `card-${id}`);
+    expect(url).toBe(`https://mixin-bot.invalid/push/${id}/choose/0?o=1`);
+    // As the text it is, as a number an earlier card carried, and from the address alone: all read alike.
+    const read = { push: id, action: "choose" as const, version: 0, option: 1 };
+    expect(clickData({ data })).toEqual(read);
+    expect(clickData({ data: { ...data, v: 0, o: 1 } })).toEqual(read);
+    expect(clickData({ url, method: "POST", headers: { "Content-Type": "application/json" }, data: null })).toEqual(read);
+    const tap = (content: { url: string; data: unknown }, at: number) => h.service.click({ payload: { eventType: "callback:card_interaction", userId: im(ZHANG),
+      msgUid: `card-${id}`, groupId: "", type: "api", content: { method: "POST", headers: { "Content-Type": "application/json" }, ...content } },
+      sentAt: START + at, receivedAt: h.clock.now });
+    // The client that drops the data: the address alone answers the card.
+    tap({ url, data: null }, 999_990);
     await h.settle();
     expect(h.store.recipient(id, ZHANG)!.choice).toBe(1);
-    // The same click as a client sent it that dropped the data: nothing changes.
-    h.service.click({ payload: { eventType: "callback:card_interaction", userId: im(ZHANG), msgUid: `card-${id}`, groupId: "", type: "api",
-      content: { url: "", method: "POST", headers: {}, data: null } }, sentAt: START + 999_999, receivedAt: h.clock.now });
+    // A click with neither data nor address: nothing changes.
+    tap({ url: other.replace("/push/", "/other/"), data: null }, 999_991);
+    tap({ url: "", data: null }, 999_992);
     await h.settle();
     expect(h.store.recipient(id, ZHANG)!.choice).toBe(1);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
+  // Addresses that are not a push button's, or not whole, read as nothing.
+  for (const url of ["https://mixin-bot.invalid/push/abcd1234/ack/", "https://mixin-bot.invalid/push/abcd1234/ack/1/2", "https://mixin-bot.invalid/push/abcd1234/ack/1?x=1",
+    "https://mixin-bot.invalid/push/abcd1234/ack/1?o=1&o=2", "https://mixin-bot.invalid/push/abcd1234/ack/1#f", "https://mixin-bot.invalid.example/push/abcd1234/ack/1",
+    "http://mixin-bot.invalid/push/abcd1234/ack/1", "https://mixin-bot.invalid/push/ABCD1234/ack/1", "https://mixin-bot.invalid/push/abcd1234/forward/1",
+    "https://mixin-bot.invalid/push/abcd1234/choose/1?o=17", "https://mixin-bot.invalid/push/abcd1234/ack/-1"]) expect(clickData({ url, data: null })).toBeUndefined();
+  expect(clickData({ url: "https://mixin-bot.invalid/push/abcd1234/forward/2?f=efgh5678", data: null })).toEqual({ push: "abcd1234", action: "forward", version: 2, forward: "efgh5678" });
   expect(clickShape({ url: "", method: "POST", headers: {}, data: null })).toBe("{url=string(0) method=string(4) headers={} data=null}");
   expect(clickData({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack", v: 0 }) })).toEqual({ push: "abcd1234", action: "ack", version: 0 });
   expect(clickData({ data: { k: "push", p: "abcd1234", a: "ack" } })).toBeUndefined();

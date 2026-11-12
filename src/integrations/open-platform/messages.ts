@@ -24,7 +24,8 @@ export type OutboundMessage =
 
 /**
  * 交互卡片（推送用，src/push/cards.ts）。正文是 Markdown，实测上限约 5000 字符。
- * 按钮点击经 Stream 推送 `callback:card_interaction`，带卡片 `msgUid` 和按钮的 `data`；带上 `msgUid` 再发一次即原地更新这张卡片。
+ * 按钮点击经 Stream 推送 `callback:card_interaction`，带卡片 `msgUid` 和按钮的 `url`、`data`；带上 `msgUid` 再发一次即原地更新这张卡片。
+ * 有的客户端点击时 `data` 为 null，`url` 照原样带回（2026-11-12 实测：鸿蒙 4 上的安卓版），所以推送按钮在两处都写了自己的数据。
  */
 export interface CardContent {
   readonly title: string;
@@ -49,7 +50,8 @@ export interface CardButton {
     readonly value: string;
     /** 1 主要，2 次要。 */
     readonly style: 1 | 2;
-    readonly url: "";
+    /** 回调地址，点击事件原样带回。推送按钮写的是 `.invalid` 域名下的地址：这个域名不会被解析，不会访问到任何服务。 */
+    readonly url: string;
     readonly method: "POST";
     readonly data: Readonly<Record<string, string | number>>;
   };
