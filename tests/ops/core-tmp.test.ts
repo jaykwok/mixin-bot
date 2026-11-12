@@ -34,7 +34,7 @@ async function fixture() {
   const f = await tempFixture("core-tmp-");
   for (const dir of ["console", "ops", "scripts", "src", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
   for (const dir of ["console", "ops", "scripts", "src"]) await writeFile(join(f.root, dir, "fixture.ts"), "export {};\n");
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
   const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));

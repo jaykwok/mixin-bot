@@ -74,29 +74,27 @@ function push(mode: Push["mode"], options: string[] = []): Push {
 
 function recipient(member: string, name: string, change: Partial<Recipient> = {}): Recipient {
   return { pushId: "abcd2345", member, name, receiveId: `im-${member}`, sendState: "sent", sendAttempts: 1, sendError: null, sentAt: 1, retryAt: null,
-    card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, submitted: 0, submittedAt: null, ...change };
+    card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, repliedAt: null, ...change };
 }
 
 let itemId = 0;
-function item(member: string, revision: number, change: Partial<ReplyItem>): ReplyItem {
-  return { id: ++itemId, pushId: "abcd2345", member, revision, msgUid: `m-${itemId}`, kind: "text", text: null, attachment: null, name: null, size: null,
-    error: null, receivedAt: 1, path: null, sender: null, senderName: null, ...change };
+function item(member: string, change: Partial<ReplyItem>): ReplyItem {
+  return { id: ++itemId, pushId: "abcd2345", member, msgUid: `m-${itemId}`, kind: "text", text: null, attachment: null, name: null, size: null,
+    receivedAt: 1, path: null, sender: null, senderName: null, ...change };
 }
 
-test("a reply summary: the submission in effect per person, its files, and why a file is not packed", async () => {
+test("a reply summary: each person's reply, its files, and why a file is not packed", async () => {
   const root = await dir();
   await writeFile(join(root, "plan.xlsx"), "PLAN");
-  await writeFile(join(root, "photo.jpg"), "PHOTO");
   const files = new Map<string, HeldFile>([["att-1", { state: "ready", path: join(root, "plan.xlsx") }], ["att-2", { state: "ready", path: join(root, "gone.jpg") }],
-    ["att-3", { state: "failed", error: "平台拒绝" }], ["att-old", { state: "ready", path: join(root, "photo.jpg") }]]);
-  const recipients = [recipient("13800000001", "张三", { submitted: 2, submittedAt: 5, ackedAt: 3 }), recipient("13800000002", "李四"),
+    ["att-3", { state: "failed", error: "平台拒绝" }]]);
+  const recipients = [recipient("13800000001", "张三", { repliedAt: 5, ackedAt: 3 }), recipient("13800000002", "李四"),
     recipient("13800000003", "王五", { sendState: "failed" })];
   const items = [
-    item("13800000001", 1, { kind: "image", attachment: "att-old", name: "旧照片.jpg" }),
-    item("13800000001", 2, { text: "第一段" }), item("13800000001", 2, { text: "第二段" }),
-    item("13800000001", 2, { kind: "file", attachment: "att-1", name: "盘点.xlsx" }),
-    item("13800000001", 2, { kind: "image", attachment: "att-2", name: "照片.jpg" }),
-    item("13800000001", 2, { kind: "file", attachment: "att-3", name: "坏.pdf" }),
+    item("13800000001", { text: "第一段" }), item("13800000001", { text: "第二段" }),
+    item("13800000001", { kind: "file", attachment: "att-1", name: "盘点.xlsx" }),
+    item("13800000001", { kind: "image", attachment: "att-2", name: "照片.jpg" }),
+    item("13800000001", { kind: "file", attachment: "att-3", name: "坏.pdf" }),
   ];
   const out = join(root, "out"); await mkdir(out);
   const pack = await buildSummary({ push: push("reply"), recipients, items, files, dir: out, partBytes: 30 * 1024 * 1024, now: 10 });
@@ -110,8 +108,6 @@ test("a reply summary: the submission in effect per person, its files, and why a
   expect(note).toContain("第一段\n\n第二段");
   expect(note).toContain("照片.jpg：未打包，文件已被临时文件清理删除");
   expect(note).toContain("坏.pdf：未打包，下载失败：平台拒绝");
-  // Revision 1 was replaced: its photo is not in the package.
-  expect(note).not.toContain("旧照片");
   const sheet = readZip(join(out, "推送汇总-机房盘点-abcd2345.xlsx")).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8");
   for (const text of ["回复文字", "张三", "第一段\n\n第二段", "李四", "王五", "发送失败", "138****0001", "138****0003"]) expect(sheet).toContain(text);
   // Phones are masked everywhere.
@@ -127,8 +123,8 @@ test("a package larger than one send splits into numbered parts within the limit
     const phone = `1380000000${n}`;
     await writeFile(join(root, `f${n}.bin`), Buffer.alloc(n === 4 ? 200_000 : 60_000, n));
     files.set(`att-${n}`, { state: "ready", path: join(root, `f${n}.bin`) });
-    items.push(item(phone, 1, { kind: "file", attachment: `att-${n}`, name: `文件${n}.bin` }));
-    recipients.push(recipient(phone, `成员${n}`, { submitted: 1, submittedAt: 5 }));
+    items.push(item(phone, { kind: "file", attachment: `att-${n}`, name: `文件${n}.bin` }));
+    recipients.push(recipient(phone, `成员${n}`, { repliedAt: 5 }));
   }
   const out = join(root, "out"); await mkdir(out);
   const partBytes = 150_000;
@@ -146,12 +142,12 @@ test("a package larger than one send splits into numbered parts within the limit
 
 test("a group is one row: no phone, its clicks and who replied; its folder holds the texts with their senders", async () => {
   const root = await dir();
-  const recipients = [recipient("13800000001", "张三", { submitted: 1, submittedAt: 5 }),
-    recipient("group:1001", "销售一部", { receiveId: "1001", submitted: 2, submittedAt: 6, ackedAt: 3, clicks: 4 })];
-  const items = [item("13800000001", 1, { text: "张三的回复" }), item("group:1001", 1, { text: "被替换的", sender: "13800000003", senderName: "王五" }),
-    item("group:1001", 2, { text: "第一组已盘点", sender: "13800000003", senderName: "王五" }),
-    item("group:1001", 2, { text: "第二组缺一台", sender: "13800000002", senderName: "李四" }),
-    item("group:1001", 2, { text: "补充", sender: "13800000003", senderName: "王五" })];
+  const recipients = [recipient("13800000001", "张三", { repliedAt: 5 }),
+    recipient("group:1001", "销售一部", { receiveId: "1001", repliedAt: 6, ackedAt: 3, clicks: 4 })];
+  const items = [item("13800000001", { text: "张三的回复" }),
+    item("group:1001", { text: "第一组已盘点", sender: "13800000003", senderName: "王五" }),
+    item("group:1001", { text: "第二组缺一台", sender: "13800000002", senderName: "李四" }),
+    item("group:1001", { text: "补充", sender: "13800000003", senderName: "王五" })];
   const out = join(root, "out"); await mkdir(out);
   const pack = await buildSummary({ push: push("reply"), recipients, items, files: new Map(), dir: out, partBytes: 1 << 20, now: 10 });
   const entries = readZip(pack.parts[0]!.path);
@@ -159,7 +155,6 @@ test("a group is one row: no phone, its clicks and who replied; its folder holds
   const note = entries[2]!.data.toString("utf8");
   expect(note).toStartWith("群「销售一部」的回复");
   expect(note).toContain("王五：第一组已盘点\n\n李四：第二组缺一台\n\n王五：补充");
-  expect(note).not.toContain("被替换的");
   const sheet = readZip(join(out, "推送汇总-机房盘点-abcd2345.xlsx")).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8");
   for (const text of ["姓名或群", "群里点击次数", "群里的回复人", "王五、李四", "<v>4</v>"]) expect(sheet).toContain(text);
   expect(sheet).toContain('<t xml:space="preserve">群</t>');

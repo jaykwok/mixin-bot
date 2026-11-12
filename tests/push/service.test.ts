@@ -344,7 +344,7 @@ test("reply: a message is recorded word for word with the files sent before it; 
     expect([h.card(ZHANG).status.name, h.card(ZHANG).tailFields]).toEqual(["已确认，待回复", []]);
     // A question is heard and nothing more.
     const question = h.say(ZHANG, "这个推送是什么意思？");
-    expect(h.store.recipient(id, ZHANG)!.submitted).toBe(0);
+    expect(h.store.recipient(id, ZHANG)!.repliedAt).toBeNull();
     // The reply: the text as sent, and the file sent before it, which the push holds from now on.
     const first = h.say(ZHANG, "A 机房正常，B 机房缺一台", ["盘点.xlsx"]);
     const file = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
@@ -365,7 +365,7 @@ test("reply: a message is recorded word for word with the files sent before it; 
     expect(h.store.items(id, ZHANG).map(item => item.text)).toEqual(["改成：全部正常"]);
     // withdraw: no reply any more.
     expect(await h.service.reply(h.say(ZHANG, "刚才那条不算"), { push: id, action: "withdraw" })).toBe("已撤回「机房盘点」的回复，现在是没有回复。");
-    expect([h.store.recipient(id, ZHANG)!.submitted, h.store.items(id, ZHANG)]).toEqual([0, []]);
+    expect([h.store.recipient(id, ZHANG)!.repliedAt, h.store.items(id, ZHANG)]).toEqual([null, []]);
     expect(await h.service.reply(h.say(ZHANG, "撤回"), { push: id, action: "withdraw" })).toContain("没有可以撤回的");
     await h.settle();
     expect(h.card(ZHANG).status.name).toBe("已确认，待回复");
@@ -433,7 +433,7 @@ test("deadline: what was recorded is the reply; the package holds the replies; h
     await h.settle();
     const push = h.store.push(id)!;
     expect([push.state, push.closeReason, push.summaryState]).toEqual(["closed", "deadline", "sent"]);
-    expect([h.store.recipient(id, ZHANG)!.submitted, h.store.recipient(id, LI)!.submitted]).toEqual([1, 0]);
+    expect([h.store.recipient(id, ZHANG)!.repliedAt !== null, h.store.recipient(id, LI)!.repliedAt !== null]).toEqual([true, false]);
     expect(summaryOf(h).content).toContain("已确认 2，已回复 1，未回复 2");
     expect(summaryOf(h).content).toContain("未回复：李四、王五");
     const zip = join(fixture.root, `zip-${id}.zip`);
@@ -444,13 +444,11 @@ test("deadline: what was recorded is the reply; the package holds the replies; h
     await h.settle();
     expect(h.store.push(id)!.released).toBe(true);
     expect(Object.values(h.records.get(ZHANG)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
-    // After the end: no reply is recorded, and a click only shows the end. So does one on a button of the cards from
-    // before replies went through the conversation (「回复」, 「已回复」, 「取消」, 「修改回复」).
+    // After the end: no reply is recorded, and a click only shows the end.
     await expect(h.service.reply(h.say(LI, "迟到的回复"), { push: id, action: "add" })).rejects.toThrow("「机房盘点」已经结束");
     expect(h.card(LI).status.name).toBe("未回复");
-    const before = h.cards(LI).length, button = live.tailFields[0]!;
-    const old = { ...live, tailFields: [{ ...button, name: "回复", value: { ...button.value, data: { ...button.value.data as object, a: "reply" } } }] };
-    h.click(LI, old, "回复", "card-li");
+    const before = h.cards(LI).length;
+    h.click(LI, live, "已收到", "card-li");
     await h.settle();
     expect([h.cards(LI).length, h.card(LI).status.name]).toEqual([before + 1, "未回复"]);
     expect(h.reports).toEqual([]);
@@ -498,7 +496,7 @@ test("the deadline and 补推送 write the whole list in one transaction; a clos
     await h.settle();
     expect(h.store.push(id)!.state).toBe("closed");
     expect(outside()).toBe(0);
-    expect(h.store.recipients(id).map(recipient => [recipient.submitted, recipient.sendState, recipient.retryAt])).toEqual([[1, "sent", null], [0, "failed", null], [0, "failed", null]]);
+    expect(h.store.recipients(id).map(recipient => [recipient.repliedAt !== null, recipient.sendState, recipient.retryAt])).toEqual([[true, "sent", null], [false, "failed", null], [false, "failed", null]]);
     // The card someone clicked shows the end.
     expect([h.card(ZHANG).status.name, h.card(ZHANG).invalid]).toEqual(["已回复", true]);
     expect(h.store.push(id)!.summaryState).toBe("sent");
@@ -517,7 +515,7 @@ test("two pushes wait for a reply: a message goes to the one named and to one on
     // Withdrawn there, it goes to the other.
     await h.service.reply(h.say(ZHANG, "记错了"), { push: b, action: "withdraw" });
     expect(await h.service.reply(h.say(ZHANG, "是回甲的"), { push: a, action: "add", quote: "给乙的" })).toContain("记入 推送人 推送的「甲」的回复");
-    expect([h.store.recipient(a, ZHANG)!.submitted, h.store.recipient(b, ZHANG)!.submitted]).toEqual([1, 0]);
+    expect([h.store.recipient(a, ZHANG)!.repliedAt !== null, h.store.recipient(b, ZHANG)!.repliedAt !== null]).toEqual([true, false]);
     expect(h.store.items(a, ZHANG).map(item => item.msgUid)).toEqual([message.message.msgUid]);
     const c = await confirmed(h, { subject: "丙" });
     await expect(h.service.reply(h.say(ZHANG, "收到"), { push: c, action: "add" })).rejects.toThrow("「丙」不收回复：它要的是确认收到");
@@ -580,32 +578,22 @@ test("the frequency limit counts confirmations within 24 hours, at prepare and a
   } finally { await h.close(); }
 });
 
-test("restart: a card left sending is uncertain and never resent; a reply's files are held again; what the reply buttons of an earlier version left is settled", async () => {
+test("restart: a card left sending is uncertain and never resent; a reply's files are held again", async () => {
   const h = harness();
   try {
-    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }] });
     await h.service.reply(h.say(ZHANG, "张三的回复", ["a.txt"]), { push: id, action: "add" });
     await h.settle();
     // The process ended between the record of the reply and the hold of its file.
     const file = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
     delete h.records.get(ZHANG)!.attachments[file]!.heldBy;
     h.store.updateRecipient(id, LI, { sendState: "sending" });
-    // A version with reply buttons ended while 王五 was replying: a text, and a file whose registration never ended.
-    h.db.query("UPDATE push_recipients SET reply_state = 'replying', draft = 1, activity_at = ? WHERE push_id = ? AND member = ?").run(h.clock.now - 60_000, id, WANG);
-    const item = { pushId: id, member: WANG, revision: 1, attachment: null, size: null, error: null, receivedAt: h.clock.now - 60_000, sender: null, senderName: null };
-    h.store.addItem({ ...item, msgUid: "m-text", kind: "text", text: "王五的回复", name: null });
-    h.store.addItem({ ...item, msgUid: "m-file", kind: "file", text: null, name: "b.txt" });
     const before = h.cards(LI).length;
     await h.restart();
     await h.settle();
     expect(h.store.recipient(id, LI)!.sendState).toBe("uncertain");
     expect(h.cards(LI).length).toBe(before);
     expect(h.records.get(ZHANG)!.attachments[file]!.heldBy).toBe(`push:${id}`);
-    const wang = h.store.recipient(id, WANG)!;
-    expect([wang.submitted, wang.submittedAt]).toEqual([1, h.clock.now - 60_000]);
-    expect(h.store.items(id, WANG).map(each => [each.kind, each.text, each.error])).toEqual([["text", "王五的回复", null], ["file", null, "附件没有收全"]]);
-    expect(h.db.query("SELECT reply_state, draft FROM push_recipients WHERE push_id = ? AND member = ?").get(id, WANG)).toEqual({ reply_state: "none", draft: 0 });
-    expect(h.service.status(PUSHER, id)).toContain("王五（尾号 0003）：已回复：王五的回复；附件：b.txt");
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
@@ -1565,7 +1553,7 @@ test("group push: a text the model could not answer is the group's reply when on
     h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
     h.service.tick();
     await h.settle();
-    expect(h.store.recipient(id, `group:${G2}`)!.submitted).toBe(1);
+    expect(h.store.recipient(id, `group:${G2}`)!.repliedAt).not.toBeNull();
     expect(summaryOf(h).content).toContain("未回复：群 销售一部");
     // 提醒未回复: the unanswered group, while it is registered.
     h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-g");

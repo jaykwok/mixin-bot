@@ -222,7 +222,7 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
           <td>{recipient.name}{recipient.forwardedBy ? <div class="muted">{recipient.forwardedBy} 转来</div> : null}</td>
           <td class="mono">{recipient.phone}</td>
           <td>{SEND[recipient.sendState]}{recipient.sentAt ? <div class="muted">{dateTime(recipient.sentAt)}</div> : null}</td>
-          <td class="push-answer">{answerOf(push, recipient)}{recipient.submittedAt ? <div class="muted">{dateTime(recipient.submittedAt)}</div> : null}</td>
+          <td class="push-answer">{answerOf(push, recipient)}{recipient.repliedAt ? <div class="muted">{dateTime(recipient.repliedAt)}</div> : null}</td>
           <td>{push.mode === "reply" && recipient.reply && <button class="btn ghost small-btn" disabled={busy} onClick={() => void pack(recipient.key)}>下载</button>}</td>
         </tr>)}</tbody></table></div>
       {!shown.length && <div class="group-note">没有符合筛选的接收人。</div>}

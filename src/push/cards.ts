@@ -15,10 +15,8 @@ export type RecipientAction = "ack" | "choose";
 export type ForwardAction = "forward" | "keep";
 /** On the pusher's summary card: prepare a push to those who did not answer. */
 export type SummaryAction = "remind";
-/** `retired`: a button of the reply cards sent before replies went through the conversation; a click refreshes the card. */
-export type CardAction = PreviewAction | RecipientAction | ForwardAction | SummaryAction | "retired";
+export type CardAction = PreviewAction | RecipientAction | ForwardAction | SummaryAction;
 const ACTIONS: readonly CardAction[] = ["confirm", "cancel", "ack", "choose", "forward", "keep", "remind"];
-const RETIRED = ["reply", "done", "abandon", "edit"];
 
 export type ClickData = { push: string; action: CardAction; version: number; option?: number; forward?: string };
 
@@ -63,9 +61,9 @@ export function clickData(content: unknown): ClickData | undefined {
   };
   const data = parse(parse(content)?.data);
   if (!data || data.k !== "push" || typeof data.p !== "string" || !PUSH_ID.test(data.p)) return undefined;
-  const action = RETIRED.includes(data.a as string) ? "retired" : data.a as CardAction;
+  const action = data.a as CardAction;
   const version = Number(data.v), option = data.o === undefined ? undefined : Number(data.o);
-  if (!ACTIONS.includes(action) && action !== "retired" || !Number.isSafeInteger(version) || version < 0) return undefined;
+  if (!ACTIONS.includes(action) || !Number.isSafeInteger(version) || version < 0) return undefined;
   if (option !== undefined && (!Number.isSafeInteger(option) || option < 0 || option > 16)) return undefined;
   if (data.f !== undefined && (typeof data.f !== "string" || !PUSH_ID.test(data.f))) return undefined;
   if ((action === "forward" || action === "keep") && data.f === undefined) return undefined;
@@ -229,7 +227,7 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   }
 
   // reply
-  const replied = recipient.submitted > 0 ? `已回复（${countsText(view.reply)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
+  const replied = recipient.repliedAt !== null ? `已回复（${countsText(view.reply)}）· ${shortTime(recipient.repliedAt, now)}` : undefined;
   if (closed) {
     return replied === undefined ? make({ name: handed.length ? "已转派" : "未回复", color: COLOR.closed }, [...handed, "已截止，没有收到回复。"], [], true)
       : make({ name: "已回复", color: COLOR.closed }, [`${replied}。${ended}。`, ...handed], [], true);
@@ -255,7 +253,7 @@ function groupCard(view: RecipientView, make: Make, now: number): CardContent {
     return make({ name: recipient.ackedAt === null ? "待确认" : "已收到", color: recipient.ackedAt === null ? COLOR.waiting : COLOR.done },
       recipient.ackedAt === null ? ["请点「已收到」确认，群里谁点都可以。"] : acked, [ack(recipient.ackedAt === null ? 1 : 2)]);
   }
-  const replied = recipient.submitted > 0 ? `已回复（${groupReplyText(view.senders ?? [], view.reply)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
+  const replied = recipient.repliedAt !== null ? `已回复（${groupReplyText(view.senders ?? [], view.reply)}）· ${shortTime(recipient.repliedAt, now)}` : undefined;
   if (closed) {
     return replied === undefined ? make({ name: "未回复", color: COLOR.closed }, [...acked, "已截止，没有收到回复。"], [], true)
       : make({ name: "已回复", color: COLOR.closed }, [`${replied}。${ended}。`], [], true);

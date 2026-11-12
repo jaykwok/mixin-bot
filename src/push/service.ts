@@ -61,7 +61,7 @@ import { PUSH_NOTE_KIND } from "./note.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
-import { buildSummary, effectiveItems, type HeldFile, replyText, senders, type SummaryPackage } from "./summary.ts";
+import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage } from "./summary.ts";
 import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushMode, type PushRole, type PushState, type PushStore,
   type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
 
@@ -196,7 +196,7 @@ export type PushCounts = Omit<RecipientCounts, "unsettled" | "repliedAt">;
 export type PushCursor = Pick<Push, "createdAt" | "id">;
 export type PushListItem = Pick<Push, "id" | "subject" | "mode" | "state" | "pusher" | "pusherName" | "createdAt" | "confirmedAt" | "deadline" | "closedAt"
   | "closeReason" | "summaryState" | "followUp"> & { of: string | null; counts: PushCounts };
-export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "submittedAt"> & {
+export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "repliedAt"> & {
   choice: string | null;
   /** Answered, or handed the push on. */
   answered: boolean;
@@ -331,8 +331,6 @@ export class PushService {
   start(): void {
     const settled = this.#store.settleInterruptedSends();
     if (settled) log.warn(`推送：${settled} 张卡片在上次服务中断时正在发送，结果未知，按已发出处理`);
-    const drafts = this.#store.settleDrafts();
-    if (drafts) log.info(`推送：${drafts} 份点了「回复」还没有提交的回复，已发的内容按回复记下`);
     this.#dropSuperseded();
     this.#sweepPackages();
     this.#track(this.#holdReplies());
@@ -509,7 +507,7 @@ export class PushService {
 
   #recipientRow(pushId: string, reached: Reached): Recipient {
     return { pushId, ...reached, sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, card: null, version: 0, ackedAt: null,
-      clicks: 0, choice: null, choiceAt: null, submitted: 0, submittedAt: null };
+      clicks: 0, choice: null, choiceAt: null, repliedAt: null };
   }
 
   /**
@@ -688,7 +686,7 @@ export class PushService {
       const counts = push.options.map((option, index) => `${option} ${delivered.filter(recipient => recipient.choice === index).length}`);
       return `${head}；${counts.join("，")}${also}，未选择 ${delivered.filter(recipient => recipient.choice === null).length - passed}`;
     }
-    const acked = delivered.filter(recipient => recipient.ackedAt !== null).length, replied = delivered.filter(recipient => recipient.submitted > 0).length;
+    const acked = delivered.filter(recipient => recipient.ackedAt !== null).length, replied = delivered.filter(recipient => recipient.repliedAt !== null).length;
     return `${head}；已确认 ${acked}，已回复 ${replied}${also}，未回复 ${delivered.length - replied - passed}`;
   }
 
@@ -698,7 +696,7 @@ export class PushService {
     const clicks = memberGroup(recipient.member) === undefined ? "" : `，群里共点击 ${recipient.clicks} 次`;
     if (push.mode === "ack") return recipient.ackedAt === null ? "未确认" : `已确认（${shortTime(recipient.ackedAt, this.#now())}${clicks}）`;
     if (push.mode === "options") return recipient.choice === null ? "未选择" : `选择「${push.options[recipient.choice]}」`;
-    const own = effectiveItems(recipient, items);
+    const own = replyItems(recipient, items);
     if (!own.length) return recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复";
     const text = replyText(own), files = own.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
     return `已回复：${text ? truncate(oneLine(text), 200) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}`;
@@ -909,7 +907,7 @@ export class PushService {
 
   /** Answered; whoever handed the push on (`handed`) counts as that too. */
   #answered(push: Push, recipient: Recipient, handed: ReadonlySet<string>): boolean {
-    return handed.has(recipient.member) || (push.mode === "ack" ? recipient.ackedAt !== null : push.mode === "options" ? recipient.choice !== null : recipient.submitted > 0);
+    return handed.has(recipient.member) || (push.mode === "ack" ? recipient.ackedAt !== null : push.mode === "options" ? recipient.choice !== null : recipient.repliedAt !== null);
   }
 
   /** The recipients who handed the push on. */
@@ -981,10 +979,10 @@ export class PushService {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
         summaryError: push.summaryError, summaryAt: push.summaryAt },
       recipients: recipients.map(recipient => {
-        const own = effectiveItems(recipient, items), text = replyText(own);
+        const own = replyItems(recipient, items), text = replyText(own);
         return { member: recipient.member, name: recipient.name, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
           ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice === null ? null : push.options[recipient.choice] ?? null, choiceAt: recipient.choiceAt,
-          submittedAt: recipient.submittedAt,
+          repliedAt: recipient.repliedAt,
           answered: (recipient.sendState === "sent" || recipient.sendState === "uncertain") && this.#answered(push, recipient, handed),
           reply: own.length ? { text: chars(text) > 2000 ? truncate(text, 2000) : text,
             files: own.filter(item => item.kind !== "text").map(item => ({ name: item.name ?? "附件", size: item.size, kind: item.kind })), senders: senders(own) } : null,
@@ -1220,7 +1218,7 @@ export class PushService {
     if (!rows.length) return undefined;
     const shown = rows.slice(-this.#limits.pendingShown);
     const lines = shown.map(({ push, recipient }) => {
-      const items = effectiveItems(recipient, this.#store.items(push.id, member));
+      const items = this.#store.items(push.id, member);
       const to = this.#store.forwards(push.id, "confirmed").filter(forward => forward.from === member).map(forward => forward.toName);
       const own = group ? items.filter(item => item.sender === phone).length : 0;
       const state = push.mode === "ack" ? (recipient.ackedAt === null ? "还没有确认" : "已确认")
@@ -1333,7 +1331,7 @@ export class PushService {
     const push = this.#store.push(pushId), recipient = this.#store.recipient(pushId, member);
     if (!push || !recipient || !LIVE_STATES.includes(push.state)) throw new PushRefused(`「${push?.subject ?? pushId}」已经结束，不能再改了。`);
     const group = memberGroup(member) !== undefined, now = this.#now();
-    const current = effectiveItems(recipient, this.#store.items(pushId, member));
+    const current = this.#store.items(pushId, member);
     const arrived = files.filter(file => file.state === "ready" || file.state === "pending");
     const lost = files.filter(file => !arrived.includes(file)).map(file => file.name);
     if (!source.text.trim() && !arrived.length) throw new PushRefused("这条消息没有可以记的内容。");
@@ -1341,12 +1339,7 @@ export class PushService {
     for (const uid of uids) {
       const existing = this.#store.itemOf(uid);
       if (!existing || current.some(item => item.id === existing.id)) continue;
-      const elsewhere = this.#store.recipient(existing.pushId, existing.member);
-      if (elsewhere && existing.revision === elsewhere.submitted) {
-        throw new PushRefused(`这条消息已经记在「${this.#store.push(existing.pushId)?.subject ?? existing.pushId}」的回复里；一条消息只记到一条推送，要改记先把那边的撤回，或者请成员再发一遍。`);
-      }
-      // Left by a reply that was replaced before replies went through the conversation: not part of anything.
-      this.#store.removeItems([existing.id]);
+      throw new PushRefused(`这条消息已经记在「${this.#store.push(existing.pushId)?.subject ?? existing.pushId}」的回复里；一条消息只记到一条推送，要改记先把那边的撤回，或者请成员再发一遍。`);
     }
     const have = new Set(current.map(item => item.msgUid));
     const already = uids.every(uid => have.has(uid) || (uid === source.msgUid && !source.text.trim()));
@@ -1357,19 +1350,18 @@ export class PushService {
     } else if (already) {
       return { already, counts: countsOf(current), held: [], lost };
     }
-    const revision = recipient.submitted > 0 ? recipient.submitted : this.#store.items(pushId, member).reduce((max, item) => Math.max(max, item.revision), 0) + 1;
     const name = group ? this.#directory.byPhone(sender)?.name ?? sender : null;
     if (source.text.trim() && !have.has(source.msgUid)) {
-      this.#store.addItem({ pushId, member, revision, msgUid: source.msgUid, kind: "text", text: source.text, attachment: null, name: null, size: null, error: null,
+      this.#store.addItem({ pushId, member, msgUid: source.msgUid, kind: "text", text: source.text, attachment: null, name: null, size: null,
         receivedAt: source.receivedAt, sender: group ? sender : null, senderName: name });
     }
     for (const file of arrived) {
       if (have.has(file.msgUid)) continue;
-      this.#store.addItem({ pushId, member, revision, msgUid: file.msgUid, kind: file.kind, text: null, attachment: file.id, name: file.name, size: file.actualSize ?? file.size ?? null,
-        error: null, receivedAt: file.receivedAt, sender: null, senderName: null });
+      this.#store.addItem({ pushId, member, msgUid: file.msgUid, kind: file.kind, text: null, attachment: file.id, name: file.name, size: file.actualSize ?? file.size ?? null,
+        receivedAt: file.receivedAt, sender: null, senderName: null });
     }
-    this.#store.updateRecipient(pushId, member, { submitted: revision, submittedAt: now, ackedAt: recipient.ackedAt ?? now, version: recipient.version + 1 });
-    const after = this.#store.items(pushId, member, revision);
+    this.#store.updateRecipient(pushId, member, { repliedAt: now, ackedAt: recipient.ackedAt ?? now, version: recipient.version + 1 });
+    const after = this.#store.items(pushId, member);
     return { already: already && !replace, counts: countsOf(after), held: arrived.map(file => file.id), lost };
   }
 
@@ -1396,13 +1388,13 @@ export class PushService {
     const group = memberGroup(asked.member) !== undefined;
     const left = this.#atomic(() => {
       const recipient = this.#store.recipient(push.id, asked.member)!;
-      const current = effectiveItems(recipient, this.#store.items(push.id, asked.member));
+      const current = this.#store.items(push.id, asked.member);
       const own = group ? current.filter(item => item.sender === sender) : current;
       if (!own.length) return undefined;
       this.#store.removeItems(own.map(item => item.id));
       this.#release(push.id, asked.member, own);
       const rest = current.length - own.length;
-      this.#store.updateRecipient(push.id, asked.member, { ...(rest ? { submittedAt: this.#now() } : { submitted: 0, submittedAt: null }), version: recipient.version + 1 });
+      this.#store.updateRecipient(push.id, asked.member, { repliedAt: rest ? this.#now() : null, version: recipient.version + 1 });
       return rest;
     });
     if (left === undefined) return group ? `这位成员在本群没有给「${push.subject}」记过回复，没有可以撤回的。` : `「${push.subject}」还没有记过回复，没有可以撤回的。`;
@@ -1672,7 +1664,7 @@ export class PushService {
       const current = this.#store.recipients(pushId);
       // Waiting: a send or a registration that ends, or the timer, tries again.
       if (this.#now() - (push.closedAt ?? 0) < this.#limits.settleWaitMs
-        && current.some(recipient => recipient.sendState === "sending" || effectiveItems(recipient, items).some(item => unsettled(item, files)))) return;
+        && current.some(recipient => recipient.sendState === "sending" || replyItems(recipient, items).some(item => unsettled(item, files)))) return;
       // A card still without a result is unknown for good (#send leaves it so), then the counts below cannot change.
       this.#store.transaction(() => {
         for (const recipient of current) if (recipient.sendState === "sending") this.#store.updateRecipient(pushId, recipient.member, { sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
@@ -1787,16 +1779,15 @@ export class PushService {
     this.#refreshing.set(key, { again: false });
     try {
       const items = this.#store.items(pushId).filter(item => item.kind !== "text");
-      const effective = new Set(this.#store.recipients(pushId).flatMap(recipient => effectiveItems(recipient, items)));
       const files = await this.#heldFiles(pushId, items);
       // The records go; where the files are stays with the items, for the console's downloads until the tmp cleanup takes them.
       const byMember = new Map<string, string[]>();
       let waiting = false;
       for (const item of items) {
         const file = item.attachment ? files.get(item.attachment) : undefined;
-        if (unsettled(item, files) && effective.has(item)) { waiting = true; continue; }
+        if (unsettled(item, files)) { waiting = true; continue; }
         if (!file) continue;
-        if (file.state === "ready" && file.path && item.path !== file.path) this.#store.updateItem(item.id, { path: file.path });
+        if (file.state === "ready" && file.path && item.path !== file.path) this.#store.keepItemPath(item.id, file.path);
         byMember.set(item.member, [...byMember.get(item.member) ?? [], item.attachment!]);
       }
       for (const [member, ids] of byMember) await this.#host!.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids);
@@ -1873,7 +1864,7 @@ export class PushService {
   #recipientCard(pushId: string, member: string): CardContent | undefined {
     const push = this.#store.push(pushId), recipient = this.#store.recipient(pushId, member);
     if (!push || !recipient) return undefined;
-    const reply = recipient.submitted ? this.#store.items(pushId, member, recipient.submitted) : [];
+    const reply = this.#store.items(pushId, member);
     const forwards = memberGroup(member) === undefined ? this.#store.forwards(pushId, "confirmed") : [];
     const by = forwards.find(forward => forward.to === member), to = forwards.filter(forward => forward.from === member).map(forward => forward.toName);
     return recipientCard({ push, recipient, reply: countsOf(reply), ...(memberGroup(member) === undefined ? {} : { senders: senders(reply) }),
@@ -1982,5 +1973,5 @@ function countsOf(items: readonly ReplyItem[]): Counts {
 
 /** A reply attachment still being downloaded. */
 function unsettled(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): boolean {
-  return item.kind !== "text" && item.error === null && item.attachment !== null && files.get(item.attachment)?.state === "pending";
+  return item.attachment !== null && files.get(item.attachment)?.state === "pending";
 }

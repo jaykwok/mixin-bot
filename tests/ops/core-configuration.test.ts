@@ -46,7 +46,7 @@ async function fixture() {
   const f = await tempFixture("core-configuration-");
   for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
   await mkdir(join(f.root, "data/state"), { recursive: true });
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
   prepareConsoleDir(join(f.root, ".console"));
   const drafts = new ConfigurationDrafts(f.root), view = drafts.create("app", "test");
   drafts.edit(view.id, "test", 0, { appId: "fixture", environment: "production", secret: { mode: "set", value: secret } });

@@ -278,7 +278,7 @@ export interface PushPersonView { key: string; name: string; phone: string }
 export interface PushRecipientView extends PushPersonView {
   group: boolean;
   sendState: "pending" | "sending" | "sent" | "uncertain" | "failed"; sendError: string | null; sentAt: number | null;
-  ackedAt: number | null; clicks: number; choice: string | null; choiceAt: number | null; submittedAt: number | null;
+  ackedAt: number | null; clicks: number; choice: string | null; choiceAt: number | null; repliedAt: number | null;
   answered: boolean;
   reply: { text: string; files: { name: string; size: number | null; kind: string }[]; senders: string[] } | null;
   forwardedBy: string | null; forwardedTo: string[];

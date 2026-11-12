@@ -8,10 +8,11 @@ export const APP_VERSION: string = manifest.version;
  * Data format version: whether this program can open the existing databases and directories. It changes only with the
  * storage format, not with every release.
  *
- * 2: application-shared workspace, per-space conversation databases under data/conversations, data/tmp and
- * data/state/stats.sqlite. Deployments of earlier formats are not upgraded: deploy fresh and restore the statistics.
+ * 3: application-shared workspace, per-space conversation databases under data/conversations, data/tmp,
+ * data/state/stats.sqlite, and the state database with the push tables as src/push/store.ts creates them. Deployments of
+ * earlier formats are not upgraded: deploy fresh and restore the statistics.
  */
-export const DATA_VERSION = 2;
+export const DATA_VERSION = 3;
 
 /**
  * Build identity: the commit the running code was built from, `-dirty` when built from a modified working tree. Set by

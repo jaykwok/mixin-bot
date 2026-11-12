@@ -42,9 +42,9 @@ const ENTRY_OVERHEAD = 30 + 46;
 const END_RECORD = 22;
 const ZIP_MAX = 0xffff_ffff;
 
-/** The reply: the items of the revision in effect. */
-export function effectiveItems(recipient: Pick<Recipient, "member" | "submitted">, items: readonly ReplyItem[]): ReplyItem[] {
-  return recipient.submitted > 0 ? items.filter(item => item.member === recipient.member && item.revision === recipient.submitted) : [];
+/** A recipient's reply among a push's items. */
+export function replyItems(recipient: Pick<Recipient, "member">, items: readonly ReplyItem[]): ReplyItem[] {
+  return items.filter(item => item.member === recipient.member);
 }
 
 /** The texts of a reply; a group's name their senders (`张三：…`). */
@@ -62,7 +62,6 @@ const maskPhone = (phone: string) => phone.length <= 7 ? (phone.length <= 2 ? ph
 
 /** Where a held attachment's file is (still held, or recorded when the hold was released), or why it is not there. */
 async function located(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): Promise<{ path: string; size: number } | { missing: string }> {
-  if (item.error) return { missing: item.error };
   const file = (item.attachment ? files.get(item.attachment) : undefined) ?? (item.path ? { state: "ready", path: item.path } : undefined);
   if (!file) return { missing: "附件记录已不存在" };
   if (file.state === "pending") return { missing: "还在下载" };
@@ -99,7 +98,7 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   let missingFiles = 0, index = 0;
   for (const recipient of recipients) {
     index++;
-    const own = effectiveItems(recipient, items), group = memberGroup(recipient.member) !== undefined;
+    const own = replyItems(recipient, items), group = memberGroup(recipient.member) !== undefined;
     const row: (string | number | null)[] = [recipient.name, group ? "群" : phone(recipient.member), SEND_LABEL[recipient.sendState], time(recipient.ackedAt)];
     if (groups) row.push(group ? recipient.clicks : null);
     if (push.mode === "options") row.push(recipient.choice === null ? null : push.options[recipient.choice] ?? null, time(recipient.choiceAt));
@@ -124,10 +123,10 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
         lines.push(`- ${label}：${name.slice(folder.length + 1)}`);
       }
       const text = replyText(own);
-      row.push(time(recipient.submittedAt), text || null, names.join("\n") || null);
+      row.push(time(recipient.repliedAt), text || null, names.join("\n") || null);
       if (groups) row.push(group ? senders(own).join("、") || null : null);
       if (own.length) {
-        const data = new TextEncoder().encode([`${group ? `群「${recipient.name}」` : `${recipient.name}（${phone(recipient.member)}）`}的回复，${time(recipient.submittedAt)}`,
+        const data = new TextEncoder().encode([`${group ? `群「${recipient.name}」` : `${recipient.name}（${phone(recipient.member)}）`}的回复，${time(recipient.repliedAt)}`,
           "", text || "（没有文字）", ...(lines.length ? ["", "附件：", ...lines] : [])].join("\n") + "\n");
         entries.push({ name: `${folder}/回复.txt`, size: data.length, data });
       }

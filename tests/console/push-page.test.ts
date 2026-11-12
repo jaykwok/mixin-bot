@@ -19,7 +19,7 @@ const DETAIL: PushDetail = {
   push: { ...ITEM, body: "请回复", options: [], defaultDeadline: true, target: { people: [{ phone: ZHANG, name: "张三" }], departments: [{ id: "10", path: "技术部", children: true }],
     everyone: false }, cc: [{ phone: WANG, name: "王五" }], summaryError: null, summaryAt: null },
   recipients: [ZHANG, LI].map((member, index) => ({ member, name: index ? "李四" : "张三", sendState: "sent", sendError: null, sentAt: 2, ackedAt: index ? null : 2, clicks: 0,
-    choice: null, choiceAt: null, submittedAt: index ? null : 3, answered: !index,
+    choice: null, choiceAt: null, repliedAt: index ? null : 3, answered: !index,
     reply: index ? null : { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] }, forwardedBy: index ? "张三" : null, forwardedTo: index ? [] : ["李四"] })),
 };
 

@@ -134,10 +134,8 @@ export type Recipient = {
   clicks: number;
   choice: number | null;
   choiceAt: number | null;
-  /** The revision of the reply items in effect; 0: no reply. */
-  submitted: number;
-  /** When the reply last changed. */
-  submittedAt: number | null;
+  /** When the reply (the member's reply items) last changed; null: no reply. */
+  repliedAt: number | null;
 };
 
 /** `sent`: pushes that went out (`followUps` of them 补推送, `live` not closed); the rest is over the closed ones. */
@@ -148,16 +146,13 @@ export type ReplyItem = {
   id: number;
   pushId: string;
   member: string;
-  revision: number;
   msgUid: string;
   kind: ItemKind;
   text: string | null;
-  /** The held attachment in the member's records (src/durable/attachments.ts); null until registered. */
+  /** The held attachment in the member's records (src/durable/attachments.ts); null for a text. */
   attachment: string | null;
   name: string | null;
   size: number | null;
-  /** Registration of the attachment failed or was interrupted. */
-  error: string | null;
   receivedAt: number;
   /** The attachment's file, recorded when the push released its hold (the record is gone then; the console still downloads it). */
   path: string | null;
@@ -211,16 +206,14 @@ CREATE INDEX IF NOT EXISTS pushes_by_state ON pushes (state);
 CREATE TABLE IF NOT EXISTS push_recipients (
   push_id TEXT NOT NULL, member TEXT NOT NULL, name TEXT NOT NULL, receive_id TEXT NOT NULL, send_state TEXT NOT NULL,
   send_attempts INTEGER NOT NULL, send_error TEXT, sent_at INTEGER, retry_at INTEGER, card TEXT, version INTEGER NOT NULL,
-  acked_at INTEGER, clicks INTEGER NOT NULL, choice INTEGER, choice_at INTEGER, reply_state TEXT NOT NULL, draft INTEGER NOT NULL,
-  submitted INTEGER NOT NULL, submitted_at INTEGER, activity_at INTEGER, reminded_at INTEGER, hinted_at INTEGER,
+  acked_at INTEGER, clicks INTEGER NOT NULL, choice INTEGER, choice_at INTEGER, replied_at INTEGER,
   PRIMARY KEY (push_id, member)) STRICT;
--- reply_state, draft, activity_at, reminded_at, hinted_at: of the reply buttons replies no longer need; written as 'none', 0 and NULL, never read.
-CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member, reply_state);
+CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member);
 CREATE TABLE IF NOT EXISTS push_reply_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, push_id TEXT NOT NULL, member TEXT NOT NULL, revision INTEGER NOT NULL,
-  msg_uid TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, text TEXT, attachment TEXT, name TEXT, size INTEGER, error TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, push_id TEXT NOT NULL, member TEXT NOT NULL,
+  msg_uid TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, text TEXT, attachment TEXT, name TEXT, size INTEGER,
   received_at INTEGER NOT NULL, path TEXT, sender TEXT, sender_name TEXT) STRICT;
-CREATE INDEX IF NOT EXISTS push_reply_items_by_reply ON push_reply_items (push_id, member, revision);
+CREATE INDEX IF NOT EXISTS push_reply_items_by_reply ON push_reply_items (push_id, member);
 CREATE TABLE IF NOT EXISTS push_forwards (
   id TEXT PRIMARY KEY, push_id TEXT NOT NULL, from_member TEXT NOT NULL, to_member TEXT NOT NULL, to_name TEXT NOT NULL, state TEXT NOT NULL,
   card TEXT, version INTEGER NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER) STRICT;
@@ -247,7 +240,7 @@ const PUSH_COLUMNS = {
 const RECIPIENT_COLUMNS = {
   pushId: "push_id", member: "member", name: "name", receiveId: "receive_id", sendState: "send_state", sendAttempts: "send_attempts",
   sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
-  choice: "choice", choiceAt: "choice_at", submitted: "submitted", submittedAt: "submitted_at",
+  choice: "choice", choiceAt: "choice_at", repliedAt: "replied_at",
 } as const satisfies Record<keyof Recipient, string>;
 
 const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "summaryDone"]);
@@ -275,15 +268,13 @@ function decodeRecipient(row: Row): Recipient {
 }
 
 const RECIPIENT_KEYS = Object.keys(RECIPIENT_COLUMNS) as (keyof Recipient)[];
-/** A new recipient row; the two columns of the reply buttons have no default. */
-const RECIPIENT_INSERT = `INSERT INTO push_recipients (${RECIPIENT_KEYS.map(key => RECIPIENT_COLUMNS[key]).join(", ")}, reply_state, draft)
-  VALUES (${RECIPIENT_KEYS.map(() => "?").join(", ")}, 'none', 0)`;
+const RECIPIENT_INSERT = `INSERT INTO push_recipients (${RECIPIENT_KEYS.map(key => RECIPIENT_COLUMNS[key]).join(", ")}) VALUES (${RECIPIENT_KEYS.map(() => "?").join(", ")})`;
 /** Handed on to someone (a confirmed forward of the row's member). */
 const FORWARDED = "EXISTS (SELECT 1 FROM push_forwards f WHERE f.push_id = r.push_id AND f.from_member = r.member AND f.state = 'confirmed')";
 const FORWARD_SELECT = `SELECT id, push_id AS pushId, from_member AS "from", to_member AS "to", to_name AS toName, state, card, version,
   created_at AS createdAt, decided_at AS decidedAt FROM push_forwards`;
 
-const ITEM_SELECT = `SELECT id, push_id AS pushId, member, revision, msg_uid AS msgUid, kind, text, attachment, name, size, error,
+const ITEM_SELECT = `SELECT id, push_id AS pushId, member, msg_uid AS msgUid, kind, text, attachment, name, size,
   received_at AS receivedAt, path, sender, sender_name AS senderName FROM push_reply_items`;
 const GROUP_SELECT = `SELECT group_id AS id, name, state, first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, registered_at AS registeredAt,
   registered_by AS registeredBy FROM chat_groups`;
@@ -404,7 +395,7 @@ export class PushStore {
     const pushes = this.db.query(`SELECT count(*) AS sent, coalesce(sum(json_extract(target, '$.of') IS NOT NULL), 0) AS followUps,
       coalesce(sum(state != 'closed'), 0) AS live FROM pushes WHERE state IN ('sending', 'open', 'closed')`).get() as Pick<PushTotals, "sent" | "followUps" | "live">;
     const answers = this.db.query(`SELECT count(*) AS delivered, coalesce(sum(r.acked_at IS NOT NULL), 0) AS acked,
-      coalesce(sum(p.mode = 'reply'), 0) AS replyDelivered, coalesce(sum(p.mode = 'reply' AND r.submitted > 0), 0) AS replied
+      coalesce(sum(p.mode = 'reply'), 0) AS replyDelivered, coalesce(sum(p.mode = 'reply' AND r.replied_at IS NOT NULL), 0) AS replied
       FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE p.state = 'closed' AND r.send_state IN ('sent', 'uncertain')`).get() as
       Omit<PushTotals, "sent" | "followUps" | "live">;
     return { ...pushes, ...answers };
@@ -468,9 +459,9 @@ export class PushStore {
     const rows = this.db.query(`SELECT r.push_id AS pushId, count(*) AS total, sum(r.member LIKE 'group:%') AS groups,
       sum(r.send_state IN ('sent', 'uncertain')) AS delivered, sum(r.send_state = 'failed') AS failed,
       sum(r.send_state IN ('sent', 'uncertain') AND (CASE p.mode WHEN 'ack' THEN r.acked_at IS NOT NULL WHEN 'options' THEN r.choice IS NOT NULL
-        ELSE r.submitted > 0 END OR ${FORWARDED})) AS answered,
+        ELSE r.replied_at IS NOT NULL END OR ${FORWARDED})) AS answered,
       sum(r.send_state IN ('pending', 'sending') OR (r.send_state = 'failed' AND r.retry_at IS NOT NULL)) AS unsettled,
-      max(CASE WHEN r.submitted > 0 THEN r.submitted_at END) AS repliedAt
+      max(r.replied_at) AS repliedAt
       FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE r.push_id IN (${pushIds.map(() => "?").join(", ")}) GROUP BY r.push_id`)
       .all(...pushIds) as (RecipientCounts & { pushId: string })[];
     return new Map(rows.map(({ pushId, ...counts }) => [pushId, counts]));
@@ -519,7 +510,7 @@ export class PushStore {
   /** Live pushes that want a reply from the member (or group) and have none yet, unless they handed the push on. */
   awaitingReply(member: string): Recipient[] {
     return (this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
-      WHERE r.member = ? AND p.mode = 'reply' AND p.state IN ('sending', 'open') AND r.submitted = 0 AND NOT ${FORWARDED}
+      WHERE r.member = ? AND p.mode = 'reply' AND p.state IN ('sending', 'open') AND r.replied_at IS NULL AND NOT ${FORWARDED}
       AND r.send_state IN ('sent', 'uncertain') ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
   }
 
@@ -535,26 +526,13 @@ export class PushStore {
     return this.db.query("UPDATE push_recipients SET send_state = 'uncertain', send_error = '发送过程中服务中断，结果未知' WHERE send_state = 'sending'").run().changes;
   }
 
-  /**
-   * At startup: what the reply buttons left. A reply being collected (after 「回复」, before 「已回复」) with content is the
-   * reply, as it was at the deadline; an attachment whose registration never ended is not coming.
-   */
-  settleDrafts(): number {
-    return this.transaction(() => {
-      this.db.query(`UPDATE push_recipients SET submitted = draft, submitted_at = coalesce(activity_at, submitted_at, 0) WHERE reply_state = 'replying'
-        AND EXISTS (SELECT 1 FROM push_reply_items i WHERE i.push_id = push_recipients.push_id AND i.member = push_recipients.member AND i.revision = push_recipients.draft)`).run();
-      this.db.query("UPDATE push_reply_items SET error = '附件没有收全' WHERE kind != 'text' AND attachment IS NULL AND error IS NULL").run();
-      return this.db.query("UPDATE push_recipients SET reply_state = 'none', draft = 0 WHERE reply_state = 'replying'").run().changes;
-    });
-  }
-
   // ---- reply items ----------------------------------------------------------------------------------------------------
 
   /** The new item's ID; undefined when the message was recorded before (a redelivery). */
   addItem(item: Omit<ReplyItem, "id" | "path">): number | undefined {
-    const result = this.db.query(`INSERT OR IGNORE INTO push_reply_items (push_id, member, revision, msg_uid, kind, text, attachment, name, size, error,
-      received_at, sender, sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(item.pushId, item.member, item.revision, item.msgUid, item.kind,
-      item.text, item.attachment, item.name, item.size, item.error, item.receivedAt, item.sender, item.senderName);
+    const result = this.db.query(`INSERT OR IGNORE INTO push_reply_items (push_id, member, msg_uid, kind, text, attachment, name, size,
+      received_at, sender, sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(item.pushId, item.member, item.msgUid, item.kind,
+      item.text, item.attachment, item.name, item.size, item.receivedAt, item.sender, item.senderName);
     return result.changes ? Number(result.lastInsertRowid) : undefined;
   }
 
@@ -567,16 +545,15 @@ export class PushStore {
     for (const id of ids) this.db.query("DELETE FROM push_reply_items WHERE id = ?").run(id);
   }
 
-  updateItem(id: number, change: Partial<Pick<ReplyItem, "error" | "path">>): void {
-    const keys = Object.keys(change) as ("error" | "path")[];
-    if (!keys.length) return;
-    this.db.query(`UPDATE push_reply_items SET ${keys.map(key => `${key} = ?`).join(", ")} WHERE id = ?`).run(...keys.map(key => change[key] ?? null), id);
+  /** Where the item's file is, kept when the push lets its hold go. */
+  keepItemPath(id: number, path: string): void {
+    this.db.query("UPDATE push_reply_items SET path = ? WHERE id = ?").run(path, id);
   }
 
-  items(pushId: string, member?: string, revision?: number): ReplyItem[] {
+  /** A push's reply items in order; `member`: one recipient's reply. */
+  items(pushId: string, member?: string): ReplyItem[] {
     if (member === undefined) return this.db.query(`${ITEM_SELECT} WHERE push_id = ? ORDER BY received_at, id`).all(pushId) as ReplyItem[];
-    if (revision === undefined) return this.db.query(`${ITEM_SELECT} WHERE push_id = ? AND member = ? ORDER BY received_at, id`).all(pushId, member) as ReplyItem[];
-    return this.db.query(`${ITEM_SELECT} WHERE push_id = ? AND member = ? AND revision = ? ORDER BY received_at, id`).all(pushId, member, revision) as ReplyItem[];
+    return this.db.query(`${ITEM_SELECT} WHERE push_id = ? AND member = ? ORDER BY received_at, id`).all(pushId, member) as ReplyItem[];
   }
 
   // ---- forwards -------------------------------------------------------------------------------------------------------

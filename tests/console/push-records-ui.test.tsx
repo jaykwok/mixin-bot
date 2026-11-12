@@ -14,7 +14,7 @@ const item = (id: string, state: string, extra: Record<string, unknown> = {}) =>
   confirmedAt: 2, deadline: 3, closedAt: state === "closed" ? 4 : null, closeReason: state === "closed" ? "deadline" : null, summaryState: state === "closed" ? "sent" : null,
   of: null, followUp: null, counts: { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1 }, ...extra });
 const recipient = (key: string, name: string, answered: boolean, handed: { forwardedBy?: string; forwardedTo?: string[] } = {}) => ({ key, name, phone: `138****000${key.slice(-1)}`, group: false, sendState: "sent", sendError: null, sentAt: 2,
-  ackedAt: answered ? 2 : null, clicks: 0, choice: null, choiceAt: null, submittedAt: answered ? 3 : null, answered,
+  ackedAt: answered ? 2 : null, clicks: 0, choice: null, choiceAt: null, repliedAt: answered ? 3 : null, answered,
   reply: answered ? { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] } : null, forwardedBy: handed.forwardedBy ?? null, forwardedTo: handed.forwardedTo ?? [] });
 const detail = (id: string, state: string) => ({ view: `view-${id}`, push: { ...item(id, state), body: "请回复", options: [], defaultDeadline: true, target: ["部门 技术部（含下级）"],
   cc: [{ key: "cc1", name: "王五", phone: "138****0003" }], summaryError: null, summaryAt: state === "closed" ? 5 : null },
