@@ -2170,3 +2170,48 @@ test("fields: refused without values for everyone, with departments or groups, o
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
+
+// ---- a reply attachment larger than one file may be ------------------------------------------------------------------
+
+test("summary: a reply attachment above the size of one file goes in segments over the archives, and the summary says how to get it whole", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-04 18:00" });
+    const speaker = h.say(ZHANG, "录像在附件里", ["巡检录像.mp4"]);
+    // 31 MB: more than a file message carries, and no relay is configured.
+    const attachment = Object.values(h.records.get(ZHANG)!.attachments)[0]!;
+    const big = Buffer.alloc(31 * 1024 * 1024, 7);
+    big.write("start");
+    big.write("end", big.length - 3);
+    writeFileSync(attachment.path!, big);
+    attachment.size = big.length;
+    await h.service.reply(speaker, { push: id, action: "add" });
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.summaryState).toBe("sent");
+    const summary = summaryOf(h).content;
+    expect(summary).toContain("有 1 个附件超过单个文件 30.0MB 的发送上限，分段放在几个压缩包里（文件名以 .001、.002 结尾）：把全部压缩包解压到同一个文件夹后合并，"
+      + "方法写在那个人文件夹的“回复.txt”里；也可以请管理员在控制台下载完整的汇总包");
+    expect(summary).toContain("汇总表和回复内容分成 2 个压缩包，见下面。");
+    expect(summary).not.toContain("没能打包");
+    expect(h.files(PUSHER)).toEqual([1, 2].map(part => `推送汇总-机房盘点-${id}-${part}of2.zip`));
+    // Each archive is within the size of a file message; the segments join to the file as it was sent.
+    const parts = h.uploads.filter(upload => upload.name.endsWith(".zip"));
+    for (const part of parts) expect(part.data.length).toBeLessThanOrEqual(30 * 1024 * 1024);
+    const entries = [];
+    for (const part of parts) {
+      const zip = join(fixture.root, `split-${++counter}.zip`);
+      await writeFile(zip, part.data);
+      entries.push(...readZip(zip));
+    }
+    const segments = entries.filter(entry => /\.00\d$/.test(entry.name));
+    expect(segments.map(entry => entry.name)).toEqual(["回复/001-张三-0001/01-巡检录像.mp4.001", "回复/001-张三-0001/01-巡检录像.mp4.002"]);
+    expect(Buffer.concat(segments.map(entry => entry.data)).equals(big)).toBe(true);
+    // The console's package has the file whole.
+    const pack = await h.service.package(id);
+    expect(readZip(pack.path).find(entry => entry.name === "回复/001-张三-0001/01-巡检录像.mp4")!.data.length).toBe(big.length);
+    await pack.done();
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});

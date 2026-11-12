@@ -2,8 +2,9 @@
 // is one row, with who replied; a push handed on names by whom and to whom), and per recipient a folder with the reply
 // text and the reply attachments. Phones are masked everywhere in it: it goes to the pusher, the CCs and the console. A package
 // larger than one file may be (the native limit, or the relay's when one is configured) is split into numbered
-// archives; an attachment that alone does not fit is listed as not packed. With nothing but the workbook in it (a push
-// that asked for a confirmation or a choice, or got no reply), the chat gets the workbook itself.
+// archives; an attachment that alone does not fit goes in segments over several of them (`name.001`, `name.002`, …, with how
+// to join them in the reply's text file), or for the console's single archive is listed as not packed. With nothing but
+// the workbook in it (a push that asked for a confirmation or a choice, or got no reply), the chat gets the workbook itself.
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { access, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -30,14 +31,16 @@ export type SummaryInput = {
   partBytes: number;
   /** A package of the workbook alone is the workbook, not an archive of it. */
   bare?: boolean;
+  /** An attachment larger than one archive goes in segments over several, instead of being left out. */
+  split?: boolean;
   now: number;
   /** Stops the copying into the archives. */
   signal?: AbortSignal;
 };
 
 export type SummaryPart = { path: string; name: string; size: number };
-/** `bare`: the one part is the workbook itself. */
-export type SummaryPackage = { parts: SummaryPart[]; missingFiles: number; bare: boolean };
+/** `bare`: the one part is the workbook itself. `splitFiles`: attachments that went in segments. */
+export type SummaryPackage = { parts: SummaryPart[]; missingFiles: number; splitFiles: number; bare: boolean };
 
 const SEND_LABEL: Record<Recipient["sendState"], string> = { pending: "未发出", sending: "未发出", sent: "已发出", uncertain: "可能已发出", failed: "发送失败" };
 
@@ -45,6 +48,8 @@ const SEND_LABEL: Record<Recipient["sendState"], string> = { pending: "未发出
 const ENTRY_OVERHEAD = 30 + 46;
 const END_RECORD = 22;
 const ZIP_MAX = 0xffff_ffff;
+/** Segments one attachment may go in (their names end in .001 to .999), and up to how many the join command names one by one. */
+const SEGMENTS_MAX = 999, SEGMENTS_LISTED = 6;
 
 /** A recipient's reply among a push's items. */
 export function replyItems(recipient: Pick<Recipient, "member">, items: readonly ReplyItem[]): ReplyItem[] {
@@ -75,7 +80,8 @@ async function located(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): P
   catch { return { missing: "文件已被临时文件清理删除" }; }
 }
 
-type Entry = { name: string; size: number } & ({ path: string } | { data: Uint8Array });
+/** `start`: the entry is `size` bytes of the file from there (a segment). */
+type Entry = { name: string; size: number } & ({ path: string; start?: number } | { data: Uint8Array });
 const entrySize = (entry: Entry) => ENTRY_OVERHEAD + 2 * Buffer.byteLength(entry.name) + entry.size;
 
 /**
@@ -111,7 +117,7 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
     ...(forwards.length ? [{ title: "转派", width: 24 }] : []),
   ];
   const rows: (string | number | null)[][] = [], entries: Entry[] = [];
-  let missingFiles = 0, index = 0;
+  let missingFiles = 0, splitFiles = 0, index = 0;
   for (const recipient of recipients) {
     index++;
     const own = replyItems(recipient, items), group = memberGroup(recipient.member) !== undefined;
@@ -128,7 +134,26 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
         const label = item.name ?? "附件";
         const name = `${folder}/${String(++n).padStart(2, "0")}-${safeFileName(label)}`;
         let where = await located(item, input.files);
-        if ("path" in where && entrySize({ name, size: where.size, path: where.path }) + END_RECORD > limit) where = { missing: `${formatSize(where.size)}，超过单个文件的发送上限` };
+        if ("path" in where && entrySize({ name, size: where.size, path: where.path }) + END_RECORD > limit) {
+          // Too large for one archive: as few segments as fit one each, of equal size (the first may share an archive with
+          // what comes before it), to be joined again after unpacking.
+          const room = limit - END_RECORD - ENTRY_OVERHEAD - 2 * Buffer.byteLength(`${name}.000`);
+          const count = room > 0 ? Math.ceil(where.size / room) : Infinity, each = Math.ceil(where.size / count);
+          if (input.split && count <= SEGMENTS_MAX) {
+            const file = name.slice(folder.length + 1), segments = Array.from({ length: count }, (_, at) => `${file}.${String(at + 1).padStart(3, "0")}`);
+            for (const [at, segment] of segments.entries()) {
+              entries.push({ name: `${folder}/${segment}`, path: where.path, size: Math.min(each, where.size - at * each), start: at * each });
+            }
+            splitFiles++;
+            names.push(`${label}（${formatSize(where.size)}，分成 ${count} 段）`);
+            lines.push(`- ${label}：${formatSize(where.size)}，超过单个文件的发送上限，分成 ${count} 段（${segments[0]} 到 ${segments.at(-1)}），分在几个压缩包里。`,
+              `  合并：把全部压缩包解压到同一个文件夹，在这个文件夹里用 7-Zip 打开 ${segments[0]} 再解压。`
+              + (count <= SEGMENTS_LISTED ? `也可以在命令提示符里执行：copy /b ${segments.map(segment => `"${segment}"`).join("+")} "${file}"` : "")
+              + `（macOS、Linux：cat "${file}".??? > "${file}"）`);
+            continue;
+          }
+          where = { missing: `${formatSize(where.size)}，超过单个文件的发送上限` };
+        }
         if ("missing" in where) {
           missingFiles++;
           names.push(`${label}（未打包：${where.missing}）`);
@@ -153,7 +178,7 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   }
   await writeWorkbook(workbook, { name: "汇总", columns, rows }, now);
   const sheet = { name: workbookName, size: (await stat(workbook)).size, path: workbook };
-  if (input.bare && !entries.length) return { parts: [sheet], missingFiles, bare: true };
+  if (input.bare && !entries.length) return { parts: [sheet], missingFiles, splitFiles, bare: true };
   entries.unshift(sheet);
 
   // Entries in order; a new archive starts when the next entry would not fit.
@@ -170,12 +195,12 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
         used = 0;
       }
       if ("data" in entry) await zip.addBuffer(entry.name, entry.data);
-      else await zip.addFile(entry.name, entry.path, input.signal);
+      else await zip.addFile(entry.name, entry.path, input.signal, entry.start === undefined ? undefined : { start: entry.start, length: entry.size });
       used += need;
     }
     await zip!.close();
   } catch (error) { await zip?.abort(); throw error; }
   const parts = await Promise.all(paths.map(async (path, at) => ({ path, size: (await stat(path)).size,
     name: paths.length === 1 ? `${base}.zip` : `${base}-${at + 1}of${paths.length}.zip` })));
-  return { parts, missingFiles, bare: false };
+  return { parts, missingFiles, splitFiles, bare: false };
 }

@@ -39,16 +39,16 @@ export class ZipWriter {
     await this.#entry(name, { crc: crc32(data), size: data.length, compressed: body.length, method: body === data ? 0 : 8 }, async () => { await this.#write(body); });
   }
 
-  /** A file, stored as it is. */
-  async addFile(name: string, path: string, signal?: AbortSignal): Promise<void> {
+  /** A file, stored as it is; `range`: only these bytes of it (a segment of a file too large for one archive). */
+  async addFile(name: string, path: string, signal?: AbortSignal, range?: { start: number; length: number }): Promise<void> {
     const source = await open(path, "r");
     try {
-      const size = (await source.stat()).size;
+      const start = range?.start ?? 0, size = range?.length ?? (await source.stat()).size;
       let crc = 0;
       const buffer = Buffer.allocUnsafe(Math.min(CHUNK, Math.max(size, 1)));
       for (let position = 0; position < size;) {
         signal?.throwIfAborted();
-        const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+        const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, size - position), start + position);
         if (bytesRead === 0) throw new Error(`文件在打包时变短：${name}`);
         crc = crc32(buffer.subarray(0, bytesRead), crc);
         position += bytesRead;
@@ -56,7 +56,7 @@ export class ZipWriter {
       await this.#entry(name, { crc, size, compressed: size, method: 0 }, async () => {
         for (let position = 0; position < size;) {
           signal?.throwIfAborted();
-          const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, size - position), position);
+          const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, size - position), start + position);
           if (bytesRead === 0) throw new Error(`文件在打包时变短：${name}`);
           await this.#write(buffer.subarray(0, bytesRead));
           position += bytesRead;

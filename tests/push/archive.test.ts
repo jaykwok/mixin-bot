@@ -138,6 +138,21 @@ test("a package larger than one send splits into numbered parts within the limit
   expect(pack.missingFiles).toBe(1);
   const note = pack.parts.flatMap(part => readZip(part.path)).find(entry => entry.name === "回复/004-成员4-0004/回复.txt")!.data.toString("utf8");
   expect(note).toContain("文件4.bin：未打包，195.3KB，超过单个文件的发送上限");
+  // Asked to split (the chat's summary): that file goes in segments over the archives, in order, and joins to the same bytes.
+  const pattern = Buffer.from(Array.from({ length: 200_000 }, (_, at) => at % 251));
+  await writeFile(join(root, "f4.bin"), pattern);
+  const cut = join(root, "cut"); await mkdir(cut);
+  const split = await buildSummary({ push: push("reply"), recipients, items, files, dir: cut, partBytes, split: true, now: 10 });
+  expect([split.missingFiles, split.splitFiles]).toEqual([0, 1]);
+  for (const part of split.parts) expect(part.size).toBeLessThanOrEqual(partBytes);
+  const all = split.parts.flatMap(part => readZip(part.path));
+  const segments = all.filter(entry => entry.name.startsWith("回复/004-成员4-0004/01-文件4.bin."));
+  expect(segments.map(entry => [entry.name.slice(-4), entry.data.length])).toEqual([[".001", 100_000], [".002", 100_000]]);
+  expect(Buffer.concat(segments.map(entry => entry.data)).equals(pattern)).toBe(true);
+  const how = all.find(entry => entry.name === "回复/004-成员4-0004/回复.txt")!.data.toString("utf8");
+  expect(how).toContain("- 文件4.bin：195.3KB，超过单个文件的发送上限，分成 2 段（01-文件4.bin.001 到 01-文件4.bin.002），分在几个压缩包里。");
+  expect(how).toContain(`用 7-Zip 打开 01-文件4.bin.001 再解压。也可以在命令提示符里执行：copy /b "01-文件4.bin.001"+"01-文件4.bin.002" "01-文件4.bin"（macOS、Linux：cat "01-文件4.bin".??? > "01-文件4.bin"）`);
+  expect(all.map(entry => entry.name)).toContain("回复/003-成员3-0003/01-文件3.bin");
 });
 
 test("a group is one row: no phone, its clicks and who replied; its folder holds the texts with their senders", async () => {

@@ -1956,7 +1956,8 @@ export class PushService {
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const forwards = this.#store.forwards(pushId, "confirmed"), handed = new Set(forwards.map(forward => forward.from));
-      const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, bare: true, now: this.#now(), signal: this.#signal });
+      const partBytes = this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES;
+      const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes, bare: true, split: true, now: this.#now(), signal: this.#signal });
       const tally = this.#tally(push, recipients);
       const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && !this.#answered(push, recipient, handed))
         .map(recipient => memberGroup(recipient.member) === undefined ? recipient.name : `群 ${recipient.name}`);
@@ -1965,6 +1966,8 @@ export class PushService {
         ...(unknown ? [`有 ${unknown} 张卡片发送结果未知，按已发出统计`] : []),
         ...(missing.length ? [`${push.mode === "reply" ? "未回复" : push.mode === "ack" ? "未确认" : "未选择"}：${missing.slice(0, 30).join("、")}${missing.length > 30 ? ` 等 ${missing.length} 个` : ""}`] : []),
         ...(pack.missingFiles ? [`有 ${pack.missingFiles} 个附件没能打包（原因见汇总表）`] : []),
+        ...(pack.splitFiles ? [`有 ${pack.splitFiles} 个附件超过单个文件 ${formatSize(partBytes)} 的发送上限，分段放在几个压缩包里（文件名以 .001、.002 结尾）：`
+          + "把全部压缩包解压到同一个文件夹后合并，方法写在那个人文件夹的“回复.txt”里；也可以请管理员在控制台下载完整的汇总包"] : []),
         pack.bare ? "汇总表见下面的文件。" : pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : "汇总表和回复内容见下面的压缩包。"];
       this.#store.updatePush(pushId, { summaryText: lines.join("\n") });
       const failures: { name: string; reason: string }[] = [];
