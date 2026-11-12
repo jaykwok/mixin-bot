@@ -1,5 +1,5 @@
 // Pushes: a pusher asks the model, the model calls push_prepare (./tools.ts), the pusher confirms on a preview card,
-// cards go to the recipients, and their clicks and replies are collected here without the model.
+// cards go to the recipients, and their answers are collected here.
 //
 // Flow of one push:
 // - prepare: the people are checked against the address book (in the sync scope, name and phone matching) and the
@@ -8,29 +8,34 @@
 //   sending → sent | failed | uncertain; uncertain counts as sent and is never resent, failed is tried again twice).
 //   Once no card is pending the push is `open`.
 // - Clicks come back over the event stream with the card's ID; the first click gives the card's ID, after which the
-//   service updates the card whenever the recipient's state changes (also on each reply message).
-// - Replies (mode `reply`): 「回复」 starts a draft revision; while it is open the member's direct messages and attachments
-//   are recorded into it (the inbound router asks `directText` / `directAttachment` first) instead of reaching the model;
-//   「已回复」 or /完成 submits it, 「取消」 or /取消 drops it, 「修改回复」 starts a new revision. The last submitted
-//   revision is the reply.
-// - Deadline, or everyone answered: `closed`; an open draft with content is submitted. The deadline counts by the time
-//   input is handled: a click, message or attachment after it ends the push first (the timer may not have run yet) and
-//   counts for nothing. The summary (message and package) goes to the pusher and the CCs once the cards still being
-//   sent have their result and the reply attachments in effect are received and downloaded, or `settleWaitMs` after the
-//   end: a card still without a result then stays uncertain, whatever comes back later, so the summary stays true. Then
-//   the held reply attachments are released, each one still being received or downloaded once that ends (its file stays
-//   for the console's package).
+//   service updates the card whenever the recipient's state changes.
+// - Replies (mode `reply`) have no buttons. The recipient writes to the bot as always; the conversation's model sees the
+//   live pushes in the tail of its requests (`pending`) and calls push_reply when the message answers one. `reply` then
+//   records the member's message word for word (the request's text and the attachments it bound, or an earlier message
+//   the model quotes from: the texts of recipients are kept a day for that, `directText` / `groupText`), adds to the reply,
+//   replaces it or withdraws it. A request that ends without an answer is recorded as the reply when exactly one push
+//   waits for one (`failed`): an outage of the model loses no reply.
+// - Handing on (`forward`, the model's push_forward): a recipient names someone in the address book; a card asks the
+//   recipient, and 「确认转派」 makes that person a recipient of the same push. Whoever handed a push on counts as answered.
+//   A card that cannot be delivered to that person undoes it: the push is with the one who handed it on again.
+// - Deadline, or everyone answered (for replies: and nobody added to one for `replyGraceMs`): `closed`. The deadline
+//   counts by the time input is handled: a click or a reply after it ends the push first (the timer may not have run yet)
+//   and counts for nothing. The summary (message and package) goes to the pusher and the CCs once the cards still being
+//   sent have their result and the reply attachments are downloaded, or `settleWaitMs` after the end: a card still
+//   without a result then stays uncertain, whatever comes back later, so the summary stays true. Then the held reply
+//   attachments are released, each one still being downloaded once that ends (its file stays for the console's package).
 // - Conversation notes go through an outbox in the state database into the members' conversations as passive entries,
 //   so the model later knows what happened.
 //
 // Groups: the bot learns a group only when someone there @-mentions it (`groupText`, every group text the inbound
 // router has); an admin names it with /登记群 (or the console does), and only registered groups take pushes. A group
 // gets one card and one recipient row (`group:<ID>`), answered by anyone there: clicks cannot be traced to people, so
-// 「已收到」 counts clicks, and options are refused. While the group replies, every text @-mentioning the bot is a reply
-// item with its sender; group members' conversations learn of a live push the next time they @-mention the bot.
+// 「已收到」 counts clicks, options are refused and a group's push is not handed on. A group's reply is the texts its
+// members had recorded, each with its sender; a member replaces or withdraws only their own. Group members' conversations
+// learn of a live push the next time they @-mention the bot.
 //
-// Lookup (directory_lookup): a pusher finds people in the synced address book by part of the name, phone or department,
-// with their full phones and departments, to name recipients they know only by name or department.
+// Lookup (directory_lookup): a pusher, or a recipient of a live push, finds people in the synced address book by part of
+// the name, phone or department, with their full phones and departments.
 //
 // All state is in the state database (./store.ts); what runs in the background (sends, card updates, notes, the summary)
 // picks up from there after a restart.
@@ -44,11 +49,9 @@ import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { DIRECT_SCOPE, groupScope, parseScopeKey, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
 import { log } from "../core/log.ts";
 import { NATIVE_FILE_MAX_BYTES } from "../core/transfer-limits.ts";
-import type { AttachmentEvent } from "../durable/attachments.ts";
 import { type Outbound, sendNotice } from "../durable/outbound.ts";
-import type { MemberRecords, ReplyContext } from "../durable/records.ts";
+import type { Attachment, MemberRecords, ReplyContext } from "../durable/records.ts";
 import { sendChannel } from "../durable/send.ts";
-import type { AttachResult, InboundAttachment } from "../durable/service.ts";
 import type { DepartmentTree } from "../integrations/open-platform/department-tree.ts";
 import type { DirectoryIdentity } from "../integrations/open-platform/identity-directory.ts";
 import { cardMessage, type CardContent, splitText, type Target, textMessage } from "../integrations/open-platform/messages.ts";
@@ -56,10 +59,10 @@ import type { StreamEvent } from "../integrations/open-platform/stream.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
-import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, groupReplyText, phoneTail, previewCard, type Reach, reachText, recipientCard,
+import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
 import { buildSummary, effectiveItems, type HeldFile, replyText, senders, type SummaryPackage } from "./summary.ts";
-import { type ChatGroup, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushMode, type PushRole, type PushState, type PushStore,
+import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushMode, type PushRole, type PushState, type PushStore,
   type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
 
 export const PUSH_LIMITS = {
@@ -68,15 +71,16 @@ export const PUSH_LIMITS = {
   minDeadlineMs: 10 * 60_000,
   /** A preview not confirmed within this is void. */
   previewMs: 24 * 3600_000,
-  /** A reply with content left open this long gets one reminder to press 「已回复」. */
-  idleReminderMs: 30 * 60_000,
   /**
-   * A direct reply's later items get a receipt again once the reply sat this long without content (or was reminded): the
-   * member may have forgotten the open reply and be asking a question. Contents sent one after another get only the first.
+   * A push asking for replies ends early once everyone answered and nobody added to a reply for this long: a reply may come
+   * in several messages.
    */
-  replyReceiptMs: 10 * 60_000,
-  /** The "you have a push to reply to" notice: at most once per push and member within this. */
-  hintMs: 12 * 3600_000,
+  replyGraceMs: 10 * 60_000,
+  /** A recipient's texts are kept this long, the newest `heardKeep` of each sender, for replies recorded from an earlier message. */
+  heardMs: 24 * 3600_000,
+  heardKeep: 20,
+  /** Live pushes the tail of a model request lists. */
+  pendingShown: 10,
   /** Card sends: attempts, and the waits before the second and third. */
   sendAttempts: 3,
   sendRetryMs: [60_000, 5 * 60_000] as readonly number[],
@@ -108,8 +112,9 @@ export type PushLimits = typeof PUSH_LIMITS;
 
 /** What the push needs from the message service (src/durable/service.ts). */
 export interface PushHost {
-  attach(message: InboundAttachment): Promise<AttachResult>;
   records(scope: Scope, phone: string): Promise<Readonly<MemberRecords>>;
+  /** The attachments a reply took from a request are the push's from now on (the same call again changes nothing). */
+  holdAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number>;
   releaseAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number>;
   note(scope: Scope, phone: string, requestId: string, entry: EntryDraft): Promise<void>;
 }
@@ -160,7 +165,19 @@ export type LookupInput = {
   children?: boolean;
 };
 
-/** A refusal the model passes on to the pusher. */
+/** Who speaks in a conversation (a direct chat, or a group), and the message of the request at hand. */
+export type Speaker = { scope: Scope; phone: string; message: { msgUid: string; text: string; receivedAt: number } };
+
+/**
+ * What push_reply passes on (./tools.ts). `add` and `replace` record the request's message, or with `quote` the
+ * speaker's latest earlier message that contains it; `withdraw` drops what was recorded.
+ */
+export type ReplyInput = { push: string; action: "add" | "replace" | "withdraw"; quote?: string };
+
+/** What push_forward passes on (./tools.ts): the push and the person it should go to. */
+export type ForwardInput = { push: string; to: { name: string; phone: string } };
+
+/** A refusal the model passes on to the member. */
 export class PushRefused extends Error { override name = "PushRefused"; }
 /** The settings name people outside the synced address book; `phones` (at most 10) go back as a list, for the console to mask. */
 export class PushSettingsRefused extends Error {
@@ -174,19 +191,20 @@ export const PUSH_GROUPS = { preview: ["preview"], live: ["sending", "open"], cl
 export type PushGroup = keyof typeof PUSH_GROUPS;
 
 /** Recipient rows; `groups` of them are groups. */
-export type PushCounts = Omit<RecipientCounts, "unsettled">;
+export type PushCounts = Omit<RecipientCounts, "unsettled" | "repliedAt">;
 /** Where the console's list goes on: the last push of the page before (the list is newest first, then by ID). */
 export type PushCursor = Pick<Push, "createdAt" | "id">;
 export type PushListItem = Pick<Push, "id" | "subject" | "mode" | "state" | "pusher" | "pusherName" | "createdAt" | "confirmedAt" | "deadline" | "closedAt"
   | "closeReason" | "summaryState" | "followUp"> & { of: string | null; counts: PushCounts };
-export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "replyState"
-  | "submittedAt"> & {
+export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState" | "sendError" | "sentAt" | "ackedAt" | "clicks" | "choiceAt" | "submittedAt"> & {
   choice: string | null;
+  /** Answered, or handed the push on. */
   answered: boolean;
-  /** The reply in effect: its text (at most 2000 characters here), attachments and, for a group, who sent it. */
+  /** The reply: its text (at most 2000 characters here), attachments and, for a group, who sent it. */
   reply: { text: string; files: { name: string; size: number | null; kind: ReplyItem["kind"] }[]; senders: string[] } | null;
-  /** What the open reply holds so far. */
-  drafting: Counts | null;
+  /** Who handed the push on to this recipient, and whom this recipient handed it on to (names). */
+  forwardedBy: string | null;
+  forwardedTo: string[];
 };
 export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "summaryError" | "summaryAt">;
   recipients: PushRecipientDetail[] };
@@ -208,7 +226,7 @@ const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 const quoted = (text: string) => text.replaceAll("「", "『").replaceAll("」", "』");
 const NO_DEPARTMENT_GRANT = "你没有按部门推送的权限，请联系管理员在控制台授权";
 const NO_GROUP_GRANT = "你没有推送到群的权限，请联系管理员在控制台授权";
-const PREVIEW_GONE = "这张预览卡片对应的推送记录已清理，没有发出任何内容。确认发出一条推送后，在它之前准备、还没有确认的预览会一并清理；还需要的话请重新提出。";
+const PREVIEW_GONE = "这张预览已经作废，什么都没有发出：确认了后面准备的推送，之前没确认的预览就一起清掉了。还要发的话请再提一次。";
 /** How a group gets registered (the bot's refusals and the console say so). */
 export const GROUP_STEPS = "登记方法：把机器人拉进群，推送管理员在群里发送“@机器人 /登记群 群名”；有人 @ 过机器人的群，也可以在控制台推送页的群名单里补群名";
 const GROUP_ID = /^[0-9]{1,64}$/;
@@ -313,9 +331,11 @@ export class PushService {
   start(): void {
     const settled = this.#store.settleInterruptedSends();
     if (settled) log.warn(`推送：${settled} 张卡片在上次服务中断时正在发送，结果未知，按已发出处理`);
+    const drafts = this.#store.settleDrafts();
+    if (drafts) log.info(`推送：${drafts} 份点了「回复」还没有提交的回复，已发的内容按回复记下`);
     this.#dropSuperseded();
     this.#sweepPackages();
-    this.#track(this.#reconcileItems());
+    this.#track(this.#holdReplies());
     this.#timer = setInterval(() => this.tick(), this.#limits.tickMs);
     this.#timer.unref?.();
     this.tick();
@@ -489,7 +509,7 @@ export class PushService {
 
   #recipientRow(pushId: string, reached: Reached): Recipient {
     return { pushId, ...reached, sendState: "pending", sendAttempts: 0, sendError: null, sentAt: null, retryAt: null, card: null, version: 0, ackedAt: null,
-      clicks: 0, choice: null, choiceAt: null, replyState: "none", draft: 0, submitted: 0, submittedAt: null, activityAt: null, remindedAt: null, hintedAt: null };
+      clicks: 0, choice: null, choiceAt: null, submitted: 0, submittedAt: null };
   }
 
   /**
@@ -499,7 +519,7 @@ export class PushService {
   async #createPreview(push: Push, people: readonly Reached[], also?: () => void): Promise<"sent" | "uncertain"> {
     const recipients = people.map(person => this.#recipientRow(push.id, person));
     // The card must fit (measured ~5000 characters).
-    const sample = recipientCard({ push, recipient: recipients[0]!, draft: { texts: 0, files: 0 }, submitted: { texts: 0, files: 0 } }, this.#now());
+    const sample = recipientCard({ push, recipient: recipients[0]!, reply: { texts: 0, files: 0 } }, this.#now());
     if (chars(sample.content) > CARD_MAX_CHARS) throw new PushRefused("正文太长，卡片放不下，请精简或改为附件");
     this.#store.transaction(() => { this.#store.create(push, recipients); also?.(); });
     const outcome = await this.#outbound.send(this.#pusherTarget(push), cardMessage(this.#previewCard(push)), { signal: this.#signal });
@@ -610,10 +630,11 @@ export class PushService {
     if (used >= role.dailyLimit) throw new PushRefused(`你 24 小时内最多推送 ${role.dailyLimit} 条，已达上限，请稍后再推送。`);
   }
 
-  #newId(): string {
+  /** An ID no push has (`taken`: nor one of these). */
+  #newId(taken: (id: string) => boolean = id => this.#store.exists(id)): string {
     for (;;) {
       const id = [...randomBytes(8)].map(byte => "abcdefghjkmnpqrstuvwxyz23456789"[byte % 31]).join("");
-      if (!this.#store.exists(id)) return id;
+      if (!taken(id)) return id;
     }
   }
 
@@ -626,11 +647,13 @@ export class PushService {
     if (id) {
       const push = this.#store.push(id.trim().toLowerCase());
       if (!push || push.pusher !== phone) throw new PushRefused(`没有你发起的推送 ${id}。`);
-      const recipients = this.#store.recipients(push.id), items = this.#store.items(push.id);
+      const recipients = this.#store.recipients(push.id), items = this.#store.items(push.id), forwards = this.#store.forwards(push.id, "confirmed");
       const lines = [this.#statusLine(push, recipients, now), ""];
       for (const recipient of recipients.slice(0, 100)) {
         const who = memberGroup(recipient.member) === undefined ? `${recipient.name}（尾号 ${phoneTail(recipient.member)}）` : `群 ${recipient.name}`;
-        lines.push(`- ${who}：${this.#personState(push, recipient, items)}`);
+        const by = forwards.find(forward => forward.to === recipient.member), to = forwards.filter(forward => forward.from === recipient.member);
+        lines.push(`- ${who}${by ? `（${recipients.find(each => each.member === by.from)?.name ?? "别人"} 转来）` : ""}：${this.#personState(push, recipient, items)}`
+          + (to.length ? `；已转给 ${to.map(forward => forward.toName).join("、")}` : ""));
       }
       if (recipients.length > 100) lines.push(`……共 ${reachText(reachOf(recipients))}，其余见控制台推送页。`);
       return lines.join("\n");
@@ -653,16 +676,20 @@ export class PushService {
     const delivered = recipients.filter(recipient => recipient.sendState === "sent" || recipient.sendState === "uncertain");
     const failed = recipients.filter(recipient => recipient.sendState === "failed").length;
     const head = `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed}）` : ""}`;
+    // Handed on without an answer of their own: neither answered nor waited for.
+    const handed = this.#handed(push.id), none = new Set<string>();
+    const passed = delivered.filter(recipient => handed.has(recipient.member) && !this.#answered(push, recipient, none)).length;
+    const also = passed ? `，已转派 ${passed}` : "";
     if (push.mode === "ack") {
       const acked = delivered.filter(recipient => recipient.ackedAt !== null).length;
-      return `${head}；已确认 ${acked}，未确认 ${delivered.length - acked}`;
+      return `${head}；已确认 ${acked}${also}，未确认 ${delivered.length - acked - passed}`;
     }
     if (push.mode === "options") {
       const counts = push.options.map((option, index) => `${option} ${delivered.filter(recipient => recipient.choice === index).length}`);
-      return `${head}；${counts.join("，")}，未选择 ${delivered.filter(recipient => recipient.choice === null).length}`;
+      return `${head}；${counts.join("，")}${also}，未选择 ${delivered.filter(recipient => recipient.choice === null).length - passed}`;
     }
     const acked = delivered.filter(recipient => recipient.ackedAt !== null).length, replied = delivered.filter(recipient => recipient.submitted > 0).length;
-    return `${head}；已确认 ${acked}，已回复 ${replied}，未回复 ${delivered.length - replied}`;
+    return `${head}；已确认 ${acked}，已回复 ${replied}${also}，未回复 ${delivered.length - replied - passed}`;
   }
 
   #personState(push: Push, recipient: Recipient, items: readonly ReplyItem[]): string {
@@ -672,21 +699,20 @@ export class PushService {
     if (push.mode === "ack") return recipient.ackedAt === null ? "未确认" : `已确认（${shortTime(recipient.ackedAt, this.#now())}${clicks}）`;
     if (push.mode === "options") return recipient.choice === null ? "未选择" : `选择「${push.options[recipient.choice]}」`;
     const own = effectiveItems(recipient, items);
-    const replying = recipient.replyState === "replying" ? "（正在回复中）" : "";
-    if (!own.length) return (recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复") + replying;
+    if (!own.length) return recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复";
     const text = replyText(own), files = own.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
-    return `已回复：${text ? truncate(oneLine(text), 200) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}${replying}`;
+    return `已回复：${text ? truncate(oneLine(text), 200) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}`;
   }
 
   // ---- directory_lookup -----------------------------------------------------------------------------------------------
 
   /**
-   * People in the synced address book, for a pusher: by part of the name, by phone, or in a department (with its
+   * People in the synced address book, for a pusher or a recipient of a live push: by part of the name, by phone, or in a department (with its
    * sub-departments unless `children` is false); given together they narrow down. Each comes with the full phone and
    * the departments, at most `lookup` of them. The model's answer.
    */
   lookup(phone: string, input: LookupInput): string {
-    if (!this.isPusher(phone)) throw new PushRefused("你没有推送权限，不能查通讯录。");
+    if (!this.isPusher(phone) && !this.#store.reached(phone).length) throw new PushRefused("查通讯录是给推送人和收到推送的人用的，这位成员现在两样都不是。");
     const tree = this.#directory.departments;
     const name = compactName(input.name ?? ""), number = (input.phone ?? "").replace(/[\s-]/g, ""), department = oneLine(input.department ?? "");
     if (!name && !number && !department) throw new PushRefused("请给出姓名（可以只写其中几个字）、手机号或部门，至少一项。");
@@ -726,7 +752,7 @@ export class PushService {
     if (!/^[\x21-\x7e]{1,128}$/.test(userId) || !/^[\x21-\x7e]{1,128}$/.test(card)) { log.warn("推送卡片点击缺少有效的 userId 或 msgUid，已丢弃"); return; }
     if (groupId && !GROUP_ID.test(groupId)) { log.warn("推送卡片点击的群号无效，已丢弃"); return; }
     // The same click delivered twice (a reconnect): its stamp, card, button and version repeat.
-    const key = `${card}|${event.sentAt ?? ""}|${data.action}|${data.version}|${data.option ?? ""}|${userId}|${groupId}`;
+    const key = `${card}|${event.sentAt ?? ""}|${data.action}|${data.version}|${data.option ?? ""}|${data.forward ?? ""}|${userId}|${groupId}`;
     if (this.#clicks.has(key)) return;
     if (this.#clicks.size >= 20_000) this.#clicks.delete(this.#clicks.values().next().value!);
     this.#clicks.add(key);
@@ -741,13 +767,15 @@ export class PushService {
     try {
       // Past the deadline the push ends first: the click only shows the end.
       const push = this.#closeIfDue(found) ? this.#store.push(found.id)! : found;
-      // Previews and summaries go to the pusher's direct chat only.
+      // Previews, summaries and the cards that ask before handing on go to direct chats only.
       if (groupId) {
-        if (data.action === "confirm" || data.action === "cancel" || data.action === "remind") log.warn(`推送 ${push.id} 的预览或汇总按钮出现在群里，忽略`);
-        else this.#recipientClick(push, click, groupId);
+        if (data.action === "confirm" || data.action === "cancel" || data.action === "remind" || data.action === "forward" || data.action === "keep") {
+          log.warn(`推送 ${push.id} 的预览、汇总或转派按钮出现在群里，忽略`);
+        } else this.#recipientClick(push, click, groupId);
       }
       else if (data.action === "confirm" || data.action === "cancel") this.#previewClick(push, click);
       else if (data.action === "remind") this.#summaryClick(push, click);
+      else if (data.action === "forward" || data.action === "keep") this.#forwardClick(push, click);
       else this.#recipientClick(push, click);
     } catch (error) { this.#report(error); }
   }
@@ -873,14 +901,20 @@ export class PushService {
     return push.id;
   }
 
-  /** Recipients without an answer: delivered and not answered, or never reached. */
+  /** Recipients without an answer: delivered and neither answered nor handed on, or never reached. */
   #unanswered(push: Push): Recipient[] {
-    return this.#store.recipients(push.id).filter(recipient => recipient.sendState === "failed" || !this.#answered(push, recipient));
+    const handed = this.#handed(push.id);
+    return this.#store.recipients(push.id).filter(recipient => recipient.sendState === "failed" || !this.#answered(push, recipient, handed));
   }
 
-  #answered(push: Push, recipient: Recipient): boolean {
-    return push.mode === "ack" ? recipient.ackedAt !== null : push.mode === "options" ? recipient.choice !== null
-      : recipient.submitted > 0 && recipient.replyState !== "replying";
+  /** Answered; whoever handed the push on (`handed`) counts as that too. */
+  #answered(push: Push, recipient: Recipient, handed: ReadonlySet<string>): boolean {
+    return handed.has(recipient.member) || (push.mode === "ack" ? recipient.ackedAt !== null : push.mode === "options" ? recipient.choice !== null : recipient.submitted > 0);
+  }
+
+  /** The recipients who handed the push on. */
+  #handed(pushId: string): Set<string> {
+    return new Set(this.#store.forwards(pushId, "confirmed").map(forward => forward.from));
   }
 
   // ---- the console: 补推送 and CCs ------------------------------------------------------------------------------------
@@ -930,18 +964,19 @@ export class PushService {
   }
 
   #listItem(push: Push, counts: RecipientCounts | undefined): PushListItem {
-    const { total = 0, groups = 0, delivered = 0, failed = 0, answered = 0, replying = 0 } = counts ?? {};
+    const { total = 0, groups = 0, delivered = 0, failed = 0, answered = 0 } = counts ?? {};
     return { id: push.id, subject: push.subject, mode: push.mode, state: push.state, pusher: push.pusher, pusherName: push.pusherName, createdAt: push.createdAt,
       confirmedAt: push.confirmedAt, deadline: push.deadline, closedAt: push.closedAt, closeReason: push.closeReason, summaryState: push.summaryState,
       followUp: push.followUp, of: push.target.of ?? null,
-      counts: { total, groups, delivered, failed, answered, replying } };
+      counts: { total, groups, delivered, failed, answered } };
   }
 
   /** One push for the console: its content and every recipient's state and reply. */
   detail(id: string): PushDetail {
     const push = this.#store.push(id);
     if (!push) throw new PushRefused("推送不存在");
-    const recipients = this.#store.recipients(id), items = this.#store.items(id);
+    const recipients = this.#store.recipients(id), items = this.#store.items(id), forwards = this.#store.forwards(id, "confirmed");
+    const handed = new Set(forwards.map(forward => forward.from));
     return {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
         summaryError: push.summaryError, summaryAt: push.summaryAt },
@@ -949,11 +984,12 @@ export class PushService {
         const own = effectiveItems(recipient, items), text = replyText(own);
         return { member: recipient.member, name: recipient.name, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
           ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice === null ? null : push.options[recipient.choice] ?? null, choiceAt: recipient.choiceAt,
-          replyState: recipient.replyState, submittedAt: recipient.submittedAt,
-          answered: (recipient.sendState === "sent" || recipient.sendState === "uncertain") && this.#answered(push, recipient),
+          submittedAt: recipient.submittedAt,
+          answered: (recipient.sendState === "sent" || recipient.sendState === "uncertain") && this.#answered(push, recipient, handed),
           reply: own.length ? { text: chars(text) > 2000 ? truncate(text, 2000) : text,
             files: own.filter(item => item.kind !== "text").map(item => ({ name: item.name ?? "附件", size: item.size, kind: item.kind })), senders: senders(own) } : null,
-          drafting: recipient.replyState === "replying" ? countsOf(items.filter(item => item.member === recipient.member && item.revision === recipient.draft)) : null };
+          forwardedBy: forwards.flatMap(forward => forward.to === recipient.member ? [recipients.find(each => each.member === forward.from)?.name ?? forward.from] : [])[0] ?? null,
+          forwardedTo: forwards.filter(forward => forward.from === recipient.member).map(forward => forward.toName) };
       }),
     };
   }
@@ -990,7 +1026,8 @@ export class PushService {
     const done = () => rm(dir, { recursive: true, force: true }).catch(() => {});
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
-      const pack = await buildSummary({ push, recipients, items, files: await this.#heldFiles(id, items), dir, partBytes: Number.MAX_SAFE_INTEGER, now: this.#now(),
+      const pack = await buildSummary({ push, recipients, items, forwards: this.#store.forwards(id, "confirmed"), files: await this.#heldFiles(id, items), dir,
+        partBytes: Number.MAX_SAFE_INTEGER, now: this.#now(),
         signal: signal ? AbortSignal.any([this.#signal, signal]) : this.#signal });
       if (pack.parts.length !== 1) throw new PushRefused("回复附件合计超过 4 GiB，请按人下载");
       const part = pack.parts[0]!, person = recipients[0]!;
@@ -1042,216 +1079,372 @@ export class PushService {
         if (push.mode !== "options" || option === undefined || option >= push.options.length) break;
         bump({ choice: option, choiceAt: now, ackedAt: recipient.ackedAt ?? now });
         break;
-      case "reply":
-      case "edit":
-        if (push.mode !== "reply" || recipient.replyState === "replying") break;
-        if (action === "reply" ? recipient.submitted > 0 : recipient.submitted === 0) break;
-        if (!this.#startReply(push, recipient, now)) break;
-        break;
-      case "done":
-        if (recipient.replyState === "replying") this.#submit(push, recipient, "button");
-        break;
-      case "abandon":
-        if (recipient.replyState === "replying") this.#abandon(push, recipient);
-        break;
     }
     this.#refreshCard(push.id, phone);
     this.#checkComplete(push.id);
   }
 
-  /** Open a draft revision; false when another reply with content is open (the member is told to end it first). */
-  #startReply(push: Push, recipient: Recipient, now: number): boolean {
-    const other = this.#store.replying(recipient.member), group = memberGroup(recipient.member) !== undefined;
-    if (other && other.pushId !== push.id) {
-      const otherPush = this.#store.push(other.pushId)!;
-      if (this.#store.items(other.pushId, other.member, other.draft).length) {
-        this.#text(this.#memberTarget(recipient), group
-          ? `本群正在回复「${otherPush.subject}」，还没有提交。请先在那张卡片上点「已回复」或「取消」（也可以发送 @机器人 /完成 或 /取消），再点这张卡片的「回复」。`
-          : `你正在回复「${otherPush.subject}」，还没有提交。请先在那张卡片上点「已回复」或「取消」（也可以发送 /完成 或 /取消），再点这张卡片的「回复」。`);
-        return false;
-      }
-      // Nothing was sent into it yet: switching loses nothing.
-      this.#store.updateRecipient(other.pushId, other.member, { replyState: other.submitted > 0 ? "submitted" : "none", draft: 0, version: other.version + 1 });
-      this.#refreshCard(other.pushId, other.member);
-    }
-    const revision = Math.max(recipient.draft, recipient.submitted, this.#lastRevision(push.id, recipient.member)) + 1;
-    this.#store.updateRecipient(push.id, recipient.member, { replyState: "replying", draft: revision, ackedAt: recipient.ackedAt ?? now, activityAt: now,
-      remindedAt: null, version: recipient.version + 1 });
-    this.#text(this.#memberTarget(recipient), group
-      ? `推送「${push.subject}」回复中：请 @机器人 发送回复文字，可以分多条、由多人发；发完点卡片上的「已回复」，或发送 @机器人 /完成。这期间 @机器人 的消息都记为回复。`
-      : `请发送「${push.subject}」的回复内容，文字和附件都可以，可以分多条发；发完点卡片上的「已回复」，或发送 /完成。`
-        + "回复期间你发的消息都记入回复，不会交给机器人回答。");
-    return true;
-  }
+  // ---- handing a push on (push_forward) -------------------------------------------------------------------------------
 
-  #lastRevision(pushId: string, member: string): number {
-    return this.#store.items(pushId, member).reduce((max, item) => Math.max(max, item.revision), 0);
-  }
-
-  /** Submit the open draft; one without content is refused with a notice. */
-  #submit(push: Push, recipient: Recipient, how: "button" | "command" | "deadline"): boolean {
-    const items = this.#store.items(push.id, recipient.member, recipient.draft), group = memberGroup(recipient.member);
-    if (!items.length) {
-      if (how !== "deadline") {
-        this.#text(this.#memberTarget(recipient), group === undefined ? "还没有收到回复内容。请先发送文字或附件，再点「已回复」；不回复了请点「取消」。"
-          : "还没有收到回复内容。请先 @机器人 发送回复文字，再点「已回复」；不回复了请点「取消」。");
-      }
-      return false;
-    }
+  /**
+   * A recipient wants the push to go to someone else: the person is checked against the address book and a card asks the
+   * recipient; nothing goes to that person before 「确认转派」. The model's answer.
+   */
+  async forward(speaker: { phone: string }, input: ForwardInput): Promise<string> {
+    const { push, recipient } = this.#reachedPush(DIRECT_SCOPE, speaker.phone, input.push);
+    const problems: string[] = [];
+    const target = this.#checkPeople([input.to ?? { name: "", phone: "" }], "转派对象", problems)[0];
+    if (!target) throw new PushRefused(problems.join("；") || "转派对象要有姓名和手机号，先用 directory_lookup 查。");
+    if (target.phone === speaker.phone) throw new PushRefused("不能转给成员自己。");
+    if (target.phone === push.pusher) throw new PushRefused(`${target.name} 就是这条推送的推送人，不用转。`);
+    if (this.#listed(push.id, target.phone)) throw new PushRefused(`${target.name} 已经在「${push.subject}」的名单里，不用转。`);
     const now = this.#now();
-    const previous = recipient.submitted;
-    this.#store.updateRecipient(push.id, recipient.member, { replyState: "submitted", submitted: recipient.draft, draft: 0, submittedAt: now, activityAt: now,
-      version: recipient.version + 1 });
-    if (previous > 0) this.#release(push.id, recipient.member, this.#store.items(push.id, recipient.member, previous));
-    const counts = group === undefined ? countsText(countsOf(items)) : groupReplyText(senders(items), countsOf(items));
-    if (how === "command") this.#text(this.#memberTarget(recipient), `已提交「${push.subject}」的${group === undefined ? "" : "群"}回复（${counts}）。`);
-    if (how === "deadline") this.#text(this.#memberTarget(recipient), `「${push.subject}」已到截止时间，${group === undefined ? "你" : "群里"}已发送的内容（${counts}）按已回复提交。`);
-    const data = { push: push.id, event: "reply", revision: recipient.draft };
-    if (group === undefined) {
-      const text = replyText(items), files = items.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
-      this.#note(DIRECT_SCOPE, recipient.member, `reply:${push.id}:${recipient.draft}`, `[推送回复] 已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${quoted(push.subject)}」：`
-        + `${text ? truncate(oneLine(text), 500) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}。推送编号 ${push.id}`, data);
-    } else {
-      // Each sender's group conversation gets what they sent, never the others' texts.
-      for (const sender of new Set(items.flatMap(item => item.sender ?? []))) {
-        const own = items.filter(item => item.sender === sender).map(item => item.text ?? "").join("\n\n");
-        this.#note(groupScope(group), sender, `reply:${push.id}:${recipient.draft}`, `[推送回复] 本群已${previous > 0 ? "修改" : ""}回复 ${push.pusherName} 推送的「${quoted(push.subject)}」`
-          + `（${counts}），其中你发的：${truncate(oneLine(own), 500)}。推送编号 ${push.id}`, data);
+    const forward: Forward = { id: this.#newId(id => this.#store.forward(id) !== undefined), pushId: push.id, from: speaker.phone, to: target.phone, toName: target.name,
+      state: "pending", card: null, version: 0, createdAt: now, decidedAt: null };
+    this.#atomic(() => {
+      // Asked again for the same person: the earlier card no longer counts.
+      for (const earlier of this.#store.forwards(push.id, "pending")) {
+        if (earlier.from !== speaker.phone || earlier.to !== target.phone) continue;
+        this.#store.updateForward(earlier.id, { state: "cancelled", decidedAt: now, version: earlier.version + 1 });
+        this.#refreshForward(earlier.id);
       }
+      this.#store.addForward(forward);
+    });
+    const outcome = await this.#outbound.send(this.#memberTarget(recipient), cardMessage(this.#forwardCard(forward.id)!), { signal: this.#signal });
+    if (outcome.status === "failed") {
+      this.#store.updateForward(forward.id, { state: "cancelled", decidedAt: this.#now(), version: 1 });
+      throw new Error(`确认卡片没有发出（${outcome.reason}），没有转派，请稍后再试`);
     }
-    log.info(`推送 ${push.id}：${group === undefined ? "一位接收人" : "一个群"}${previous > 0 ? "修改了" : "提交了"}回复（${how === "deadline" ? "截止时自动提交" : how === "command" ? "命令" : "按钮"}）`);
-    return true;
+    log.info(`推送 ${push.id}：一位接收人准备转派，等待确认`);
+    const places = this.#directory.departments.departmentsOf([target.phone]).get(target.phone) ?? [];
+    return `已把确认卡片发给成员本人：把「${push.subject}」转给 ${target.name}${places.length ? `（${places.join("；")}）` : ""}。`
+      + `成员点卡片上的「确认转派」后才会发给 ${target.name}，点之前没有发给任何人。`
+      + (outcome.status === "uncertain" ? "（确认卡片的发送结果不确定，成员没收到的话请重新提出。）" : "");
   }
 
-  #abandon(push: Push, recipient: Recipient): void {
-    const items = this.#store.items(push.id, recipient.member, recipient.draft), group = memberGroup(recipient.member);
-    this.#store.updateRecipient(push.id, recipient.member, { replyState: recipient.submitted > 0 ? "submitted" : "none", draft: 0, activityAt: this.#now(),
-      version: recipient.version + 1 });
-    this.#release(push.id, recipient.member, items);
-    const requestId = `abandon:${push.id}:${recipient.draft}`, data = { push: push.id, event: "abandon", revision: recipient.draft };
-    const kept = recipient.submitted > 0 ? "修改，之前提交的回复仍然有效" : "";
-    if (items.length && group === undefined) {
-      this.#note(DIRECT_SCOPE, recipient.member, requestId, `[推送回复] 放弃了这次对 ${push.pusherName} 推送的「${quoted(push.subject)}」的回复${kept}。推送编号 ${push.id}`, data);
-    }
-    for (const sender of group === undefined ? [] : new Set(items.flatMap(item => item.sender ?? []))) {
-      this.#note(groupScope(group!), sender, requestId, `[推送回复] 本群放弃了这次对 ${push.pusherName} 推送的「${quoted(push.subject)}」的回复${kept}，你在其中发的内容不算回复。`
-        + `推送编号 ${push.id}`, data);
-    }
+  /** In the push's list already; a person whose card could not be delivered may be handed the push (again). */
+  #listed(pushId: string, member: string): boolean {
+    const row = this.#store.recipient(pushId, member);
+    return row !== undefined && !(row.sendState === "failed" && row.retryAt === null);
   }
 
-  // ---- the member's direct messages -----------------------------------------------------------------------------------
-
-  /** The message is already a reply item (a redelivery after a restart). */
-  seen(msgUid: string): boolean {
-    return this.#store.hasItem(msgUid);
+  /** 「确认转派」 or 「取消」 on the card that asked (only the recipient's click counts). */
+  #forwardClick(push: Push, click: Click): void {
+    const asked = click.data.forward === undefined ? undefined : this.#store.forward(click.data.forward);
+    if (!asked || asked.pushId !== push.id) { log.info(`推送 ${push.id} 的转派记录不存在，忽略点击`); return; }
+    const recipient = this.#store.recipient(push.id, asked.from);
+    if (this.#directory.lookup(click.userId)?.phone !== asked.from && click.userId !== recipient?.receiveId) { log.warn(`推送 ${push.id} 的转派确认卡片被别人点击，忽略`); return; }
+    if (asked.card !== click.card) this.#store.updateForward(asked.id, { card: click.card });
+    const forward = this.#store.forward(asked.id)!;
+    if (forward.state !== "pending" || click.data.version !== forward.version) { this.#refreshForward(forward.id); return; }
+    const now = this.#now();
+    const drop = (why?: string) => {
+      this.#store.updateForward(forward.id, { state: "cancelled", decidedAt: now, version: forward.version + 1 });
+      if (why && recipient) this.#text(this.#memberTarget(recipient), why);
+    };
+    const target = this.#directory.byPhone(forward.to);
+    if (click.data.action === "keep") drop();
+    else if (!recipient || !LIVE_STATES.includes(push.state)) drop(`「${push.subject}」已经结束，没有转给 ${forward.toName}。`);
+    else if (!target) drop(`${forward.toName} 已经不在机器人同步的通讯录里，「${push.subject}」没有转出去。`);
+    else if (this.#listed(push.id, forward.to)) drop(`${forward.toName} 已经在「${push.subject}」的名单里，没有再转。`);
+    else {
+      this.#atomic(() => {
+        this.#store.updateForward(forward.id, { state: "confirmed", decidedAt: now, version: forward.version + 1 });
+        // A card that could not be delivered before is tried afresh.
+        if (this.#store.recipient(push.id, forward.to)) this.#store.updateRecipient(push.id, forward.to, { sendState: "pending", sendAttempts: 0, sendError: null, retryAt: null });
+        else this.#store.addRecipient(this.#recipientRow(push.id, personReached(target)));
+        const data = { push: push.id, event: "forward", forward: forward.id };
+        this.#note(DIRECT_SCOPE, forward.from, `forward:${forward.id}`, `[推送转派] 已把 ${push.pusherName} 推送的「${quoted(push.subject)}」转给 ${target.name}。推送编号 ${push.id}`, data);
+        this.#note(DIRECT_SCOPE, push.pusher, `forwarded:${forward.id}`, `[推送转派] ${recipient.name} 把「${quoted(push.subject)}」转给了 ${target.name}。推送编号 ${push.id}`, data);
+        this.#text(this.#pusherTarget(push), `${recipient.name} 把「${push.subject}」转给了 ${target.name}。`);
+      });
+      log.info(`推送 ${push.id}：一位接收人把推送转给了另一个人`);
+      this.#refreshCard(push.id, forward.from);
+      this.#refreshPreview(push.id);
+      this.#pump();
+    }
+    this.#refreshForward(forward.id);
   }
 
   /**
-   * A direct-chat text of a member (the inbound router asks before admitting it): true when the push took it, as a reply
-   * or as /完成 or /取消, or /登记群 (answered with where to send it). Other commands keep their meaning while replying.
-   * Synchronous: call it in arrival order.
+   * The card of a push handed on could not be delivered: it did not get there, so the push is with the one who handed it
+   * on again. They are told, and may hand it on once more (to the same person too).
+   */
+  #forwardUndelivered(push: Push, recipient: Recipient): void {
+    const forward = this.#store.forwards(push.id, "confirmed").find(each => each.to === recipient.member);
+    const by = forward && this.#store.recipient(push.id, forward.from);
+    if (!forward || !by) return;
+    this.#store.updateForward(forward.id, { state: "cancelled", decidedAt: this.#now(), version: forward.version + 1 });
+    this.#text(this.#memberTarget(by), `转给 ${recipient.name} 的「${push.subject}」没有发出去，这条推送还在你这里：可以再转一次，或者直接找对方。`);
+    this.#refreshForward(forward.id);
+    this.#refreshCard(push.id, by.member);
+    this.#refreshPreview(push.id);
+  }
+
+  /** Who handed the push on to this recipient (their row), if anyone did. */
+  #forwardedBy(pushId: string, member: string): Recipient | undefined {
+    const forward = this.#store.forwards(pushId, "confirmed").find(each => each.to === member);
+    return forward && this.#store.recipient(pushId, forward.from);
+  }
+
+  // ---- replies (push_reply) and what the conversations are told -------------------------------------------------------
+
+  /** The speaker's row in live pushes: their own in a direct chat, their group's in a group. */
+  #memberOf(scope: Scope, phone: string): string {
+    return scope.kind === "group" ? groupMember(scope.groupId) : phone;
+  }
+
+  /** The live push `id` whose card reached the speaker; refuses with what to tell the member. A push past its deadline ends first. */
+  #reachedPush(scope: Scope, phone: string, id: string): { push: Push; recipient: Recipient } {
+    const found = this.#store.push(String(id ?? "").trim().toLowerCase());
+    const recipient = found && this.#store.recipient(found.id, this.#memberOf(scope, phone));
+    if (!found || !recipient || (recipient.sendState !== "sent" && recipient.sendState !== "uncertain") || found.state === "preview") {
+      throw new PushRefused(`没有发给${scope.kind === "group" ? "本群" : "这位成员"}的推送 ${String(id ?? "")}；编号见请求末尾“[推送]”一段。`);
+    }
+    if (this.#closeIfDue(found) || !LIVE_STATES.includes(found.state)) throw new PushRefused(`「${found.subject}」已经结束，不能再改了。`);
+    return { push: found, recipient };
+  }
+
+  /** Whether live pushes reached the speaker: their conversation then gets the reply tools and the tail (src/server/app.ts). */
+  hasLive(scope: Scope, phone: string): boolean {
+    return this.#store.reached(this.#memberOf(scope, phone)).length > 0;
+  }
+
+  /**
+   * The live pushes that reached the speaker, for the tail of the conversation's model requests: what each asks for, what
+   * the speaker did so far, and the body of those still waiting for a reply. Undefined when there is none.
+   */
+  pending(scope: Scope, phone: string): string | undefined {
+    const member = this.#memberOf(scope, phone), group = scope.kind === "group", now = this.#now();
+    const rows = this.#store.reached(member).map(recipient => ({ recipient, push: this.#store.push(recipient.pushId)! })).filter(({ push }) => now < push.deadline);
+    if (!rows.length) return undefined;
+    const shown = rows.slice(-this.#limits.pendingShown);
+    const lines = shown.map(({ push, recipient }) => {
+      const items = effectiveItems(recipient, this.#store.items(push.id, member));
+      const to = this.#store.forwards(push.id, "confirmed").filter(forward => forward.from === member).map(forward => forward.toName);
+      const own = group ? items.filter(item => item.sender === phone).length : 0;
+      const state = push.mode === "ack" ? (recipient.ackedAt === null ? "还没有确认" : "已确认")
+        : push.mode === "options" ? (recipient.choice === null ? "还没有选" : `已选「${push.options[recipient.choice]}」`)
+        : !items.length ? "还没有回复"
+        : group ? `已回复（共 ${items.length} 段文字，其中这位成员 ${own} 段）` : `已回复（${countsText(countsOf(items))}）`;
+      const asks = push.mode === "ack" ? "确认收到（成员在卡片上点「已收到」）" : push.mode === "options" ? `选择 ${push.options.join(" / ")}（成员在卡片上点）`
+        : group ? "回复（群里只收文字）" : "回复（文字或附件）";
+      return `- 推送编号 ${push.id}：${push.pusherName} ${shortTime(push.confirmedAt ?? push.createdAt, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」，要求${asks}，`
+        + `截止 ${shortTime(push.deadline, now)}。${state}${to.length ? `，已转给 ${to.join("、")}` : ""}。`
+        + (push.mode === "reply" && !items.length ? `正文（引用）：「${quoted(truncate(oneLine(push.body), 300))}」` : "");
+    });
+    return [`[推送] ${group ? "本群" : "这位成员"}收到、还没有结束的推送${rows.length > shown.length ? `（共 ${rows.length} 条，这里是最近 ${shown.length} 条）` : ""}：`, ...lines].join("\n");
+  }
+
+  /**
+   * A direct-chat text of a member (the inbound router asks before admitting it): true only for /登记群, answered with
+   * where to send it. A recipient's text is kept for replies recorded from it later. Synchronous: call it in arrival order.
    */
   directText(identity: DirectoryIdentity, reply: ReplyContext, text: string): boolean {
     const command = isSlashCommandMessage(text) ? canonicalCommand(text) : undefined;
     if (command === "/登记群") { this.#notice(reply, "请在要登记的群里发送“@机器人 /登记群 群名”。"); return true; }
-    let replying = this.#store.replying(identity.phone);
-    const late = this.#lateReply(replying);
-    if (late) {
-      // Other commands keep their meaning; there is no reply open any more.
-      if (command !== undefined && command !== "/完成" && command !== "/取消") replying = undefined;
-      else { this.#notice(reply, `「${late.subject}」已过截止时间，${command === undefined ? "这条消息没有记入回复" : "回复已经结束"}。`); return true; }
-    }
-    if (command === "/完成" || command === "/取消") {
-      if (!replying) this.#notice(reply, "当前没有回复中的推送。");
-      else this.#endReply(replying, command, reply);
-      return true;
-    }
-    if (!replying) {
-      if (command === undefined) this.#hint(identity.phone, reply);
-      return false;
-    }
-    if (command !== undefined) return false;
-    const push = this.#store.push(replying.pushId)!;
-    const id = this.#store.addItem({ pushId: push.id, member: identity.phone, revision: replying.draft, msgUid: reply.msgUid, kind: "text", text,
-      attachment: null, name: null, size: null, error: null, receivedAt: reply.receivedAt, sender: null, senderName: null });
-    if (id === undefined) return true;
-    this.#recorded(push, replying, reply);
-    return true;
-  }
-
-  /** A direct-chat attachment: true when it is a reply (registered as held by the push), false for the member's next request. */
-  directAttachment(identity: DirectoryIdentity, reply: ReplyContext, attachment: AttachmentEvent): boolean {
-    const replying = this.#store.replying(identity.phone);
-    if (!replying) return false;
-    const late = this.#lateReply(replying);
-    if (late) { this.#notice(reply, `「${late.subject}」已过截止时间，这个附件没有记入回复。`); return true; }
-    const push = this.#store.push(replying.pushId)!;
-    // The item first: a crash before the registration commits leaves an item the startup reconciliation settles.
-    const id = this.#store.addItem({ pushId: push.id, member: identity.phone, revision: replying.draft, msgUid: reply.msgUid, kind: attachment.kind, text: null,
-      attachment: null, name: attachment.name, size: attachment.size ?? null, error: null, receivedAt: reply.receivedAt, sender: null,
-      senderName: null });
-    if (id === undefined) return true;
-    const host = this.#host!;
-    this.#track(host.attach({ scope: DIRECT_SCOPE, phone: identity.phone, reply, attachment, hold: holderOf(push.id) }).then(result => {
-      if (result.status === "accepted") this.#store.updateItem(id, { attachment: result.attachment });
-      else if (result.status === "duplicate") return this.#reconcileItem({ ...this.#store.items(push.id, identity.phone).find(item => item.id === id)! });
-      else this.#store.updateItem(id, { error: result.message });
-    }, error => {
-      if (this.#signal.aborted) return;
-      this.#report(error);
-      this.#store.updateItem(id, { error: "附件未能登记" });
-      this.#notice(reply, "⚠️ 附件未能登记，请重新发送。");
-    }).finally(() => { this.#refreshCard(push.id, identity.phone); this.#settled(push.id); }));
-    this.#recorded(push, replying, reply);
-    return true;
-  }
-
-  /** /完成 or /取消 of the open reply (a person's, or a group's). */
-  #endReply(replying: Recipient, command: "/完成" | "/取消", reply: ReplyContext): void {
-    const push = this.#store.push(replying.pushId)!;
-    if (command === "/完成") this.#submit(push, replying, "command");
-    else {
-      this.#abandon(push, replying);
-      this.#notice(reply, `已放弃这次对「${push.subject}」的${memberGroup(replying.member) === undefined ? "" : "群"}回复${replying.submitted > 0 ? "修改，之前提交的回复仍然有效" : ""}。`);
-    }
-    this.#refreshCard(push.id, replying.member);
-    this.#checkComplete(push.id);
+    if (command === undefined) this.#hear(identity.phone, identity.phone, reply, text);
+    return false;
   }
 
   /**
    * A group text that @-mentions the bot (the inbound router asks before admitting it): the group is known from it. True
-   * when the push took it: /登记群, /完成 or /取消, or a reply text while the group is replying (with its sender; other
-   * commands keep their meaning). Otherwise the member's group conversation learns of the group's live pushes first.
-   * Synchronous: call it in arrival order.
+   * only for /登记群. Otherwise the member's group conversation learns of the group's live pushes first, and the text is
+   * kept for replies recorded from it. Synchronous: call it in arrival order.
    */
   groupText(groupId: string, identity: DirectoryIdentity, reply: ReplyContext, text: string): boolean {
     this.#groupSeen(groupId);
     const command = isSlashCommandMessage(text) ? canonicalCommand(text) : undefined;
     if (command === "/登记群") { this.#registerCommand(groupId, identity, reply, text); return true; }
-    const member = groupMember(groupId);
-    let replying = this.#store.replying(member);
-    const late = this.#lateReply(replying);
-    if (late) {
-      if (command !== undefined && command !== "/完成" && command !== "/取消") replying = undefined;
-      else { this.#notice(reply, `「${late.subject}」已过截止时间，${command === undefined ? "这条消息没有记入回复" : "回复已经结束"}。`); return true; }
-    }
-    if (command === "/完成" || command === "/取消") {
-      if (!replying) this.#notice(reply, "本群当前没有回复中的推送。");
-      else this.#endReply(replying, command, reply);
-      return true;
-    }
     this.#groupNotes(groupId, identity.phone);
-    if (!replying || command !== undefined) return false;
-    const push = this.#store.push(replying.pushId)!;
-    const id = this.#store.addItem({ pushId: push.id, member, revision: replying.draft, msgUid: reply.msgUid, kind: "text", text, attachment: null, name: null,
-      size: null, error: null, receivedAt: reply.receivedAt, sender: identity.phone, senderName: identity.name });
-    if (id === undefined) return true;
-    this.#store.updateRecipient(push.id, member, { activityAt: this.#now() });
-    // Every text gets a receipt: whoever @-mentioned the bot for something else learns it became a reply.
-    const count = this.#store.items(push.id, member, replying.draft).length;
-    this.#notice(reply, `已记为「${push.subject}」的回复（第 ${count} 段）。发完点卡片上的「已回复」，或发送 @机器人 /完成。`);
-    this.#refreshCard(push.id, member);
-    return true;
+    if (command === undefined) this.#hear(groupMember(groupId), identity.phone, reply, text);
+    return false;
+  }
+
+  /** Keep the text while a push waits for replies there. */
+  #hear(member: string, sender: string, reply: ReplyContext, text: string): void {
+    if (!this.#store.reached(member).some(recipient => this.#store.push(recipient.pushId)!.mode === "reply")) return;
+    this.#store.hear({ msgUid: reply.msgUid, member, sender, text, receivedAt: reply.receivedAt }, this.#limits.heardKeep);
+  }
+
+  /**
+   * What a member is asked when an attachment arrives in the direct chat while pushes wait for their reply: it may be one.
+   * Undefined otherwise (the message service asks as always).
+   */
+  attachmentAsk(phone: string): string | undefined {
+    const now = this.#now();
+    const waiting = this.#store.awaitingReply(phone).map(recipient => this.#store.push(recipient.pushId)!).filter(push => now < push.deadline);
+    if (!waiting.length) return undefined;
+    return waiting.length === 1 ? `是回复「${waiting[0]!.subject}」的话说一声，我记进去；要我处理别的也直接说。`
+      : "是回复推送的话告诉我是哪一条，我记进去；要我处理别的也直接说。";
+  }
+
+  /**
+   * Record a reply, or change one (push_reply): the speaker's message as it was sent, never the model's wording of it.
+   * In a group the reply is the group's and each text keeps its sender; a member replaces or withdraws only their own.
+   * The model's answer.
+   */
+  async reply(speaker: Speaker, input: ReplyInput): Promise<string> {
+    const { push, recipient } = this.#reachedPush(speaker.scope, speaker.phone, input.push);
+    const group = memberGroup(recipient.member) !== undefined;
+    if (push.mode !== "reply") throw new PushRefused(`「${push.subject}」不收回复：它要的是${requirementText(push)}，由成员在卡片上点。`);
+    if (input.action === "withdraw") return this.#withdraw(push, recipient, speaker.phone);
+    if (input.action !== "add" && input.action !== "replace") throw new PushRefused("action 必须是 add、replace 或 withdraw。");
+    const source = this.#source(speaker, recipient.member, input.quote);
+    // A group takes texts only; the attachments of a direct message are the ones its request bound.
+    const files = group ? [] : await this.#boundFiles(speaker.phone, source.msgUid);
+    const recorded = this.#atomic(() => this.#record(push.id, recipient.member, speaker.phone, source, files, input.action === "replace"));
+    await this.#hold(push.id, recipient.member, recorded.held);
+    this.#refreshCard(push.id, recipient.member);
+    this.#checkComplete(push.id);
+    log.info(`推送 ${push.id}：${group ? "一个群" : "一位接收人"}${recorded.already ? "的回复没有变化" : input.action === "replace" ? "改了回复" : "回复了"}`);
+    const total = group ? `本群的回复现在共 ${recorded.counts.texts} 段文字` : `回复现在共有${countsText(recorded.counts)}`;
+    return (recorded.already ? `这条消息已经在「${push.subject}」的回复里了，没有重复记。` : `已把成员的这条消息${input.action === "replace" ? "记为" : "记入"} ${push.pusherName} 推送的「${push.subject}」的回复`
+      + `${input.action === "replace" ? (group ? "，这位成员之前发的不算了" : "，之前记的不算了") : ""}。`)
+      + `${total}。`
+      + (recorded.lost.length ? `这些附件没有收到，没有记进去，请成员重发：${recorded.lost.join("、")}。` : "");
+  }
+
+  /** The message a reply is recorded from: the request's, or the speaker's latest kept text that contains `quote`. */
+  #source(speaker: Speaker, member: string, quote: string | undefined): Speaker["message"] {
+    const wanted = compactName(quote ?? "");
+    if (!wanted) return speaker.message;
+    const found = this.#store.heard(member, speaker.phone).find(heard => compactName(heard.text).includes(wanted));
+    if (!found) throw new PushRefused("在这位成员最近的消息里没有找到这段话。quote 要照抄成员那条消息里的原话，一小段就够；实在找不到，请成员把回复内容再发一遍。");
+    return { msgUid: found.msgUid, text: found.text, receivedAt: found.receivedAt };
+  }
+
+  /** The attachments the request of message `msgUid` bound, in arrival order. */
+  async #boundFiles(phone: string, msgUid: string): Promise<Attachment[]> {
+    const records = await this.#host!.records(DIRECT_SCOPE, phone);
+    const request = Object.values(records.requests).find(record => record.reply.msgUid === msgUid);
+    if (!request) return [];
+    return Object.values(records.attachments).filter(attachment => attachment.boundTo === request.requestId && attachment.state !== "void")
+      .sort((a, b) => a.epoch - b.epoch || a.receivedAt - b.receivedAt);
+  }
+
+  /**
+   * In one transaction: the message's text and files become items of the reply (`replace`: instead of what the sender
+   * had there). A message is part of one reply only. `held`: the attachments to hold for the push; `lost`: files that
+   * did not arrive.
+   */
+  #record(pushId: string, member: string, sender: string, source: Speaker["message"], files: readonly Attachment[], replace: boolean):
+    { already: boolean; counts: Counts; held: string[]; lost: string[] } {
+    const push = this.#store.push(pushId), recipient = this.#store.recipient(pushId, member);
+    if (!push || !recipient || !LIVE_STATES.includes(push.state)) throw new PushRefused(`「${push?.subject ?? pushId}」已经结束，不能再改了。`);
+    const group = memberGroup(member) !== undefined, now = this.#now();
+    const current = effectiveItems(recipient, this.#store.items(pushId, member));
+    const arrived = files.filter(file => file.state === "ready" || file.state === "pending");
+    const lost = files.filter(file => !arrived.includes(file)).map(file => file.name);
+    if (!source.text.trim() && !arrived.length) throw new PushRefused("这条消息没有可以记的内容。");
+    const uids = [source.msgUid, ...arrived.map(file => file.msgUid)];
+    for (const uid of uids) {
+      const existing = this.#store.itemOf(uid);
+      if (!existing || current.some(item => item.id === existing.id)) continue;
+      const elsewhere = this.#store.recipient(existing.pushId, existing.member);
+      if (elsewhere && existing.revision === elsewhere.submitted) {
+        throw new PushRefused(`这条消息已经记在「${this.#store.push(existing.pushId)?.subject ?? existing.pushId}」的回复里；一条消息只记到一条推送，要改记先把那边的撤回，或者请成员再发一遍。`);
+      }
+      // Left by a reply that was replaced before replies went through the conversation: not part of anything.
+      this.#store.removeItems([existing.id]);
+    }
+    const have = new Set(current.map(item => item.msgUid));
+    const already = uids.every(uid => have.has(uid) || (uid === source.msgUid && !source.text.trim()));
+    if (replace) {
+      const dropped = current.filter(item => (group ? item.sender === sender : true) && !uids.includes(item.msgUid));
+      this.#store.removeItems(dropped.map(item => item.id));
+      this.#release(pushId, member, dropped);
+    } else if (already) {
+      return { already, counts: countsOf(current), held: [], lost };
+    }
+    const revision = recipient.submitted > 0 ? recipient.submitted : this.#store.items(pushId, member).reduce((max, item) => Math.max(max, item.revision), 0) + 1;
+    const name = group ? this.#directory.byPhone(sender)?.name ?? sender : null;
+    if (source.text.trim() && !have.has(source.msgUid)) {
+      this.#store.addItem({ pushId, member, revision, msgUid: source.msgUid, kind: "text", text: source.text, attachment: null, name: null, size: null, error: null,
+        receivedAt: source.receivedAt, sender: group ? sender : null, senderName: name });
+    }
+    for (const file of arrived) {
+      if (have.has(file.msgUid)) continue;
+      this.#store.addItem({ pushId, member, revision, msgUid: file.msgUid, kind: file.kind, text: null, attachment: file.id, name: file.name, size: file.actualSize ?? file.size ?? null,
+        error: null, receivedAt: file.receivedAt, sender: null, senderName: null });
+    }
+    this.#store.updateRecipient(pushId, member, { submitted: revision, submittedAt: now, ackedAt: recipient.ackedAt ?? now, version: recipient.version + 1 });
+    const after = this.#store.items(pushId, member, revision);
+    return { already: already && !replace, counts: countsOf(after), held: arrived.map(file => file.id), lost };
+  }
+
+  /** The reply's attachments stay with the push until its summary went out (again at startup, should a process end before this). */
+  async #hold(pushId: string, member: string, ids: readonly string[]): Promise<void> {
+    if (!ids.length || memberGroup(member) !== undefined) return;
+    try { await this.#host!.holdAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids); }
+    catch (error) { if (!this.#signal.aborted) this.#report(error); }
+  }
+
+  /** At startup: the attachments of the replies to live pushes are held (a process may have ended between the record and the hold). */
+  async #holdReplies(): Promise<void> {
+    if (!this.#host) return;
+    for (const push of this.#store.pushesIn(LIVE_STATES)) {
+      const items = this.#store.items(push.id).filter(item => item.attachment !== null);
+      for (const member of new Set(items.map(item => item.member))) {
+        await this.#hold(push.id, member, items.flatMap(item => item.member === member ? [item.attachment!] : []));
+      }
+    }
+  }
+
+  /** Drop the reply: a person's whole reply, in a group what this member sent. */
+  #withdraw(push: Push, asked: Recipient, sender: string): string {
+    const group = memberGroup(asked.member) !== undefined;
+    const left = this.#atomic(() => {
+      const recipient = this.#store.recipient(push.id, asked.member)!;
+      const current = effectiveItems(recipient, this.#store.items(push.id, asked.member));
+      const own = group ? current.filter(item => item.sender === sender) : current;
+      if (!own.length) return undefined;
+      this.#store.removeItems(own.map(item => item.id));
+      this.#release(push.id, asked.member, own);
+      const rest = current.length - own.length;
+      this.#store.updateRecipient(push.id, asked.member, { ...(rest ? { submittedAt: this.#now() } : { submitted: 0, submittedAt: null }), version: recipient.version + 1 });
+      return rest;
+    });
+    if (left === undefined) return group ? `这位成员在本群没有给「${push.subject}」记过回复，没有可以撤回的。` : `「${push.subject}」还没有记过回复，没有可以撤回的。`;
+    this.#refreshCard(push.id, asked.member);
+    log.info(`推送 ${push.id}：${group ? "一个群里有人" : "一位接收人"}撤回了回复`);
+    return group ? `已撤回这位成员在「${push.subject}」里发的回复${left ? `，群里其他人发的 ${left} 段还在` : "，本群现在没有回复"}。`
+      : `已撤回「${push.subject}」的回复，现在是没有回复。`;
+  }
+
+  /**
+   * A request ended without an answer (the model failed or ran out of time; src/durable/service.ts asks before it tells
+   * the member): with exactly one push waiting for the speaker's reply the message is recorded as that reply, so an outage
+   * of the model loses none. Returns the line that tells the member, or undefined when no push waits.
+   */
+  async failed(speaker: Speaker): Promise<string | undefined> {
+    const group = speaker.scope.kind === "group", member = this.#memberOf(speaker.scope, speaker.phone), now = this.#now();
+    const existing = this.#store.itemOf(speaker.message.msgUid), recorded = existing && this.#store.push(existing.pushId);
+    if (recorded) return `这条消息已经记进「${recorded.subject}」的回复了，不用重发。`;
+    const waiting = this.#store.awaitingReply(member).map(recipient => this.#store.push(recipient.pushId)!).filter(push => now < push.deadline);
+    if (!waiting.length) return undefined;
+    if (waiting.length > 1) {
+      return `${group ? "本群" : "你"}有 ${waiting.length} 条推送等着回复（${waiting.slice(0, 5).map(push => `「${push.subject}」`).join("、")}${waiting.length > 5 ? " 等" : ""}），`
+        + "这条消息没有记进去；是回复的话，请过一会儿再发一次。";
+    }
+    const push = waiting[0]!;
+    try {
+      const files = group ? [] : await this.#boundFiles(speaker.phone, speaker.message.msgUid);
+      const done = this.#atomic(() => {
+        const result = this.#record(push.id, member, speaker.phone, speaker.message, files, false);
+        this.#note(speaker.scope, speaker.phone, `reply:${push.id}:${speaker.message.msgUid}`, `[推送回复] 上面那条没有答上来的消息，系统已经记为${group ? "本群" : ""}对 ${push.pusherName} 推送的`
+          + `「${quoted(push.subject)}」的回复。推送编号 ${push.id}`, { push: push.id, event: "reply" });
+        return result;
+      });
+      await this.#hold(push.id, member, done.held);
+      this.#refreshCard(push.id, member);
+      this.#checkComplete(push.id);
+      log.info(`推送 ${push.id}：模型没有答上来的一条消息记为回复`);
+      return `这条消息我先记进「${push.subject}」的回复了；不是回复的话，回头跟我说一声“撤回”。`;
+    } catch (error) {
+      if (!(error instanceof PushRefused) && !this.#signal.aborted) this.#report(error);
+      return undefined;
+    }
   }
 
   /** The group's live pushes, noted once in this member's group conversation (they may not have seen the card). */
@@ -1272,43 +1465,17 @@ export class PushService {
    */
   #cardNote(push: Push, scope: Scope, phone: string): void {
     const now = this.#now(), group = scope.kind === "group";
-    this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」，正文（引用）：`
-      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}；要求：${group && push.mode === "reply" ? "需要回复（群里只能回复文字）" : requirementText(push)}；`
-      + `截止 ${shortTime(push.deadline, now)}。${push.mode !== "reply" ? "" : group ? "回复请先点卡片上的「回复」，再 @机器人 发送文字。" : "回复请点卡片上的「回复」。"}推送编号 ${push.id}`,
+    const by = group ? undefined : this.#forwardedBy(push.id, phone);
+    this.#note(scope, phone, `card:${push.id}`, `[推送] ${push.pusherName} ${shortTime(push.confirmedAt ?? now, now)} 推送${group ? "到本群" : ""}「${quoted(push.subject)}」`
+      + `${by ? `（${by.name} 转来）` : ""}，正文（引用）：`
+      + `「${quoted(truncate(oneLine(push.body), 500))}」${chars(push.body) > 500 ? "（全文见卡片）" : ""}；要求：${group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push)}；`
+      + `截止 ${shortTime(push.deadline, now)}。推送编号 ${push.id}`,
     { push: push.id, event: "card" });
-  }
-
-  /**
-   * After a direct reply item was recorded: activity, a receipt, the card. `replying` is the recipient as it was before the
-   * item. The first item gets the receipt; so does one that arrives after the reply was reminded or sat without content for
-   * `replyReceiptMs`: it was recorded, not answered, and a member who forgot the open reply would otherwise get no response.
-   */
-  #recorded(push: Push, replying: Recipient, reply: ReplyContext): void {
-    const now = this.#now();
-    this.#store.updateRecipient(push.id, replying.member, { activityAt: now, remindedAt: null });
-    const count = this.#store.items(push.id, replying.member, replying.draft).length;
-    if (count === 1) {
-      this.#notice(reply, `已记入「${push.subject}」的回复。可以继续发送文字或附件，发完点卡片上的「已回复」，或发送 /完成。`);
-    } else if (replying.remindedAt !== null || (replying.activityAt !== null && now - replying.activityAt >= this.#limits.replyReceiptMs)) {
-      this.#notice(reply, `这条消息记入了「${push.subject}」的回复（第 ${count} 条），没有当作提问。发完请点卡片上的「已回复」或发送 /完成；要提问请先发送 /完成 或 /取消。`);
-    }
-    this.#refreshCard(push.id, replying.member);
-  }
-
-  /** Not replying: a member with a push waiting for their reply is told once in a while how to reply (not past its deadline). */
-  #hint(phone: string, reply: ReplyContext): void {
-    const now = this.#now();
-    const waiting = this.#store.awaitingReply(phone).filter(recipient => (recipient.hintedAt === null || now - recipient.hintedAt >= this.#limits.hintMs)
-      && now < this.#store.push(recipient.pushId)!.deadline);
-    if (!waiting.length) return;
-    this.#store.transaction(() => { for (const recipient of waiting) this.#store.updateRecipient(recipient.pushId, phone, { hintedAt: now }); });
-    const subjects = waiting.map(recipient => `「${this.#store.push(recipient.pushId)!.subject}」`).join("、");
-    this.#notice(reply, `你有 ${waiting.length} 条推送待回复：${subjects}。回复请先点卡片上的「回复」，再发送内容；这条消息按普通提问处理。`);
   }
 
   // ---- background: sends, deadlines, summaries, notes -----------------------------------------------------------------
 
-  /** One maintenance pass (also on a timer): due sends, expired previews, deadlines, reminders, notes, summaries. */
+  /** One maintenance pass (also on a timer): due sends, expired previews, deadlines, replies all in, notes, summaries. */
   tick(): void {
     if (this.#closing || this.#ticking) return;
     this.#ticking = true;
@@ -1320,16 +1487,11 @@ export class PushService {
         }
       }
       for (const push of this.#store.pushesIn(LIVE_STATES)) {
-        if (now >= push.deadline) { this.#close(push.id, "deadline"); continue; }
-        // Groups get no reminder: their reply stays open until someone ends it or the deadline.
-        this.#atomic(() => {
-          for (const recipient of this.#store.unreminded(push.id)) {
-            if (now - recipient.activityAt! < this.#limits.idleReminderMs || !this.#store.items(push.id, recipient.member, recipient.draft).length) continue;
-            this.#store.updateRecipient(push.id, recipient.member, { remindedAt: now });
-            this.#text(this.#memberTarget(recipient), `「${push.subject}」的回复还没有提交。发完了请点卡片上的「已回复」或发送 /完成；提交前发来的消息都会记入这次回复，截止时已发送的内容也会按已回复提交。`);
-          }
-        });
+        if (now >= push.deadline) this.#close(push.id, "deadline");
+        // Everyone replied a while ago and nobody added anything since.
+        else if (push.mode === "reply") this.#checkComplete(push.id);
       }
+      this.#store.forgetHeard(now - this.#limits.heardMs);
       this.#pump();
       this.#track(this.#drainNotes());
       for (const push of this.#store.summariesDue()) this.#track(this.#summarize(push.id));
@@ -1386,7 +1548,10 @@ export class PushService {
     if (outcome.status === "failed") {
       const retry = live && attempts < this.#limits.sendAttempts ? now + (this.#limits.sendRetryMs[attempts - 1] ?? this.#limits.sendRetryMs.at(-1)!) : null;
       this.#store.updateRecipient(push.id, recipient.member, { sendState: "failed", sendError: outcome.reason, retryAt: retry });
-      if (retry === null) log.warn(`推送 ${push.id}：一张卡片发送失败（已试 ${attempts} 次）：${outcome.reason}`);
+      if (retry === null) {
+        log.warn(`推送 ${push.id}：一张卡片发送失败（已试 ${attempts} 次）：${outcome.reason}`);
+        this.#forwardUndelivered(push, recipient);
+      }
     } else {
       this.#store.updateRecipient(push.id, recipient.member, { sendState: outcome.status, sentAt: now, sendError: outcome.status === "uncertain" ? outcome.reason : null });
       // A group's members get the note when they next @-mention the bot (#groupNotes).
@@ -1421,12 +1586,18 @@ export class PushService {
     this.#checkComplete(pushId);
   }
 
-  /** Everyone the card reached has answered (and no card is still to go): close early. */
+  /**
+   * Everyone the card reached has answered or handed it on (and no card is still to go): close early. A push asking for
+   * replies waits until nobody added to a reply for `replyGraceMs` (the timer comes back to it): a reply may come in
+   * several messages, and the first one already counts.
+   */
   #checkComplete(pushId: string): void {
     const push = this.#store.push(pushId);
     if (push?.state !== "open") return;
     const counts = this.#store.recipientCounts([pushId]).get(pushId);
-    if (counts && !counts.unsettled && counts.delivered > 0 && counts.answered === counts.delivered) this.#close(pushId, "complete");
+    if (!counts || counts.unsettled || !counts.delivered || counts.answered !== counts.delivered) return;
+    if (push.mode === "reply" && counts.repliedAt !== null && this.#now() - counts.repliedAt < this.#limits.replyGraceMs) return;
+    this.#close(pushId, "complete");
   }
 
   /** A live push past its deadline closes now, before the input at hand is handled (the timer may not have seen it yet). True when it did. */
@@ -1436,13 +1607,7 @@ export class PushService {
     return true;
   }
 
-  /** The push of an open reply, when it is past its deadline: closed now, so what came in is not part of the reply. */
-  #lateReply(replying: Recipient | undefined): Push | undefined {
-    const push = replying && this.#store.push(replying.pushId);
-    return push && this.#closeIfDue(push) ? push : undefined;
-  }
-
-  /** Close a live push: open drafts with content are submitted, the cards show the end, the summary is due. */
+  /** Close a live push: the cards show the end, what was still asked is not handed on, the summary is due. */
   #close(pushId: string, reason: "deadline" | "complete"): void {
     // One transaction for the whole list (5000 rows at most): a commit per row is a disk sync each, on the thread that
     // answers messages. What it sends starts after the commit.
@@ -1450,9 +1615,6 @@ export class PushService {
       const push = this.#store.push(pushId);
       if (!push || !LIVE_STATES.includes(push.state)) return;
       for (const recipient of this.#store.recipients(pushId)) {
-        if (recipient.replyState === "replying" && !this.#submit(push, recipient, "deadline")) {
-          this.#store.updateRecipient(pushId, recipient.member, { replyState: recipient.submitted > 0 ? "submitted" : "none", draft: 0 });
-        }
         if (recipient.sendState === "pending" || (recipient.sendState === "failed" && recipient.retryAt !== null)) {
           this.#store.updateRecipient(pushId, recipient.member, { sendState: "failed", retryAt: null, sendError: recipient.sendError ?? "截止前没有发出" });
         }
@@ -1460,6 +1622,7 @@ export class PushService {
       if (!this.#store.movePush(pushId, LIVE_STATES, { state: "closed", closedAt: this.#now(), closeReason: reason, summaryState: "pending" })) return;
       log.info(`推送 ${pushId} 已${reason === "deadline" ? "截止" : "全部答复，提前结束"}`);
       this.#store.bumpVersions(pushId);
+      this.#store.cancelForwards(pushId, this.#now());
       // Only a card someone clicked has a known ID to update.
       for (const recipient of this.#store.recipients(pushId)) if (recipient.card) this.#refreshCard(pushId, recipient.member);
       this.#refreshPreview(pushId);
@@ -1492,7 +1655,7 @@ export class PushService {
 
   /**
    * Build and send the summary to the pusher and the CCs, once the cards still being sent have their result and the reply
-   * attachments in effect are received and downloaded (or `settleWaitMs` after the end: the summary says what is unknown
+   * attachments are downloaded (or `settleWaitMs` after the end: the summary says what is unknown
    * or missing). One person's failure holds nobody else back; a retry sends only what did not go out.
    */
   async #summarize(pushId: string): Promise<void> {
@@ -1517,10 +1680,10 @@ export class PushService {
       const recipients = this.#store.recipients(pushId);
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
-      const pack = await buildSummary({ push, recipients, items, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, now: this.#now(), signal: this.#signal });
+      const forwards = this.#store.forwards(pushId, "confirmed"), handed = new Set(forwards.map(forward => forward.from));
+      const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, now: this.#now(), signal: this.#signal });
       const tally = this.#tally(push, recipients);
-      const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && (push.mode === "ack"
-        ? recipient.ackedAt === null : push.mode === "options" ? recipient.choice === null : recipient.submitted === 0))
+      const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && !this.#answered(push, recipient, handed))
         .map(recipient => memberGroup(recipient.member) === undefined ? recipient.name : `群 ${recipient.name}`);
       const unknown = recipients.filter(recipient => recipient.sendState === "uncertain").length;
       const lines = [`推送「${push.subject}」${push.closeReason === "complete" ? "已全部答复" : "已截止"}（推送编号 ${push.id}）`, tally,
@@ -1615,8 +1778,8 @@ export class PushService {
 
   /**
    * Release the held attachments of a push whose summary is done (sent or given up). A reply's file still downloading
-   * stays held until the download ends, so where it is gets kept, and an attachment still being received has no record
-   * yet: the push counts as released only once neither is left (the timer and the registration's end try again).
+   * stays held until the download ends, so where it is gets kept: the push counts as released only once none is left
+   * (the timer tries again).
    */
   async #releasePush(pushId: string): Promise<void> {
     const key = `release:${pushId}`;
@@ -1631,7 +1794,7 @@ export class PushService {
       let waiting = false;
       for (const item of items) {
         const file = item.attachment ? files.get(item.attachment) : undefined;
-        if (unsettled(item, files) && (item.attachment === null || effective.has(item))) { waiting = true; continue; }
+        if (unsettled(item, files) && effective.has(item)) { waiting = true; continue; }
         if (!file) continue;
         if (file.state === "ready" && file.path && item.path !== file.path) this.#store.updateItem(item.id, { path: file.path });
         byMember.set(item.member, [...byMember.get(item.member) ?? [], item.attachment!]);
@@ -1642,7 +1805,7 @@ export class PushService {
     finally { this.#refreshing.delete(key); }
   }
 
-  /** A card's send or a reply attachment's registration ended: a closed push's summary or release may be waiting for it. */
+  /** A card's send ended: a closed push's summary may be waiting for it. */
   #settled(pushId: string): void {
     const push = this.#store.push(pushId);
     if (this.#closing || push?.state !== "closed") return;
@@ -1650,23 +1813,12 @@ export class PushService {
     else if (!push.released) this.#track(this.#releasePush(pushId));
   }
 
-  /** Release the attachments of replaced or dropped revisions now (best effort; the summary release covers what is left). */
+  /** Release the attachments of replaced or withdrawn items now (best effort). */
   #release(pushId: string, member: string, items: readonly ReplyItem[]): void {
     const ids = items.flatMap(item => item.attachment ? [item.attachment] : []);
     if (!ids.length || !this.#host) return;
     const host = this.#host;
     this.#effect(() => this.#track(host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids).catch(error => { if (!this.#signal.aborted) this.#report(error); })));
-  }
-
-  /** Attachment items a process left half registered: find the registration by the message, or mark it failed. */
-  async #reconcileItems(): Promise<void> {
-    for (const item of this.#store.unregistered()) await this.#reconcileItem(item).catch(error => this.#report(error));
-  }
-
-  async #reconcileItem(item: ReplyItem): Promise<void> {
-    const records = await this.#host!.records(DIRECT_SCOPE, item.member);
-    const found = Object.values(records.attachments).find(attachment => attachment.msgUid === item.msgUid && attachment.heldBy === holderOf(item.pushId));
-    this.#store.updateItem(item.id, found ? { attachment: found.id } : { error: "附件登记中断，请重新发送" });
   }
 
   // ---- notes ----------------------------------------------------------------------------------------------------------
@@ -1721,10 +1873,24 @@ export class PushService {
   #recipientCard(pushId: string, member: string): CardContent | undefined {
     const push = this.#store.push(pushId), recipient = this.#store.recipient(pushId, member);
     if (!push || !recipient) return undefined;
-    const draft = recipient.draft ? this.#store.items(pushId, member, recipient.draft) : [];
-    const submitted = recipient.submitted ? this.#store.items(pushId, member, recipient.submitted) : [];
-    return recipientCard({ push, recipient, draft: countsOf(draft), submitted: countsOf(submitted),
-      ...(memberGroup(member) === undefined ? {} : { senders: { draft: senders(draft), submitted: senders(submitted) } }) }, this.#now());
+    const reply = recipient.submitted ? this.#store.items(pushId, member, recipient.submitted) : [];
+    const forwards = memberGroup(member) === undefined ? this.#store.forwards(pushId, "confirmed") : [];
+    const by = forwards.find(forward => forward.to === member), to = forwards.filter(forward => forward.from === member).map(forward => forward.toName);
+    return recipientCard({ push, recipient, reply: countsOf(reply), ...(memberGroup(member) === undefined ? {} : { senders: senders(reply) }),
+      ...(by ? { forwardedBy: this.#store.recipient(pushId, by.from)?.name ?? "别人" } : {}), ...(to.length ? { forwardedTo: to } : {}) }, this.#now());
+  }
+
+  #forwardCard(id: string): CardContent | undefined {
+    const forward = this.#store.forward(id), push = forward && this.#store.push(forward.pushId);
+    if (!forward || !push) return undefined;
+    return forwardCard({ push, forward, departments: this.#directory.departments.departmentsOf([forward.to]).get(forward.to) ?? [] }, this.#now());
+  }
+
+  #refreshForward(id: string): void {
+    this.#refresh(`forward:${id}`, () => {
+      const forward = this.#store.forward(id), recipient = forward?.card ? this.#store.recipient(forward.pushId, forward.from) : undefined;
+      return recipient ? { target: this.#memberTarget(recipient), card: this.#forwardCard(id)! } : undefined;
+    });
   }
 
   /** The pusher's summary card: the summary text, and 「提醒未回复」 while there is someone to remind and no follow-up yet. */
@@ -1814,7 +1980,7 @@ function countsOf(items: readonly ReplyItem[]): Counts {
   return { texts: items.filter(item => item.kind === "text").length, files: items.filter(item => item.kind !== "text").length };
 }
 
-/** A reply attachment still being received (its registration has not ended) or downloaded. */
+/** A reply attachment still being downloaded. */
 function unsettled(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): boolean {
-  return item.kind !== "text" && item.error === null && (item.attachment === null || files.get(item.attachment)?.state === "pending");
+  return item.kind !== "text" && item.error === null && item.attachment !== null && files.get(item.attachment)?.state === "pending";
 }

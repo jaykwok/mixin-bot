@@ -13,6 +13,7 @@
 import type { Database } from "bun:sqlite";
 import { apply } from "@earendil-works/chord/delta";
 import { PUSH_NOTE_KIND } from "../../push/note.ts";
+import { OPERATOR_NOTE_KIND } from "../operator-note.ts";
 import { SEARCH_TERMS, type SearchKind } from "./protocol.ts";
 
 const key = (value: string) => JSON.stringify(value);
@@ -286,11 +287,12 @@ export function searchTerms(text: string): string[] {
   return terms.slice(0, SEARCH_TERMS);
 }
 
-/** Which part of the history a piece of an entry belongs to; compactions and other entries (but push notes) are summaries. */
+/** Which part of the history a piece of an entry belongs to: an operator's message is an answer; compactions and other entries (but push notes) are summaries. */
 function partKind(kind: string, part: Part): SearchKind {
   if (kind === "pi.user") return "question";
   if (kind === "pi.tool-result") return "tool";
   if (kind === PUSH_NOTE_KIND) return "push";
+  if (kind === OPERATOR_NOTE_KIND) return "answer";
   if (kind === "pi.assistant") return part.type === "thinking" ? "thinking" : part.type === "toolCall" ? "tool" : "answer";
   return "summary";
 }

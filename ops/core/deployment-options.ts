@@ -265,6 +265,8 @@ export async function installScope(project: string, params: Record<string, unkno
  * file system spells it: `d:\projects\Mixin-Bot` and `D:\Projects\mixin-bot` are one deployment.
  */
 export function sameWindowsPath(a: string, b: string): boolean {
+  // An empty path names no directory (resolving it would give this process's own, the very one it is compared with).
+  if (!a.trim() || !b.trim()) return false;
   const normal = (path: string) => win32.resolve(path).replace(/\\+$/, "").toLowerCase();
   return normal(a) === normal(b);
 }

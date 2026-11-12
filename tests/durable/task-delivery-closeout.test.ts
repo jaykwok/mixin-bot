@@ -22,7 +22,7 @@ import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { fileDelivery } from "../../src/durable/file-delivery.ts";
 import { BASH_DEFAULT_TIMEOUT, NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
 import { formatSize } from "@earendil-works/pi-coding-agent";
-import { appendTiming, closeoutTool, localTime, validateCloseout } from "../../src/durable/closeout.ts";
+import { appendTail, closeoutTool, localTime, validateCloseout } from "../../src/durable/closeout.ts";
 import { MemberRecordsDoc, pendingDeliveries, recordsOf, settleInterrupted, type DeliveryPart, type LinkNote, type MemberRecords, type RequestRecord }
   from "../../src/durable/records.ts";
 import { DurableService, type DurableServiceOptions } from "../../src/durable/service.ts";
@@ -207,7 +207,7 @@ test.each(["/stop", "/clear"])("%s wins over a registered draft and no fallback 
 
 test("clock tail is copied, budgets clamp bash, delivery refuses nesting entry points, configuration rejects invalid order", async () => {
   const messages = [{ role: "user" as const, content: "hello", timestamp: 1 }];
-  const added = appendTiming(messages, "[任务计时] test", 2);
+  const added = appendTail(messages, "[任务计时] test", 2);
   expect(messages[0]!.content).toBe("hello"); expect(JSON.stringify(added)).toContain("任务计时");
   const t = { closeoutMs: 300_000, reserveMs: 120_000, fallbackMs: 120_000 };
   expect(() => validateCloseout(t, 1200_000)).not.toThrow(); expect(() => validateCloseout(t, 500_000)).toThrow("小于");
@@ -359,7 +359,7 @@ test("recovered time uses persisted startedAt and DeepSeek accepts both user-tai
   expect(JSON.stringify(injected!.messages)).toMatch(/剩余 (9分\d+|10分0)秒/);
   expect(messages[0]!.content).toBe("hello");
   const proxy = deepseekProvider().getModels()[0]!;
-  for (const transcript of [injected!.messages, appendTiming([...messages,
+  for (const transcript of [injected!.messages, appendTail([...messages,
     fauxAssistantMessage([fauxToolCall("read", { path: "file.txt" }, { id: "c" })], { stopReason: "toolUse" }),
     { role: "toolResult", toolCallId: "c", toolName: "read", content: [{ type: "text", text: "data" }], isError: false, timestamp: 1 }], "[任务计时] test", Date.now())]) {
     expect(JSON.stringify(convertMessages(proxy as never, { messages: transcript } as never, {} as never))).toContain("任务计时");

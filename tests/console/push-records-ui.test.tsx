@@ -12,13 +12,13 @@ const type = (input: HTMLInputElement, value: string) => { input.value = value; 
 
 const item = (id: string, state: string, extra: Record<string, unknown> = {}) => ({ id, subject: `推送${id}`, mode: "reply", state, pusher: "推送人 · 138****0009", createdAt: 1,
   confirmedAt: 2, deadline: 3, closedAt: state === "closed" ? 4 : null, closeReason: state === "closed" ? "deadline" : null, summaryState: state === "closed" ? "sent" : null,
-  of: null, followUp: null, counts: { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1, replying: 0 }, ...extra });
-const recipient = (key: string, name: string, answered: boolean) => ({ key, name, phone: `138****000${key.slice(-1)}`, group: false, sendState: "sent", sendError: null, sentAt: 2,
-  ackedAt: answered ? 2 : null, clicks: 0, choice: null, choiceAt: null, replyState: answered ? "submitted" : "none", submittedAt: answered ? 3 : null, answered,
-  reply: answered ? { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] } : null, drafting: null });
+  of: null, followUp: null, counts: { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1 }, ...extra });
+const recipient = (key: string, name: string, answered: boolean, handed: { forwardedBy?: string; forwardedTo?: string[] } = {}) => ({ key, name, phone: `138****000${key.slice(-1)}`, group: false, sendState: "sent", sendError: null, sentAt: 2,
+  ackedAt: answered ? 2 : null, clicks: 0, choice: null, choiceAt: null, submittedAt: answered ? 3 : null, answered,
+  reply: answered ? { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] } : null, forwardedBy: handed.forwardedBy ?? null, forwardedTo: handed.forwardedTo ?? [] });
 const detail = (id: string, state: string) => ({ view: `view-${id}`, push: { ...item(id, state), body: "请回复", options: [], defaultDeadline: true, target: ["部门 技术部（含下级）"],
   cc: [{ key: "cc1", name: "王五", phone: "138****0003" }], summaryError: null, summaryAt: state === "closed" ? 5 : null },
-  recipients: [recipient("r1", "张三", true), recipient("r2", "李四", false)] });
+  recipients: [recipient("r1", "张三", true, { forwardedTo: ["赵六"] }), recipient("r2", "李四", false, { forwardedBy: "孙七" })] });
 
 test("推送记录：列表打开详情，按未答复筛选，补推送选中的人，修改抄送，下载汇总包，删除已截止的推送", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
@@ -47,6 +47,9 @@ test("推送记录：列表打开详情，按未答复筛选，补推送选中�
     button(root, "查看").click();
     await until(() => root.textContent!.includes("已盘点"));
     expect(root.textContent).toContain("部门 技术部（含下级）");
+    // Handed on: by whom under the name, to whom after the answer.
+    expect(root.textContent).toContain("李四孙七 转来");
+    expect(root.textContent).toContain("；已转给 赵六");
     // Only 李四 is waiting; 补推送 the selection.
     [...root.querySelectorAll<HTMLButtonElement>('[aria-label="接收人筛选"] button')].find(each => each.textContent === "未答复")!.click();
     await until(() => !root.textContent!.includes("张三"));
@@ -90,7 +93,7 @@ test("推送记录：列表打开详情，按未答复筛选，补推送选中�
 
 test("推送记录里的群：按群名列出，号码一栏写“群”，确认写首次时间和点击次数，人数和补推送按人和群分开说", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
-  const counts = { total: 2, groups: 1, delivered: 2, failed: 0, answered: 1, replying: 0 };
+  const counts = { total: 2, groups: 1, delivered: 2, failed: 0, answered: 1 };
   const group = { ...recipient("r2", "销售一部", false), phone: "群", group: true };
   const acked = { ...group, key: "r3", name: "客服", ackedAt: new Date(2026, 10, 3, 9, 30).getTime(), clicks: 3, answered: true };
   globalThis.fetch = (async (url: string) => {

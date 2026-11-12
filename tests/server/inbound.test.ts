@@ -196,39 +196,20 @@ test("a full queue is answered with the service's message and remembered; failur
   expect(h.reports).toHaveLength(2); expect(h.notices).toHaveLength(3);
 });
 
-/** A push service stand-in: members (and `group:<ID>`) in `replying` have their texts (and direct attachments) taken as reply items. */
-function fakePush(replying: Set<string>) {
+/** A push service stand-in: it sees every text and takes /登记群 only; members in `waiting` have pushes waiting for their reply. */
+function fakePush(waiting: Set<string> = new Set()) {
   const calls: string[] = [];
-  const items = new Set<string>();
   const push: InboundPush = {
-    seen: msgUid => items.has(msgUid),
     click: event => { calls.push(`click ${String(event.payload.msgUid)}`); },
-    directText: (identity, reply, text) => {
-      calls.push(`text ${text}`);
-      if (text === "/完成" || text === "/取消") return true;
-      if (!replying.has(identity.phone) || text.startsWith("/")) return false;
-      items.add(reply.msgUid);
-      return true;
-    },
-    directAttachment: (identity, reply, attachment) => {
-      calls.push(`attachment ${attachment.fileId}`);
-      if (!replying.has(identity.phone)) return false;
-      items.add(reply.msgUid);
-      return true;
-    },
-    groupText: (groupId, _identity, reply, text) => {
-      calls.push(`group ${groupId} ${text}`);
-      if (["/完成", "/取消"].includes(text) || text.startsWith("/登记群")) return true;
-      if (!replying.has(`group:${groupId}`) || text.startsWith("/")) return false;
-      items.add(reply.msgUid);
-      return true;
-    },
+    directText: (_identity, _reply, text) => { calls.push(`text ${text}`); return text.startsWith("/登记群"); },
+    groupText: (groupId, _identity, _reply, text) => { calls.push(`group ${groupId} ${text}`); return text.startsWith("/登记群"); },
+    attachmentAsk: phone => waiting.has(phone) ? "是回复「周报」的话说一声，我记进去；要我处理别的也直接说。" : undefined,
   };
   return { push, calls };
 }
 
 test("card clicks go to the push service only; without one they are dropped", async () => {
-  const fake = fakePush(new Set());
+  const fake = fakePush();
   const h = harness({ push: fake.push });
   h.router.handle(h.event({ eventType: "callback:card_interaction", msgUid: "card-1", content: { data: "{}" } }));
   await h.router.drain();
@@ -240,60 +221,48 @@ test("card clicks go to the push service only; without one they are dropped", as
   expect(bare.calls).toEqual([]); expect(bare.notices).toEqual([]);
 });
 
-test("a member replying to a push has direct texts and attachments taken by it; commands and other members are not; a group text is asked too", async () => {
+test("the push service sees every text and takes none but /登记群: questions, replies and commands go on to the message service", async () => {
   const fake = fakePush(new Set(["13800000001"]));
   const h = harness({ push: fake.push });
   const direct = { eventType: "callback:direct", groupId: "" };
   h.router.handle(h.event({ ...direct, msgUid: "r-1", content: { content: " my reply " } }));
-  h.router.handle(h.event({ ...direct, type: "file", msgUid: "r-2", content: { fileId: "file-9", filename: "r.pdf" } }));
-  h.router.handle(h.event({ ...direct, msgUid: "r-3", content: { content: "/status" } }));
+  h.router.handle(h.event({ ...direct, msgUid: "r-2", content: { content: "/status" } }));
   h.router.handle(h.event({ msgUid: "g-1", content: { content: "group question" } }));
+  h.router.handle(h.event({ msgUid: "g-2", content: { content: "/stop" } }));
   await h.router.drain();
-  expect(fake.calls).toEqual(["text my reply", "attachment file-9", "text /status", "group 100 group question"]);
-  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "r-3"], ["admit", "g-1"]]);
-  // A redelivered reply item is recognised by the push service and never reaches it or the model again.
-  h.router.handle(h.event({ ...direct, msgUid: "r-1", content: { content: " my reply " } }));
-  await h.router.drain();
-  expect(fake.calls).toHaveLength(4); expect(h.calls).toHaveLength(2);
-  // Without a reply in progress the push service declines and the message is admitted as usual.
-  const idle = fakePush(new Set());
-  const other = harness({ push: idle.push });
-  other.router.handle(other.event({ ...direct, msgUid: "q-1", content: { content: "question" } }));
-  other.router.handle(other.event({ ...direct, type: "image", msgUid: "q-2", content: { fileId: "file-8" } }));
-  await other.router.drain();
-  expect(idle.calls).toEqual(["text question", "attachment file-8"]);
-  expect(other.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["admit", "q-1"], ["attach", "q-2"]]);
+  expect(fake.calls).toEqual(["text my reply", "text /status", "group 100 group question", "group 100 /stop"]);
+  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["admit", "r-1"], ["control", "r-2"], ["admit", "g-1"], ["control", "g-2"]]);
+  expect(h.notices).toEqual([]);
 });
 
-test("/完成 and /取消 go to the push service in direct chats and groups, /登记群 in groups; all are ignored when late", async () => {
-  const fake = fakePush(new Set());
+test("a direct attachment is registered as always; a member with a push waiting for a reply is asked whether it is one", async () => {
+  const fake = fakePush(new Set(["13800000001"]));
+  const h = harness({ push: fake.push });
+  const direct = { eventType: "callback:direct", groupId: "" };
+  h.router.handle(h.event({ ...direct, type: "file", msgUid: "f-1", content: { fileId: "file-9", filename: "r.pdf" } }));
+  await h.router.drain();
+  expect(h.calls.map(call => [call.kind, (call.message as InboundAttachment).ask])).toEqual([["attach", "是回复「周报」的话说一声，我记进去；要我处理别的也直接说。"]]);
+  const idle = harness({ push: fakePush().push });
+  idle.router.handle(idle.event({ ...direct, type: "image", msgUid: "f-2", content: { fileId: "file-8" } }));
+  await idle.router.drain();
+  expect(idle.calls.map(call => [call.kind, "ask" in call.message])).toEqual([["attach", false]]);
+  // A group takes no media, push or not.
+  h.router.handle(h.event({ msgUid: "f-3", type: "file", content: { fileId: "file-7", filename: "x.pdf" } }));
+  await h.router.drain();
+  expect(h.calls).toHaveLength(1);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("群里收不了图片、文件和视频")]);
+});
+
+test("/登记群 goes to the push service, in a group and in a direct chat, and is ignored when late; /完成 and /取消 are ordinary texts now", async () => {
+  const fake = fakePush();
   const h = harness({ push: fake.push }), now = Date.now();
   const direct = { eventType: "callback:direct", groupId: "" };
-  h.router.handle(h.event({ ...direct, content: { content: "/完成" } }));
-  h.router.handle(h.event({ ...direct, content: { content: "/取消" } }, { sentAt: now - 5 * 60_000, receivedAt: now }));
-  h.router.handle(h.event({ content: { content: "/取消" } }));
   h.router.handle(h.event({ content: { content: "/登记群 销售一部" } }));
   h.router.handle(h.event({ content: { content: "/登记群 客服" } }, { sentAt: now - 5 * 60_000, receivedAt: now }));
-  h.router.handle(h.event({ content: { content: "/stop" } }));
+  h.router.handle(h.event({ ...direct, content: { content: "/登记群 销售一部" } }));
+  h.router.handle(h.event({ ...direct, msgUid: "c-1", content: { content: "/完成" } }, { sentAt: now - 5 * 60_000, receivedAt: now }));
   await h.router.drain();
-  expect(fake.calls).toEqual(["text /完成", "group 100 /取消", "group 100 /登记群 销售一部", "group 100 /stop"]);
-  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("这条指令是 5 分钟前发的，没有执行"), expect.stringContaining("这条指令是 5 分钟前发的，没有执行")]);
-  expect(h.calls.map(call => [call.kind, call.message.scope, (call.message as Inbound).content])).toEqual([["control", groupScope("100"), "/stop"]]);
-});
-
-test("a group replying to a push has its members' texts taken by it; group media are still refused", async () => {
-  const fake = fakePush(new Set(["group:100"]));
-  const h = harness({ push: fake.push });
-  h.router.handle(h.event({ msgUid: "gr-1", content: { content: "我们组已盘点" } }));
-  h.router.handle(h.event({ msgUid: "gr-2", content: { content: "/status" } }));
-  h.router.handle(h.event({ msgUid: "gr-3", type: "file", content: { fileId: "file-7", filename: "x.pdf" } }));
-  h.router.handle(h.event({ msgUid: "gr-4", groupId: "200", content: { content: "其他群的问题" } }));
-  await h.router.drain();
-  expect(fake.calls).toEqual(["group 100 我们组已盘点", "group 100 /status", "group 200 其他群的问题"]);
-  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "gr-2"], ["admit", "gr-4"]]);
-  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("群里收不了图片、文件和视频")]);
-  // Redelivered: the push service has it.
-  h.router.handle(h.event({ msgUid: "gr-1", content: { content: "我们组已盘点" } }));
-  await h.router.drain();
-  expect(fake.calls).toHaveLength(3);
+  expect(fake.calls).toEqual(["group 100 /登记群 销售一部", "text /登记群 销售一部", "text /完成"]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("这条指令是 5 分钟前发的，没有执行")]);
+  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "c-1"]]);
 });

@@ -13,14 +13,14 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const ZHANG = "13800000001", LI = "13800000002", WANG = "13800000003", PUSHER = "13800000009";
 const ITEM: PushListItem = { id: "abcd2345", subject: "机房盘点", mode: "reply", state: "open", pusher: PUSHER, pusherName: "推送人", createdAt: 1, confirmedAt: 2,
-  deadline: 3, closedAt: null, closeReason: null, summaryState: null, followUp: null, of: null, counts: { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1, replying: 0 } };
+  deadline: 3, closedAt: null, closeReason: null, summaryState: null, followUp: null, of: null, counts: { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1 } };
 const TOTALS = { sent: 3, followUps: 1, live: 1, delivered: 4, acked: 3, replyDelivered: 2, replied: 1 };
 const DETAIL: PushDetail = {
   push: { ...ITEM, body: "请回复", options: [], defaultDeadline: true, target: { people: [{ phone: ZHANG, name: "张三" }], departments: [{ id: "10", path: "技术部", children: true }],
     everyone: false }, cc: [{ phone: WANG, name: "王五" }], summaryError: null, summaryAt: null },
   recipients: [ZHANG, LI].map((member, index) => ({ member, name: index ? "李四" : "张三", sendState: "sent", sendError: null, sentAt: 2, ackedAt: index ? null : 2, clicks: 0,
-    choice: null, choiceAt: null, replyState: index ? "none" : "submitted", submittedAt: index ? null : 3, answered: !index,
-    reply: index ? null : { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] }, drafting: null })),
+    choice: null, choiceAt: null, submittedAt: index ? null : 3, answered: !index,
+    reply: index ? null : { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] }, forwardedBy: index ? "张三" : null, forwardedTo: index ? [] : ["李四"] })),
 };
 
 test("推送页：经本机控制接口读列表和详情，页面只见打码号码和随机键；补推送、抄送、删除按键找回号码并记审计；拒绝原样转达", async () => {

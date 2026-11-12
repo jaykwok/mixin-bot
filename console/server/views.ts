@@ -4,13 +4,13 @@
 // session ends or the console exits; reopening a space, switching it or logging in again starts over in default mode.
 import type {
   EntryPage, GlobalSearchHit, GlobalSearchResponse, GlobalSearchViewResponse, IdentityMode, MemberRow, MembersResponse, NamesStatus,
-  RequestsResponse, RequestView, SearchResponse, SpaceSummary, SpacesResponse, SpaceViewResponse, ViewInfo, Identity,
+  RequestsResponse, RequestView, SearchResponse, SpaceSummary, SpacesResponse, SpaceViewResponse, TakeoverSayResponse, ViewInfo, Identity,
 } from "../ui/src/contract.ts";
 import { READ_LIMITS, ReadRequestError, SEARCH_KINDS, type SearchKind, spaceName } from "../../src/durable/read/protocol.ts";
 import { maskUser } from "../../ops/lib/format.ts";
 import type { AuditLog } from "./audit.ts";
 import { groupTitles, type GroupTitles } from "./group-titles.ts";
-import { BotReadError, type BotReader } from "./bot.ts";
+import { BotReadError, type BotReader, type BotTakeover } from "./bot.ts";
 import { identityOf, lookupNames, MemberCodes, opaqueKey, redactPhones, type NameInfo } from "./identity.ts";
 import { ApiProblem, input, problemOf, type Route, type RouteContext } from "./routes.ts";
 
@@ -134,7 +134,12 @@ const spaceOrder = <T extends { space: string; lastAt?: number | null }>(spaces:
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
-export interface ConversationDeps { bot: BotReader; audit: AuditLog; views: Views; now?: () => number }
+export interface ConversationDeps { bot: BotReader; audit: AuditLog; views: Views; now?: () => number;
+  /** Taking a conversation over; without it the two routes answer that the bot is not available. */
+  takeover?: BotTakeover }
+
+/** The longest text an operator sends at once (src/durable/takeover.ts OPERATOR_TEXT_MAX). */
+export const TAKEOVER_TEXT_MAX = 4_000;
 
 type SpaceRow = { space: string; state: "ready" | "empty" | "unreadable"; generation?: string; members?: number; lastEntry?: number | null; lastAt?: number | null; error?: string };
 type MemberInfo = { phone: string; conversationId: number; createdAt: number | null; document: number };
@@ -197,7 +202,7 @@ function keptMember(views: Views, session: string, keep: unknown, view: SpaceVie
 
 const describeMember = (view: SpaceView, member: Member) => `${view.space} ${view.mode === "anonymous" ? `成员 ${member.code}` : maskUser(member.phone)}`;
 
-export function conversationRoutes({ bot, audit, views, now = Date.now }: ConversationDeps): Record<string, Route> {
+export function conversationRoutes({ bot, audit, views, takeover, now = Date.now }: ConversationDeps): Record<string, Route> {
   /** Runs `read` against a view, mapping failures with the view's numbers rewritten. */
   const withView = <T>(context: RouteContext, read: (view: SpaceView, body: Record<string, unknown>) => Promise<T>) => {
     const body = record(context.body);
@@ -209,6 +214,17 @@ export function conversationRoutes({ bot, audit, views, now = Date.now }: Conver
     return member ?? input("这个视图里没有该成员");
   };
   const at = (view: SpaceView) => ({ space: view.space, generation: view.generation });
+  /**
+   * The member an operator takes over, with the link to the bot. Not in anonymous mode: the operator would speak to a
+   * person the page does not name. The audit is written first (an unwritable audit refuses the action); it never has the text.
+   */
+  const takenOver = (context: RouteContext, view: SpaceView, body: Record<string, unknown>, action: "conversation-stop" | "conversation-say", bytes?: number) => {
+    if (!takeover) throw new ApiProblem(503, "bot-offline", "这个控制台没有连接到机器人，不能接管");
+    if (view.mode === "anonymous") input("匿名模式下不能接管对话，请换一种身份模式重新打开这个空间");
+    const member = memberOf(view, body.member);
+    audit.write({ action, session: context.session.label, scope: describeMember(view, member), mode: view.mode, ...(bytes === undefined ? {} : { bytes }) });
+    return { link: takeover, member: { space: view.space, phone: member.phone } };
+  };
 
   /** Members in document order after the member document `after`; more than `room` of them is a truncated list. */
   const readMembers = async (space: { space: string; generation: string }, after: number, room: number, signal: AbortSignal) => {
@@ -361,6 +377,28 @@ export function conversationRoutes({ bot, audit, views, now = Date.now }: Conver
         const member = memberOf(view, body.member);
         return bot.read({ op: "boundaries", ...at(view), conversation: member.conversation, after: optionalInt(body.after, "after") ?? 0,
           limit: READ_LIMITS.boundaries }, context.signal);
+      }),
+    },
+
+    // Takeover: the bot stops what it is doing for the member; `say` then sends the operator's text as the bot's message
+    // and keeps it in the conversation. The member's next message is the bot's again.
+    "POST /api/conversation/stop": {
+      slow: true,
+      run: context => withView(context, async (view, body) => {
+        const { link, member } = takenOver(context, view, body, "conversation-stop");
+        await link.stop(member);
+        return { ok: true };
+      }),
+    },
+
+    "POST /api/conversation/say": {
+      slow: true,
+      run: context => withView(context, async (view, body) => {
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!text) input("请输入要发给成员的内容");
+        if ([...text].length > TAKEOVER_TEXT_MAX) input(`一次最多发 ${TAKEOVER_TEXT_MAX} 个字，请分几次发`);
+        const { link, member } = takenOver(context, view, body, "conversation-say", Buffer.byteLength(text));
+        return await link.say(member, text) satisfies TakeoverSayResponse;
       }),
     },
 

@@ -6,6 +6,7 @@ import type { DepartmentDescription, DepartmentInfo } from "../integrations/open
 import { type DirectoryScope, parseDepartmentIds, parseScopeRequest } from "../integrations/open-platform/directory-scope.ts";
 import { readStatus } from "../durable/read/client.ts";
 import { parseReadOp, ReadRequestError, type ReadOp } from "../durable/read/protocol.ts";
+import type { Takeover } from "../durable/takeover.ts";
 import { PUSH_ID } from "../push/cards.ts";
 import { PUSH_GROUPS, type PushAdmin, type PushCursor, type PushGroup } from "../push/service.ts";
 import { constantTimeEqual } from "./http.ts";
@@ -42,12 +43,17 @@ export interface AppOptions {
    * list, one push, 补推送, the CCs, deleting, and the package download.
    */
   push?: PushAdmin;
+  /** The console's takeover of a conversation (src/durable/takeover.ts): stop the bot's work for a member, answer in its place. */
+  takeover?: Pick<Takeover, "stop" | "say">;
   /** How long a route may wait on the platform (default PLATFORM_WAIT_MS); tests shorten it. */
   platformWaitMs?: number;
 }
 
 /** A console package may take this long to build (attachments are copied into one archive). */
 const PACKAGE_MS = 10 * 60_000;
+
+/** A stop waits for the member's run, its tools and their processes to end; the send follows. */
+const TAKEOVER_MS = 120_000;
 
 /** A push request's parameters; a malformed one throws PushInput (HTTP 400). */
 class PushInput extends Error { override name = "PushInput"; }
@@ -91,8 +97,8 @@ function keepOpen(c: Context, limitMs: number): void {
 const expired = (signal: AbortSignal, error: unknown) => signal.aborted && error === signal.reason;
 
 /**
- * The host-local control surface: `/health`, `/_admin/shutdown`, `/_admin/directory/*`, `/_admin/read` and `/_admin/push/*` (settings and the
- * console's push page). Messages arrive over the platform's event stream,
+ * The host-local control surface: `/health`, `/_admin/shutdown`, `/_admin/directory/*`, `/_admin/read`, `/_admin/conversation/*` (the
+ * console's takeover) and `/_admin/push/*` (settings and the console's push page). Messages arrive over the platform's event stream,
  * so nothing here is reachable from the platform; the server listens on loopback only (src/core/config.ts).
  */
 export function createApp(options: AppOptions): Hono {
@@ -174,6 +180,25 @@ export function createApp(options: AppOptions): Hono {
       return c.json({ status: "error", code: (error as Error).name, message: (error as Error).message }, status);
     }
   });
+  // The console's takeover: a refusal (TakeoverRefused) answers 409 with the reason, malformed parameters 400.
+  for (const name of ["stop", "say"] as const) {
+    app.post(`/_admin/conversation/${name}`, async (c) => {
+      if (!authorized(c.req.header("Authorization")) || !options.takeover) return c.notFound();
+      const body = await c.req.json().catch(() => undefined) as { space?: unknown; phone?: unknown; text?: unknown } | undefined;
+      const { space, phone: member, text } = body ?? {};
+      if (typeof space !== "string" || space.length > 80 || typeof member !== "string" || !/^[A-Za-z0-9_+-]{1,32}$/.test(member) || (name === "say" && typeof text !== "string")) {
+        return c.json({ status: "error", message: "参数无效" }, 400);
+      }
+      keepOpen(c, TAKEOVER_MS);
+      try {
+        if (name === "stop") { await options.takeover.stop(space, member); return c.json({ status: "ok" }); }
+        return c.json({ status: "ok", ...await options.takeover.say(space, member, text as string) });
+      } catch (error) {
+        if ((error as Error).name === "TakeoverRefused") return c.json({ status: "error", code: "TakeoverRefused", message: (error as Error).message }, 409);
+        throw error;
+      }
+    });
+  }
   app.post("/_admin/push/settings", (c) => {
     if (!authorized(c.req.header("Authorization")) || !options.push) return c.notFound();
     return c.json({ status: "ok", ...options.push.settings() as object });

@@ -40,6 +40,7 @@ const BOT_CODES: Record<string, [number, ApiErrorCode, string?]> = {
   ReadExpired: [504, "timeout", "读取超过期限，请稍后重试"],
   TimeoutError: [504, "timeout"],
   ReadRequestError: [400, "input"],
+  TakeoverRefused: [409, "input"],
 };
 
 /**

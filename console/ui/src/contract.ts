@@ -205,6 +205,13 @@ export interface RequestView {
   deliverables: { name: string; status: string; size: number; complete: boolean; auto?: true }[];
 }
 
+/**
+ * What an operator's message came to (POST /api/conversation/say). sent: the member has it. uncertain: the platform
+ * did not confirm it. partial: a long text went out in segments and a later one failed (`segments`: how many of how
+ * many arrived). `recorded` false: the conversation could not keep it, so the bot will not know what was said.
+ */
+export interface TakeoverSayResponse { sent: "sent" | "uncertain" | "partial"; recorded: boolean; segments?: { sent: number; total: number } }
+
 /** Run records still kept (closed ones are pruned after a day); mutable, read at `observedAt`. */
 export interface RequestsResponse { items: RequestView[]; total: number; observedAt: number }
 
@@ -250,12 +257,12 @@ export interface PushListItemView {
   /** This push reminds the people of push `of`; `followUp`: the push its summary's 「提醒未回复」 prepared. */
   of: string | null; followUp: string | null;
   /** `groups`: how many of `total` are group chats (one row each). */
-  counts: { total: number; groups: number; delivered: number; failed: number; answered: number; replying: number };
+  counts: { total: number; groups: number; delivered: number; failed: number; answered: number };
 }
 /**
  * Totals over the pushes the bot keeps: `sent` went out (`followUps` of them 补推送, `live` not closed yet); over the
  * closed ones, `delivered` recipients (a person or a group each), `acked` of them confirmed (「已收到」, a choice or
- * 「回复」), and of the pushes asking for a reply `replied` of `replyDelivered`.
+ * a reply), and of the pushes asking for a reply `replied` of `replyDelivered`.
  */
 export interface PushTotalsView { sent: number; followUps: number; live: number; delivered: number; acked: number; replyDelivered: number; replied: number }
 export interface PushListResponse { pushes: PushListItemView[]; more: boolean; totals: PushTotalsView }
@@ -265,15 +272,16 @@ export type PushListCursor = Pick<PushListItemView, "createdAt" | "id">;
 export interface PushPersonView { key: string; name: string; phone: string }
 /**
  * One recipient: a person, or (`group`) a group chat by name with phone "群". In a group `ackedAt` is the first 「已收到」
- * and `clicks` counts them all; `senders` names who wrote the group's reply.
+ * and `clicks` counts them all; `senders` names who wrote the group's reply. `answered`: answered, or handed the push on
+ * (`forwardedTo`: to whom; `forwardedBy`: who handed it on to this recipient).
  */
 export interface PushRecipientView extends PushPersonView {
   group: boolean;
   sendState: "pending" | "sending" | "sent" | "uncertain" | "failed"; sendError: string | null; sentAt: number | null;
-  ackedAt: number | null; clicks: number; choice: string | null; choiceAt: number | null; replyState: "none" | "replying" | "submitted"; submittedAt: number | null;
+  ackedAt: number | null; clicks: number; choice: string | null; choiceAt: number | null; submittedAt: number | null;
   answered: boolean;
   reply: { text: string; files: { name: string; size: number | null; kind: string }[]; senders: string[] } | null;
-  drafting: { texts: number; files: number } | null;
+  forwardedBy: string | null; forwardedTo: string[];
 }
 export interface PushDetailView extends PushListItemView {
   body: string; options: string[]; defaultDeadline: boolean;

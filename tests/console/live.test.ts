@@ -1,6 +1,7 @@
 // The console's conversation and statistics API end to end: the real service writes synthetic chats with faux models,
 // the bot's HTTP app serves /health and /_admin/read on a loopback port, and the console's handler answers the page
-// through BotLink. Checks what the page receives in each identity mode, the name states and the audit. Synthetic data.
+// through BotLink. Checks what the page receives in each identity mode, the name states and the audit, and an operator
+// taking a conversation over (/_admin/conversation/*). Synthetic data.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -8,13 +9,14 @@ import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { appLayout } from "../../src/core/layout.ts";
 import { DurableService } from "../../src/durable/service.ts";
+import { Takeover } from "../../src/durable/takeover.ts";
 import { ReadChannel } from "../../src/durable/read/client.ts";
 import type { ReadOp } from "../../src/durable/read/protocol.ts";
 import { PushStore } from "../../src/push/store.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { AuditLog } from "../../console/server/audit.ts";
 import { Auth } from "../../console/server/auth.ts";
-import { BotLink, BotOffline, BotReadError, type BotReader } from "../../console/server/bot.ts";
+import { BotLink, BotOffline, BotReadError, type BotReader, type BotTakeover } from "../../console/server/bot.ts";
 import type { Bundle } from "../../console/server/bundle.ts";
 import { Exports } from "../../console/server/exports.ts";
 import { guardConfig } from "../../console/server/guard.ts";
@@ -23,7 +25,7 @@ import { statsRoutes } from "../../console/server/stats.ts";
 import { conversationRoutes, Views } from "../../console/server/views.ts";
 import type {
   EntryPage, ExportStatus, ExportTicket, GlobalSearchCursor, GlobalSearchHit, GlobalSearchResponse, GlobalSearchViewResponse, MemberRow, MembersResponse,
-  Overview, RequestsResponse, SearchResponse, SpacesResponse, SpaceViewResponse, StatsResponse, ViewInfo,
+  Overview, RequestsResponse, SearchResponse, SpacesResponse, SpaceViewResponse, StatsResponse, TakeoverSayResponse, ViewInfo,
 } from "../../console/ui/src/contract.ts";
 import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
@@ -66,7 +68,10 @@ async function ask(space: string, phone: string, text: string, answers: Paramete
 /** The bot's HTTP app on a fresh loopback port, recorded the way src/server/app.ts records it. */
 async function startBot(token = TOKEN) {
   const instanceId = crypto.randomUUID(), startedAt = Date.now();
-  const app = createApp({ isStopping: () => false, adminToken: token, instanceId, startedAt, shutdown: () => {}, read: channel });
+  // The directory the takeover sends by: Alice and Carol are in it, Bob is not (as in the names table below).
+  const people = new Map([[ALICE, { phone: ALICE, name: "张三", imUserId: "im-a" }], [CAROL, { phone: CAROL, name: "李四", imUserId: "im-c" }]]);
+  const takeover = new Takeover({ host: service, outbound: out.outbound, directory: { byPhone: phone => people.get(phone) }, layout, signal: new AbortController().signal });
+  const app = createApp({ isStopping: () => false, adminToken: token, instanceId, startedAt, shutdown: () => {}, read: channel, takeover });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
   await writeFile(instanceFile, JSON.stringify({ pid: process.pid, port: server.port, token, host: "127.0.0.1", instanceId, startedAt }));
   return server;
@@ -103,13 +108,14 @@ const bundle: Bundle = { index: { path: "/", type: "text/html; charset=utf-8", b
 /** Every response body the page received, to check none carries a complete number or the bot's token. */
 const received: string[] = [];
 
-function consoleWith(reader: BotReader, options: { ticketMs?: number } = {}) {
+function consoleWith(reader: BotReader, options: { ticketMs?: number; takeover?: BotTakeover } = {}) {
   const auth = new Auth(), views = new Views(), audit = new AuditLog(auditDir);
-  const exporter = new Exports({ bot: reader, audit, views, root, gapMs: 1, ...options });
+  const exporter = new Exports({ bot: reader, audit, views, root, gapMs: 1, ...(options.ticketMs === undefined ? {} : { ticketMs: options.ticketMs }) });
   auth.onEnd(label => views.end(label));
   auth.onEnd(label => exporter.end(label));
   const handle = createHandler({ port: PORT, guard: guardConfig(PORT), bundle, auth, instanceId: "console", overview: async () => ({}) as Overview,
-    routes: { ...conversationRoutes({ bot: reader, audit, views }), ...statsRoutes({ bot: reader, audit, views, root }), ...exporter.routes() },
+    routes: { ...conversationRoutes({ bot: reader, audit, views, ...(options.takeover ? { takeover: options.takeover } : {}) }), ...statsRoutes({ bot: reader, audit, views, root }),
+      ...exporter.routes() },
     download: (ticket, context) => exporter.download(ticket, context) });
   /** A download as the browser starts it from the console page: a GET navigation without the API header. */
   const download = (cookie: string, url: string, headers: Record<string, string> = {}, signal?: AbortSignal) =>
@@ -132,7 +138,8 @@ function consoleWith(reader: BotReader, options: { ticketMs?: number } = {}) {
   return { auth, views, exporter, login, call, download };
 }
 
-const live = consoleWith(new BotLink({ instanceFile }));
+const link = new BotLink({ instanceFile });
+const live = consoleWith(link, { takeover: link });
 
 async function openSpace(cookie: string, space: string, mode = "default", confirm?: boolean) {
   const spaces = await live.call<SpacesResponse>(cookie, "GET", "/api/spaces");
@@ -784,5 +791,89 @@ describe("registered group names", () => {
     const stats = await live.call<{ view: ViewInfo }>(cookie, "POST", "/api/views/stats", { mode: "default" });
     const all = await live.call<StatsResponse>(cookie, "POST", "/api/stats", { view: stats.body.view.id, period: "all" });
     expect(all.body.groups.map(group => [group.group, group.title]).sort()).toEqual([["100", "群 销售一部"], ["direct", "单聊"]]);
+  });
+});
+
+// After everything else: it writes to Alice's conversations.
+describe("takeover", () => {
+  const SAID = "接管测试：这个问题稍后电话答复。";
+
+  test("an operator's message goes out as the bot's, stays in the conversation and is audited without its text; a stop is audited too", async () => {
+    const cookie = await live.login();
+    const view = (await openSpace(cookie, "direct")).body;
+    const member = view.members.find(row => row.identity.name === "张三")!.identity.key;
+    const before = out.sent.length, lines = (await auditLines()).length;
+    const said = await live.call<TakeoverSayResponse>(cookie, "POST", "/api/conversation/say", { view: view.view.id, member, text: `  ${SAID}  ` });
+    expect([said.status, said.body]).toEqual([200, { sent: "sent", recorded: true }]);
+    // Sent once, to nobody's message in particular (no receipt, no answer of the model).
+    expect(out.sent.slice(before).map(item => [item.kind, item.text, item.msgUid])).toEqual([["reply", SAID, ""]]);
+    const page = await live.call<EntryPage>(cookie, "POST", "/api/conversation/entries", { view: view.view.id, member, older: true, cursor: null, upper: null });
+    const note = page.body.items.find(entry => entry.kind === "mixin.operator-note")!;
+    expect(note.parts.map(part => part.type === "text" ? part.text : "").join("")).toBe(`[人工回复] 管理员以你的名义直接回复了这位用户，用户已经看到：\n${SAID}`);
+    const stopped = await live.call<{ ok: true }>(cookie, "POST", "/api/conversation/stop", { view: view.view.id, member });
+    expect([stopped.status, stopped.body]).toEqual([200, { ok: true }]);
+    expect(out.sent.length).toBe(before + 1);
+    const written = (await auditLines()).slice(lines).filter(line => String(line.action).startsWith("conversation-s"));
+    expect(written.map(line => [line.action, line.scope, line.mode, line.bytes])).toEqual([
+      ["conversation-say", "direct 138****0001", "default", Buffer.byteLength(SAID)], ["conversation-stop", "direct 138****0001", "default", undefined]]);
+    expect(JSON.stringify(written)).not.toContain("接管测试");
+    // The member's next message is the bot's again, with the operator's words before it.
+    faux.setResponses([(transcript) => {
+      const users = transcript.messages.filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content
+        : message.content.map(part => "text" in part ? part.text : "").join(""));
+      return fauxAssistantMessage(users.some(each => each.includes(SAID)) ? "看到了人工回复" : "没有看到人工回复");
+    }]);
+    const answers = replyTexts(out.sent.filter(item => item.msgUid !== "")).length;
+    await service.admit(out.message("direct", ALICE, "那我等电话"));
+    await until(() => replyTexts(out.sent.filter(item => item.msgUid !== "")).length > answers, "the answer after the takeover");
+    expect(replyTexts(out.sent.filter(item => item.msgUid !== "")).at(-1)).toBe("看到了人工回复");
+  });
+
+  test("a group conversation: the message names the member in the group", async () => {
+    const cookie = await live.login();
+    const view = (await openSpace(cookie, "groups/100", "full", true)).body;
+    const member = view.members.find(row => row.identity.name === "李四")!.identity.key;
+    const before = out.sent.length;
+    const said = await live.call<TakeoverSayResponse>(cookie, "POST", "/api/conversation/say", { view: view.view.id, member, text: "群里补充一句。" });
+    expect([said.status, said.body]).toEqual([200, { sent: "sent", recorded: true }]);
+    expect(out.sent.slice(before).map(item => [item.kind, item.text, item.space, item.mention])).toEqual([["reply", "群里补充一句。", "100", "im-c"]]);
+  });
+
+  test("refused: anonymous mode, a member the directory no longer knows (no complete number in the answer), an empty or oversized text, an unknown member; nothing is sent", async () => {
+    const cookie = await live.login();
+    const before = out.sent.length, lines = (await auditLines()).length;
+    const anonymous = (await openSpace(cookie, "direct", "anonymous")).body;
+    for (const path of ["/api/conversation/say", "/api/conversation/stop"]) {
+      const refused = await live.call(cookie, "POST", path, { view: anonymous.view.id, member: anonymous.members[0]!.identity.key, text: "x" });
+      expect([refused.status, refused.body.code, refused.body.error]).toEqual([400, "input", "匿名模式下不能接管对话，请换一种身份模式重新打开这个空间"]);
+    }
+    const view = (await openSpace(cookie, "direct")).body;
+    const bob = view.members.find(row => row.identity.label === "138****0002")!.identity.key, alice = view.members.find(row => row.identity.name === "张三")!.identity.key;
+    const gone = await live.call(cookie, "POST", "/api/conversation/say", { view: view.view.id, member: bob, text: "x" });
+    expect([gone.status, gone.body.code, gone.body.error]).toEqual([409, "input", "这位成员已不在机器人同步的通讯录范围内，不能接管。"]);
+    for (const number of NUMBERS) expect(gone.text).not.toContain(number);
+    for (const [body, reason] of [[{ member: alice, text: "   " }, "请输入要发给成员的内容"], [{ member: alice }, "请输入要发给成员的内容"],
+      [{ member: alice, text: "字".repeat(4_001) }, "一次最多发 4000 个字，请分几次发"], [{ member: "nobody", text: "x" }, "这个视图里没有该成员"]] as const) {
+      const refused = await live.call(cookie, "POST", "/api/conversation/say", { view: view.view.id, ...body });
+      expect([refused.status, refused.body.code, refused.body.error]).toEqual([400, "input", reason]);
+    }
+    expect(out.sent.length).toBe(before);
+    // Only what reached the bot is in the audit: the member the directory does not know.
+    expect((await auditLines()).slice(lines).filter(line => String(line.action).startsWith("conversation-s")).map(line => [line.action, line.scope]))
+      .toEqual([["conversation-say", "direct 138****0002"]]);
+  });
+
+  test("a console without the link to the bot, and a bot that is not running, say so", async () => {
+    const bare = consoleWith(link);
+    const cookie = await bare.login();
+    const spaces = await bare.call<SpacesResponse>(cookie, "GET", "/api/spaces");
+    const opened = await bare.call<SpaceViewResponse>(cookie, "POST", "/api/views/space", { space: "direct", generation: spaces.body.spaces[0]!.generation, mode: "default" });
+    const refused = await bare.call(cookie, "POST", "/api/conversation/stop", { view: opened.body.view.id, member: opened.body.members[0]!.identity.key });
+    expect([refused.status, refused.body.code]).toEqual([503, "bot-offline"]);
+    const offline = consoleWith(link, { takeover: new BotLink({ instanceFile: join(fixture.root, "no-instance.json") }) });
+    const again = await offline.login();
+    const view = await offline.call<SpaceViewResponse>(again, "POST", "/api/views/space", { space: "direct", generation: spaces.body.spaces[0]!.generation, mode: "default" });
+    const down = await offline.call(again, "POST", "/api/conversation/say", { view: view.body.view.id, member: view.body.members[0]!.identity.key, text: "x" });
+    expect([down.status, down.body.code, down.body.error]).toEqual([503, "bot-offline", "机器人未运行（没有服务实例记录）"]);
   });
 });

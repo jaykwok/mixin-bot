@@ -3,11 +3,10 @@
 // 回调里同步完成：字段校验、会话识别、身份查询（本地映射表）、生成回复上下文，并调用推送服务或 admit/control/attach，
 // 它们在第一个 await 之前取到达序号并占住成员顺序，所以同一成员的消息按事件到达顺序处理。之后的等待在后台进行。
 //
-// 推送（src/push/service.ts）：卡片点击直接交给推送服务。单聊里的文字和附件先问推送服务：成员正在回复推送时记入回复，
-// /完成、/取消 结束回复，其余照常交给消息服务。群里的文字也先问推送服务：它由此知道这个群；/登记群 由它处理；群正在回复
-// 推送时记入群的回复，/完成、/取消 结束回复。
+// 推送（src/push/service.ts）：卡片点击直接交给推送服务。文字先让推送服务过目：/登记群 由它处理，群里的文字让它知道这个群，
+// 有推送在等回复的成员发的文字它留一份（回复由对话里的模型用 push_reply 记下，记的是成员的原话）。其余照常交给消息服务。
 //
-// 去重：写入持久记录的消息由回执去重（消息服务在同一事务里写回执，推送回复按消息 ID 唯一）。不产生持久记录的结果
+// 去重：写入持久记录的消息由回执去重（消息服务在同一事务里写回执）。不产生持久记录的结果
 // （身份未知、类型不支持、量子消息、迟到被忽略的命令、/status、/help、排队已满）只在进程内去重；重启后重复投递最多
 // 多回一条提示。
 import { isSlashCommandMessage, canonicalCommand } from "../agent/commands.ts";
@@ -31,15 +30,13 @@ export interface InboundService {
 
 /** 推送服务在入站上的部分（src/push/service.ts）。同步方法：调用顺序就是到达顺序。 */
 export interface InboundPush {
-  /** 这条消息已记入推送回复（重复投递）。 */
-  seen(msgUid: string): boolean;
   click(event: StreamEvent): void;
-  /** 单聊文字：推送收下（记入回复，或 /完成、/取消）时为 true。 */
+  /** 单聊文字：推送自己处理了（/登记群）时为 true。 */
   directText(identity: DirectoryIdentity, reply: ReplyContext, text: string): boolean;
-  /** 单聊附件：记入回复时为 true，否则留给成员的下一条消息。 */
-  directAttachment(identity: DirectoryIdentity, reply: ReplyContext, attachment: AttachmentEvent): boolean;
-  /** 群里 @ 机器人的文字：推送收下（/登记群、群回复，或 /完成、/取消）时为 true。 */
+  /** 群里 @ 机器人的文字：推送自己处理了（/登记群）时为 true。 */
   groupText(groupId: string, identity: DirectoryIdentity, reply: ReplyContext, text: string): boolean;
+  /** 单聊收到附件时问成员的话：有推送在等这位成员回复时，附件可能就是回复。 */
+  attachmentAsk(phone: string): string | undefined;
 }
 
 export interface InboundOptions {
@@ -56,7 +53,7 @@ export interface InboundOptions {
 }
 
 /** 改变状态或产生交付副作用的命令：迟到时不执行。 */
-const STATEFUL = new Set(["/stop", "/clear", "/compact", "/完成", "/取消", "/登记群"]);
+const STATEFUL = new Set(["/stop", "/clear", "/compact", "/登记群"]);
 const CARD_EVENT = "callback:card_interaction";
 const HANDLED_LIMIT = 20_000;
 const GROUP_ID = /^[0-9]{1,64}$/;
@@ -127,7 +124,7 @@ export class InboundRouter {
       log.warn(`入站事件的群号与会话类型不符（${eventType}），已丢弃`);
       return;
     }
-    if (this.#handled.has(msgUid) || this.#inflight.has(msgUid) || this.#options.service.seen(msgUid) || this.#options.push?.seen(msgUid)) return;
+    if (this.#handled.has(msgUid) || this.#inflight.has(msgUid) || this.#options.service.seen(msgUid)) return;
     if (quantumSession(payload.extraContent)) {
       this.#remember(msgUid);
       log.info(`跳过量子会话消息（${group ? "群" : "单聊"}）`);
@@ -153,7 +150,7 @@ export class InboundRouter {
     return undefined;
   }
 
-  /** 图片、文件、视频（只在单聊收）：推送回复，或登记给成员的下一条消息。 */
+  /** 图片、文件、视频（只在单聊收）：登记给成员的下一条消息。 */
   #media(message: Parsed, identity: DirectoryIdentity, reply: ReplyContext): void {
     const { type, msgUid } = message;
     const media = type === "image" || type === "file" || type === "video";
@@ -163,10 +160,10 @@ export class InboundRouter {
         : message.groupId !== undefined ? "群里收不了图片、文件和视频，请在单聊里发给我。" : "附件没有收全，请再发一次。");
       return;
     }
-    if (this.#options.push?.directAttachment(identity, reply, attachment)) { this.#remember(msgUid); return; }
+    const ask = this.#options.push?.attachmentAsk(identity.phone);
     this.#inflight.add(msgUid);
     // attach() reserves arrival order before its first await, like admit(): the next message binds this attachment.
-    this.#track(this.#options.service.attach({ scope: DIRECT_SCOPE, phone: identity.phone, reply, attachment }).then(result => {
+    this.#track(this.#options.service.attach({ scope: DIRECT_SCOPE, phone: identity.phone, reply, attachment, ...(ask === undefined ? {} : { ask }) }).then(result => {
       if (result.status === "full") {
         this.#remember(msgUid);
         this.#notice(reply, result.message, false);
@@ -178,7 +175,7 @@ export class InboundRouter {
     }).finally(() => this.#inflight.delete(msgUid)));
   }
 
-  /** 文字：推送回复与推送命令，然后是命令和提问。 */
+  /** 文字：先让推送过目，然后是命令和提问。 */
   #text(parsed: Parsed, identity: DirectoryIdentity, reply: ReplyContext): void {
     const { msgUid } = parsed;
     const trimmed = parsed.text!.trim();

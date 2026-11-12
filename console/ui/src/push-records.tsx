@@ -95,14 +95,12 @@ export function PushRecords() {
   </>;
 }
 
-type Filter = "all" | "waiting" | "answered" | "failed" | "replying";
+type Filter = "all" | "waiting" | "answered" | "failed";
 const FILTERS: { value: Filter; label: string }[] = [
   { value: "all", label: "全部" }, { value: "waiting", label: "未答复" }, { value: "answered", label: "已答复" }, { value: "failed", label: "发送失败" },
-  { value: "replying", label: "回复中" },
 ];
 const matches = (filter: Filter, recipient: PushRecipientView) => filter === "all" ? true : filter === "answered" ? recipient.answered
-  : filter === "failed" ? recipient.sendState === "failed" : filter === "replying" ? recipient.replyState === "replying"
-  : !recipient.answered;
+  : filter === "failed" ? recipient.sendState === "failed" : !recipient.answered;
 const SEND = { pending: "未发出", sending: "发送中", sent: "已发出", uncertain: "可能已发出", failed: "发送失败" } as const;
 
 /** "3 人", "2 个群", "3 人、2 个群". */
@@ -111,17 +109,18 @@ function reach(total: number, groups: number): string {
   return [...(people || !groups ? [`${people} 人`] : []), ...(groups ? [`${groups} 个群`] : [])].join("、");
 }
 
+/** `；已转给 张三、李四`, or nothing. */
+const handedOn = (recipient: PushRecipientView) => recipient.forwardedTo.length ? `；已转给 ${recipient.forwardedTo.join("、")}` : "";
+
 function answerOf(push: PushDetailResponse["push"], recipient: PushRecipientView): string {
   if (recipient.sendState === "failed") return recipient.sendError ? `没有送达：${recipient.sendError}` : "没有送达";
-  if (push.mode === "options") return recipient.choice === null ? "未选择" : `选择「${recipient.choice}」${recipient.choiceAt ? `（${dateTime(recipient.choiceAt)}）` : ""}`;
+  if (push.mode === "options") return (recipient.choice === null ? "未选择" : `选择「${recipient.choice}」${recipient.choiceAt ? `（${dateTime(recipient.choiceAt)}）` : ""}`) + handedOn(recipient);
   // A group's 「已收到」 is anyone's click there: the first one's time and how many there were.
   const acked = recipient.ackedAt === null ? "" : recipient.group ? `首次 ${dateTime(recipient.ackedAt)}，共点击 ${recipient.clicks} 次` : dateTime(recipient.ackedAt);
-  if (push.mode === "ack") return recipient.ackedAt === null ? "未确认" : `已确认（${acked}）`;
-  const replying = !recipient.drafting ? "" : recipient.group ? `正在回复（已收到文字 ${recipient.drafting.texts} 段）`
-    : `正在回复（已收到文字 ${recipient.drafting.texts} 段、附件 ${recipient.drafting.files} 个）`;
-  if (!recipient.reply) return replying || (recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复");
+  if (push.mode === "ack") return (recipient.ackedAt === null ? "未确认" : `已确认（${acked}）`) + handedOn(recipient);
+  if (!recipient.reply) return (recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复") + handedOn(recipient);
   const files = recipient.reply.files.map(file => file.name).join("、");
-  return `${recipient.reply.text || "（没有文字）"}${files ? `；附件：${files}` : ""}${replying ? `；${replying}` : ""}`;
+  return `${recipient.reply.text || "（没有文字）"}${files ? `；附件：${files}` : ""}${handedOn(recipient)}`;
 }
 
 function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: () => void; onDeleted: () => void }) {
@@ -180,8 +179,7 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
           <dt>要求</dt><dd>{MODE[push.mode]}{push.options.length ? `：${push.options.join(" / ")}` : ""}</dd>
           <dt>时间</dt><dd>{dateTime(push.createdAt)} 准备{push.confirmedAt ? `，${dateTime(push.confirmedAt)} 发出` : ""}，截止 {dateTime(push.deadline)}{push.defaultDeadline ? "（未指定，默认 3 天）" : ""}
             {push.closedAt ? `，${dateTime(push.closedAt)} ${push.closeReason === "complete" ? "全部答复" : "结束"}` : ""}</dd>
-          <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}
-            {push.counts.replying ? `，回复中 ${push.counts.replying}` : ""}</dd>
+          <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}</dd>
           <dt>汇总</dt><dd>{push.summaryState === "sent" ? `已发出${push.summaryAt ? `（${dateTime(push.summaryAt)}）` : ""}` : push.summaryState === "failed" ? `没有发出：${push.summaryError ?? "原因未知"}`
             : push.summaryState === "pending" ? "待发" : "截止或全部答复后发给推送人和抄送人"}</dd>
           {push.of && <><dt>补推送</dt><dd>推送编号 {push.of} 中没有答复的人</dd></>}
@@ -221,10 +219,10 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
         <tbody>{shown.map(recipient => <tr key={recipient.key}>
           <td>{canRemind && selectable(recipient) && <input type="checkbox" aria-label={`选择 ${recipient.name}`} checked={chosen.has(recipient.key)} disabled={busy}
             onChange={() => toggle(recipient.key)} />}</td>
-          <td>{recipient.name}</td>
+          <td>{recipient.name}{recipient.forwardedBy ? <div class="muted">{recipient.forwardedBy} 转来</div> : null}</td>
           <td class="mono">{recipient.phone}</td>
           <td>{SEND[recipient.sendState]}{recipient.sentAt ? <div class="muted">{dateTime(recipient.sentAt)}</div> : null}</td>
-          <td class="push-answer">{answerOf(push, recipient)}{recipient.submittedAt ? <div class="muted">{dateTime(recipient.submittedAt)} 提交</div> : null}</td>
+          <td class="push-answer">{answerOf(push, recipient)}{recipient.submittedAt ? <div class="muted">{dateTime(recipient.submittedAt)}</div> : null}</td>
           <td>{push.mode === "reply" && recipient.reply && <button class="btn ghost small-btn" disabled={busy} onClick={() => void pack(recipient.key)}>下载</button>}</td>
         </tr>)}</tbody></table></div>
       {!shown.length && <div class="group-note">没有符合筛选的接收人。</div>}

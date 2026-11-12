@@ -83,7 +83,7 @@ import { conversationIds, idleSpaceReferences } from "./conversations.ts";
 import { lateMinutes, type Outbound, replyMessage, replySegments, sendNotice, targetOf } from "./outbound.ts";
 import { sendChannel } from "./send.ts";
 import { ATTACHMENT_LIMITS, AttachmentDownloads, type AttachmentEvent, type AttachmentLimits, type AttachmentSource, arrivedBefore, attachmentLabel,
-  attachmentPrompt, bindAttachments, expireAttachments, newAttachmentId, releaseHeld, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
+  attachmentPrompt, bindAttachments, expireAttachments, holdAttachments, newAttachmentId, releaseHeld, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
 import {
   type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, fileSendOutcome, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
   pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
@@ -153,6 +153,12 @@ export interface DurableServiceOptions {
    * selection is checked whenever the member's conversation is opened for a message, a command or an attachment.
    */
   memberExtensions?: { install(scope: Scope): readonly Extension[]; selected(scope: Scope, phone: string): readonly string[] };
+  /**
+   * Asked when a request ends without an answer (the model failed, or a limit stopped the run), before the member is told:
+   * a line to add to what they are told (the push service records the message as a reply to the one push waiting for it,
+   * src/push/service.ts `failed`). Must not throw.
+   */
+  unanswered?: (request: { scope: Scope; phone: string; message: { msgUid: string; text: string; receivedAt: number } }) => Promise<string | undefined>;
   /** Refresh the application's materials index before each model request (default true). */
   materials?: boolean;
   maxIdleSpaces?: number;
@@ -173,8 +179,8 @@ export interface Inbound {
   reply: ReplyContext;
 }
 
-/** A direct-chat image, file or video; `hold` names the push reply it belongs to (src/push/service.ts) instead of the next request. */
-export type InboundAttachment = Omit<Inbound, "content"> & { attachment: AttachmentEvent; hold?: string };
+/** A direct-chat image, file or video; `ask`: what the member is asked once it is received, instead of what to do with it. */
+export type InboundAttachment = Omit<Inbound, "content"> & { attachment: AttachmentEvent; ask?: string };
 
 /** A registered attachment carries its ID. */
 export type AttachResult = { status: "accepted"; attachment: string } | { status: "duplicate" } | { status: "full"; message: string };
@@ -253,6 +259,8 @@ function openTimingText(scope: Scope, { kept, total, steps, sql }: SpaceOpenTimi
     + `；SQL ${sql.requests} 次（秒）：库内排队 ${seconds(sql.queued)}，线程排队 ${seconds(sql.waited)}，执行 ${seconds(sql.exec)}，事务 ${sql.transactions} 个占用 ${seconds(sql.held)}`;
 }
 type ControlReceipt = { scope: Scope; phone: string; requestId: string; ticket?: ControlTicket };
+/** Where a /stop or /clear came from: the receipt key that makes a redelivery a no-op, and the member's message when it was one. */
+type ControlSource = { msgUid: string; reply?: ReplyContext };
 /** Held while maintenance reclaims a group's results. A waiting message or command sets `yield`. */
 type ReclamationGate = { promise: Promise<void>; resolve: () => void; yield: boolean };
 
@@ -454,12 +462,10 @@ export class DurableService {
   /**
    * Register a direct-chat attachment with its receipt in arrival order, acknowledge it and start its download; the
    * member's next admitted request binds it. Everything up to the admission turn is synchronous, as for admit().
-   * A held attachment (a push reply) is registered the same way but belongs to its holder: it is not limited by the
-   * member's unconsumed count, is not acknowledged here (the push answers) and is never voided by an earlier control.
    */
   async attach(message: InboundAttachment): Promise<AttachResult> {
     this.#assertRunning();
-    const { scope: space, phone, reply, attachment: event, hold } = message;
+    const { scope: space, phone, reply, attachment: event, ask } = message;
     if (this.#seen.has(reply.msgUid)) return { status: "duplicate" };
     const downloads = this.#downloads, limits = downloads?.limits ?? ATTACHMENT_LIMITS;
     const receivedAt = this.#arrival();
@@ -483,14 +489,14 @@ export class DurableService {
           const now = Date.now();
           receipts.items[reply.msgUid] = { at: now, phone };
           const records = await recordsOf(tx, phone);
-          if (hold === undefined && unconsumed(records).length >= limits.memberCount) return { status: "full" as const };
+          if (unconsumed(records).length >= limits.memberCount) return { status: "full" as const };
           const attachment: Attachment = {
             id: newAttachmentId(), msgUid: reply.msgUid, receivedAt, epoch: this.#runtimes.get(scopeKey(space))!.epoch, fileId: event.fileId, kind: event.kind,
             name: event.name, ...(event.size === undefined ? {} : { size: event.size }), ...(event.mimeType ? { mimeType: event.mimeType } : {}),
-            reply: structuredClone(reply), state: "pending", at: now, ...(hold === undefined ? {} : { heldBy: hold }),
+            reply: structuredClone(reply), state: "pending", at: now,
           };
-          // As when a /clear runs: an unbound attachment behind its admitted boundary is void; a /stop leaves it for the next message (a held one is not the request's).
-          if (hold === undefined && receivedAt <= (member.clearBefore ?? -Infinity)) attachment.state = "void";
+          // As when a /clear runs: an unbound attachment behind its admitted boundary is void; a /stop leaves it for the next message.
+          if (receivedAt <= (member.clearBefore ?? -Infinity)) attachment.state = "void";
           else if (downloads === undefined) Object.assign(attachment, { state: "rejected", error: "现在不接收附件" });
           records.attachments[attachment.id] = attachment;
           return { status: "added" as const, attachment: { ...attachment, reply: { ...attachment.reply } } };
@@ -504,8 +510,8 @@ export class DurableService {
       const { attachment } = outcome;
       if (attachment.state === "pending") {
         downloads!.schedule(space, phone, attachment.id);
-        if (hold === undefined) this.#track(this.#notify(reply, `${attachmentLabel(attachment)}收到了，想让我怎么处理？`));
-      } else if (attachment.state === "rejected" && hold === undefined) this.#track(this.#notify(reply, `${attachmentLabel(attachment)}没有收下：${attachment.error}。`));
+        this.#track(this.#notify(reply, ask === undefined ? `${attachmentLabel(attachment)}收到了，想让我怎么处理？` : `${attachmentLabel(attachment)}收到了。${ask}`));
+      } else if (attachment.state === "rejected") this.#track(this.#notify(reply, `${attachmentLabel(attachment)}没有收下：${attachment.error}。`));
       return { status: "accepted", attachment: attachment.id };
     } finally {
       member.uses--;
@@ -514,7 +520,16 @@ export class DurableService {
     }
   }
 
-  /** Drop a holder's attachment records (attachments.ts `releaseHeld`); their files stay for the tmp lifecycle. */
+  /** A push holds these attachments of the member (attachments.ts `holdAttachments`): the ones a request bound whose message is now a reply. */
+  async holdAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number> {
+    this.#assertRunning();
+    if (!ids.length) return 0;
+    const handle = await this.#spaces.acquire(scope);
+    try { return await handle.harness.commit(async tx => holdAttachments(await recordsOf(tx, phone), holder, ids), this.#context); }
+    finally { handle.release(); }
+  }
+
+  /** A holder lets its attachments go (attachments.ts `releaseHeld`); their files stay for the tmp lifecycle. */
   async releaseAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number> {
     this.#assertRunning();
     if (!ids.length) return 0;
@@ -578,32 +593,7 @@ export class DurableService {
     if (this.#seen.has(context.msgUid) && ["/stop", "/clear", "/compact"].includes(command)) return "";
     let reply: string;
     if (command === "/stop" || command === "/clear") {
-      // A duplicate is known only after the receipt check. Until then the hold only keeps new work from starting; a run
-      // that settles meanwhile waits for the decision (#settle), so a redelivered command cannot cancel its reply.
-      const release = this.#hold(member);
-      const decision = Promise.withResolvers<void>();
-      member.deciding.add(decision.promise);
-      const decided = () => { member.deciding.delete(decision.promise); decision.resolve(); };
-      const receipt: ControlReceipt = { scope, phone, requestId: `ctl:${randomUUID()}` };
-      this.#receipts.set(receipt.requestId, receipt);
-      receipt.ticket = this.#runtimes.get(scopeKey(scope))?.door.controlReceived(phone, receipt.requestId);
-      // Reserve this member's order before any await; slower identity/open steps cannot reorder controls.
-      const run = member.controls.then(async () => {
-        await this.#yieldToReclamation(scope);
-        await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
-        return this.#control(member, command, receivedAt, receipt, context, decided);
-      });
-      member.controls = run.catch(() => {});
-      let admitted: boolean;
-      try {
-        admitted = await run;
-      } finally {
-        decided();
-        this.#receipts.delete(receipt.requestId);
-        if (receipt.ticket) this.#runtimes.get(scopeKey(scope))?.door.controlDropped(receipt.ticket);
-        release();
-      }
-      if (!admitted) return "";
+      if (!await this.#stopOrClear(member, command, receivedAt, { msgUid: context.msgUid, reply: context })) return "";
       reply = await this.#controlReceipt(member, command);
     } else if (command === "/compact") {
       // Reserve command order before any await. Only admission is serialized; waiting for a summary must not block stop.
@@ -660,12 +650,71 @@ export class DurableService {
   }
 
   /**
+   * A /stop or /clear from its arrival to its end: the member's worker is held, the control runs in the member's command
+   * order. False for a redelivered command. `source.reply` is the command message's reply context (retry notices go
+   * there); an operator's stop has none.
+   */
+  async #stopOrClear(member: MemberState, command: ControlCommand, receivedAt: number, source: ControlSource): Promise<boolean> {
+    const { scope, phone } = member;
+    // A duplicate is known only after the receipt check. Until then the hold only keeps new work from starting; a run
+    // that settles meanwhile waits for the decision (#settle), so a redelivered command cannot cancel its reply.
+    const release = this.#hold(member);
+    const decision = Promise.withResolvers<void>();
+    member.deciding.add(decision.promise);
+    const decided = () => { member.deciding.delete(decision.promise); decision.resolve(); };
+    const receipt: ControlReceipt = { scope, phone, requestId: `ctl:${randomUUID()}` };
+    this.#receipts.set(receipt.requestId, receipt);
+    receipt.ticket = this.#runtimes.get(scopeKey(scope))?.door.controlReceived(phone, receipt.requestId);
+    // Reserve this member's order before any await; slower identity/open steps cannot reorder controls.
+    const run = member.controls.then(async () => {
+      await this.#yieldToReclamation(scope);
+      await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+      return this.#control(member, command, receivedAt, receipt, source, decided);
+    });
+    member.controls = run.catch(() => {});
+    try {
+      return await run;
+    } finally {
+      decided();
+      this.#receipts.delete(receipt.requestId);
+      if (receipt.ticket) this.#runtimes.get(scopeKey(scope))?.door.controlDropped(receipt.ticket);
+      release();
+    }
+  }
+
+  /**
+   * An operator's stop (the console's takeover, src/server/takeover.ts): the member's running task and the messages
+   * waiting behind it are cancelled exactly as the member's own /stop cancels them; the member gets no receipt.
+   * Resolves once the conversation is idle, with the texts of the messages that were still waiting: the model never saw
+   * those (the one it was answering stays in the conversation).
+   */
+  async halt(scope: Scope, phone: string): Promise<{ waiting: string[] }> {
+    this.#assertRunning();
+    const member = this.#member(scope, phone);
+    member.uses++;
+    try {
+      const receivedAt = this.#arrival();
+      member.lastUsed = Date.now();
+      const handle = await this.#spaces.acquire(scope);
+      let waiting: string[];
+      try {
+        member.conversationId ??= (await handle.harness.snapshot(MemberDirectory, phone, this.#context))?.conversationId;
+        const items = member.conversationId === undefined ? [] : await inboxItems(handle.harness, member.conversationId, this.#context);
+        waiting = items.filter(item => !item.cancelled && item.startedAt === undefined).map(item => item.content);
+      } finally { handle.release(); }
+      await this.#stopOrClear(member, "/stop", receivedAt, { msgUid: `operator:${randomUUID()}` });
+      return { waiting };
+    } finally { member.uses--; this.#pruneMember(member); }
+  }
+
+  /**
    * Commit the control (with its receipt) to the stream, execute it, commit its removal; the door holds the member's
    * requests meanwhile. False for a redelivered command: nothing was done. `decided` is called once the receipt check
    * is known: after the cancellation boundary is set, or for a redelivery.
    */
-  async #control(member: MemberState, command: ControlCommand, receivedAt: number, receipt: ControlReceipt, reply: ReplyContext,
+  async #control(member: MemberState, command: ControlCommand, receivedAt: number, receipt: ControlReceipt, source: ControlSource,
     decided: () => void): Promise<boolean> {
+    const { msgUid, reply } = source;
     const handle = await this.#spaces.acquire(member.scope);
     try {
       await member.replaying;
@@ -677,11 +726,11 @@ export class DurableService {
       try {
         const admitted = await harness.commit(async (tx) => {
           const receipts = await tx.doc(ReceiptsDoc);
-          if (receipts.items[reply.msgUid]) return undefined;
-          receipts.items[reply.msgUid] = { at: Date.now(), phone: member.phone };
+          if (receipts.items[msgUid]) return undefined;
+          receipts.items[msgUid] = { at: Date.now(), phone: member.phone };
           const controls = await tx.doc(ControlsDoc);
           controls.seq++;
-          controls.pending.push({ phone: member.phone, requestId, seq: controls.seq, command, receivedAt, epoch: controls.epoch ?? 0, reply: structuredClone(reply) });
+          controls.pending.push({ phone: member.phone, requestId, seq: controls.seq, command, receivedAt, epoch: controls.epoch ?? 0, ...(reply ? { reply: structuredClone(reply) } : {}) });
           // A stop or clear ends the sending of earlier replies too; what is left of them is dropped.
           const now = Date.now(), withdrawn: string[] = [];
           for (const record of Object.values((await recordsOf(tx, member.phone)).requests)) {
@@ -689,7 +738,7 @@ export class DurableService {
           }
           return { seq: controls.seq, withdrawn };
         }, this.#context);
-        this.#remember(reply.msgUid);
+        this.#remember(msgUid);
         if (admitted === undefined) { decided(); return false; }
         const { seq, withdrawn } = admitted;
         member.withdrawals++;
@@ -749,9 +798,9 @@ export class DurableService {
         const cancelled = new Set<string>();
         for (const item of inbox.items) if (receivedBefore(item, pending)) { item.cancelled = true; cancelled.add(item.requestId); }
         // Attachments go with the requests that bound them; a /clear also voids the unbound ones received before it.
-        // Held ones belong to a push reply, which a control of the model's work does not touch.
-        return voidWhere(await recordsOf(tx, member.phone), attachment => attachment.boundTo !== undefined ? cancelled.has(attachment.boundTo)
-          : attachment.heldBy === undefined && command === "/clear" && arrivedBefore(attachment, pending), Date.now());
+        // Held ones are part of a push reply, which a control of the model's work does not touch.
+        return voidWhere(await recordsOf(tx, member.phone), attachment => attachment.heldBy !== undefined ? false
+          : attachment.boundTo !== undefined ? cancelled.has(attachment.boundTo) : command === "/clear" && arrivedBefore(attachment, pending), Date.now());
       }, this.#context);
       // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
       await conversation.abort(this.#context, { background: true });
@@ -1083,9 +1132,9 @@ export class DurableService {
         const latest = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
         // A control that arrived while the candidates were checked cancels the fallback too.
         if (!latest?.cancelled && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
-          delivery = await this.#fallback(record, failure, this.#options.closeout.fallbackMs, now);
+          delivery = await this.#fallback(record, await this.#unanswered(member, item, record, failure), this.#options.closeout.fallbackMs, now);
         }
-      } else delivery = failureDelivery(record.reply, failure, record.notes, now);
+      } else delivery = failureDelivery(record.reply, await this.#unanswered(member, item, record, failure), record.notes, now);
     }
     // A control that arrived while the plan was prepared decides first; one committed meanwhile is found by #close.
     await this.#controlsDecided(member, item);
@@ -1106,6 +1155,14 @@ export class DurableService {
     while (member.deciding.size && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
       await waitFor(Promise.race(member.deciding), this.#closing.signal);
     }
+  }
+
+  /** What the member is told of a request without an answer: the failure, and what `unanswered` adds (the message became a push reply). */
+  async #unanswered(member: MemberState, item: InboxItem, record: Readonly<RequestRecord>, failure: string): Promise<string> {
+    if (!this.#options.unanswered || this.#closing.signal.aborted) return failure;
+    const added = await this.#options.unanswered({ scope: member.scope, phone: member.phone,
+      message: { msgUid: record.reply.msgUid, text: item.content, receivedAt: record.reply.receivedAt } }).catch(error => { this.#report(error); return undefined; });
+    return added ? `${failure}\n\n${added}` : failure;
   }
 
   /** The closeout fallback: the failure, what the run registered, and the files themselves. */

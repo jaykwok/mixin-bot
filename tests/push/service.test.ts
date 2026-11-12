@@ -1,21 +1,21 @@
 // The push service (src/push/service.ts) over a fresh state database: settings, push_prepare's checks, the preview and
-// its confirmation, card sends and retries, clicks and replies (text, attachments, /完成 and /取消), the deadline and
-// the summary with its package, held attachments, conversation notes, restarts. A recording platform, a fake address
-// book and a fake message service; no network.
+// its confirmation, card sends and retries, clicks, replies recorded from the members' own messages (push_reply), pushes
+// handed on (push_forward), the deadline and the summary with its package, held attachments, conversation notes,
+// restarts. A recording platform, a fake address book and a fake message service; no network.
 import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EntryDraft } from "@earendil-works/pi-durable";
-import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput } from "../../src/push/service.ts";
+import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput, type Speaker } from "../../src/push/service.ts";
 import { type Grants, PushStore } from "../../src/push/store.ts";
-import { scopeKey } from "../../src/core/layout.ts";
+import { DIRECT_SCOPE, scopeKey } from "../../src/core/layout.ts";
 import { DepartmentTree, emptyWalk } from "../../src/integrations/open-platform/department-tree.ts";
 import type { CardButton, CardContent, OutboundMessage, SendOptions, SendOutcome } from "../../src/integrations/open-platform/messages.ts";
 import type { Outbound } from "../../src/durable/outbound.ts";
-import type { Attachment, MemberRecords, ReplyContext } from "../../src/durable/records.ts";
-import type { AttachResult, InboundAttachment } from "../../src/durable/service.ts";
+import { holdAttachments, releaseHeld } from "../../src/durable/attachments.ts";
+import type { Attachment, MemberRecords, ReplyContext, RequestRecord } from "../../src/durable/records.ts";
 import type { DirectoryIdentity } from "../../src/integrations/open-platform/identity-directory.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { readZip } from "../helpers/zip-reader.ts";
@@ -74,35 +74,25 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
     departments.replace(walk, clock.now);
   };
   const grant = (grants: Grants) => store.replaceRoles([{ phone: PUSHER, admin: false, pusher: true, grants, dailyLimit: options.dailyLimit ?? null }], clock.now);
-  // The message service: attachment records per member, released holds, passive notes (deduplicated by request ID).
+  // The message service: request and attachment records per member, holds as it keeps them (src/durable/attachments.ts),
+  // passive notes (deduplicated by request ID).
   const records = new Map<string, MemberRecords>();
   const notes: { scope: string; phone: string; requestId: string; entry: EntryDraft }[] = [];
-  const attached: InboundAttachment[] = [], released: { phone: string; holder: string; ids: string[] }[] = [];
-  /** Registrations wait for `gate` while it is set (still under way); with `pending` they leave the download to `finishDownload`. */
-  const registering: { gate: Promise<void> | null; pending: boolean } = { gate: null, pending: false };
+  const held: { phone: string; holder: string; ids: string[] }[] = [], released: { phone: string; holder: string; ids: string[] }[] = [];
+  const recordsOf = (phone: string) => {
+    const own = records.get(phone) ?? { requests: {}, attachments: {} };
+    records.set(phone, own);
+    return own;
+  };
   const host: PushHost = {
-    async attach(message): Promise<AttachResult> {
-      attached.push(message);
-      if (registering.gate) await registering.gate;
-      const id = `att-${message.reply.msgUid}`, path = join(root, "files", `${id}.bin`);
-      if (!registering.pending) {
-        await mkdir(dirname(path), { recursive: true });
-        await writeFile(path, `content of ${message.attachment.name}`);
-      }
-      const own = records.get(message.phone) ?? { requests: {}, attachments: {} };
-      own.attachments[id] = { id, msgUid: message.reply.msgUid, receivedAt: clock.now, epoch: 0, fileId: message.attachment.fileId, kind: message.attachment.kind,
-        name: message.attachment.name, reply: message.reply, at: clock.now, ...(registering.pending ? { state: "pending" } : { state: "ready", path }),
-        ...(message.hold ? { heldBy: message.hold } : {}) } satisfies Attachment;
-      records.set(message.phone, own);
-      return { status: "accepted", attachment: id };
-    },
     records: async (_scope, phone) => structuredClone(records.get(phone) ?? { requests: {}, attachments: {} }),
+    async holdAttachments(_scope, phone, holder, ids) {
+      held.push({ phone, holder, ids: [...ids] });
+      return holdAttachments(recordsOf(phone), holder, ids);
+    },
     async releaseAttachments(_scope, phone, holder, ids) {
       released.push({ phone, holder, ids: [...ids] });
-      const own = records.get(phone);
-      let count = 0;
-      for (const id of ids) if (own?.attachments[id]?.heldBy === holder) { delete own.attachments[id]; count++; }
-      return count;
+      return releaseHeld(recordsOf(phone), holder, ids);
     },
     async note(scope, phone, requestId, entry) {
       const key = scopeKey(scope);
@@ -170,10 +160,37 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
       content: { url: "", method: "POST", headers: {}, data: JSON.stringify(buttonOf(content, name).value.data) } },
     sentAt: START + ++stamp, receivedAt: clock.now,
   });
+  /**
+   * A member's direct message as the message service admits it: the text is a request (its record keeps the reply context)
+   * that takes the files sent before it, and the push service hears it. `downloading`: the files have not arrived yet.
+   * The speaker the reply tools get.
+   */
+  const say = (phone: string, value: string, names: readonly string[] = [], state: { downloading?: boolean } = {}): Speaker => {
+    const own = recordsOf(phone);
+    const context = reply(phone), requestId = `req-${context.msgUid}`;
+    for (const name of names) {
+      const file = reply(phone), id = `att-${file.msgUid}`, path = join(root, "files", `${id}.bin`);
+      if (!state.downloading) {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, `content of ${name}`);
+      }
+      own.attachments[id] = { id, msgUid: file.msgUid, receivedAt: clock.now, epoch: 0, fileId: `file-${id}`, kind: /\.(png|jpg)$/.test(name) ? "image" : "file", name, reply: file,
+        size: Buffer.byteLength("content of " + name), at: clock.now, boundTo: requestId, ...(state.downloading ? { state: "pending" } : { state: "ready", path }) } satisfies Attachment;
+    }
+    own.requests[requestId] = { requestId, reply: context, createdAt: clock.now, notes: [], deliverables: [], files: [], events: {} } satisfies RequestRecord;
+    service.directText(byPhone.get(phone)!, context, value);
+    return { scope: DIRECT_SCOPE, phone, message: { msgUid: context.msgUid, text: value, receivedAt: context.receivedAt } };
+  };
+  /** A group text that @-mentions the bot, heard by the push service: the speaker the reply tool gets in that group. */
+  const groupSay = (groupId: string, phone: string, value: string): Speaker => {
+    const context = groupReply(groupId, phone);
+    service.groupText(groupId, byPhone.get(phone)!, context, value);
+    return { scope: { kind: "group", groupId }, phone, message: { msgUid: context.msgUid, text: value, receivedAt: context.receivedAt } };
+  };
   const groupText = (groupId: string, phone: string, value: string, context = groupReply(groupId, phone)) => service.groupText(groupId, byPhone.get(phone)!, context, value);
   return {
-    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, attached, released, registering, finishDownload, abort, reply, identity, cards, texts,
-    files, card, buttonOf, click,
+    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, held, released, finishDownload, abort, reply, identity, cards, texts,
+    files, card, buttonOf, click, say, groupSay,
     settle, prepare, pushId, tree, grant, groupReply, groupCards, groupTexts, groupClick, groupText, get service() { return service; },
     async restart() { await service.close(); service = make(); },
     async close() { await service.close(); },
@@ -315,153 +332,139 @@ test("ack: a click updates the card in place; a stale click only refreshes; all 
   } finally { await h.close(); }
 });
 
-test("reply: 回复 starts collecting; texts and attachments are recorded, not handed on; 已回复 submits; 修改回复 replaces it; /完成 submits", async () => {
+test("reply: a message is recorded word for word with the files sent before it; replace and withdraw; an earlier message by a quote", async () => {
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "reply" });
-    // Before 回复: a question, with a hint once (not again within 12 hours).
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "这个推送是什么意思？")).toBe(false);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "还有一个问题")).toBe(false);
+    expect(h.card(ZHANG).status.name).toBe("待回复");
+    expect(h.card(ZHANG).tailFields.map(button => button.name)).toEqual(["已收到"]);
+    expect(h.card(ZHANG).content).toContain("直接把回复发给我");
+    h.click(ZHANG, h.card(ZHANG), "已收到", "card-zhang");
     await h.settle();
-    expect(h.texts(ZHANG).filter(text => text.includes("推送待回复"))).toHaveLength(1);
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    expect([h.card(ZHANG).status.name, h.card(ZHANG).tailFields]).toEqual(["已确认，待回复", []]);
+    // A question is heard and nothing more.
+    const question = h.say(ZHANG, "这个推送是什么意思？");
+    expect(h.store.recipient(id, ZHANG)!.submitted).toBe(0);
+    // The reply: the text as sent, and the file sent before it, which the push holds from now on.
+    const first = h.say(ZHANG, "A 机房正常，B 机房缺一台", ["盘点.xlsx"]);
+    const file = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
+    expect(await h.service.reply(first, { push: id, action: "add" })).toBe("已把成员的这条消息记入 推送人 推送的「机房盘点」的回复。回复现在共有文字 1 段，附件 1 个。");
     await h.settle();
-    expect(h.card(ZHANG).status.name).toBe("回复中");
-    expect(h.texts(ZHANG).at(-1)).toContain("请发送「机房盘点」的回复内容");
-    const text1 = h.reply(ZHANG);
-    expect(h.service.directText(h.identity(ZHANG), text1, "A 机房正常")).toBe(true);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "B 机房缺一台")).toBe(true);
-    // A redelivered message is known and recorded once.
-    expect(h.service.seen(text1.msgUid)).toBe(true);
-    expect(h.service.directText(h.identity(ZHANG), text1, "A 机房正常")).toBe(true);
-    const file = h.reply(ZHANG);
-    expect(h.service.directAttachment(h.identity(ZHANG), file, { fileId: "f-1", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
-    // Other commands keep their meaning while replying.
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "/stop")).toBe(false);
-    await h.settle();
-    expect(h.attached.map(each => [each.hold, each.attachment.name])).toEqual([[`push:${id}`, "盘点.xlsx"]]);
-    expect(h.texts(ZHANG).filter(text => text.includes("已记入"))).toHaveLength(1);
-    expect(h.card(ZHANG).content).toContain("已收到 文字 2 段，附件 1 个");
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
-    await h.settle();
+    expect(h.held).toEqual([{ phone: ZHANG, holder: `push:${id}`, ids: [file] }]);
+    expect(h.records.get(ZHANG)!.attachments[file]!.heldBy).toBe(`push:${id}`);
     expect(h.card(ZHANG).status.name).toBe("已回复");
-    expect(h.card(ZHANG).content).toContain("已回复（文字 2 段，附件 1 个）");
-    // 修改回复: a new revision; /完成 submits it and the replaced revision's attachment is released.
-    h.click(ZHANG, h.card(ZHANG), "修改回复", "card-zhang");
+    expect(h.card(ZHANG).content).toContain("已回复（文字 1 段，附件 1 个）");
+    // The same message again changes nothing; another one adds to the reply.
+    expect(await h.service.reply(first, { push: id, action: "add" })).toContain("没有重复记");
+    await h.service.reply(h.say(ZHANG, "补充：C 机房已封存"), { push: id, action: "add" });
+    expect(h.service.status(PUSHER, id)).toContain("张三（尾号 0001）：已回复：A 机房正常，B 机房缺一台 补充：C 机房已封存；附件：盘点.xlsx");
+    // replace: this message alone is the reply, and the file of the replaced one is let go.
+    expect(await h.service.reply(h.say(ZHANG, "改成：全部正常"), { push: id, action: "replace" })).toContain("之前记的不算了。回复现在共有文字 1 段。");
     await h.settle();
-    expect(h.card(ZHANG).status.name).toBe("修改中");
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "更正：B 机房已补齐")).toBe(true);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "/完成")).toBe(true);
+    expect(h.released).toEqual([{ phone: ZHANG, holder: `push:${id}`, ids: [file] }]);
+    expect(h.store.items(id, ZHANG).map(item => item.text)).toEqual(["改成：全部正常"]);
+    // withdraw: no reply any more.
+    expect(await h.service.reply(h.say(ZHANG, "刚才那条不算"), { push: id, action: "withdraw" })).toBe("已撤回「机房盘点」的回复，现在是没有回复。");
+    expect([h.store.recipient(id, ZHANG)!.submitted, h.store.items(id, ZHANG)]).toEqual([0, []]);
+    expect(await h.service.reply(h.say(ZHANG, "撤回"), { push: id, action: "withdraw" })).toContain("没有可以撤回的");
     await h.settle();
-    expect(h.texts(ZHANG).at(-1)).toContain("已提交「机房盘点」的回复（文字 1 段）");
-    expect(h.released).toEqual([{ phone: ZHANG, holder: `push:${id}`, ids: [`att-${file.msgUid}`] }]);
-    expect(h.service.status(PUSHER, id)).toContain("张三（尾号 0001）：已回复：更正：B 机房已补齐");
-    const notes = h.notes.filter(note => note.phone === ZHANG).map(note => (note.entry.model![0] as { content: { text: string }[] }).content[0]!.text);
-    expect(notes.some(text => text.startsWith("[推送回复] 已回复 推送人 推送的「机房盘点」：A 机房正常 B 机房缺一台；附件：盘点.xlsx"))).toBe(true);
-    expect(notes.some(text => text.startsWith("[推送回复] 已修改回复"))).toBe(true);
+    expect(h.card(ZHANG).status.name).toBe("已确认，待回复");
+    // An earlier message, found by words quoted from it (white space aside): the question was the reply after all.
+    const later = h.say(ZHANG, "刚才问的那句就是我的回复");
+    expect(await h.service.reply(later, { push: id, action: "add", quote: "推送是 什么意思" })).toContain("记入");
+    expect(h.store.items(id, ZHANG).map(item => [item.msgUid, item.text])).toEqual([[question.message.msgUid, "这个推送是什么意思？"]]);
+    await expect(h.service.reply(later, { push: id, action: "add", quote: "没说过的话" })).rejects.toThrow("没有找到这段话");
+    // Not a recipient, or not a push.
+    await expect(h.service.reply(h.say(WANG, "我也回一个"), { push: id, action: "add" })).rejects.toThrow("没有发给这位成员的推送");
+    await expect(h.service.reply(later, { push: "zzzzzzzz", action: "add" })).rejects.toThrow("没有发给这位成员的推送");
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
 
-test("reply: a later direct message gets a receipt again after a pause or a reminder, not while contents follow one another", async () => {
-  // A pause far longer than the reminder, so the second case is the reminder's alone.
-  const h = harness({ limits: { replyReceiptMs: 10 * 3600_000 } });
-  const again = () => h.texts(ZHANG).filter(text => text.includes("没有当作提问"));
+test("what a conversation is told: the live pushes that reached the member and what they did; the body while a reply is awaited; nothing after the deadline", async () => {
+  const h = harness({ limits: { heardKeep: 3 } });
   try {
-    const id = await confirmed(h, { mode: "reply" });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    expect([h.service.hasLive(DIRECT_SCOPE, ZHANG), h.service.pending(DIRECT_SCOPE, ZHANG), h.service.attachmentAsk(ZHANG)]).toEqual([false, undefined, undefined]);
+    const a = await confirmed(h, { mode: "reply", subject: "周报", body: "请回复本周进展。" });
+    const b = await confirmed(h, { subject: "通知" });
+    expect([h.service.hasLive(DIRECT_SCOPE, ZHANG), h.service.hasLive(DIRECT_SCOPE, WANG)]).toEqual([true, false]);
+    expect(h.service.pending(DIRECT_SCOPE, ZHANG)).toBe([
+      "[推送] 这位成员收到、还没有结束的推送：",
+      `- 推送编号 ${a}：推送人 11-03 09:00 推送「周报」，要求回复（文字或附件），截止 11-06 09:00。还没有回复。正文（引用）：「请回复本周进展。」`,
+      `- 推送编号 ${b}：推送人 11-03 09:00 推送「通知」，要求确认收到（成员在卡片上点「已收到」），截止 11-06 09:00。还没有确认。`].join("\n"));
+    expect(h.service.attachmentAsk(ZHANG)).toBe("是回复「周报」的话说一声，我记进去；要我处理别的也直接说。");
+    await h.service.reply(h.say(ZHANG, "本周完成了迁移"), { push: a, action: "add" });
+    h.click(ZHANG, h.card(ZHANG, b), "已收到", "card-b");
     await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "A 机房正常")).toBe(true);
-    h.clock.now += 60_000;
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "B 机房缺一台")).toBe(true);
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-9", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
-    await h.settle();
-    expect(h.texts(ZHANG).filter(text => text.includes("已记入"))).toHaveLength(1);
-    expect(again()).toHaveLength(0);
-    // Forgotten: the reminder says later messages still count, and the next message is told what happened to it.
-    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
+    const told = h.service.pending(DIRECT_SCOPE, ZHANG)!;
+    expect(told).toContain("推送「周报」，要求回复（文字或附件），截止 11-06 09:00。已回复（文字 1 段）。");
+    expect(told).not.toContain("正文（引用）");
+    expect(told).toContain("推送「通知」，要求确认收到（成员在卡片上点「已收到」），截止 11-06 09:00。已确认。");
+    expect(h.service.attachmentAsk(ZHANG)).toBeUndefined();
+    // A recipient of a live push may look people up; others who are not pushers may not.
+    expect(h.service.lookup(ZHANG, { name: "王" })).toContain("王五，手机号 13800000003");
+    expect(() => h.service.lookup(WANG, { name: "张" })).toThrow("查通讯录是给推送人和收到推送的人用的");
+    // Texts are kept while a push waits for replies: the newest few of a member, for a day; commands and outsiders' texts never.
+    for (const text of ["一", "二", "三", "四"]) h.say(ZHANG, text);
+    h.say(ZHANG, "/status");
+    h.say(WANG, "路过");
+    expect([h.store.heard(ZHANG, ZHANG).map(heard => heard.text), h.store.heard(WANG, WANG)]).toEqual([["四", "三", "二"], []]);
+    h.clock.now += PUSH_LIMITS.heardMs + 1;
     h.service.tick();
-    await h.settle();
-    expect(h.texts(ZHANG).at(-1)).toContain("提交前发来的消息都会记入这次回复");
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "顺便问一下，X100 的报价是多少？")).toBe(true);
-    await h.settle();
-    expect(again()).toHaveLength(1);
-    expect(again()[0]).toContain("记入了「机房盘点」的回复（第 4 条）");
-    expect(again()[0]).toContain("要提问请先发送 /完成 或 /取消");
-    // The receipt cleared the reminder: what follows at once is content again.
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "再补一句")).toBe(true);
-    await h.settle();
-    expect(again()).toHaveLength(1);
-    expect(h.store.items(id, ZHANG, 1)).toHaveLength(5);
+    expect(h.store.heard(ZHANG, ZHANG)).toEqual([]);
+    // Past the deadline nothing is told any more, also before the timer has ended the pushes.
+    expect(h.service.pending(DIRECT_SCOPE, ZHANG)).toContain("推送「周报」");
+    h.clock.now = START + PUSH_LIMITS.defaultDeadlineMs;
+    expect(h.service.pending(DIRECT_SCOPE, ZHANG)).toBeUndefined();
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
-
-  // After a pause without a reminder (an attachment as well as a text).
-  const paused = harness({ limits: { replyReceiptMs: 5 * 60_000 } });
-  try {
-    await confirmed(paused, { mode: "reply" });
-    paused.click(ZHANG, paused.card(ZHANG), "回复", "card-zhang");
-    await paused.settle();
-    expect(paused.service.directText(paused.identity(ZHANG), paused.reply(ZHANG), "A 机房正常")).toBe(true);
-    paused.clock.now += 5 * 60_000;
-    expect(paused.service.directAttachment(paused.identity(ZHANG), paused.reply(ZHANG), { fileId: "f-10", kind: "image", name: "图片" })).toBe(true);
-    await paused.settle();
-    expect(paused.texts(ZHANG).filter(text => text.includes("没有当作提问"))).toHaveLength(1);
-    expect(paused.texts(ZHANG).at(-1)).toContain("第 2 条");
-    expect(paused.reports).toEqual([]);
-  } finally { await paused.close(); }
 });
 
-test("deadline: an open draft with content counts as replied, one without content does not; the package holds the replies; holds are released", async () => {
+test("deadline: what was recorded is the reply; the package holds the replies; holds are released; nothing is recorded after the end", async () => {
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    h.click(LI, h.card(LI), "回复", "card-li");
+    await h.service.reply(h.say(ZHANG, "张三的回复", ["照片.png"]), { push: id, action: "add" });
+    h.click(LI, h.card(LI), "已收到", "card-li");
     await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-2", kind: "image", name: "图片" })).toBe(true);
-    await h.settle();
-    // Idle with content: one reminder.
-    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
-    h.service.tick();
-    h.service.tick();
-    await h.settle();
-    expect(h.texts(ZHANG).filter(text => text.includes("还没有提交"))).toHaveLength(1);
-    expect(h.texts(LI).filter(text => text.includes("还没有提交"))).toHaveLength(0);
+    const live = h.cards(LI)[0]!;
     h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
     h.service.tick();
     await h.settle();
     const push = h.store.push(id)!;
     expect([push.state, push.closeReason, push.summaryState]).toEqual(["closed", "deadline", "sent"]);
     expect([h.store.recipient(id, ZHANG)!.submitted, h.store.recipient(id, LI)!.submitted]).toEqual([1, 0]);
-    expect(h.texts(ZHANG).at(-1)).toContain("按已回复提交");
+    expect(summaryOf(h).content).toContain("已确认 2，已回复 1，未回复 2");
     expect(summaryOf(h).content).toContain("未回复：李四、王五");
     const zip = join(fixture.root, `zip-${id}.zip`);
     await writeFile(zip, h.uploads.at(-1)!.data);
     const entries = readZip(zip);
-    expect(entries.map(entry => entry.name)).toEqual([`推送汇总-机房盘点-${id}.xlsx`, "回复/001-张三-0001/01-图片", "回复/001-张三-0001/回复.txt"]);
+    expect(entries.map(entry => entry.name)).toEqual([`推送汇总-机房盘点-${id}.xlsx`, "回复/001-张三-0001/01-照片.png", "回复/001-张三-0001/回复.txt"]);
     expect(entries[2]!.data.toString("utf8")).toContain("张三的回复");
     await h.settle();
     expect(h.store.push(id)!.released).toBe(true);
     expect(Object.values(h.records.get(ZHANG)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
-    // A click after the end only shows the end.
-    h.click(LI, h.cards(LI)[0]!, "回复", "card-li");
-    await h.settle();
+    // After the end: no reply is recorded, and a click only shows the end. So does one on a button of the cards from
+    // before replies went through the conversation (「回复」, 「已回复」, 「取消」, 「修改回复」).
+    await expect(h.service.reply(h.say(LI, "迟到的回复"), { push: id, action: "add" })).rejects.toThrow("「机房盘点」已经结束");
     expect(h.card(LI).status.name).toBe("未回复");
+    const before = h.cards(LI).length, button = live.tailFields[0]!;
+    const old = { ...live, tailFields: [{ ...button, name: "回复", value: { ...button.value, data: { ...button.value.data as object, a: "reply" } } }] };
+    h.click(LI, old, "回复", "card-li");
+    await h.settle();
+    expect([h.cards(LI).length, h.card(LI).status.name]).toEqual([before + 1, "未回复"]);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
 
-test("deadline, reminders and 补推送 write the whole list in one transaction; a close that fails half way changes nothing and sends nothing", async () => {
+test("the deadline and 补推送 write the whole list in one transaction; a close that fails half way changes nothing and sends nothing", async () => {
   const h = harness();
   try {
-    const id = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    h.click(LI, h.card(LI), "回复", "card-li");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
-    expect(h.service.directText(h.identity(LI), h.reply(LI), "李四的回复")).toBe(true);
+    // Two cards are refused and wait for another try: the deadline settles both rows.
+    h.failing.when = item => item.message.msgType === "card" && (item.to === im(LI) || item.to === im(WANG)) ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const id = await confirmed(h, { mode: "reply", deadline: "2026-11-03 09:30", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
+    h.click(ZHANG, h.card(ZHANG), "已收到", "card-zhang");
+    await h.service.reply(h.say(ZHANG, "张三的回复"), { push: id, action: "add" });
     await h.settle();
     // Every row write from here on: whether a transaction was open, and a failure on demand.
     const writes: boolean[] = [], update = h.store.updateRecipient.bind(h.store);
@@ -472,20 +475,14 @@ test("deadline, reminders and 补推送 write the whole list in one transaction;
       update(...args);
     };
     const outside = () => writes.filter(inside => !inside).length;
-    // Two idle drafts are reminded in one transaction.
-    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
-    h.service.tick();
-    await h.settle();
-    expect([writes.length, outside()]).toEqual([2, 0]);
-    expect([ZHANG, LI].map(phone => h.texts(phone).filter(text => text.includes("还没有提交")).length)).toEqual([1, 1]);
-    // 补推送 to the one without an answer or a draft.
-    writes.length = 0;
+    // 补推送 to one whose card failed: refused again, it waits for another try as before.
     expect(await h.service.remind(id, [WANG])).toEqual({ resent: 1 });
     expect(writes[0]).toBe(true);
     await h.settle();
-    // The deadline: the second row's write fails. The first row's submission is rolled back and its messages are not sent.
+    expect(h.store.recipients(id).map(recipient => [recipient.sendState, recipient.retryAt !== null])).toEqual([["sent", false], ["failed", true], ["failed", true]]);
+    // The deadline: the second row's write fails. The first row's is rolled back and nothing is sent.
     const before = { sent: h.sent.length, notes: h.notes.length, rows: h.store.recipients(id) };
-    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.clock.now = new Date(2026, 10, 3, 9, 30, 1).getTime();
     writes.length = 0;
     failAt = 2;
     h.service.tick();
@@ -494,52 +491,37 @@ test("deadline, reminders and 补推送 write the whole list in one transaction;
     expect(h.store.push(id)!.state).toBe("open");
     expect(h.store.recipients(id)).toEqual(before.rows);
     expect([h.sent.length, h.notes.length]).toEqual([before.sent, before.notes]);
-    // The next pass closes it: both drafts submitted, each told once, every write inside the one transaction.
+    // The next pass closes it, every write inside the one transaction.
     failAt = 0;
     writes.length = 0;
     h.service.tick();
     await h.settle();
     expect(h.store.push(id)!.state).toBe("closed");
     expect(outside()).toBe(0);
-    expect(h.store.recipients(id).map(recipient => [recipient.submitted, recipient.replyState, recipient.version > before.rows.find(row => row.member === recipient.member)!.version]))
-      .toEqual([[1, "submitted", true], [1, "submitted", true], [0, "none", true]]);
-    expect([ZHANG, LI].map(phone => h.texts(phone).filter(text => text.includes("已到截止时间")).length)).toEqual([1, 1]);
-    expect(h.notes.filter(note => note.requestId.includes(`reply:${id}`)).map(note => note.phone).toSorted()).toEqual([ZHANG, LI].toSorted());
-    // The cards someone clicked show the end.
-    expect([h.card(ZHANG).status.name, h.card(LI).status.name]).toEqual(["已回复", "已回复"]);
+    expect(h.store.recipients(id).map(recipient => [recipient.submitted, recipient.sendState, recipient.retryAt])).toEqual([[1, "sent", null], [0, "failed", null], [0, "failed", null]]);
+    // The card someone clicked shows the end.
+    expect([h.card(ZHANG).status.name, h.card(ZHANG).invalid]).toEqual(["已回复", true]);
     expect(h.store.push(id)!.summaryState).toBe("sent");
   } finally { await h.close(); }
 });
 
-test("one reply at a time: an empty draft switches to the other push; one with content refuses until ended; /取消 keeps the earlier submission", async () => {
+test("two pushes wait for a reply: a message goes to the one named and to one only; a push that only wants a click takes none", async () => {
   const h = harness();
   try {
-    const a = await confirmed(h, { mode: "reply", subject: "甲", recipients: [{ name: "张三", phone: ZHANG }] });
-    // Two recipients: a single one replying would complete the push and close it early.
-    const b = await confirmed(h, { mode: "reply", subject: "乙", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }] });
-    h.click(ZHANG, h.card(ZHANG, a), "回复", "card-a");
-    await h.settle();
-    h.click(ZHANG, h.card(ZHANG, b), "回复", "card-b");
-    await h.settle();
-    expect([h.store.recipient(a, ZHANG)!.replyState, h.store.recipient(b, ZHANG)!.replyState]).toEqual(["none", "replying"]);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "给乙的")).toBe(true);
-    h.click(ZHANG, h.card(ZHANG, a), "回复", "card-a");
-    await h.settle();
-    expect(h.texts(ZHANG).at(-1)).toContain("你正在回复「乙」");
-    expect(h.store.recipient(a, ZHANG)!.replyState).toBe("none");
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "/完成")).toBe(true);
-    // Edit, then /取消: the submission stays.
-    h.click(ZHANG, h.card(ZHANG, b), "修改回复", "card-b");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "不要了")).toBe(true);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "/取消")).toBe(true);
-    await h.settle();
-    expect(h.texts(ZHANG).at(-1)).toContain("之前提交的回复仍然有效");
-    const recipient = h.store.recipient(b, ZHANG)!;
-    expect([recipient.replyState, recipient.submitted]).toEqual(["submitted", 1]);
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "/完成")).toBe(true);
-    await h.settle();
-    expect(h.texts(ZHANG).at(-1)).toBe("当前没有回复中的推送。");
+    const a = await confirmed(h, { mode: "reply", subject: "甲" });
+    const b = await confirmed(h, { mode: "reply", subject: "乙" });
+    expect(h.service.attachmentAsk(ZHANG)).toBe("是回复推送的话告诉我是哪一条，我记进去；要我处理别的也直接说。");
+    const message = h.say(ZHANG, "给乙的");
+    await h.service.reply(message, { push: b, action: "add" });
+    await expect(h.service.reply(message, { push: a, action: "add" })).rejects.toThrow("这条消息已经记在「乙」的回复里");
+    // Withdrawn there, it goes to the other.
+    await h.service.reply(h.say(ZHANG, "记错了"), { push: b, action: "withdraw" });
+    expect(await h.service.reply(h.say(ZHANG, "是回甲的"), { push: a, action: "add", quote: "给乙的" })).toContain("记入 推送人 推送的「甲」的回复");
+    expect([h.store.recipient(a, ZHANG)!.submitted, h.store.recipient(b, ZHANG)!.submitted]).toEqual([1, 0]);
+    expect(h.store.items(a, ZHANG).map(item => item.msgUid)).toEqual([message.message.msgUid]);
+    const c = await confirmed(h, { subject: "丙" });
+    await expect(h.service.reply(h.say(ZHANG, "收到"), { push: c, action: "add" })).rejects.toThrow("「丙」不收回复：它要的是确认收到");
+    expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
 
@@ -570,7 +552,7 @@ test("card sends: a refused card is tried again after 1 and 5 minutes, then fail
     // The failed card's recipient has no answer: 「提醒未回复」 can reach them.
     expect(summaryOf(h).tailFields.map(button => button.name)).toEqual(["提醒未回复"]);
     expect(h.service.list({ group: "closed", before: null, limit: 10 }).pushes.map(push => push.counts))
-      .toEqual([{ total: 3, groups: 0, delivered: 2, failed: 1, answered: 2, replying: 0 }]);
+      .toEqual([{ total: 3, groups: 0, delivered: 2, failed: 1, answered: 2 }]);
   } finally { await h.close(); }
 });
 
@@ -598,25 +580,33 @@ test("the frequency limit counts confirmations within 24 hours, at prepare and a
   } finally { await h.close(); }
 });
 
-test("restart: a card left sending is uncertain and never resent; an attachment item left unregistered is matched by its message or marked failed", async () => {
+test("restart: a card left sending is uncertain and never resent; a reply's files are held again; what the reply buttons of an earlier version left is settled", async () => {
   const h = harness();
   try {
-    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }] });
+    await h.service.reply(h.say(ZHANG, "张三的回复", ["a.txt"]), { push: id, action: "add" });
     await h.settle();
+    // The process ended between the record of the reply and the hold of its file.
+    const file = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
+    delete h.records.get(ZHANG)!.attachments[file]!.heldBy;
     h.store.updateRecipient(id, LI, { sendState: "sending" });
-    // Two items whose registration did not finish: one the message service has, one it never got.
-    const kept = h.store.addItem({ pushId: id, member: ZHANG, revision: 1, msgUid: "m-kept", kind: "file", text: null, attachment: null, name: "a.txt", size: 1, error: null, receivedAt: h.clock.now, sender: null, senderName: null })!;
-    const lost = h.store.addItem({ pushId: id, member: ZHANG, revision: 1, msgUid: "m-lost", kind: "file", text: null, attachment: null, name: "b.txt", size: 1, error: null, receivedAt: h.clock.now, sender: null, senderName: null })!;
-    h.records.set(ZHANG, { requests: {}, attachments: { "att-k": { id: "att-k", msgUid: "m-kept", receivedAt: 0, epoch: 0, fileId: "f", kind: "file", name: "a.txt",
-      reply: h.reply(ZHANG), state: "ready", path: "x", at: 0, heldBy: `push:${id}` } } });
+    // A version with reply buttons ended while 王五 was replying: a text, and a file whose registration never ended.
+    h.db.query("UPDATE push_recipients SET reply_state = 'replying', draft = 1, activity_at = ? WHERE push_id = ? AND member = ?").run(h.clock.now - 60_000, id, WANG);
+    const item = { pushId: id, member: WANG, revision: 1, attachment: null, size: null, error: null, receivedAt: h.clock.now - 60_000, sender: null, senderName: null };
+    h.store.addItem({ ...item, msgUid: "m-text", kind: "text", text: "王五的回复", name: null });
+    h.store.addItem({ ...item, msgUid: "m-file", kind: "file", text: null, name: "b.txt" });
     const before = h.cards(LI).length;
     await h.restart();
     await h.settle();
     expect(h.store.recipient(id, LI)!.sendState).toBe("uncertain");
     expect(h.cards(LI).length).toBe(before);
-    const items = new Map(h.store.items(id, ZHANG).map(item => [item.id, item]));
-    expect([items.get(kept)!.attachment, items.get(lost)!.error]).toEqual(["att-k", "附件登记中断，请重新发送"]);
+    expect(h.records.get(ZHANG)!.attachments[file]!.heldBy).toBe(`push:${id}`);
+    const wang = h.store.recipient(id, WANG)!;
+    expect([wang.submitted, wang.submittedAt]).toEqual([1, h.clock.now - 60_000]);
+    expect(h.store.items(id, WANG).map(each => [each.kind, each.text, each.error])).toEqual([["text", "王五的回复", null], ["file", null, "附件没有收全"]]);
+    expect(h.db.query("SELECT reply_state, draft FROM push_recipients WHERE push_id = ? AND member = ?").get(id, WANG)).toEqual({ reply_state: "none", draft: 0 });
+    expect(h.service.status(PUSHER, id)).toContain("王五（尾号 0003）：已回复：王五的回复；附件：b.txt");
+    expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
 
@@ -667,7 +657,7 @@ test("department and everyone pushes: grants, names and paths, duplicates and ne
   } finally { await h.close(); }
 });
 
-test("directory_lookup: pushers only; by part of the name, phone or department, together narrowing down; full phones and departments; capped", async () => {
+test("directory_lookup: by part of the name, phone or department, together narrowing down; full phones and departments; capped", async () => {
   const h = harness({ limits: { lookup: 2 }, people: [{ phone: "13800000004", name: "张 三丰", imUserId: im("13800000004") }] });
   try {
     // Before the tree is synced: names and phones work, departments wait.
@@ -690,9 +680,9 @@ test("directory_lookup: pushers only; by part of the name, phone or department, 
     // The same name twice, or no such department: the paths to choose from, or the near misses.
     expect(h.service.lookup(PUSHER, { department: "研发组" })).toBe("有 2 个部门叫「研发组」，请用完整路径再查：技术部/研发组；财务部/研发组。");
     expect(h.service.lookup(PUSHER, { department: "研发" })).toBe("找不到部门「研发」，是不是：技术部/研发组、财务部/研发组。");
-    // No department grant is needed (people are pushed to one by one); the pusher role is.
+    // No department grant is needed (people are pushed to one by one); the pusher role is, or a live push received.
     h.store.replaceRoles([], h.clock.now);
-    expect(() => h.service.lookup(PUSHER, { name: "李" })).toThrow("没有推送权限");
+    expect(() => h.service.lookup(PUSHER, { name: "李" })).toThrow("查通讯录是给推送人和收到推送的人用的");
     expect(h.sent).toEqual([]);
   } finally { await h.close(); }
 });
@@ -891,21 +881,54 @@ async function summaryArchive(h: Harness, upload = h.uploads.at(-1)!): Promise<{
     sheet: readZip(workbook).find(entry => entry.name === "xl/worksheets/sheet1.xml")!.data.toString("utf8") };
 }
 
-/** Wait for `done` without waiting for all the service's work (a registration held at its gate is part of it). */
+/** Wait for `done` without waiting for all the service's work (a send held at its gate is part of it). */
 async function until(done: () => boolean): Promise<void> {
   for (let round = 0; round < 2000 && !done(); round++) await Bun.sleep(5);
   expect(done()).toBe(true);
 }
 
+/** Everyone has answered and nobody changed a reply for the grace period: the timer ends the push. */
+async function graceOver(h: Harness): Promise<void> {
+  h.clock.now += PUSH_LIMITS.replyGraceMs;
+  h.service.tick();
+  await h.settle();
+}
+
+test("replies end a push early only after they stood for a while: a change starts the wait again, a withdrawal keeps the push open", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
+    await h.service.reply(h.say(ZHANG, "第一段"), { push: id, action: "add" });
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.state).toBe("open");
+    // More of the reply within the wait: it counts from there.
+    h.clock.now += PUSH_LIMITS.replyGraceMs - 1;
+    await h.service.reply(h.say(ZHANG, "第二段"), { push: id, action: "add" });
+    h.clock.now += PUSH_LIMITS.replyGraceMs - 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.state).toBe("open");
+    // Withdrawn: nobody has answered, however long ago.
+    await h.service.reply(h.say(ZHANG, "先撤回"), { push: id, action: "withdraw" });
+    await graceOver(h);
+    expect(h.store.push(id)!.state).toBe("open");
+    await h.service.reply(h.say(ZHANG, "最终版"), { push: id, action: "add" });
+    await graceOver(h);
+    const push = h.store.push(id)!;
+    expect([push.state, push.closeReason, push.summaryState]).toEqual(["closed", "complete", "sent"]);
+    expect(summaryOf(h).content).toContain("已全部答复");
+    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/回复.txt")).toContain("最终版");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
 test("summary: the archive sent at the end masks phones in the workbook and in the reply texts", async () => {
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }], cc: [{ name: "王五", phone: WANG }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
-    await h.settle();
+    await h.service.reply(h.say(ZHANG, "张三的回复"), { push: id, action: "add" });
+    await graceOver(h);
     expect(h.store.push(id)!.summaryState).toBe("sent");
     // The pusher's archive and the CC's.
     expect(h.uploads).toHaveLength(2);
@@ -922,16 +945,11 @@ test("summary: the archive sent at the end masks phones in the workbook and in t
 test("summary: a reply attachment still downloading holds it back; then it is packed and its hold released", async () => {
   const h = harness();
   try {
-    h.registering.pending = true;
     const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    await h.settle();
-    const file = h.reply(ZHANG), att = `att-${file.msgUid}`;
-    expect(h.service.directAttachment(h.identity(ZHANG), file, { fileId: "f-1", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
-    await h.settle();
-    // 已回复 answers the last one: the push closes while the file is still downloading.
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
-    await h.settle();
+    await h.service.reply(h.say(ZHANG, "见附件", ["盘点.xlsx"], { downloading: true }), { push: id, action: "add" });
+    const att = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
+    // The push ends while the file is still downloading.
+    await graceOver(h);
     h.service.tick();
     await h.settle();
     expect([h.store.push(id)!.state, h.store.push(id)!.summaryState, h.uploads.length]).toEqual(["closed", "pending", 0]);
@@ -943,7 +961,8 @@ test("summary: a reply attachment still downloading holds it back; then it is pa
     const push = h.store.push(id)!;
     expect([push.summaryState, push.summaryAttempts, push.released]).toEqual(["sent", 0, true]);
     expect((await summaryArchive(h)).files.get("回复/001-张三-0001/01-盘点.xlsx")).toBe("content of 盘点.xlsx");
-    expect(h.records.get(ZHANG)!.attachments[att]).toBeUndefined();
+    // The file is its request's alone again; the push remembers where it is.
+    expect(h.records.get(ZHANG)!.attachments[att]!.heldBy).toBeUndefined();
     expect(h.store.items(id, ZHANG).find(item => item.kind === "file")!.path).toEndWith(`${att}.bin`);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
@@ -952,15 +971,10 @@ test("summary: a reply attachment still downloading holds it back; then it is pa
 test("summary: after the wait it goes out without a file still downloading; the hold stays until the download ends, then the console's package has the file", async () => {
   const h = harness();
   try {
-    h.registering.pending = true;
     const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    await h.settle();
-    const file = h.reply(ZHANG), att = `att-${file.msgUid}`;
-    expect(h.service.directAttachment(h.identity(ZHANG), file, { fileId: "f-1", kind: "file", name: "盘点.xlsx", size: 20 })).toBe(true);
-    await h.settle();
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
-    await h.settle();
+    await h.service.reply(h.say(ZHANG, "见附件", ["盘点.xlsx"], { downloading: true }), { push: id, action: "add" });
+    const att = Object.keys(h.records.get(ZHANG)!.attachments)[0]!;
+    await graceOver(h);
     h.clock.now += PUSH_LIMITS.settleWaitMs;
     h.service.tick();
     await h.settle();
@@ -976,54 +990,11 @@ test("summary: after the wait it goes out without a file still downloading; the 
     h.service.tick();
     await h.settle();
     expect(h.store.push(id)!.released).toBe(true);
-    expect(h.records.get(ZHANG)!.attachments[att]).toBeUndefined();
+    expect(h.records.get(ZHANG)!.attachments[att]!.heldBy).toBeUndefined();
     const pack = await h.service.package(id);
     try { expect(readZip(pack.path).map(entry => entry.name)).toContain("回复/001-张三-0001/01-盘点.xlsx"); } finally { await pack.done(); }
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
-});
-
-test("summary: a reply attachment still registering holds it back; one registered only after the summary went out is released all the same", async () => {
-  const h = harness();
-  let open = () => {};
-  const gate = () => { h.registering.gate = new Promise(resolve => { open = () => { h.registering.gate = null; resolve(); }; }); };
-  try {
-    // 甲: the registration ends within the wait, and the summary follows it.
-    const a = await confirmed(h, { mode: "reply", subject: "甲", recipients: [{ name: "张三", phone: ZHANG }] });
-    h.click(ZHANG, h.card(ZHANG, a), "回复", "card-a");
-    await h.settle();
-    gate();
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-1", kind: "file", name: "甲.xlsx", size: 20 })).toBe(true);
-    h.click(ZHANG, h.card(ZHANG, a), "已回复", "card-a");
-    expect(h.store.push(a)!.state).toBe("closed");
-    h.service.tick();
-    await Bun.sleep(100);
-    expect([h.store.push(a)!.summaryState, h.uploads.length]).toEqual(["pending", 0]);
-    open();
-    await h.settle();
-    expect([h.store.push(a)!.summaryState, h.store.push(a)!.released]).toEqual(["sent", true]);
-    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/01-甲.xlsx")).toBe("content of 甲.xlsx");
-    // 乙: the registration ends after the summary went out at the end of the wait; its hold is released, not kept for ever.
-    const b = await confirmed(h, { mode: "reply", subject: "乙", recipients: [{ name: "张三", phone: ZHANG }] });
-    h.click(ZHANG, h.card(ZHANG, b), "回复", "card-b");
-    await h.settle();
-    gate();
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-2", kind: "file", name: "乙.xlsx", size: 20 })).toBe(true);
-    h.click(ZHANG, h.card(ZHANG, b), "已回复", "card-b");
-    h.clock.now += PUSH_LIMITS.settleWaitMs;
-    h.service.tick();
-    await until(() => h.store.push(b)!.summaryState === "sent");
-    await Bun.sleep(100);
-    expect(h.store.push(b)!.released).toBe(false);
-    expect((await summaryArchive(h)).files.get("回复/001-张三-0001/回复.txt")).toContain("乙.xlsx：未打包，还在接收");
-    open();
-    await h.settle();
-    h.service.tick();
-    await h.settle();
-    expect(h.store.push(b)!.released).toBe(true);
-    expect(Object.values(h.records.get(ZHANG)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
-    expect(h.reports).toEqual([]);
-  } finally { open(); await h.close(); }
 });
 
 /** A 补推送 begun 1 ms before the deadline whose result is held back (`held.open` lets it return), with the timer having ended the push. */
@@ -1290,7 +1261,7 @@ test("previews: confirming a push deletes the pusher's earlier unconfirmed previ
     firstClick();
     firstClick();
     await h.settle();
-    expect(h.texts(PUSHER).slice(texts)).toEqual(["这张预览卡片对应的推送记录已清理，没有发出任何内容。确认发出一条推送后，在它之前准备、还没有确认的预览会一并清理；还需要的话请重新提出。"]);
+    expect(h.texts(PUSHER).slice(texts)).toEqual(["这张预览已经作废，什么都没有发出：确认了后面准备的推送，之前没确认的预览就一起清掉了。还要发的话请再提一次。"]);
     expect(h.cards(ZHANG).filter(each => each.content.includes("第一版"))).toHaveLength(0);
     h.click(PUSHER, firstCard, "取消", "preview-first");
     await h.settle();
@@ -1331,12 +1302,8 @@ test("console: the list pages newest first by state; one push shows every recipi
   const h = harness();
   try {
     const a = await confirmed(h, { mode: "reply", subject: "甲" });
-    h.click(ZHANG, h.card(ZHANG, a), "回复", "card-zhang");
+    await h.service.reply(h.say(ZHANG, "已盘点", ["清单.xlsx"]), { push: a, action: "add" });
     await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "已盘点")).toBe(true);
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-1", kind: "file", name: "清单.xlsx", size: 20 })).toBe(true);
-    await h.settle();
-    h.click(ZHANG, h.card(ZHANG, a), "已回复", "card-zhang");
     h.clock.now += 1000;
     const b = h.pushId(await h.prepare({ subject: "乙" }));
     h.clock.now += 1000;
@@ -1348,14 +1315,14 @@ test("console: the list pages newest first by state; one push shows every recipi
     const rest = h.service.list({ group: null, before: { createdAt: first.pushes.at(-1)!.createdAt, id: first.pushes.at(-1)!.id }, limit: 2 });
     expect([rest.pushes.map(push => push.id), rest.more]).toEqual([[a], false]);
     expect(h.service.list({ group: "live", before: null, limit: 10 }).pushes.map(push => [push.id, push.counts]))
-      .toEqual([[a, { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1, replying: 0 }]]);
+      .toEqual([[a, { total: 2, groups: 0, delivered: 2, failed: 0, answered: 1 }]]);
     expect(h.service.list({ group: "void", before: null, limit: 10 }).pushes.map(push => push.id)).toEqual([c]);
     // Totals: only a went out, and it is still live; rates count closed pushes only.
     expect(first.totals).toEqual({ sent: 1, followUps: 0, live: 1, delivered: 0, acked: 0, replyDelivered: 0, replied: 0 });
     const detail = h.service.detail(a);
     expect([detail.push.subject, detail.push.target.people.length, detail.push.state]).toEqual(["甲", 2, "open"]);
     const zhang = detail.recipients.find(recipient => recipient.member === ZHANG)!, li = detail.recipients.find(recipient => recipient.member === LI)!;
-    expect([zhang.answered, zhang.reply, zhang.replyState]).toEqual([true, { text: "已盘点", files: [{ name: "清单.xlsx", size: 20, kind: "file" }], senders: [] }, "submitted"]);
+    expect([zhang.answered, zhang.reply, zhang.forwardedBy, zhang.forwardedTo]).toEqual([true, { text: "已盘点", files: [{ name: "清单.xlsx", size: 22, kind: "file" }], senders: [] }, null, []]);
     expect([li.answered, li.reply, li.sendState]).toEqual([false, null, "sent"]);
     expect(() => h.service.detail("zzzzzzzz")).toThrow("推送不存在");
     // Live and preview pushes stay; a cancelled one goes.
@@ -1363,7 +1330,7 @@ test("console: the list pages newest first by state; one push shows every recipi
     await expect(h.service.remove(b)).rejects.toThrow("还没有结束");
     await h.service.remove(c);
     expect(h.store.push(c)).toBeUndefined();
-    // At the deadline a closes: 张三 confirmed (回复) and replied, 李四 neither.
+    // At the deadline a closes: 张三 replied (which confirms too), 李四 did neither.
     h.clock.now = h.store.push(a)!.deadline + 1;
     h.service.tick();
     await h.settle();
@@ -1394,12 +1361,7 @@ test("console package: the workbook and replies with phones masked, of the push 
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00" });
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-1", kind: "file", name: "清单.txt", size: 20 })).toBe(true);
-    await h.settle();
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
+    await h.service.reply(h.say(ZHANG, "张三的回复", ["清单.txt"]), { push: id, action: "add" });
     await h.settle();
     const unpack = async (member?: string) => {
       const pack = await h.service.package(id, member);
@@ -1520,7 +1482,7 @@ test("group limits: none registered yet, too many groups, and a group counting a
   } finally { await h.close(); }
 });
 
-test("group push: one card in the group; 已收到 counts every click; anyone starts the reply, each @ text is a reply with its sender, anyone submits; notes go to the members' group conversations", async () => {
+test("group push: one card in the group; 已收到 counts every click; each @ text the conversation records is the group's reply with its sender; a member changes only their own", async () => {
   const h = harness();
   try {
     roles(h, { group: true });
@@ -1530,58 +1492,55 @@ test("group push: one card in the group; 已收到 counts every click; anyone st
     expect(h.card(PUSHER, id).content).toContain("已发出 1 人、1 个群");
     const card = h.groupCards(G1).at(-1)!;
     expect(card.content).toContain("推送到本群");
-    expect(card.content).toContain("群里只能回复文字");
-    expect(card.tailFields.map(button => button.name)).toEqual(["已收到", "回复"]);
-    // A member's group conversation learns of the push when the member next speaks there, once.
+    expect(card.content).toContain("群里只收文字");
+    expect(card.tailFields.map(button => button.name)).toEqual(["已收到"]);
+    // A member's group conversation learns of the push when the member next speaks there, once; its requests are told of it each time.
+    const scope = { kind: "group", groupId: G1 } as const;
     const groupNotes = () => h.notes.filter(note => note.scope === `group:${G1}`)
       .map(note => [note.phone, note.requestId, (note.entry.model![0] as { content: { text: string }[] }).content[0]!.text] as const);
     expect(groupNotes()).toEqual([]);
-    expect(h.groupText(G1, LI, "这是什么推送？")).toBe(false);
-    expect(h.groupText(G1, LI, "再问一次")).toBe(false);
+    h.groupSay(G1, LI, "这是什么推送？");
+    h.groupSay(G1, LI, "再问一次");
     await h.settle();
     expect(groupNotes()).toEqual([[LI, `push-note:card:${id}`,
-      expect.stringMatching(/^\[推送\] 推送人 11-03 09:00 推送到本群「机房盘点」，正文（引用）：「.*」.*需要回复（群里只能回复文字）.*再 @机器人 发送文字。推送编号/)]]);
+      expect.stringMatching(/^\[推送\] 推送人 11-03 09:00 推送到本群「机房盘点」，正文（引用）：「.*」；要求：需要回复（群里只收文字）；截止 .*推送编号/)]]);
+    expect(h.service.pending(scope, LI)).toBe(`[推送] 本群收到、还没有结束的推送：\n- 推送编号 ${id}：推送人 11-03 09:00 推送到本群「机房盘点」，要求回复（群里只收文字），`
+      + "截止 11-06 09:00。还没有回复。正文（引用）：「请回复本周机房盘点结果。」");
     // 已收到: every click counts, also on an older card version; the clickers are not named.
     h.groupClick(G1, card, "已收到", "group-card", "clicker-1");
     h.groupClick(G1, card, "已收到", "group-card", "clicker-2");
     await h.settle();
     expect(h.store.recipient(id, `group:${G1}`)).toMatchObject({ clicks: 2, ackedAt: START, card: "group-card" });
     expect(h.groupCards(G1).at(-1)!.content).toContain("已收到：首次 11-03 09:00，共点击 2 次");
-    // 回复 by anyone: the group replies; every @ text is recorded with its sender and gets a receipt.
-    h.groupClick(G1, h.groupCards(G1).at(-1)!, "回复", "group-card");
+    // Replies: the texts as sent, each with its sender; the same message twice is one.
+    const first = h.groupSay(G1, WANG, "第一组已盘点");
+    expect(await h.service.reply(first, { push: id, action: "add" })).toBe("已把成员的这条消息记入 推送人 推送的「机房盘点」的回复。本群的回复现在共 1 段文字。");
+    await h.service.reply(h.groupSay(G1, LI, "第二组缺一台"), { push: id, action: "add" });
+    expect(await h.service.reply(first, { push: id, action: "add" })).toContain("没有重复记");
     await h.settle();
-    expect(h.groupCards(G1).at(-1)!.status.name).toBe("回复中");
-    expect(h.groupTexts(G1).at(-1)).toContain("推送「机房盘点」回复中");
-    const first = h.groupReply(G1, WANG);
-    expect(h.groupText(G1, WANG, "第一组已盘点", first)).toBe(true);
-    expect(h.groupText(G1, LI, "第二组缺一台")).toBe(true);
-    expect(h.groupText(G1, WANG, "第一组已盘点", first)).toBe(true);
-    expect(h.groupText(G1, LI, "/status")).toBe(false);
+    expect([h.groupCards(G1).at(-1)!.status.name, h.groupCards(G1).at(-1)!.tailFields.map(button => button.name)]).toEqual(["已回复", ["已收到"]]);
+    expect(h.groupCards(G1).at(-1)!.content).toContain("已回复（王五等 2 人，2 段文字）");
+    expect(h.service.pending(scope, WANG)).toContain("已回复（共 2 段文字，其中这位成员 1 段）");
+    // A quote finds what this member said in this group: not their direct texts, not another member's.
+    h.say(WANG, "单聊里说的");
+    await expect(h.service.reply(h.groupSay(G1, WANG, "把我单聊那句记上"), { push: id, action: "add", quote: "单聊里说的" })).rejects.toThrow("没有找到这段话");
+    await expect(h.service.reply(h.groupSay(G1, WANG, "把李四那句再记一遍"), { push: id, action: "add", quote: "第二组缺一台" })).rejects.toThrow("没有找到这段话");
+    // replace and withdraw touch only what the member sent.
+    expect(await h.service.reply(h.groupSay(G1, WANG, "第一组改为缺两台"), { push: id, action: "replace" }))
+      .toBe("已把成员的这条消息记为 推送人 推送的「机房盘点」的回复，这位成员之前发的不算了。本群的回复现在共 2 段文字。");
+    expect(h.service.status(PUSHER, id)).toContain("群 销售一部：已回复：李四：第二组缺一台 王五：第一组改为缺两台");
+    expect(await h.service.reply(h.groupSay(G1, LI, "我那段撤回"), { push: id, action: "withdraw" })).toBe("已撤回这位成员在「机房盘点」里发的回复，群里其他人发的 1 段还在。");
+    expect(await h.service.reply(h.groupSay(G1, ZHANG, "撤回"), { push: id, action: "withdraw" })).toContain("没有可以撤回的");
+    await h.service.reply(h.groupSay(G1, LI, "第二组缺一台，已报修"), { push: id, action: "add" });
+    // 张三 answers in the direct chat: everyone answered, and the push ends once the replies stood.
+    await h.service.reply(h.say(ZHANG, "张三的回复"), { push: id, action: "add" });
     await h.settle();
-    expect(h.groupTexts(G1).filter(text => text.includes("已记为「机房盘点」的回复"))).toHaveLength(2);
-    expect(h.groupCards(G1).at(-1)!.content).toContain("已收到 王五等 2 人，2 段文字");
-    // A member's direct texts are not the group's reply.
-    expect(h.service.directText(h.identity(WANG), h.reply(WANG), "单聊的问题")).toBe(false);
-    expect(h.groupText(G1, ZHANG, "/完成")).toBe(true);
-    await h.settle();
-    expect(h.groupTexts(G1).at(-1)).toContain("已提交「机房盘点」的群回复（王五等 2 人，2 段文字）");
-    expect(h.groupCards(G1).at(-1)!.status.name).toBe("已回复");
-    expect(h.service.status(PUSHER, id)).toContain("群 销售一部：已回复：王五：第一组已盘点 李四：第二组缺一台");
-    // Each sender's group conversation has only what they sent.
-    const replies = groupNotes().filter(([, requestId]) => requestId.startsWith("push-note:reply:"));
-    expect(replies.map(([phone]) => phone).sort()).toEqual([LI, WANG].sort());
-    expect(replies.find(([phone]) => phone === WANG)![2]).toContain("其中你发的：第一组已盘点。");
-    expect(replies.find(([phone]) => phone === WANG)![2]).not.toContain("第二组");
-    // 张三 answers in the direct chat: everyone answered; the console sees the group's clicks and repliers.
-    h.click(ZHANG, h.card(ZHANG), "回复", "card-zhang");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "张三的回复")).toBe(true);
-    h.click(ZHANG, h.card(ZHANG), "已回复", "card-zhang");
-    await h.settle();
+    expect(h.store.push(id)!.state).toBe("open");
+    await graceOver(h);
     expect(h.store.push(id)!.state).toBe("closed");
     expect(summaryOf(h).content).toContain("共 1 人、1 个群；已确认 2，已回复 2，未回复 0");
     expect(h.service.list({ group: "closed", before: null, limit: 10 }).pushes.map(push => push.counts))
-      .toEqual([{ total: 2, groups: 1, delivered: 2, failed: 0, answered: 2, replying: 0 }]);
+      .toEqual([{ total: 2, groups: 1, delivered: 2, failed: 0, answered: 2 }]);
     const group = h.service.detail(id).recipients.find(recipient => recipient.member === `group:${G1}`)!;
     expect([group.name, group.clicks, group.reply!.senders]).toEqual(["销售一部", 2, ["王五", "李四"]]);
     expect(h.groupCards(G1).at(-1)!.invalid).toBe(true);
@@ -1589,7 +1548,7 @@ test("group push: one card in the group; 已收到 counts every click; anyone st
   } finally { await h.close(); }
 });
 
-test("group push: /取消 drops the group's draft; the deadline submits one with content; 提醒未回复 reaches a group still registered", async () => {
+test("group push: a text the model could not answer is the group's reply when one push waits there; the deadline keeps what was recorded; 提醒未回复 reaches a group still registered", async () => {
   const h = harness();
   try {
     roles(h, { group: true });
@@ -1597,25 +1556,16 @@ test("group push: /取消 drops the group's draft; the deadline submits one with
     h.service.saveGroup(G1, { name: "销售一部", state: "registered" });
     h.service.saveGroup(G2, { name: "客服群", state: "registered" });
     const id = await confirmed(h, { mode: "reply", recipients: [], groups: [{ name: "销售一部" }, { name: "客服群" }], deadline: "2026-11-04 18:00" });
-    for (const [group, cardId] of [[G1, "card-g1"], [G2, "card-g2"]] as const) h.groupClick(group, h.groupCards(group).at(-1)!, "回复", cardId);
+    const said = h.groupSay(G2, LI, "客服群的回复");
+    expect(await h.service.failed(said)).toBe("这条消息我先记进「机房盘点」的回复了；不是回复的话，回头跟我说一声“撤回”。");
+    expect(await h.service.failed(said)).toBe("这条消息已经记进「机房盘点」的回复了，不用重发。");
     await h.settle();
-    expect(h.groupText(G1, WANG, "先发一段")).toBe(true);
-    expect(h.groupText(G1, LI, "/取消")).toBe(true);
-    await h.settle();
-    expect(h.groupTexts(G1).at(-1)).toContain("已放弃这次对「机房盘点」的群回复");
-    expect(h.store.recipient(id, `group:${G1}`)!.replyState).toBe("none");
-    expect(h.notes.find(note => note.scope === `group:${G1}` && note.requestId.startsWith("push-note:abandon:"))!.phone).toBe(WANG);
-    expect(h.groupText(G2, LI, "客服群的回复")).toBe(true);
-    // No idle reminder in a group; at the deadline the draft with content is submitted.
-    h.clock.now += PUSH_LIMITS.idleReminderMs + 1000;
-    h.service.tick();
-    await h.settle();
-    expect(h.groupTexts(G2).filter(text => text.includes("还没有提交"))).toEqual([]);
+    expect(h.store.items(id, `group:${G2}`).map(item => [item.text, item.senderName])).toEqual([["客服群的回复", "李四"]]);
+    expect(h.notes.find(note => note.scope === `group:${G2}` && note.requestId === `push-note:reply:${id}:${said.message.msgUid}`)!.phone).toBe(LI);
     h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
     h.service.tick();
     await h.settle();
     expect(h.store.recipient(id, `group:${G2}`)!.submitted).toBe(1);
-    expect(h.groupTexts(G2).at(-1)).toContain("群里已发送的内容（李四，1 段文字）按已回复提交");
     expect(summaryOf(h).content).toContain("未回复：群 销售一部");
     // 提醒未回复: the unanswered group, while it is registered.
     h.click(PUSHER, summaryOf(h), "提醒未回复", "summary-g");
@@ -1627,7 +1577,150 @@ test("group push: /取消 drops the group's draft; the deadline submits one with
   } finally { await h.close(); }
 });
 
-test("deadline: a click, an attachment or a group text after the deadline, before the timer has run, ends the push at its deadline and counts for nothing", async () => {
+test("a request the model could not answer: with one push waiting the message is the reply, files included; with several it is not, and the member is told; with none nothing is said", async () => {
+  const h = harness();
+  try {
+    expect(await h.service.failed(h.say(ZHANG, "没有推送时的问题"))).toBeUndefined();
+    const a = await confirmed(h, { mode: "reply", subject: "甲" });
+    const first = h.say(ZHANG, "甲的回复", ["表.xlsx"]);
+    expect(await h.service.failed(first)).toBe("这条消息我先记进「甲」的回复了；不是回复的话，回头跟我说一声“撤回”。");
+    await h.settle();
+    expect(h.store.items(a, ZHANG).map(item => item.text ?? item.name)).toEqual(["甲的回复", "表.xlsx"]);
+    expect(h.held.map(hold => [hold.phone, hold.holder])).toEqual([[ZHANG, `push:${a}`]]);
+    const note = h.notes.find(each => each.phone === ZHANG && each.requestId === `push-note:reply:${a}:${first.message.msgUid}`)!;
+    expect((note.entry.model![0] as { content: { text: string }[] }).content[0]!.text).toBe(`[推送回复] 上面那条没有答上来的消息，系统已经记为对 推送人 推送的「甲」的回复。推送编号 ${a}`);
+    // The member says it was no reply: withdrawn like any other.
+    expect(await h.service.reply(h.say(ZHANG, "刚才那条不是回复，撤回"), { push: a, action: "withdraw" })).toContain("已撤回「甲」的回复");
+    await h.service.reply(h.say(ZHANG, "这才是回复"), { push: a, action: "add" });
+    // Nothing waits for 张三 now: nothing is recorded and nothing is said.
+    expect(await h.service.failed(h.say(ZHANG, "又一个问题"))).toBeUndefined();
+    expect(h.store.items(a, ZHANG).map(item => item.text)).toEqual(["这才是回复"]);
+    // Two wait for 李四: the message goes to neither.
+    const b = await confirmed(h, { mode: "reply", subject: "乙" });
+    expect(await h.service.failed(h.say(LI, "李四的话"))).toBe("你有 2 条推送等着回复（「甲」、「乙」），这条消息没有记进去；是回复的话，请过一会儿再发一次。");
+    expect([h.store.items(a, LI), h.store.items(b, LI)]).toEqual([[], []]);
+    expect(await h.service.failed(h.say(ZHANG, "乙的回复"))).toContain("记进「乙」的回复");
+    // A push that wants a click takes none; past the deadline none does.
+    const c = await confirmed(h, { subject: "丙", recipients: [{ name: "王五", phone: WANG }] });
+    expect(await h.service.failed(h.say(WANG, "收到"))).toBeUndefined();
+    expect(h.store.items(c)).toEqual([]);
+    h.clock.now = START + PUSH_LIMITS.defaultDeadlineMs;
+    expect(await h.service.failed(h.say(LI, "太晚了"))).toBeUndefined();
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("handing on: the person is checked and the recipient asked first; 确认转派 sends the card on, tells the pusher and settles the one who handed it on; 取消 sends nothing", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
+    const to = (name: string, phone: string) => ({ push: id, to: { name, phone } });
+    await expect(h.service.forward({ phone: ZHANG }, to("张三", ZHANG))).rejects.toThrow("不能转给成员自己");
+    await expect(h.service.forward({ phone: ZHANG }, to("推送人", PUSHER))).rejects.toThrow("就是这条推送的推送人");
+    await expect(h.service.forward({ phone: ZHANG }, to("李五", LI))).rejects.toThrow("与「李五」不符");
+    await expect(h.service.forward({ phone: ZHANG }, to("外人", "13900000000"))).rejects.toThrow("不在机器人同步的通讯录范围内");
+    await expect(h.service.forward({ phone: WANG }, to("李四", LI))).rejects.toThrow("没有发给这位成员的推送");
+    expect(h.cards(ZHANG)).toHaveLength(1);
+    // Asked: a card for the recipient, nothing for the other person.
+    expect(await h.service.forward({ phone: ZHANG }, to("李四", LI)))
+      .toBe("已把确认卡片发给成员本人：把「机房盘点」转给 李四。成员点卡片上的「确认转派」后才会发给 李四，点之前没有发给任何人。");
+    const asked = h.card(ZHANG);
+    expect([asked.title, asked.status.name, asked.tailFields.map(button => button.name)]).toEqual(["转派确认：机房盘点", "待确认", ["确认转派", "取消"]]);
+    expect(asked.content).toContain("转给 **李四**（尾号 0002）？");
+    h.click(ZHANG, asked, "取消", "ask-1");
+    await h.settle();
+    expect([h.card(ZHANG).msgUid, h.card(ZHANG).status.name, h.card(ZHANG).tailFields]).toEqual(["ask-1", "没有转派", []]);
+    expect([h.cards(LI), h.store.recipient(id, LI)]).toEqual([[], undefined]);
+    // Asked again: another person's click is nothing, the recipient's sends the push on.
+    await h.service.forward({ phone: ZHANG }, to("李四", LI));
+    const again = h.card(ZHANG);
+    h.click(WANG, again, "确认转派", "ask-2");
+    await h.settle();
+    expect(h.cards(LI)).toEqual([]);
+    h.click(ZHANG, again, "确认转派", "ask-2");
+    await h.settle();
+    expect([h.card(ZHANG).msgUid, h.card(ZHANG).status.name]).toEqual(["ask-2", "已转派"]);
+    expect([h.card(LI).title, h.card(LI).status.name]).toEqual(["推送：机房盘点", "待回复"]);
+    expect(h.card(LI).content).toContain("**张三** 转给你");
+    expect(h.texts(PUSHER).at(-1)).toBe("张三 把「机房盘点」转给了 李四。");
+    const noteOf = (phone: string, prefix: string) => (h.notes.find(note => note.phone === phone && note.requestId.startsWith(`push-note:${prefix}`))!.entry.model![0] as
+      { content: { text: string }[] }).content[0]!.text;
+    expect(noteOf(ZHANG, "forward:")).toBe(`[推送转派] 已把 推送人 推送的「机房盘点」转给 李四。推送编号 ${id}`);
+    expect(noteOf(PUSHER, "forwarded:")).toBe(`[推送转派] 张三 把「机房盘点」转给了 李四。推送编号 ${id}`);
+    expect(noteOf(LI, "card:")).toContain("推送「机房盘点」（张三 转来），正文（引用）：");
+    // A second click on the old card changes nothing; 李四 is in the list, so nobody hands it to them again.
+    h.click(ZHANG, again, "确认转派", "ask-2");
+    await h.settle();
+    expect(h.cards(LI)).toHaveLength(1);
+    await expect(h.service.forward({ phone: ZHANG }, to("李四", LI))).rejects.toThrow("李四 已经在「机房盘点」的名单里");
+    const status = h.service.status(PUSHER, id);
+    expect(status).toContain("共 2 人；已确认 0，已回复 0，已转派 1，未回复 1");
+    expect(status).toContain("- 张三（尾号 0001）：未确认，未回复；已转给 李四");
+    expect(status).toContain("- 李四（尾号 0002）（张三 转来）：未确认，未回复");
+    expect(h.service.pending(DIRECT_SCOPE, ZHANG)).toContain("还没有回复，已转给 李四。");
+    // The one it went to hands it on in turn, and that person answers: nobody is waited for.
+    await h.service.forward({ phone: LI }, to("王五", WANG));
+    h.click(LI, h.card(LI), "确认转派", "ask-3");
+    await h.settle();
+    expect(h.card(WANG, id).content).toContain("**李四** 转给你");
+    // 张三 asks for one more person and has not confirmed when the push ends.
+    h.tree({ "2": [PUSHER, ZHANG, LI, WANG, "13800000004"] });
+    await h.service.reply(h.say(WANG, "王五来办"), { push: id, action: "add" });
+    await graceOver(h);
+    const push = h.store.push(id)!;
+    expect([push.state, push.closeReason]).toEqual(["closed", "complete"]);
+    expect(summaryOf(h).content).toContain("共 3 人；已确认 1，已回复 1，已转派 2，未回复 0");
+    const { sheet } = await summaryArchive(h);
+    expect(sheet).toContain("转给 李四");
+    expect(sheet).toContain("由 张三 转来；转给 王五");
+    const detail = h.service.detail(id).recipients;
+    expect(detail.map(recipient => [recipient.name, recipient.answered, recipient.forwardedBy, recipient.forwardedTo]))
+      .toEqual([["张三", true, null, ["李四"]], ["李四", true, "张三", ["王五"]], ["王五", true, "李四", []]]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("handing on: a card that cannot be delivered leaves the push with the one who handed it on, who is told; a request not confirmed when the push ends sends nothing", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-04 18:00" });
+    // 李四's card is refused every time: 张三 learns that it did not get there.
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(LI) ? { status: "failed", reason: "HTTP 500" } : undefined;
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "李四", phone: LI } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "ask-li");
+    await h.settle();
+    for (const wait of [60_000, 5 * 60_000]) {
+      h.clock.now += wait;
+      h.service.tick();
+      await h.settle();
+    }
+    expect(h.store.recipient(id, LI)!.sendState).toBe("failed");
+    expect(h.texts(ZHANG).at(-1)).toBe("转给 李四 的「机房盘点」没有发出去，这条推送还在你这里：可以再转一次，或者直接找对方。");
+    expect([h.card(ZHANG).msgUid, h.card(ZHANG).status.name]).toEqual(["ask-li", "没有转派"]);
+    // The push is 张三's again: nobody has answered, and it stays open.
+    expect(h.store.push(id)!.state).toBe("open");
+    expect(h.service.status(PUSHER, id)).toContain("共 2 人（发送失败 1）；已确认 0，未确认 1");
+    // Handed to the same person once more: the card is tried afresh and gets there.
+    h.failing.when = undefined;
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "李四", phone: LI } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "ask-li-2");
+    await h.settle();
+    expect([h.store.recipient(id, LI)!.sendState, h.card(LI).content.includes("**张三** 转给你")]).toEqual(["sent", true]);
+    expect(h.service.status(PUSHER, id)).toContain("共 2 人；已确认 0，已转派 1，未确认 1");
+    // Asked for 王五, and the deadline passes before the click.
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "王五", phone: WANG } });
+    const asked = h.card(ZHANG);
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.click(ZHANG, asked, "确认转派", "ask-wang");
+    await h.settle();
+    expect([h.store.push(id)!.state, h.cards(WANG), h.store.recipient(id, WANG)]).toEqual(["closed", [], undefined]);
+    expect([h.card(ZHANG).msgUid, h.card(ZHANG).status.name]).toEqual(["ask-wang", "没有转派"]);
+    await expect(h.service.forward({ phone: ZHANG }, { push: id, to: { name: "王五", phone: WANG } })).rejects.toThrow("已经结束");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("deadline: a click, a reply or a group text after the deadline, before the timer has run, ends the push at its deadline and counts for nothing", async () => {
   const h = harness();
   try {
     // ack: the last 已收到 a second after the deadline does not complete the push.
@@ -1639,37 +1732,29 @@ test("deadline: a click, an attachment or a group text after the deadline, befor
     await h.settle();
     expect([h.store.push(a)!.state, h.store.push(a)!.closeReason, h.store.recipient(a, LI)!.ackedAt]).toEqual(["closed", "deadline", null]);
     expect(summaryOf(h).content).toContain("未确认：李四");
-    // reply: an attachment at the deadline is neither recorded nor registered; the draft is submitted as the deadline submits it.
+    // reply: a message at the deadline is not recorded and its file not held; what was recorded before is the reply.
     const b = await confirmed(h, { subject: "乙", mode: "reply", deadline: "2026-11-05 18:00" });
-    h.click(ZHANG, h.card(ZHANG, b), "回复", "card-zhang-b");
-    await h.settle();
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "截止前发的")).toBe(true);
+    await h.service.reply(h.say(ZHANG, "截止前发的"), { push: b, action: "add" });
     await h.settle();
     h.clock.now = h.store.push(b)!.deadline;
-    const attached = h.attached.length;
-    expect(h.service.directAttachment(h.identity(ZHANG), h.reply(ZHANG), { fileId: "f-late", kind: "file", name: "晚了.xlsx", size: 20 })).toBe(true);
+    await expect(h.service.reply(h.say(ZHANG, "截止后发的", ["晚了.xlsx"]), { push: b, action: "add" })).rejects.toThrow("「乙」已经结束，不能再改了。");
     await h.settle();
-    expect([h.store.push(b)!.state, h.store.push(b)!.closeReason, h.attached.length]).toEqual(["closed", "deadline", attached]);
+    expect([h.store.push(b)!.state, h.store.push(b)!.closeReason, h.held]).toEqual(["closed", "deadline", []]);
     expect(h.store.items(b, ZHANG).map(item => item.text ?? item.name)).toEqual(["截止前发的"]);
-    expect(h.texts(ZHANG).some(text => text.includes("「乙」已到截止时间，你已发送的内容（文字 1 段）按已回复提交"))).toBe(true);
-    expect(h.texts(ZHANG).at(-1)).toBe("「乙」已过截止时间，这个附件没有记入回复。");
     // A group: a text after the deadline ends the push and is not the group's reply.
     roles(h, { group: true });
     h.groupText(G1, WANG, "你好");
     h.service.saveGroup(G1, { name: "销售一部", state: "registered" });
     const c = await confirmed(h, { subject: "丙", mode: "reply", recipients: [], groups: [{ name: "销售一部" }], deadline: "2026-11-06 18:00" });
-    h.groupClick(G1, h.groupCards(G1).at(-1)!, "回复", "card-g1");
-    await h.settle();
     h.clock.now = h.store.push(c)!.deadline;
-    expect(h.groupText(G1, WANG, "截止后才发")).toBe(true);
+    await expect(h.service.reply(h.groupSay(G1, WANG, "截止后才发"), { push: c, action: "add" })).rejects.toThrow("「丙」已经结束，不能再改了。");
     await h.settle();
     expect([h.store.push(c)!.state, h.store.push(c)!.closeReason, h.store.items(c)]).toEqual(["closed", "deadline", []]);
-    expect(h.groupTexts(G1).at(-1)).toContain("「丙」已过截止时间，这条消息没有记入回复。");
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
 
-test("deadline: past it, the console's 补推送 ends the push instead of sending cards, and a question gets no reply hint for it", async () => {
+test("deadline: past it, the console's 补推送 ends the push instead of sending cards, and a member's conversation is told nothing of it", async () => {
   const h = harness();
   try {
     const a = await confirmed(h, { subject: "甲", deadline: "2026-11-04 18:00" });
@@ -1680,9 +1765,10 @@ test("deadline: past it, the console's 补推送 ends the push instead of sendin
     expect([h.store.push(a)!.state, h.store.push(a)!.closeReason, h.cards(LI).length]).toEqual(["closed", "deadline", cards]);
     const b = await confirmed(h, { subject: "乙", mode: "reply", deadline: "2026-11-05 18:00", recipients: [{ name: "张三", phone: ZHANG }] });
     h.clock.now = h.store.push(b)!.deadline;
-    expect(h.service.directText(h.identity(ZHANG), h.reply(ZHANG), "一个问题")).toBe(false);
+    h.say(ZHANG, "一个问题", ["表.xlsx"]);
+    expect([h.service.pending(DIRECT_SCOPE, ZHANG), h.service.attachmentAsk(ZHANG)]).toEqual([undefined, undefined]);
     await h.settle();
-    expect(h.texts(ZHANG).filter(text => text.includes("推送待回复"))).toEqual([]);
+    expect(h.texts(ZHANG)).toEqual([]);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });

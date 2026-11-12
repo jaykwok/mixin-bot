@@ -1,19 +1,21 @@
-// What the message service gives the push service (src/push/service.ts PushHost) and the pushers' tools: held attachments
-// (a push reply's files), passive conversation notes, and the member extension only a pusher's conversation selects.
+// What the message service gives the push service (src/push/service.ts PushHost) and the push tools: attachments a push
+// holds (the files of a recorded reply), passive conversation notes, the member extensions a conversation selects by what
+// the member is to pushes right now, the live pushes at the tail of its requests, and the question after a failed run.
 import { afterAll, expect, test } from "bun:test";
 import type { Message, Models } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import type { ModelRef } from "@earendil-works/pi-durable";
-import type { AttachmentEvent, AttachmentSource } from "../../src/durable/attachments.ts";
+import { type AttachmentEvent, type AttachmentSource, holdAttachments, releaseHeld } from "../../src/durable/attachments.ts";
 import type { ModelSelection } from "../../src/durable/models.ts";
 import type { Outbound } from "../../src/durable/outbound.ts";
-import type { Attachment } from "../../src/durable/records.ts";
+import type { Attachment, MemberRecords } from "../../src/durable/records.ts";
 import { DurableService, type DurableServiceOptions, type InboundAttachment } from "../../src/durable/service.ts";
 import { PlatformClient } from "../../src/integrations/open-platform/client.ts";
 import { downloadFile } from "../../src/integrations/open-platform/files.ts";
 import { appLayout, DIRECT_SCOPE, groupScope } from "../../src/core/layout.ts";
 import { PUSH_NOTE_KIND } from "../../src/push/note.ts";
-import { PUSH_EXTENSION, pushExtension } from "../../src/push/tools.ts";
+import type { ForwardInput, ReplyInput, Speaker } from "../../src/push/service.ts";
+import { pushExtensions, pushSelection, type PushTools } from "../../src/push/tools.ts";
 import { FakePlatform } from "../helpers/fake-platform.ts";
 import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { DIRECT_SPACE, type Recording, recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
@@ -81,9 +83,9 @@ async function until(probe: () => boolean | Promise<boolean>, label: string, ms 
 }
 
 const ask = (out: Recording, phone: string, text: string) => out.message(DIRECT_SPACE, phone, text);
-function attachment(out: Recording, phone: string, event: Partial<AttachmentEvent> & { fileId: string }, hold?: string): InboundAttachment {
+function attachment(out: Recording, phone: string, event: Partial<AttachmentEvent> & { fileId: string }, ask?: string): InboundAttachment {
   const { scope, reply } = out.message(DIRECT_SPACE, phone, "[文件]");
-  return { scope, phone, reply, attachment: { kind: "file", name: "a.txt", ...event }, ...(hold ? { hold } : {}) };
+  return { scope, phone, reply, attachment: { kind: "file", name: "a.txt", ...event }, ...(ask ? { ask } : {}) };
 }
 async function stateOf(service: DurableService, msgUid: string, phone = ALICE): Promise<Attachment | undefined> {
   return Object.values((await service.records(DIRECT_SCOPE, phone)).attachments).find(item => item.msgUid === msgUid);
@@ -105,35 +107,56 @@ function declared(messages: Message[]) {
   return { tools, sections };
 }
 
-test("a held attachment downloads but is not counted, acknowledged, bound, voided or expired until its holder releases it", async () => {
+test("holding and releasing: one holder at a time; released, a file is its request's alone again, and its record goes when the request's is gone", () => {
+  const file = (id: string, extra: Partial<Attachment> = {}): Attachment => ({ id, msgUid: `m-${id}`, receivedAt: 1, epoch: 0, fileId: `f-${id}`, kind: "file", name: `${id}.txt`,
+    reply: { kind: "direct", receiveId: "im", senderImUserId: "im", msgUid: `m-${id}`, summary: "", receivedAt: 1 }, state: "ready", path: `/tmp/${id}`, at: 1, ...extra });
+  const records: MemberRecords = { requests: { "req-1": { requestId: "req-1", reply: file("x").reply, createdAt: 1, notes: [], deliverables: [], files: [], events: {} } },
+    attachments: { a: file("a", { boundTo: "req-1" }), b: file("b", { boundTo: "req-gone" }), c: file("c", { state: "void" }), d: file("d", { heldBy: "push:p2" }) } };
+  // Void ones, missing ones and those another holder has are left; holding again is the same hold.
+  expect(holdAttachments(records, "push:p1", ["a", "b", "c", "d", "missing"])).toBe(2);
+  expect(holdAttachments(records, "push:p1", ["a"])).toBe(1);
+  expect(Object.values(records.attachments).map(each => each.heldBy)).toEqual(["push:p1", "push:p1", undefined, "push:p2"]);
+  expect(releaseHeld(records, "push:p2", ["a", "b"])).toBe(0);
+  expect(releaseHeld(records, "push:p1", ["a", "b", "c", "missing"])).toBe(2);
+  expect(Object.keys(records.attachments)).toEqual(["a", "c", "d"]);
+  expect([records.attachments.a!.heldBy, records.attachments.a!.boundTo]).toEqual([undefined, "req-1"]);
+});
+
+test("a push holds the files of a recorded reply: /clear and a day of maintenance leave them, until the holder releases them; a waiting push changes what the member is asked", async () => {
   const where = root(), m = model(), out = recordingOutbound();
   const service = open(where, m, out.outbound);
   try {
-    const held = attachment(out, ALICE, { fileId: upload("reply", "reply.txt"), name: "reply.txt" }, "push:p1");
-    expect(await service.attach(held)).toMatchObject({ status: "accepted" });
-    await until(async () => (await stateOf(service, held.reply.msgUid))?.state === "ready", "the held download");
-    // The member's own limit is one unconsumed attachment: the held one does not take it.
+    // With a push waiting for the member's reply the receipt asks whether the file is one.
+    const sent = attachment(out, ALICE, { fileId: upload("reply", "reply.txt"), name: "reply.txt" }, "是回复「周报」的话说一声，我记进去；要我处理别的也直接说。");
+    expect(await service.attach(sent)).toMatchObject({ status: "accepted" });
+    await until(async () => (await stateOf(service, sent.reply.msgUid))?.state === "ready", "the download");
+    expect(out.texts("notice", ALICE)).toEqual(["文件「reply.txt」收到了。是回复「周报」的话说一声，我记进去；要我处理别的也直接说。"]);
+    // The member's next message takes the file; the push that recorded the message holds it.
+    await service.admit(ask(out, ALICE, "这是我的周报"));
+    await until(() => replyTexts(out.sent).length === 1, "the answer");
+    expect(userTexts(m.requests[0]!).at(-1)!).toContain("reply.txt");
+    const bound = (await stateOf(service, sent.reply.msgUid))!;
+    expect(bound.boundTo).toBeDefined();
+    expect(await service.holdAttachments(DIRECT_SCOPE, ALICE, "push:p1", [bound.id, "missing"])).toBe(1);
+    expect(await service.holdAttachments(DIRECT_SCOPE, ALICE, "push:p2", [bound.id])).toBe(0);
+    // The member's own limit is one unconsumed attachment: neither a consumed nor a held one takes it.
     const own = attachment(out, ALICE, { fileId: upload("own", "own.txt"), name: "own.txt" });
     expect(await service.attach(own)).toMatchObject({ status: "accepted" });
     await until(async () => (await stateOf(service, own.reply.msgUid))?.state === "ready", "the member's download");
-    expect(out.texts("notice", ALICE)).toEqual(["文件「own.txt」收到了，想让我怎么处理？"]);
-    await service.admit(ask(out, ALICE, "what did I send"));
-    await until(() => replyTexts(out.sent).length === 1, "the answer");
-    const prompt = userTexts(m.requests[0]!).at(-1)!;
-    expect(prompt).toContain("own.txt"); expect(prompt).not.toContain("reply.txt");
-    // /clear and a day of maintenance void or drop the member's attachments, not the held one.
+    expect(out.texts("notice", ALICE).at(-1)).toBe("文件「own.txt」收到了，想让我怎么处理？");
+    // /clear voids the member's waiting file and a day of maintenance drops old records: the held one stays as it is.
     await service.control(ask(out, ALICE, "/clear"));
     await service.maintain(Date.now() + 25 * 3600_000);
-    const kept = (await stateOf(service, held.reply.msgUid))!;
+    expect((await stateOf(service, own.reply.msgUid))?.state ?? "void").toBe("void");
+    const kept = (await stateOf(service, sent.reply.msgUid))!;
     expect(kept).toMatchObject({ state: "ready", heldBy: "push:p1" });
-    expect(kept.boundTo).toBeUndefined();
     const file = kept.path!.split(/[\\/]/).at(-1)!;
-    // Only its holder releases it; the record goes, the file is left to the tmp lifecycle.
+    // Only its holder releases it; the file is left to the tmp lifecycle.
     expect(await service.releaseAttachments(DIRECT_SCOPE, ALICE, "push:p2", [kept.id])).toBe(0);
     expect(await service.releaseAttachments(DIRECT_SCOPE, ALICE, "push:p1", [kept.id, "missing"])).toBe(1);
-    expect(await stateOf(service, held.reply.msgUid)).toBeUndefined();
+    expect((await stateOf(service, sent.reply.msgUid))?.heldBy).toBeUndefined();
     expect(await received(where)).toContain(file);
-    expect(await service.attach(held)).toEqual({ status: "duplicate" });
+    expect(await service.attach(sent)).toEqual({ status: "duplicate" });
   } finally { await service.close(); }
 });
 
@@ -184,41 +207,142 @@ test("a note into a group nobody has asked in yet creates the space and the memb
   } finally { await service.close(); }
 });
 
-test("only a pusher's conversation selects the push tools and section; a revoked pusher's next request has neither", async () => {
-  const where = root(), out = recordingOutbound();
-  const status: string[] = [], lookups: unknown[] = [];
-  const pushers = new Set([ALICE]);
-  const fake = { prepare: async () => "预览已发出", status: (phone: string) => { status.push(phone); return "没有推送"; },
-    lookup: (phone: string, input: unknown) => { lookups.push([phone, input]); return "找到 1 人"; } };
+/** A push service as the tools see it: `pushers` push, `live` are the members and groups (`group:<ID>`) a live push reached. */
+function fakePushes() {
+  const pushers = new Set<string>(), live = new Set<string>();
+  const calls: unknown[][] = [];
+  const key = (scope: { kind: string; groupId?: string }, phone: string) => scope.kind === "group" ? `group:${scope.groupId}` : phone;
+  const push: PushTools = {
+    prepare: async () => "预览已发出",
+    status: phone => { calls.push(["status", phone]); return "没有推送"; },
+    lookup: (phone, input) => { calls.push(["lookup", phone, input]); return "找到 1 人"; },
+    reply: async (speaker: Speaker, input: ReplyInput) => { calls.push(["reply", speaker, input]); return "已记入回复"; },
+    forward: async (speaker: { phone: string }, input: ForwardInput) => { calls.push(["forward", speaker, input]); return "已把确认卡片发给成员"; },
+    pending: (scope, phone) => live.has(key(scope, phone)) ? `[推送] ${scope.kind === "group" ? "本群" : "这位成员"}收到、还没有结束的推送：\n- 推送编号 abcd2345：推送人 推送「周报」` : undefined,
+    isPusher: phone => pushers.has(phone),
+    hasLive: (scope, phone) => live.has(key(scope, phone)),
+  };
+  return { push, pushers, live, calls };
+}
+const PUSH_TOOLS = ["directory_lookup", "push_forward", "push_prepare", "push_reply", "push_status"];
+const pushTools = (names: Set<string>) => [...names].filter(name => PUSH_TOOLS.includes(name)).sort();
+const pushSections = (names: Set<string>) => [...names].filter(name => name.startsWith("push")).sort();
+function withPushes(where: string, fake: ReturnType<typeof fakePushes>): Partial<DurableServiceOptions> {
+  return { memberExtensions: { install: scope => pushExtensions(fake.push, scope, { layout: appLayout(where) }), selected: (scope, phone) => pushSelection(fake.push, scope, phone) } };
+}
+
+test("a pusher's conversation selects the push tools and section and the address book; a revoked pusher's next request has none", async () => {
+  const where = root(), out = recordingOutbound(), fake = fakePushes();
+  fake.pushers.add(ALICE);
   const m = model([() => fauxAssistantMessage([fauxToolCall("push_status", {}, { id: "status-1" }),
     fauxToolCall("directory_lookup", { department: "华东分公司" }, { id: "lookup-1" })], { stopReason: "toolUse" })]);
-  const pushTools = (names: Set<string>) => [...names].filter(name => name.startsWith("push_") || name === "directory_lookup");
-  const service = open(where, m, out.outbound, {
-    memberExtensions: {
-      install: scope => scope.kind === "direct" ? [pushExtension(fake, { layout: appLayout(where) })] : [],
-      selected: (scope, phone) => scope.kind === "direct" && pushers.has(phone) ? [PUSH_EXTENSION] : [],
-    },
-  });
+  const service = open(where, m, out.outbound, withPushes(where, fake));
   try {
     await service.admit(ask(out, ALICE, "how are my pushes"));
     await until(() => replyTexts(out.sent).length === 1, "Alice's answer");
-    expect(status).toEqual([ALICE]);
-    expect(lookups).toEqual([[ALICE, { department: "华东分公司" }]]);
+    // The two calls of one model turn run side by side: either may reach the service first.
+    expect(fake.calls.length).toBe(2);
+    expect(fake.calls).toContainEqual(["status", ALICE]);
+    expect(fake.calls).toContainEqual(["lookup", ALICE, { department: "华东分公司" }]);
     const alice = declared(m.requests[0]!);
-    expect(pushTools(alice.tools).sort()).toEqual(["directory_lookup", "push_prepare", "push_status"]);
-    expect(alice.sections.has("push")).toBe(true);
+    expect([pushTools(alice.tools), pushSections(alice.sections)]).toEqual([["directory_lookup", "push_prepare", "push_status"], ["push"]]);
     expect(m.requests[1]!.some(message => message.role === "toolResult" && text(message) === "没有推送")).toBe(true);
     expect(m.requests[1]!.some(message => message.role === "toolResult" && text(message) === "找到 1 人")).toBe(true);
+    expect(userTexts(m.requests[0]!).join("\n")).not.toContain("[推送]");
     await service.admit(ask(out, BOB, "hello"));
     await until(() => replyTexts(out.sent).length === 2, "Bob's answer");
     const bob = declared(m.requests[2]!);
-    expect(pushTools(bob.tools)).toEqual([]);
-    expect(bob.sections.has("push")).toBe(false);
-    pushers.delete(ALICE);
+    expect([pushTools(bob.tools), pushSections(bob.sections)]).toEqual([[], []]);
+    fake.pushers.delete(ALICE);
     await service.admit(ask(out, ALICE, "and now"));
     await until(() => replyTexts(out.sent).length === 3, "Alice's answer after the revocation");
     const revoked = declared(m.requests[3]!);
-    expect(pushTools(revoked.tools)).toEqual([]);
-    expect(revoked.sections.has("push")).toBe(false);
+    expect([pushTools(revoked.tools), pushSections(revoked.sections)]).toEqual([[], []]);
+  } finally { await service.close(); }
+});
+
+test("a member a live push reached gets the reply tools, the address book and the live pushes at the tail of each request; push_reply is given the message as it was sent", async () => {
+  const where = root(), out = recordingOutbound(), fake = fakePushes();
+  const plain = () => fauxAssistantMessage("好的");
+  const m = model([plain,
+    () => fauxAssistantMessage([fauxToolCall("push_reply", { push: "abcd2345", action: "add" }, { id: "reply-1" })], { stopReason: "toolUse" }), plain,
+    () => fauxAssistantMessage([fauxToolCall("push_forward", { push: "abcd2345", to: { name: "王五", phone: "13800000003" } }, { id: "forward-1" })], { stopReason: "toolUse" })]);
+  const service = open(where, m, out.outbound, withPushes(where, fake));
+  try {
+    await service.admit(ask(out, BOB, "之前的问题"));
+    await until(() => replyTexts(out.sent).length === 1, "the answer before the push");
+    expect(pushTools(declared(m.requests[0]!).tools)).toEqual([]);
+    // A push reaches Bob.
+    fake.live.add(BOB);
+    const said = ask(out, BOB, "  本周完成了迁移，\n下周联调  ");
+    await service.admit(said);
+    await until(() => replyTexts(out.sent).length === 2, "the answer that recorded the reply");
+    const second = declared(m.requests[1]!);
+    expect([pushTools(second.tools), pushSections(second.sections)]).toEqual([["directory_lookup", "push_forward", "push_reply"], ["push-reply"]]);
+    expect(userTexts(m.requests[1]!).at(-1)).toEndWith("[推送] 这位成员收到、还没有结束的推送：\n- 推送编号 abcd2345：推送人 推送「周报」");
+    // The service's own copy of the message, not the model's wording: text, message ID and time as they arrived.
+    expect(fake.calls).toEqual([["reply", { scope: DIRECT_SCOPE, phone: BOB, message: { msgUid: said.reply.msgUid, text: said.content, receivedAt: said.reply.receivedAt } },
+      { push: "abcd2345", action: "add" }]]);
+    // The tail is part of the request only: the next one has it once, at its own end.
+    await service.admit(ask(out, BOB, "把这件事转给王五"));
+    await until(() => replyTexts(out.sent).length === 3, "the answer that asked to hand it on");
+    const last = userTexts(m.requests.at(-1)!);
+    expect(last.filter(each => each.includes("[推送] 这位成员收到")).length).toBe(1);
+    expect(last.at(-1)).toContain("[推送] 这位成员收到");
+    expect(fake.calls.at(-1)).toEqual(["forward", { phone: BOB }, { push: "abcd2345", to: { name: "王五", phone: "13800000003" } }]);
+    // The push is over: the tools and the tail go with it.
+    fake.live.delete(BOB);
+    await service.admit(ask(out, BOB, "之后的问题"));
+    await until(() => replyTexts(out.sent).length === 4, "the answer after the push");
+    const after = declared(m.requests.at(-1)!);
+    expect([pushTools(after.tools), pushSections(after.sections)]).toEqual([[], []]);
+    expect(userTexts(m.requests.at(-1)!).at(-1)).not.toContain("[推送] 这位成员收到");
+  } finally { await service.close(); }
+});
+
+test("a group a live push reached: its members' conversations there get push_reply alone, with the group's pushes at the tail", async () => {
+  const where = root(), out = recordingOutbound(), fake = fakePushes();
+  fake.live.add("group:100");
+  fake.pushers.add(BOB);
+  const m = model([() => fauxAssistantMessage([fauxToolCall("push_reply", { push: "abcd2345", action: "replace" }, { id: "reply-1" })], { stopReason: "toolUse" })]);
+  const service = open(where, m, out.outbound, withPushes(where, fake));
+  try {
+    const said = out.message("100", BOB, "我们组已盘点");
+    await service.admit(said);
+    await until(() => replyTexts(out.sent).length === 1, "the group answer");
+    const group = declared(m.requests[0]!);
+    // A pusher too has only the reply tool in a group: pushing and the address book stay in the direct chat.
+    expect([pushTools(group.tools), pushSections(group.sections)]).toEqual([["push_reply"], ["push-reply"]]);
+    expect(userTexts(m.requests[0]!).at(-1)).toEndWith("[推送] 本群收到、还没有结束的推送：\n- 推送编号 abcd2345：推送人 推送「周报」");
+    expect(fake.calls).toEqual([["reply", { scope: groupScope("100"), phone: BOB, message: { msgUid: said.reply.msgUid, text: "我们组已盘点", receivedAt: said.reply.receivedAt } },
+      { push: "abcd2345", action: "replace" }]]);
+    // Another group has nothing of it.
+    await service.admit(out.message("200", BOB, "别的群"));
+    await until(() => replyTexts(out.sent).length === 2, "the other group's answer");
+    expect(pushTools(declared(m.requests.at(-1)!).tools)).toEqual([]);
+  } finally { await service.close(); }
+});
+
+test("a request that ends without an answer is offered to the push service, and what it says follows the failure", async () => {
+  const where = root(), out = recordingOutbound();
+  const offered: unknown[] = [];
+  const failed = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 invalid api key" });
+  const m = model([failed, failed, failed, failed]);
+  const service = open(where, m, out.outbound, {
+    unanswered: async request => { offered.push(request); return request.message.text.includes("周报") ? "这条消息我先记进「周报」的回复了；不是回复的话，回头跟我说一声“撤回”。" : undefined; },
+  });
+  try {
+    const said = ask(out, ALICE, "周报：本周完成了迁移");
+    await service.admit(said);
+    await until(() => replyTexts(out.sent).length === 1, "the failure text");
+    expect(offered).toEqual([{ scope: DIRECT_SCOPE, phone: ALICE, message: { msgUid: said.reply.msgUid, text: "周报：本周完成了迁移", receivedAt: said.reply.receivedAt } }]);
+    const told = replyTexts(out.sent)[0]!;
+    expect(told).toContain("没有处理成功");
+    expect(told).toEndWith("\n\n这条消息我先记进「周报」的回复了；不是回复的话，回头跟我说一声“撤回”。");
+    // Nothing to add: the failure alone.
+    await service.admit(ask(out, ALICE, "一个问题"));
+    await until(() => replyTexts(out.sent).length === 2, "the second failure text");
+    expect(offered).toHaveLength(2);
+    expect(replyTexts(out.sent)[1]).not.toContain("周报");
   } finally { await service.close(); }
 });

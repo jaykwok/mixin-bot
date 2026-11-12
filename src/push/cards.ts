@@ -1,21 +1,26 @@
 // Push cards: the pusher's preview, each recipient's card in every state (a person's, or a group's that anyone in the
-// group answers), and the button data a click brings back.
+// group answers), the card that asks a recipient before a push is handed on, and the button data a click brings back.
 //
-// Buttons carry `{ k: "push", p: <push ID>, a: <action>, v: <card version>, o?: <option index> }`. Every update of a card
-// raises its version, so a redelivered click or one on a button the card no longer shows names an older version: the
-// service then only refreshes the card to its current state (./service.ts).
+// Buttons carry `{ k: "push", p: <push ID>, a: <action>, v: <card version>, o?: <option index>, f?: <forward ID> }`. Every
+// update of a card raises its version, so a redelivered click or one on a button the card no longer shows names an older
+// version: the service then only refreshes the card to its current state (./service.ts). Replies have no buttons: the
+// recipient writes to the bot and the conversation records the reply (./tools.ts push_reply).
 import type { CardButton, CardContent } from "../integrations/open-platform/messages.ts";
 import { escapeInline } from "../durable/outbound.ts";
-import { memberGroup, type Push, type Recipient } from "./store.ts";
+import { type Forward, memberGroup, type Push, type Recipient } from "./store.ts";
 
 export type PreviewAction = "confirm" | "cancel";
-export type RecipientAction = "ack" | "choose" | "reply" | "done" | "abandon" | "edit";
+export type RecipientAction = "ack" | "choose";
+/** On the card that asks a recipient whether to hand the push on. */
+export type ForwardAction = "forward" | "keep";
 /** On the pusher's summary card: prepare a push to those who did not answer. */
 export type SummaryAction = "remind";
-export type CardAction = PreviewAction | RecipientAction | SummaryAction;
-const ACTIONS: readonly CardAction[] = ["confirm", "cancel", "ack", "choose", "reply", "done", "abandon", "edit", "remind"];
+/** `retired`: a button of the reply cards sent before replies went through the conversation; a click refreshes the card. */
+export type CardAction = PreviewAction | RecipientAction | ForwardAction | SummaryAction | "retired";
+const ACTIONS: readonly CardAction[] = ["confirm", "cancel", "ack", "choose", "forward", "keep", "remind"];
+const RETIRED = ["reply", "done", "abandon", "edit"];
 
-export type ClickData = { push: string; action: CardAction; version: number; option?: number };
+export type ClickData = { push: string; action: CardAction; version: number; option?: number; forward?: string };
 
 const COLOR = { waiting: "#2D71FF", replying: "#D97706", done: "#16A34A", closed: "#8A8F99" } as const;
 export const PUSH_ID = /^[a-z0-9]{8}$/;
@@ -39,9 +44,10 @@ export function requirementText(push: Pick<Push, "mode" | "options">): string {
   return push.mode === "ack" ? "确认收到" : push.mode === "options" ? `选择：${push.options.join(" / ")}` : "需要回复（文字或附件）";
 }
 
-function button(push: Pick<Push, "id">, version: number, index: number, name: string, action: CardAction, style: 1 | 2, option?: number): CardButton {
+function button(push: Pick<Push, "id">, version: number, index: number, name: string, action: CardAction, style: 1 | 2,
+  extra: { option?: number; forward?: string } = {}): CardButton {
   return { name, type: "button", index, show: true, disabled: false, value: { placeholder: "action", value: action, style, url: "", method: "POST",
-    data: { k: "push", p: push.id, a: action, v: version, ...(option === undefined ? {} : { o: option }) } } };
+    data: { k: "push", p: push.id, a: action, v: version, ...(extra.option === undefined ? {} : { o: extra.option }), ...(extra.forward === undefined ? {} : { f: extra.forward }) } } };
 }
 
 function card(title: string, content: string, status: { name: string; color: string }, buttons: CardButton[], msgUid: string | null, invalid = false): CardContent {
@@ -57,10 +63,13 @@ export function clickData(content: unknown): ClickData | undefined {
   };
   const data = parse(parse(content)?.data);
   if (!data || data.k !== "push" || typeof data.p !== "string" || !PUSH_ID.test(data.p)) return undefined;
-  const action = data.a as CardAction, version = Number(data.v), option = data.o === undefined ? undefined : Number(data.o);
-  if (!ACTIONS.includes(action) || !Number.isSafeInteger(version) || version < 0) return undefined;
+  const action = RETIRED.includes(data.a as string) ? "retired" : data.a as CardAction;
+  const version = Number(data.v), option = data.o === undefined ? undefined : Number(data.o);
+  if (!ACTIONS.includes(action) && action !== "retired" || !Number.isSafeInteger(version) || version < 0) return undefined;
   if (option !== undefined && (!Number.isSafeInteger(option) || option < 0 || option > 16)) return undefined;
-  return { push: data.p, action, version, ...(option === undefined ? {} : { option }) };
+  if (data.f !== undefined && (typeof data.f !== "string" || !PUSH_ID.test(data.f))) return undefined;
+  if ((action === "forward" || action === "keep") && data.f === undefined) return undefined;
+  return { push: data.p, action, version, ...(option === undefined ? {} : { option }), ...(data.f === undefined ? {} : { forward: data.f }) };
 }
 
 export type Counts = { texts: number; files: number };
@@ -86,9 +95,9 @@ export function groupReplyText(senders: readonly string[], counts: Counts): stri
   return `${escapeInline(senders[0] ?? "")}${senders.length > 1 ? `等 ${senders.length} 人` : ""}，${counts.texts} 段文字`;
 }
 
-const REPLY_HINT = "**请先点「回复」，再发送文字或附件，发完后点「已回复」结束。直接发送的消息不会算作回复。**";
-const GROUP_REPLY_HINT = "**请先点「回复」，再 @机器人 发送回复文字，可以分多条、由多人发；发完点「已回复」或发送 @机器人 /完成。没点「回复」时 @机器人 的消息不算回复。"
-  + "群里只能回复文字；需要附件请单独发给推送人。**";
+const REPLY_HINT = "**直接把回复发给我：文字、附件都行，可以分几条发。**";
+const GROUP_REPLY_HINT = "**回复请 @机器人 直接发文字，谁发都算本群的回复，可以分几条发。群里只收文字，附件请单独发给推送人。**";
+const FORWARD_HINT = "这件事该由别人处理的话，告诉我转给谁。";
 
 // ---- the pusher's preview -------------------------------------------------------------------------------------------
 
@@ -172,11 +181,13 @@ export function previewCard(view: PreviewView, now = Date.now()): CardContent {
 export type RecipientView = {
   push: Push;
   recipient: Recipient;
-  /** What the reply being collected holds, and what the submitted one held. */
-  draft: Counts;
-  submitted: Counts;
-  /** A group's card: who sent the texts of each (names in order of their first text). */
-  senders?: { draft: readonly string[]; submitted: readonly string[] };
+  /** What the reply holds. */
+  reply: Counts;
+  /** A group's card: who sent the reply's texts (names in order of their first text). */
+  senders?: readonly string[];
+  /** Who handed the push on to this recipient, and whom this recipient handed it on to (names). */
+  forwardedBy?: string;
+  forwardedTo?: readonly string[];
 };
 
 export function recipientCard(view: RecipientView, now = Date.now()): CardContent {
@@ -184,8 +195,9 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   const group = memberGroup(recipient.member) !== undefined;
   const title = `推送：${push.subject}`;
   const head = [`**${escapeInline(push.pusherName)}** 于 ${shortTime(push.confirmedAt ?? push.createdAt, now)} 推送${group ? "到本群" : ""}`
+    + (view.forwardedBy ? `，**${escapeInline(view.forwardedBy)}** 转给你` : "")
     + (push.target.of ? `（补推送：之前的推送还没有收到${group ? "本群" : "你"}的答复）` : ""), "", push.body, "", "---", "",
-    `**要求**：${escapeInline(group && push.mode === "reply" ? "需要回复（群里只能回复文字）" : requirementText(push))}`, `**截止**：${shortTime(push.deadline, now)}`];
+    `**要求**：${escapeInline(group && push.mode === "reply" ? "需要回复（群里只收文字）" : requirementText(push))}`, `**截止**：${shortTime(push.deadline, now)}`];
   const tail = ["", `推送编号 ${push.id}`];
   const make = (status: { name: string; color: string }, extra: string[], buttons: CardButton[], invalid = false) =>
     card(title, [...head, ...extra, ...tail].join("\n"), status, buttons, recipient.card, invalid);
@@ -193,56 +205,49 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   const closed = push.state === "closed";
   if (group) return groupCard(view, make, now);
   const ended = endedText(push);
+  const handed = view.forwardedTo?.length ? [`已转给 ${view.forwardedTo.map(escapeInline).join("、")}。`] : [];
+  // Handed on and not answered: the push is off this recipient's hands, the buttons stay.
+  const waiting = (name: string) => handed.length ? { name: "已转派", color: COLOR.done } : { name, color: COLOR.waiting };
 
   if (push.mode === "ack") {
-    if (recipient.ackedAt !== null) return make({ name: "已确认收到", color: closed ? COLOR.closed : COLOR.done }, [`已于 ${shortTime(recipient.ackedAt, now)} 确认收到。`], [], closed);
-    if (closed) return make({ name: "已截止", color: COLOR.closed }, ["已截止。"], [], true);
-    return make({ name: "待确认", color: COLOR.waiting }, ["请点「已收到」确认。"], [button(push, v, 1, "已收到", "ack", 1)]);
+    if (recipient.ackedAt !== null) return make({ name: "已确认收到", color: closed ? COLOR.closed : COLOR.done }, [`已于 ${shortTime(recipient.ackedAt, now)} 确认收到。`, ...handed], [], closed);
+    if (closed) return make({ name: handed.length ? "已转派" : "已截止", color: COLOR.closed }, [...handed, "已截止。"], [], true);
+    return make(waiting("待确认"), [...handed, "请点「已收到」确认。", ...(handed.length ? [] : [FORWARD_HINT])], [button(push, v, 1, "已收到", "ack", 1)]);
   }
 
   if (push.mode === "options") {
     const chosen = recipient.choice === null ? undefined : push.options[recipient.choice];
     if (closed) {
-      return chosen === undefined ? make({ name: "已截止", color: COLOR.closed }, ["已截止，没有选择。"], [], true)
-        : make({ name: `已选择：${chosen}`, color: COLOR.closed }, [`已选择「${escapeInline(chosen)}」。`], [], true);
+      return chosen === undefined ? make({ name: handed.length ? "已转派" : "已截止", color: COLOR.closed }, [...handed, "已截止，没有选择。"], [], true)
+        : make({ name: `已选择：${chosen}`, color: COLOR.closed }, [`已选择「${escapeInline(chosen)}」。`, ...handed], [], true);
     }
     const buttons = push.options.map((option, index) => button(push, v, index + 1, index === recipient.choice ? `✓ ${option}` : option, "choose",
-      index === recipient.choice ? 1 : 2, index));
+      index === recipient.choice ? 1 : 2, { option: index }));
     return chosen === undefined
-      ? make({ name: "待选择", color: COLOR.waiting }, ["请点选一项；推送结束前可以改选。"], buttons)
-      : make({ name: `已选择：${chosen}`, color: COLOR.done }, [`已选择「${escapeInline(chosen)}」（${shortTime(recipient.choiceAt!, now)}）；推送结束前可以改选。`], buttons);
+      ? make(waiting("待选择"), [...handed, "请点选一项；推送结束前可以改选。", ...(handed.length ? [] : [FORWARD_HINT])], buttons)
+      : make({ name: `已选择：${chosen}`, color: COLOR.done }, [`已选择「${escapeInline(chosen)}」（${shortTime(recipient.choiceAt!, now)}）；推送结束前可以改选。`, ...handed], buttons);
   }
 
   // reply
-  const submitted = recipient.submitted > 0 ? `已回复（${countsText(view.submitted)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
+  const replied = recipient.submitted > 0 ? `已回复（${countsText(view.reply)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
   if (closed) {
-    return submitted === undefined ? make({ name: "未回复", color: COLOR.closed }, ["已截止，没有收到回复。"], [], true)
-      : make({ name: "已回复", color: COLOR.closed }, [`${submitted}。${ended}。`], [], true);
+    return replied === undefined ? make({ name: handed.length ? "已转派" : "未回复", color: COLOR.closed }, [...handed, "已截止，没有收到回复。"], [], true)
+      : make({ name: "已回复", color: COLOR.closed }, [`${replied}。${ended}。`, ...handed], [], true);
   }
-  if (recipient.replyState === "replying") {
-    const extra = [
-      ...(submitted ? [`上次提交：${submitted}。修改以最后一次提交为准。`] : []),
-      `**回复中**：已收到${countsText(view.draft) === "还没有内容" ? "：还没有内容" : ` ${countsText(view.draft)}`}。`,
-      "继续发送文字或附件；发完点「已回复」，或发送 /完成。点「取消」或发送 /取消 放弃这次的内容。",
-    ];
-    return make({ name: submitted ? "修改中" : "回复中", color: COLOR.replying }, extra,
-      [button(push, v, 1, "已回复", "done", 1), button(push, v, 2, "取消", "abandon", 2)]);
-  }
-  if (submitted) return make({ name: "已回复", color: COLOR.done }, [`${submitted}。推送结束前可以点「修改回复」重新提交。`], [button(push, v, 1, "修改回复", "edit", 2)]);
+  if (replied) return make({ name: "已回复", color: COLOR.done }, [`${replied}。`, ...handed, "要补充、修改或者撤回，直接发消息告诉我。"], []);
   const acked = recipient.ackedAt === null ? [] : [`已于 ${shortTime(recipient.ackedAt, now)} 确认收到。`];
-  const buttons = recipient.ackedAt === null ? [button(push, v, 1, "已收到", "ack", 2), button(push, v, 2, "回复", "reply", 1)] : [button(push, v, 1, "回复", "reply", 1)];
-  return make({ name: recipient.ackedAt === null ? "待回复" : "已确认，待回复", color: COLOR.waiting }, [...acked, "", REPLY_HINT], buttons);
+  const buttons = recipient.ackedAt === null ? [button(push, v, 1, "已收到", "ack", 2)] : [];
+  return make(waiting(recipient.ackedAt === null ? "待回复" : "已确认，待回复"), [...acked, ...handed, "", REPLY_HINT, ...(handed.length ? [] : [FORWARD_HINT])], buttons);
 }
 
 type Make = (status: { name: string; color: string }, extra: string[], buttons: CardButton[], invalid?: boolean) => CardContent;
 
 /**
  * A group's card: anyone answers for the group. 「已收到」 stays to count clicks (the clickers cannot be named); a reply
- * is texts @-mentioning the bot, from anyone, while the group is replying. Groups take no options (./service.ts).
+ * is texts @-mentioning the bot, from anyone, that the conversation recorded. Groups take no options (./service.ts).
  */
 function groupCard(view: RecipientView, make: Make, now: number): CardContent {
   const { push, recipient } = view, v = recipient.version, closed = push.state === "closed", ended = endedText(push);
-  const senders = view.senders ?? { draft: [], submitted: [] };
   const acked = recipient.ackedAt === null ? [] : [`已收到：首次 ${shortTime(recipient.ackedAt, now)}，共点击 ${recipient.clicks} 次。`];
   const ack = (style: 1 | 2) => button(push, v, 1, "已收到", "ack", style);
   if (push.mode !== "reply") {
@@ -250,22 +255,39 @@ function groupCard(view: RecipientView, make: Make, now: number): CardContent {
     return make({ name: recipient.ackedAt === null ? "待确认" : "已收到", color: recipient.ackedAt === null ? COLOR.waiting : COLOR.done },
       recipient.ackedAt === null ? ["请点「已收到」确认，群里谁点都可以。"] : acked, [ack(recipient.ackedAt === null ? 1 : 2)]);
   }
-  const submitted = recipient.submitted > 0 ? `已回复（${groupReplyText(senders.submitted, view.submitted)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
+  const replied = recipient.submitted > 0 ? `已回复（${groupReplyText(view.senders ?? [], view.reply)}）· ${shortTime(recipient.submittedAt!, now)}` : undefined;
   if (closed) {
-    return submitted === undefined ? make({ name: "未回复", color: COLOR.closed }, [...acked, "已截止，没有收到回复。"], [], true)
-      : make({ name: "已回复", color: COLOR.closed }, [`${submitted}。${ended}。`], [], true);
+    return replied === undefined ? make({ name: "未回复", color: COLOR.closed }, [...acked, "已截止，没有收到回复。"], [], true)
+      : make({ name: "已回复", color: COLOR.closed }, [`${replied}。${ended}。`], [], true);
   }
-  if (recipient.replyState === "replying") {
-    const extra = [
-      ...(submitted ? [`上次提交：${submitted}。修改以最后一次提交为准。`] : []),
-      `**回复中**：已收到${view.draft.texts ? ` ${groupReplyText(senders.draft, view.draft)}` : "：还没有内容"}。`,
-      "请 @机器人 继续发送回复文字；发完点「已回复」，或发送 @机器人 /完成。点「取消」或发送 @机器人 /取消 放弃这次的内容。这期间 @机器人 的消息都记为回复。",
-    ];
-    return make({ name: submitted ? "修改中" : "回复中", color: COLOR.replying }, extra,
-      [button(push, v, 1, "已回复", "done", 1), button(push, v, 2, "取消", "abandon", 2)]);
+  if (replied) return make({ name: "已回复", color: COLOR.done }, [...acked, `${replied}。`, "要补充就继续 @机器人 发；改或者撤回自己发的内容，@机器人 说一声。"], [ack(2)]);
+  return make({ name: "待回复", color: COLOR.waiting }, [...acked, "", GROUP_REPLY_HINT], [ack(2)]);
+}
+
+// ---- handing a push on ----------------------------------------------------------------------------------------------
+
+export type ForwardView = {
+  push: Push;
+  forward: Forward;
+  /** The departments of the person it goes to (paths). */
+  departments: readonly string[];
+};
+
+/** The card that asks the recipient before a push goes to someone else: nothing is sent to them until 「确认转派」. */
+export function forwardCard(view: ForwardView, now = Date.now()): CardContent {
+  const { push, forward } = view;
+  const who = `**${escapeInline(forward.toName)}**（尾号 ${phoneTail(forward.to)}${view.departments.length ? `，${view.departments.map(escapeInline).join("；")}` : ""}）`;
+  const title = `转派确认：${push.subject}`, tail = ["", `推送编号 ${push.id}`];
+  const subject = `**${escapeInline(push.pusherName)}** 推送的「${escapeInline(push.subject)}」`;
+  if (forward.state === "confirmed") {
+    return card(title, [`已把${subject}转给 ${who}（${shortTime(forward.decidedAt ?? forward.createdAt, now)}）。`, ...tail].join("\n"), { name: "已转派", color: COLOR.done }, [], forward.card, true);
   }
-  if (submitted) return make({ name: "已回复", color: COLOR.done }, [`${submitted}。推送结束前可以点「修改回复」重新提交。`], [button(push, v, 1, "修改回复", "edit", 2)]);
-  return make({ name: "待回复", color: COLOR.waiting }, [...acked, "", GROUP_REPLY_HINT], [ack(2), button(push, v, 2, "回复", "reply", 1)]);
+  if (forward.state === "cancelled") {
+    return card(title, [`${subject}没有转给 ${who}。`, ...tail].join("\n"), { name: "没有转派", color: COLOR.closed }, [], forward.card, true);
+  }
+  const lines = [`把${subject}转给 ${who}？`, "", "点「确认转派」后，这条推送的卡片会发给对方，推送人也会知道是你转的；发出后收不回来。", ...tail];
+  return card(title, lines.join("\n"), { name: "待确认", color: COLOR.waiting },
+    [button(push, forward.version, 1, "确认转派", "forward", 1, { forward: forward.id }), button(push, forward.version, 2, "取消", "keep", 2, { forward: forward.id })], forward.card);
 }
 
 // ---- the pusher's summary -------------------------------------------------------------------------------------------

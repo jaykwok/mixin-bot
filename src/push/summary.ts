@@ -1,6 +1,6 @@
 // The summary package of a closed push: a workbook with one row per recipient (a group
-// is one row, with who replied), and per recipient a folder with the reply text and the reply attachments of the
-// submission in effect. Phones are masked everywhere in it: it goes to the pusher, the CCs and the console. A package
+// is one row, with who replied; a push handed on names by whom and to whom), and per recipient a folder with the reply
+// text and the reply attachments. Phones are masked everywhere in it: it goes to the pusher, the CCs and the console. A package
 // larger than one file may be (the native limit, or the relay's when one is configured) is split into numbered
 // archives; an attachment that alone does not fit is listed as not packed.
 import { formatSize } from "@earendil-works/pi-coding-agent";
@@ -8,7 +8,7 @@ import { access, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { safeFileName } from "../durable/attachments.ts";
 import { shortTime } from "./cards.ts";
-import { memberGroup, type Push, type Recipient, type ReplyItem } from "./store.ts";
+import { type Forward, memberGroup, type Push, type Recipient, type ReplyItem } from "./store.ts";
 import { writeWorkbook, type Sheet } from "./xlsx.ts";
 import { ZipWriter } from "./zip.ts";
 
@@ -19,6 +19,8 @@ export type SummaryInput = {
   push: Push;
   recipients: readonly Recipient[];
   items: readonly ReplyItem[];
+  /** The push's confirmed forwards. */
+  forwards?: readonly Forward[];
   /** Held attachments by ID. */
   files: ReadonlyMap<string, HeldFile>;
   /** An empty directory the package is written to. */
@@ -40,7 +42,7 @@ const ENTRY_OVERHEAD = 30 + 46;
 const END_RECORD = 22;
 const ZIP_MAX = 0xffff_ffff;
 
-/** The reply in effect: the items of the last submitted revision. */
+/** The reply: the items of the revision in effect. */
 export function effectiveItems(recipient: Pick<Recipient, "member" | "submitted">, items: readonly ReplyItem[]): ReplyItem[] {
   return recipient.submitted > 0 ? items.filter(item => item.member === recipient.member && item.revision === recipient.submitted) : [];
 }
@@ -61,7 +63,6 @@ const maskPhone = (phone: string) => phone.length <= 7 ? (phone.length <= 2 ? ph
 /** Where a held attachment's file is (still held, or recorded when the hold was released), or why it is not there. */
 async function located(item: ReplyItem, files: ReadonlyMap<string, HeldFile>): Promise<{ path: string; size: number } | { missing: string }> {
   if (item.error) return { missing: item.error };
-  if (!item.attachment && !item.path) return { missing: "还在接收" };
   const file = (item.attachment ? files.get(item.attachment) : undefined) ?? (item.path ? { state: "ready", path: item.path } : undefined);
   if (!file) return { missing: "附件记录已不存在" };
   if (file.state === "pending") return { missing: "还在下载" };
@@ -81,12 +82,18 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   const workbookName = `${base}.xlsx`, workbook = join(input.dir, workbookName);
   const time = (at: number | null) => at === null ? null : shortTime(at, now);
   const groups = recipients.some(recipient => memberGroup(recipient.member) !== undefined);
+  const forwards = input.forwards ?? [];
+  const nameOf = (member: string) => recipients.find(recipient => recipient.member === member)?.name ?? phone(member);
+  /** `由 李四 转来；转给 王五`. */
+  const handed = (member: string) => [...forwards.filter(forward => forward.to === member).map(forward => `由 ${nameOf(forward.from)} 转来`),
+    ...(forwards.some(forward => forward.from === member) ? [`转给 ${forwards.filter(forward => forward.from === member).map(forward => forward.toName).join("、")}`] : [])].join("；");
   const columns: Sheet["columns"] = [
     { title: groups ? "姓名或群" : "姓名", width: 12 }, { title: "手机号", width: 15 }, { title: "发送", width: 10 }, { title: groups ? "确认时间（群为首次）" : "确认时间", width: 13 },
     ...(groups ? [{ title: "群里点击次数", width: 8 }] : []),
     ...(push.mode === "options" ? [{ title: "选择", width: 14 }, { title: "选择时间", width: 13 }] : []),
     ...(push.mode === "reply" ? [{ title: "回复时间", width: 13 }, { title: "回复文字", width: 60 }, { title: "附件", width: 40 }] : []),
     ...(push.mode === "reply" && groups ? [{ title: "群里的回复人", width: 24 }] : []),
+    ...(forwards.length ? [{ title: "转派", width: 24 }] : []),
   ];
   const rows: (string | number | null)[][] = [], entries: Entry[] = [];
   let missingFiles = 0, index = 0;
@@ -120,11 +127,12 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
       row.push(time(recipient.submittedAt), text || null, names.join("\n") || null);
       if (groups) row.push(group ? senders(own).join("、") || null : null);
       if (own.length) {
-        const data = new TextEncoder().encode([`${group ? `群「${recipient.name}」` : `${recipient.name}（${phone(recipient.member)}）`}的回复，提交于 ${time(recipient.submittedAt)}`,
+        const data = new TextEncoder().encode([`${group ? `群「${recipient.name}」` : `${recipient.name}（${phone(recipient.member)}）`}的回复，${time(recipient.submittedAt)}`,
           "", text || "（没有文字）", ...(lines.length ? ["", "附件：", ...lines] : [])].join("\n") + "\n");
         entries.push({ name: `${folder}/回复.txt`, size: data.length, data });
       }
     }
+    if (forwards.length) row.push(handed(recipient.member) || null);
     rows.push(row);
   }
   await writeWorkbook(workbook, { name: "汇总", columns, rows }, now);

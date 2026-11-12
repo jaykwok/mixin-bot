@@ -16,7 +16,6 @@ export type PushMode = "ack" | "options" | "reply";
 export type PushState = "preview" | "cancelled" | "expired" | "sending" | "open" | "closed";
 /** As for delivery parts: uncertain counts as sent and is never resent (the platform does not deduplicate). */
 export type SendState = "pending" | "sending" | "sent" | "failed" | "uncertain";
-export type ReplyState = "none" | "replying" | "submitted";
 export type SummaryState = "pending" | "sent" | "failed";
 
 /** Beyond individuals, which a pusher may always reach. */
@@ -135,16 +134,10 @@ export type Recipient = {
   clicks: number;
   choice: number | null;
   choiceAt: number | null;
-  replyState: ReplyState;
-  /** Revision being collected while replying; 0 otherwise. */
-  draft: number;
-  /** Revision in effect (the last submitted one); 0: none yet. */
+  /** The revision of the reply items in effect; 0: no reply. */
   submitted: number;
+  /** When the reply last changed. */
   submittedAt: number | null;
-  /** The last reply content or reply state change. */
-  activityAt: number | null;
-  remindedAt: number | null;
-  hintedAt: number | null;
 };
 
 /** `sent`: pushes that went out (`followUps` of them 补推送, `live` not closed); the rest is over the closed ones. */
@@ -173,6 +166,29 @@ export type ReplyItem = {
   senderName: string | null;
 };
 
+/**
+ * A recipient hands a push on to someone else in the address book: `pending` until the recipient presses 「确认转派」 on the
+ * card that asks (its ID is known from a click on it), then `confirmed` (the other person is a recipient of the push from
+ * then on, and the one who handed it on counts as answered) or `cancelled`.
+ */
+export type ForwardState = "pending" | "confirmed" | "cancelled";
+export type Forward = {
+  id: string;
+  pushId: string;
+  /** The recipient who hands on, and the person it goes to (phones). */
+  from: string;
+  to: string;
+  toName: string;
+  state: ForwardState;
+  card: string | null;
+  version: number;
+  createdAt: number;
+  decidedAt: number | null;
+};
+
+/** A text a recipient of a live push sent (`member`: the phone, or the group's row; `sender`: who wrote it), kept a day so a reply can be recorded word for word. */
+export type Heard = { msgUid: string; member: string; sender: string; text: string; receivedAt: number };
+
 /** `scope`: the conversation's scope key (src/core/layout.ts scopeKey): `direct`, or `group:<ID>` for a member's group conversation. */
 export type PushNote = { scope: string; requestId: string; phone: string; text: string; data: string; attempts: number; nextAt: number; createdAt: number };
 
@@ -198,12 +214,20 @@ CREATE TABLE IF NOT EXISTS push_recipients (
   acked_at INTEGER, clicks INTEGER NOT NULL, choice INTEGER, choice_at INTEGER, reply_state TEXT NOT NULL, draft INTEGER NOT NULL,
   submitted INTEGER NOT NULL, submitted_at INTEGER, activity_at INTEGER, reminded_at INTEGER, hinted_at INTEGER,
   PRIMARY KEY (push_id, member)) STRICT;
+-- reply_state, draft, activity_at, reminded_at, hinted_at: of the reply buttons replies no longer need; written as 'none', 0 and NULL, never read.
 CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member, reply_state);
 CREATE TABLE IF NOT EXISTS push_reply_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT, push_id TEXT NOT NULL, member TEXT NOT NULL, revision INTEGER NOT NULL,
   msg_uid TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, text TEXT, attachment TEXT, name TEXT, size INTEGER, error TEXT,
   received_at INTEGER NOT NULL, path TEXT, sender TEXT, sender_name TEXT) STRICT;
 CREATE INDEX IF NOT EXISTS push_reply_items_by_reply ON push_reply_items (push_id, member, revision);
+CREATE TABLE IF NOT EXISTS push_forwards (
+  id TEXT PRIMARY KEY, push_id TEXT NOT NULL, from_member TEXT NOT NULL, to_member TEXT NOT NULL, to_name TEXT NOT NULL, state TEXT NOT NULL,
+  card TEXT, version INTEGER NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER) STRICT;
+CREATE INDEX IF NOT EXISTS push_forwards_by_push ON push_forwards (push_id, from_member);
+CREATE TABLE IF NOT EXISTS push_heard (
+  msg_uid TEXT PRIMARY KEY, member TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, received_at INTEGER NOT NULL) STRICT;
+CREATE INDEX IF NOT EXISTS push_heard_by_member ON push_heard (member, sender, received_at);
 CREATE TABLE IF NOT EXISTS push_notes (
   scope TEXT NOT NULL, phone TEXT NOT NULL, request_id TEXT NOT NULL, text TEXT NOT NULL, data TEXT NOT NULL, attempts INTEGER NOT NULL,
   next_at INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (scope, phone, request_id)) STRICT;
@@ -223,8 +247,7 @@ const PUSH_COLUMNS = {
 const RECIPIENT_COLUMNS = {
   pushId: "push_id", member: "member", name: "name", receiveId: "receive_id", sendState: "send_state", sendAttempts: "send_attempts",
   sendError: "send_error", sentAt: "sent_at", retryAt: "retry_at", card: "card", version: "version", ackedAt: "acked_at", clicks: "clicks",
-  choice: "choice", choiceAt: "choice_at", replyState: "reply_state", draft: "draft", submitted: "submitted",
-  submittedAt: "submitted_at", activityAt: "activity_at", remindedAt: "reminded_at", hintedAt: "hinted_at",
+  choice: "choice", choiceAt: "choice_at", submitted: "submitted", submittedAt: "submitted_at",
 } as const satisfies Record<keyof Recipient, string>;
 
 const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "summaryDone"]);
@@ -251,13 +274,25 @@ function decodeRecipient(row: Row): Recipient {
   return recipient as Recipient;
 }
 
+const RECIPIENT_KEYS = Object.keys(RECIPIENT_COLUMNS) as (keyof Recipient)[];
+/** A new recipient row; the two columns of the reply buttons have no default. */
+const RECIPIENT_INSERT = `INSERT INTO push_recipients (${RECIPIENT_KEYS.map(key => RECIPIENT_COLUMNS[key]).join(", ")}, reply_state, draft)
+  VALUES (${RECIPIENT_KEYS.map(() => "?").join(", ")}, 'none', 0)`;
+/** Handed on to someone (a confirmed forward of the row's member). */
+const FORWARDED = "EXISTS (SELECT 1 FROM push_forwards f WHERE f.push_id = r.push_id AND f.from_member = r.member AND f.state = 'confirmed')";
+const FORWARD_SELECT = `SELECT id, push_id AS pushId, from_member AS "from", to_member AS "to", to_name AS toName, state, card, version,
+  created_at AS createdAt, decided_at AS decidedAt FROM push_forwards`;
+
 const ITEM_SELECT = `SELECT id, push_id AS pushId, member, revision, msg_uid AS msgUid, kind, text, attachment, name, size, error,
   received_at AS receivedAt, path, sender, sender_name AS senderName FROM push_reply_items`;
 const GROUP_SELECT = `SELECT group_id AS id, name, state, first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, registered_at AS registeredAt,
   registered_by AS registeredBy FROM chat_groups`;
 
-/** A push's recipient rows, counted: `groups` of them are groups, `delivered` were reached and `answered` of those answered, `unsettled` have a send still to come. */
-export type RecipientCounts = { total: number; groups: number; delivered: number; failed: number; answered: number; replying: number; unsettled: number };
+/**
+ * A push's recipient rows, counted: `groups` of them are groups, `delivered` were reached and `answered` of those answered or
+ * handed the push on, `unsettled` have a send still to come; `repliedAt`: when a reply last changed.
+ */
+export type RecipientCounts = { total: number; groups: number; delivered: number; failed: number; answered: number; unsettled: number; repliedAt: number | null };
 
 /** States in which a push still takes clicks and replies. */
 export const LIVE_STATES: readonly PushState[] = ["sending", "open"];
@@ -329,9 +364,7 @@ export class PushStore {
       const keys = Object.keys(PUSH_COLUMNS) as (keyof Push)[];
       this.db.query(`INSERT INTO pushes (${keys.map(key => PUSH_COLUMNS[key]).join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`)
         .run(...keys.map(key => encodePush(key, push[key])));
-      const columns = Object.keys(RECIPIENT_COLUMNS) as (keyof Recipient)[];
-      const insert = this.db.query(`INSERT INTO push_recipients (${columns.map(key => RECIPIENT_COLUMNS[key]).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
-      for (const recipient of recipients) insert.run(...columns.map(key => recipient[key]));
+      for (const recipient of recipients) this.addRecipient(recipient);
     });
   }
 
@@ -364,23 +397,23 @@ export class PushStore {
 
   /**
    * The console's totals over the pushes kept here: those that went out, and over the closed ones the
-   * delivered recipients (a person or a group each) that confirmed (「已收到」, a choice, or 「回复」) and, of the pushes
+   * delivered recipients (a person or a group each) that confirmed (「已收到」, a choice, or a reply) and, of the pushes
    * asking for a reply, that replied. A push deleted in the console no longer counts.
    */
   totals(): PushTotals {
     const pushes = this.db.query(`SELECT count(*) AS sent, coalesce(sum(json_extract(target, '$.of') IS NOT NULL), 0) AS followUps,
       coalesce(sum(state != 'closed'), 0) AS live FROM pushes WHERE state IN ('sending', 'open', 'closed')`).get() as Pick<PushTotals, "sent" | "followUps" | "live">;
     const answers = this.db.query(`SELECT count(*) AS delivered, coalesce(sum(r.acked_at IS NOT NULL), 0) AS acked,
-      coalesce(sum(p.mode = 'reply'), 0) AS replyDelivered, coalesce(sum(p.mode = 'reply' AND r.submitted > 0 AND r.reply_state != 'replying'), 0) AS replied
+      coalesce(sum(p.mode = 'reply'), 0) AS replyDelivered, coalesce(sum(p.mode = 'reply' AND r.submitted > 0), 0) AS replied
       FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE p.state = 'closed' AND r.send_state IN ('sent', 'uncertain')`).get() as
       Omit<PushTotals, "sent" | "followUps" | "live">;
     return { ...pushes, ...answers };
   }
 
-  /** Delete a push with its recipients and reply items (the console). */
+  /** Delete a push with its recipients, reply items and forwards (the console). */
   remove(id: string): void {
     this.transaction(() => {
-      for (const table of ["push_reply_items", "push_recipients"]) this.db.query(`DELETE FROM ${table} WHERE push_id = ?`).run(id);
+      for (const table of ["push_reply_items", "push_recipients", "push_forwards"]) this.db.query(`DELETE FROM ${table} WHERE push_id = ?`).run(id);
       this.db.query("DELETE FROM pushes WHERE id = ?").run(id);
     });
   }
@@ -434,10 +467,10 @@ export class PushStore {
     if (!pushIds.length) return new Map();
     const rows = this.db.query(`SELECT r.push_id AS pushId, count(*) AS total, sum(r.member LIKE 'group:%') AS groups,
       sum(r.send_state IN ('sent', 'uncertain')) AS delivered, sum(r.send_state = 'failed') AS failed,
-      sum(r.send_state IN ('sent', 'uncertain') AND CASE p.mode WHEN 'ack' THEN r.acked_at IS NOT NULL WHEN 'options' THEN r.choice IS NOT NULL
-        ELSE r.submitted > 0 AND r.reply_state != 'replying' END) AS answered,
-      sum(r.reply_state = 'replying') AS replying,
-      sum(r.send_state IN ('pending', 'sending') OR (r.send_state = 'failed' AND r.retry_at IS NOT NULL)) AS unsettled
+      sum(r.send_state IN ('sent', 'uncertain') AND (CASE p.mode WHEN 'ack' THEN r.acked_at IS NOT NULL WHEN 'options' THEN r.choice IS NOT NULL
+        ELSE r.submitted > 0 END OR ${FORWARDED})) AS answered,
+      sum(r.send_state IN ('pending', 'sending') OR (r.send_state = 'failed' AND r.retry_at IS NOT NULL)) AS unsettled,
+      max(CASE WHEN r.submitted > 0 THEN r.submitted_at END) AS repliedAt
       FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE r.push_id IN (${pushIds.map(() => "?").join(", ")}) GROUP BY r.push_id`)
       .all(...pushIds) as (RecipientCounts & { pushId: string })[];
     return new Map(rows.map(({ pushId, ...counts }) => [pushId, counts]));
@@ -456,10 +489,13 @@ export class PushStore {
   replaceRecipients(pushId: string, recipients: readonly Recipient[]): void {
     this.transaction(() => {
       this.db.query("DELETE FROM push_recipients WHERE push_id = ?").run(pushId);
-      const columns = Object.keys(RECIPIENT_COLUMNS) as (keyof Recipient)[];
-      const insert = this.db.query(`INSERT INTO push_recipients (${columns.map(key => RECIPIENT_COLUMNS[key]).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
-      for (const recipient of recipients) insert.run(...columns.map(key => recipient[key]));
+      for (const recipient of recipients) this.addRecipient(recipient);
     });
+  }
+
+  /** One more recipient of a push (the list at its creation and confirmation, then people it is handed on to). */
+  addRecipient(recipient: Recipient): void {
+    this.db.query(RECIPIENT_INSERT).run(...RECIPIENT_KEYS.map(key => recipient[key]));
   }
 
   updateRecipient(pushId: string, member: string, change: Partial<Omit<Recipient, "pushId" | "member">>): void {
@@ -474,29 +510,16 @@ export class PushStore {
     this.db.query("UPDATE push_recipients SET version = version + 1 WHERE push_id = ?").run(pushId);
   }
 
-  /** A push's people replying with activity and not reminded yet (the idle reminder; groups get none). */
-  unreminded(pushId: string): Recipient[] {
-    return (this.db.query(`SELECT * FROM push_recipients WHERE push_id = ? AND reply_state = 'replying' AND reminded_at IS NULL
-      AND activity_at IS NOT NULL AND member NOT LIKE 'group:%' ORDER BY rowid`).all(pushId) as Row[]).map(decodeRecipient);
-  }
-
-  /** The member's reply in progress, if any (at most one: starting another first ends this one). */
-  replying(member: string): Recipient | undefined {
-    const row = this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
-      WHERE r.member = ? AND r.reply_state = 'replying' AND p.state IN ('sending', 'open') ORDER BY r.activity_at DESC LIMIT 1`).get(member) as Row | null;
-    return row ? decodeRecipient(row) : undefined;
-  }
-
   /** The member's (or group's) rows in live pushes whose card reached them. */
   reached(member: string): Recipient[] {
     return (this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
       WHERE r.member = ? AND p.state IN ('sending', 'open') AND r.send_state IN ('sent', 'uncertain') ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
   }
 
-  /** Live pushes that want a reply from the member and have none yet. */
+  /** Live pushes that want a reply from the member (or group) and have none yet, unless they handed the push on. */
   awaitingReply(member: string): Recipient[] {
     return (this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
-      WHERE r.member = ? AND p.mode = 'reply' AND p.state IN ('sending', 'open') AND r.submitted = 0 AND r.reply_state = 'none'
+      WHERE r.member = ? AND p.mode = 'reply' AND p.state IN ('sending', 'open') AND r.submitted = 0 AND NOT ${FORWARDED}
       AND r.send_state IN ('sent', 'uncertain') ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
   }
 
@@ -512,6 +535,19 @@ export class PushStore {
     return this.db.query("UPDATE push_recipients SET send_state = 'uncertain', send_error = '发送过程中服务中断，结果未知' WHERE send_state = 'sending'").run().changes;
   }
 
+  /**
+   * At startup: what the reply buttons left. A reply being collected (after 「回复」, before 「已回复」) with content is the
+   * reply, as it was at the deadline; an attachment whose registration never ended is not coming.
+   */
+  settleDrafts(): number {
+    return this.transaction(() => {
+      this.db.query(`UPDATE push_recipients SET submitted = draft, submitted_at = coalesce(activity_at, submitted_at, 0) WHERE reply_state = 'replying'
+        AND EXISTS (SELECT 1 FROM push_reply_items i WHERE i.push_id = push_recipients.push_id AND i.member = push_recipients.member AND i.revision = push_recipients.draft)`).run();
+      this.db.query("UPDATE push_reply_items SET error = '附件没有收全' WHERE kind != 'text' AND attachment IS NULL AND error IS NULL").run();
+      return this.db.query("UPDATE push_recipients SET reply_state = 'none', draft = 0 WHERE reply_state = 'replying'").run().changes;
+    });
+  }
+
   // ---- reply items ----------------------------------------------------------------------------------------------------
 
   /** The new item's ID; undefined when the message was recorded before (a redelivery). */
@@ -522,12 +558,17 @@ export class PushStore {
     return result.changes ? Number(result.lastInsertRowid) : undefined;
   }
 
-  hasItem(msgUid: string): boolean {
-    return this.db.query("SELECT 1 FROM push_reply_items WHERE msg_uid = ?").get(msgUid) !== null;
+  /** The item a message became, if any. */
+  itemOf(msgUid: string): ReplyItem | undefined {
+    return (this.db.query(`${ITEM_SELECT} WHERE msg_uid = ?`).get(msgUid) as ReplyItem | null) ?? undefined;
   }
 
-  updateItem(id: number, change: Partial<Pick<ReplyItem, "attachment" | "error" | "path">>): void {
-    const keys = Object.keys(change) as ("attachment" | "error" | "path")[];
+  removeItems(ids: readonly number[]): void {
+    for (const id of ids) this.db.query("DELETE FROM push_reply_items WHERE id = ?").run(id);
+  }
+
+  updateItem(id: number, change: Partial<Pick<ReplyItem, "error" | "path">>): void {
+    const keys = Object.keys(change) as ("error" | "path")[];
     if (!keys.length) return;
     this.db.query(`UPDATE push_reply_items SET ${keys.map(key => `${key} = ?`).join(", ")} WHERE id = ?`).run(...keys.map(key => change[key] ?? null), id);
   }
@@ -538,9 +579,54 @@ export class PushStore {
     return this.db.query(`${ITEM_SELECT} WHERE push_id = ? AND member = ? AND revision = ? ORDER BY received_at, id`).all(pushId, member, revision) as ReplyItem[];
   }
 
-  /** Attachment items whose registration did not finish (a process ended between the two steps). */
-  unregistered(): ReplyItem[] {
-    return this.db.query(`${ITEM_SELECT} WHERE kind != 'text' AND attachment IS NULL AND error IS NULL ORDER BY id`).all() as ReplyItem[];
+  // ---- forwards -------------------------------------------------------------------------------------------------------
+
+  addForward(forward: Forward): void {
+    this.db.query(`INSERT INTO push_forwards (id, push_id, from_member, to_member, to_name, state, card, version, created_at, decided_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(forward.id, forward.pushId, forward.from, forward.to, forward.toName, forward.state, forward.card, forward.version,
+      forward.createdAt, forward.decidedAt);
+  }
+
+  forward(id: string): Forward | undefined {
+    return (this.db.query(`${FORWARD_SELECT} WHERE id = ?`).get(id) as Forward | null) ?? undefined;
+  }
+
+  /** A push's forwards in order; `state`: only these. */
+  forwards(pushId: string, state?: ForwardState): Forward[] {
+    return state === undefined ? this.db.query(`${FORWARD_SELECT} WHERE push_id = ? ORDER BY created_at, rowid`).all(pushId) as Forward[]
+      : this.db.query(`${FORWARD_SELECT} WHERE push_id = ? AND state = ? ORDER BY created_at, rowid`).all(pushId, state) as Forward[];
+  }
+
+  updateForward(id: string, change: Partial<Pick<Forward, "state" | "card" | "version" | "decidedAt">>): void {
+    const columns = { state: "state", card: "card", version: "version", decidedAt: "decided_at" } as const;
+    const keys = Object.keys(change) as (keyof typeof columns)[];
+    if (!keys.length) return;
+    this.db.query(`UPDATE push_forwards SET ${keys.map(key => `${columns[key]} = ?`).join(", ")} WHERE id = ?`).run(...keys.map(key => change[key] ?? null), id);
+  }
+
+  /** The push ended: what was still asked is not handed on. */
+  cancelForwards(pushId: string, now: number): void {
+    this.db.query("UPDATE push_forwards SET state = 'cancelled', decided_at = ?, version = version + 1 WHERE push_id = ? AND state = 'pending'").run(now, pushId);
+  }
+
+  // ---- heard messages -------------------------------------------------------------------------------------------------
+
+  /** Keep a recipient's text, and of this sender there only the newest `keep`. */
+  hear(heard: Heard, keep: number): void {
+    this.db.query("INSERT OR IGNORE INTO push_heard (msg_uid, member, sender, text, received_at) VALUES (?, ?, ?, ?, ?)")
+      .run(heard.msgUid, heard.member, heard.sender, heard.text, heard.receivedAt);
+    this.db.query(`DELETE FROM push_heard WHERE member = ? AND sender = ? AND msg_uid NOT IN (
+      SELECT msg_uid FROM push_heard WHERE member = ? AND sender = ? ORDER BY received_at DESC, rowid DESC LIMIT ?)`).run(heard.member, heard.sender, heard.member, heard.sender, keep);
+  }
+
+  /** What this sender said there, newest first. */
+  heard(member: string, sender: string): Heard[] {
+    return this.db.query(`SELECT msg_uid AS msgUid, member, sender, text, received_at AS receivedAt FROM push_heard WHERE member = ? AND sender = ?
+      ORDER BY received_at DESC, rowid DESC`).all(member, sender) as Heard[];
+  }
+
+  forgetHeard(before: number): void {
+    this.db.query("DELETE FROM push_heard WHERE received_at < ?").run(before);
   }
 
   // ---- conversation notes ---------------------------------------------------------------------------------------------

@@ -20,7 +20,7 @@ export function validateCloseout(timing: CloseoutTiming, runTimeoutMs: number): 
     throw new Error("收尾配置无效：交付保留时间须小于收尾时间，收尾时间须小于任务总时限的一半；各时间须为正数");
   }
 }
-/** The running inbox item of the calling conversation, with its member and run record. */
+/** The running inbox item of the calling conversation, with its member, the member's text and its run record. */
 export async function activeRequest(api: Pick<DocumentReader, "snapshot"> & Pick<HookApi, "conversationId">, context: Context) {
   const head = (await api.snapshot(InboxDoc, api.conversationId, context))?.items[0];
   if (!head || head.startedAt === undefined || head.cancelled) return;
@@ -28,7 +28,7 @@ export async function activeRequest(api: Pick<DocumentReader, "snapshot"> & Pick
   if (!identity?.phone) return;
   const record = (await memberRecords(api, identity.phone, context)).requests[head.requestId];
   if (!record) return;
-  return { requestId: head.requestId, startedAt: head.startedAt, phone: identity.phone, space: identity.space, record };
+  return { requestId: head.requestId, startedAt: head.startedAt, phone: identity.phone, space: identity.space, content: head.content, record };
 }
 
 /** Change one run record in its own commit (hooks have no transaction of their own). */
@@ -36,7 +36,7 @@ export type RecordWriter = (phone: string, requestId: string, change: (record: R
 export function phase(remaining: number, timing: CloseoutTiming): "常规" | "收尾" | "交付" {
   return remaining <= timing.reserveMs ? "交付" : remaining <= timing.closeoutMs ? "收尾" : "常规";
 }
-export function appendTiming(messages: readonly Message[], text: string, now: number): Message[] {
+export function appendTail(messages: readonly Message[], text: string, now: number): Message[] {
   const last = messages.at(-1);
   if (last?.role === "user") {
     const content = typeof last.content === "string" ? [{ type: "text" as const, text: last.content }] : [...last.content];
@@ -92,7 +92,7 @@ export function closeoutExtension(write: RecordWriter, timing: CloseoutTiming, r
           .filter(Boolean).map(part => "；" + part).join("");
         const text = `[任务计时] 剩余 ${Math.floor(seconds / 60)}分${seconds % 60}秒；阶段：${stage}；现在是 ${localTime(now)}${counts}。${direction}${versions >= 4 ? "除修正事实错误外不要再重建。" : ""}`
           + (places ? `\n[临时目录] ${places(item.phone, item.requestId).requestDir!.replace(/\\/g, "/")}` : "");
-        return { messages: appendTiming(request.messages, text, now) };
+        return { messages: appendTail(request.messages, text, now) };
       },
       async onYield(_answer, api, context) {
         const item = await activeRequest(api, context); if (!item) return;

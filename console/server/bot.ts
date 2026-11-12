@@ -19,6 +19,18 @@ export interface BotReader {
   read<T>(op: ReadOp, signal?: AbortSignal): Promise<T>;
 }
 
+/** What the operator's message came to (src/durable/takeover.ts SayResult). */
+export type SayResult = { sent: "sent" | "uncertain" | "partial"; recorded: boolean; segments?: { sent: number; total: number } };
+
+/** Taking a conversation over (the bot's `/_admin/conversation/*`): a refusal is a BotReadError with the code TakeoverRefused. */
+export interface BotTakeover {
+  stop(member: { space: string; phone: string }): Promise<void>;
+  say(member: { space: string; phone: string }, text: string): Promise<SayResult>;
+}
+
+/** A stop waits for the member's run and its tools to end (the bot allows 120 s). */
+const TAKEOVER_MS = 130_000;
+
 type Instance = { port: number; token: string; instanceId: string; pid: number; startedAt: number };
 
 export interface BotLinkOptions {
@@ -36,7 +48,7 @@ export interface BotLinkOptions {
 const signalWith = (timeoutMs: number, signal?: AbortSignal) =>
   signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
 
-export class BotLink implements BotReader {
+export class BotLink implements BotReader, BotTakeover {
   readonly #options: Required<BotLinkOptions>;
   #verified: { key: string; at: number } | undefined;
   #active = 0;
@@ -53,7 +65,7 @@ export class BotLink implements BotReader {
       // matches: the bot restarted between reading its record and the request.
       for (let attempt = 0; ; attempt++) {
         const instance = await this.#verify(signal);
-        const response = await this.#post(instance, op, signal);
+        const response = await this.#post(instance, "/_admin/read", op, this.#options.timeoutMs, signal);
         const body = response.body as { status?: unknown; result?: unknown; code?: unknown; message?: unknown } | null;
         const refused = response.status === 404 && body?.status !== "error";
         if (refused && attempt === 0) { this.#verified = undefined; continue; }
@@ -65,6 +77,32 @@ export class BotLink implements BotReader {
     } finally {
       this.#release();
     }
+  }
+
+  stop(member: { space: string; phone: string }): Promise<void> {
+    return this.#takeover("stop", member).then(() => {});
+  }
+
+  async say(member: { space: string; phone: string }, text: string): Promise<SayResult> {
+    const body = await this.#takeover("say", { ...member, text });
+    return { sent: body.sent as SayResult["sent"], recorded: body.recorded === true, ...(body.segments ? { segments: body.segments as { sent: number; total: number } } : {}) };
+  }
+
+  /**
+   * Not counted against the read slots (a stop may wait long), and never repeated: after a refused token the operator
+   * sends again. The page going away does not end it either, so the stop and the message stay one step.
+   */
+  async #takeover(name: "stop" | "say", body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const instance = await this.#verify();
+    const response = await this.#post(instance, `/_admin/conversation/${name}`, body, TAKEOVER_MS);
+    const reply = response.body as Record<string, unknown> | null;
+    if (response.status === 200 && reply?.status === "ok") return reply;
+    if (response.status === 404 && reply?.status !== "error") {
+      this.#verified = undefined;
+      throw new BotOffline("机器人拒绝了请求（实例口令不符，或运行中的版本还不支持接管），它可能刚刚重启，请稍后重试");
+    }
+    throw new BotReadError(typeof reply?.message === "string" ? reply.message : `机器人没有完成这次操作（HTTP ${response.status}）`, response.status,
+      typeof reply?.code === "string" ? reply.code : "unknown");
   }
 
   async #instance(): Promise<Instance> {
@@ -100,17 +138,17 @@ export class BotLink implements BotReader {
     return instance;
   }
 
-  async #post(instance: Instance, op: ReadOp, signal?: AbortSignal): Promise<{ status: number; body: unknown }> {
+  async #post(instance: Instance, path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<{ status: number; body: unknown }> {
     let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:${instance.port}/_admin/read`, {
+      response = await fetch(`http://127.0.0.1:${instance.port}${path}`, {
         method: "POST", headers: { Authorization: `Bearer ${instance.token}`, "Content-Type": "application/json" },
-        body: JSON.stringify(op), signal: signalWith(this.#options.timeoutMs, signal), redirect: "error",
+        body: JSON.stringify(body), signal: signalWith(timeoutMs, signal), redirect: "error",
       });
     } catch (error) {
       signal?.throwIfAborted();
       this.#verified = undefined;
-      if ((error as Error).name === "TimeoutError") throw new BotReadError(`机器人 ${Math.round(this.#options.timeoutMs / 1000)} 秒内没有答复`, 504, "TimeoutError");
+      if ((error as Error).name === "TimeoutError") throw new BotReadError(`机器人 ${Math.round(timeoutMs / 1000)} 秒内没有答复`, 504, "TimeoutError");
       throw new BotOffline("机器人没有应答，它可能已经停止");
     }
     return { status: response.status, body: await response.json().catch(() => null) };

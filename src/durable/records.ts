@@ -155,9 +155,8 @@ export type Attachment = {
   /** The request that consumed it. */
   boundTo?: string;
   /**
-   * A reply to a push (`push:<id>`, src/push/service.ts) holds it instead: never bound to a request, not counted among the
-   * member's unconsumed attachments, not expired and not voided by /clear. The push releases it (drops this record) once
-   * its summary is out; the file is then left to the tmp lifecycle.
+   * A reply to a push (`push:<id>`, src/push/service.ts) holds it besides: once the message of its request was recorded as
+   * the reply, no control voids it and it stays when the request's record goes, until the push releases it.
    */
   heldBy?: string;
   at: number;

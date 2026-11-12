@@ -1,12 +1,12 @@
-// .console/audit/: one JSON line per conversation view, search, identity mode opened in full and export (requested, sent,
-// interrupted, failed). Metadata only: no message text, no search text, no complete number, no credential or login link.
+// .console/audit/: one JSON line per conversation view, takeover (a stop, a message sent as the bot), search, identity
+// mode opened in full and export (requested, sent, interrupted, failed). Metadata only: no message text, no search text, no complete number, no credential or login link.
 // Daily files, kept for a limited number of days.
 import { appendFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { IdentityMode } from "../ui/src/contract.ts";
 import { dayKey } from "../../src/agent/stats-ledger.ts";
 
-export type AuditAction = "view-open" | "identity-full" | "conversation-open" | "search"
+export type AuditAction = "view-open" | "identity-full" | "conversation-open" | "conversation-stop" | "conversation-say" | "search"
   | "export-request" | "export-sent" | "export-interrupted" | "export-failed" | "log-view" | "log-export" | "plan" | "task-submit" | "directory-apply"
   | "push-settings" | "push-view" | "push-remind" | "push-cc" | "push-delete" | "push-group" | "setup-dependencies";
 

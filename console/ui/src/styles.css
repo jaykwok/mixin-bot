@@ -1129,6 +1129,19 @@ input[type="file"]::file-selector-button:hover { background: var(--fill-hover); 
 .push-note-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12.5px; color: var(--muted); }
 .push-note-head .entry-when { margin-left: auto; }
 .push-note.target { box-shadow: inset 3px 0 0 var(--accent); }
+.operator-note { background: var(--warn-soft); }
+.operator-note > .icon { color: var(--warn); }
+
+.takeover { display: flex; flex-direction: column; gap: 8px; padding: 10px 24px 12px; border-top: 1px solid var(--separator); background: var(--surface); }
+.takeover > * { width: 100%; max-width: 880px; margin-left: auto; margin-right: auto; }
+.takeover-head { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; }
+.takeover-head > span { display: inline-flex; align-items: center; gap: 6px; }
+.takeover textarea { min-height: 64px; max-height: 30vh; }
+.takeover-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.takeover-actions > span { margin-right: auto; }
+.takeover-note { margin: 0; font-size: 13px; }
+.takeover-note.ok-text { color: var(--ok); }
+.takeover .footnote { margin: 0; }
 
 .divider { position: relative; margin: 16px 0; text-align: center; font-size: 12.5px; color: var(--muted); }
 .divider.reset::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid var(--separator); }

@@ -13,8 +13,8 @@
 // - Void: a /stop or /clear voids what its cancelled requests bound, a /clear also the unbound ones received before it,
 //   and unbound ones expire after `retentionMs`. Void records keep no path; their files are removed best effort here and
 //   otherwise by the tmp archive (non-void paths are protected as run-record references).
-// - Held: an attachment sent as a reply to a push belongs to that reply (`heldBy`), not to the member's next request:
-//   it is none of the above (not unconsumed, never bound, expired or voided by a control) until the push releases it.
+// - Held: an attachment of a message recorded as a reply to a push belongs to that reply too (`heldBy`, set once its
+//   request ran): no control voids it and its record outlives the request's, until the push releases it.
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -74,12 +74,29 @@ export function unconsumed(records: Readonly<MemberRecords>): Attachment[] {
   return Object.values(records.attachments).filter(attachment => attachment.boundTo === undefined && attachment.heldBy === undefined && attachment.state !== "void");
 }
 
-/** Drop held records (the push released them); their files stay for the tmp lifecycle. Returns how many were dropped. */
+/** The push holds these attachments of the member from now on; void ones and those of another holder are left. Returns how many it holds. */
+export function holdAttachments(records: MemberRecords, holder: string, ids: readonly string[]): number {
+  let held = 0;
+  for (const id of ids) {
+    const attachment = records.attachments[id];
+    if (!attachment || attachment.state === "void" || (attachment.heldBy !== undefined && attachment.heldBy !== holder)) continue;
+    attachment.heldBy = holder;
+    held++;
+  }
+  return held;
+}
+
+/**
+ * The push released these: an attachment whose request still has its record is the request's alone again, the others'
+ * records go (their files stay for the tmp lifecycle). Returns how many were released.
+ */
 export function releaseHeld(records: MemberRecords, holder: string, ids: readonly string[]): number {
   let released = 0;
   for (const id of ids) {
-    if (records.attachments[id]?.heldBy !== holder) continue;
-    delete records.attachments[id];
+    const attachment = records.attachments[id];
+    if (attachment?.heldBy !== holder) continue;
+    if (attachment.boundTo !== undefined && records.requests[attachment.boundTo] !== undefined) delete attachment.heldBy;
+    else delete records.attachments[id];
     released++;
   }
   return released;
@@ -118,11 +135,11 @@ export function voidWhere(records: MemberRecords, match: (attachment: Attachment
 
 /**
  * Maintenance: unbound attachments expire; records bound to a request that is gone (pruned after its retention) are
- * dropped with it. Returns the voided attachments.
+ * dropped with it, unless a push holds them. Returns the voided attachments.
  */
 export function expireAttachments(records: MemberRecords, now: number, retentionMs = ATTACHMENT_LIMITS.retentionMs): Attachment[] {
   for (const [id, attachment] of Object.entries(records.attachments)) {
-    if (attachment.boundTo !== undefined && attachment.state !== "void" && records.requests[attachment.boundTo] === undefined) delete records.attachments[id];
+    if (attachment.boundTo !== undefined && attachment.heldBy === undefined && attachment.state !== "void" && records.requests[attachment.boundTo] === undefined) delete records.attachments[id];
   }
   return voidWhere(records, attachment => attachment.boundTo === undefined && attachment.heldBy === undefined && now - attachment.receivedAt > retentionMs, now);
 }

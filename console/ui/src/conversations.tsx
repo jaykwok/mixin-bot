@@ -8,7 +8,7 @@ import { api, ApiFailure } from "./api.ts";
 import type {
   Boundary, EntryPage, EntryPart, EntryView, GlobalSearchCursor, GlobalSearchHit, GlobalSearchResponse, GlobalSearchViewResponse, Identity, IdentityMode,
   MemberRow, MembersResponse, RequestsResponse, RequestView, SearchFilters, SearchHitView, SearchKind, SearchResponse, SpacesResponse, SpaceSummary,
-  SpaceViewResponse,
+  SpaceViewResponse, TakeoverSayResponse,
 } from "./contract.ts";
 import { ConversationExportDialog } from "./exports.tsx";
 import { ago, bytes, clock, count, dateTime, seconds, stamp } from "./format.ts";
@@ -19,6 +19,12 @@ import { TaskAction } from "./tasks.tsx";
 
 /** The entry kind of a push note (src/push/note.ts). */
 const PUSH_NOTE_KIND = "mixin.push-note";
+/** The entry kind of an operator's message (src/durable/operator-note.ts). */
+const OPERATOR_NOTE_KIND = "mixin.operator-note";
+/** The longest text an operator sends at once (console/server/views.ts TAKEOVER_TEXT_MAX). */
+const TAKEOVER_TEXT_MAX = 4_000;
+/** A stop waits for the member's run and its tools to end (console/server/bot.ts allows 130 s). */
+const TAKEOVER_WAIT_MS = 150_000;
 import { Banner, Chip, Dialog, EmptyState, Segmented, Spinner, type Tone } from "./ui.tsx";
 
 const MEMBER_BATCH = 200;
@@ -267,7 +273,7 @@ export function ConversationsPage() {
           busy={membersBusy} onRefresh={() => void refreshMembers()} />
         <section class="pane reader-pane" aria-label="会话内容">
           {selected ? (
-            <MemberReader key={`${open.view.id}:${selected.identity.key}`} view={open.view.id} row={selected} onProblem={onProblem}
+            <MemberReader key={`${open.view.id}:${selected.identity.key}`} view={open.view.id} mode={open.view.mode} row={selected} onProblem={onProblem}
               jump={jump?.member === selected.identity.key ? jump : null} onBack={() => setMember(null)} onRefresh={() => void refreshMembers()} />
           ) : (
             <EmptyState icon="messages" title="选择一位成员查看会话">
@@ -380,9 +386,10 @@ function MemberPane({ rows, selected, onSelect, names, busy, onRefresh }: {
 
 // ─── Reader ────────────────────────────────────────────────────────────────
 
-function MemberReader({ view, row, onProblem, jump, onBack, onRefresh }: {
-  view: string; row: MemberRow; onProblem: Problem; jump: { id: number; nonce: number } | null; onBack: () => void; onRefresh: () => void;
+function MemberReader({ view, mode, row, onProblem, jump, onBack, onRefresh }: {
+  view: string; mode: IdentityMode; row: MemberRow; onProblem: Problem; jump: { id: number; nonce: number } | null; onBack: () => void; onRefresh: () => void;
 }) {
+  const [taking, setTaking] = useState(false);
   const [tab, setTab] = useState<"chat" | "runs">("chat");
   const [target, setTarget] = useState<{ id: number; nonce: number } | null>(jump);
   const [reload, setReload] = useState(0);
@@ -404,6 +411,11 @@ function MemberReader({ view, row, onProblem, jump, onBack, onRefresh }: {
           <Segmented label="内容" size="small" value={tab} onChange={setTab}
             options={[{ value: "chat", label: "对话", icon: "messages" }, { value: "runs", label: "运行记录", icon: "activity" }]} />
           {tab === "chat" && <BoundaryMenu view={view} member={row.identity.key} onJump={goTo} onProblem={onProblem} />}
+          {tab === "chat" && (
+            <button type="button" class={`btn small-btn${taking ? " active" : ""}`} aria-pressed={taking} disabled={mode === "anonymous"}
+              data-tip={mode === "anonymous" ? "匿名模式下不能接管对话" : "停止机器人对这位成员的回答，或以机器人的名义回复"}
+              onClick={() => setTaking(value => !value)}><Icon name="user" size={14} />接管对话</button>
+          )}
           <button type="button" class="btn ghost icon-btn" aria-label={tab === "chat" ? "回到最新" : "刷新运行记录"} data-tip={tab === "chat" ? "回到最新" : "刷新"}
             onClick={() => { setTarget(null); setReload(value => value + 1); onRefresh(); }}><Icon name="refresh" /></button>
         </div>
@@ -411,7 +423,69 @@ function MemberReader({ view, row, onProblem, jump, onBack, onRefresh }: {
       {tab === "chat"
         ? <Transcript key={`${reload}:${target?.nonce ?? 0}`} view={view} identity={row.identity} target={target?.id ?? null} onProblem={onProblem} />
         : <Runs key={reload} view={view} member={row.identity.key} onJump={goTo} onProblem={onProblem} />}
+      {tab === "chat" && taking && mode !== "anonymous" && (
+        <TakeoverBar view={view} member={row.identity.key} onProblem={onProblem} onClose={() => setTaking(false)}
+          onDone={() => { setTarget(null); setReload(value => value + 1); onRefresh(); }} />
+      )}
     </>
+  );
+}
+
+/** What the page says after an operator's message, by how the send ended. */
+function takeoverOutcome(result: TakeoverSayResponse): { tone: Tone; text: string; keep: boolean } {
+  const unrecorded = result.recorded ? "" : "这段话没能记进会话，机器人之后回答时不知道你说过什么。";
+  if (result.sent === "partial") {
+    return { tone: "warn", keep: true, text: `只发出了前 ${result.segments?.sent ?? 0} 段（共 ${result.segments?.total ?? 0} 段），后面的没有发出去，请把剩下的内容再发一次。${unrecorded}` };
+  }
+  if (result.sent === "uncertain") return { tone: "warn", keep: false, text: `平台没有确认这条消息是否送达，成员可能已经收到；确认没收到再重发。${unrecorded}` };
+  return { tone: unrecorded ? "warn" : "ok", keep: false, text: `已发给成员。成员的下一条消息仍由机器人回答。${unrecorded}` };
+}
+
+/**
+ * Taking the conversation over: stop what the bot is doing for this member, or answer in the bot's place (which stops
+ * it first). Nothing is switched off: the member's next message is the bot's again.
+ */
+function TakeoverBar({ view, member, onProblem, onDone, onClose }: { view: string; member: string; onProblem: Problem; onDone: () => void; onClose: () => void }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState<"stop" | "say" | null>(null);
+  const [note, setNote] = useState<{ tone: Tone; text: string } | null>(null);
+  const length = [...text.trim()].length;
+  const run = async (action: "stop" | "say") => {
+    setBusy(action);
+    setNote(null);
+    try {
+      if (action === "stop") {
+        await api<{ ok: true }>("/api/conversation/stop", { method: "POST", intent: true, body: { view, member }, timeoutMs: TAKEOVER_WAIT_MS });
+        setNote({ tone: "ok", text: "机器人已经停下：这位成员正在处理的任务和排队的消息都取消了。成员没有收到提示，可以接着发消息说明。" });
+      } else {
+        const outcome = takeoverOutcome(await api<TakeoverSayResponse>("/api/conversation/say",
+          { method: "POST", intent: true, body: { view, member, text }, timeoutMs: TAKEOVER_WAIT_MS }));
+        if (!outcome.keep) setText("");
+        setNote(outcome);
+      }
+      onDone();
+    } catch (failure) {
+      if (!onProblem(failure)) setNote({ tone: "danger", text: failureOf(failure).message });
+    } finally { setBusy(null); }
+  };
+  return (
+    <footer class="takeover" aria-label="接管对话">
+      <div class="takeover-head">
+        <span><Icon name="user" size={14} />以机器人的名义回复这位成员</span>
+        <button type="button" class="btn ghost icon-btn" aria-label="收起接管" onClick={onClose}><Icon name="x" size={14} /></button>
+      </div>
+      <textarea value={text} rows={3} maxLength={TAKEOVER_TEXT_MAX * 2} disabled={busy !== null} placeholder="输入要发给成员的话，成员看到的是机器人发来的消息"
+        aria-label="发给成员的内容" onInput={event => setText((event.target as HTMLTextAreaElement).value)} />
+      <div class="takeover-actions">
+        <span class={`muted small${length > TAKEOVER_TEXT_MAX ? " warn-text" : ""}`}>{count(length)} / {count(TAKEOVER_TEXT_MAX)} 字</span>
+        <button type="button" class="btn small-btn" disabled={busy !== null} onClick={() => void run("stop")}>
+          {busy === "stop" ? <><Icon name="loader" size={14} class="spin" />正在停止…</> : <><Icon name="square" size={14} />只停止机器人</>}</button>
+        <button type="button" class="btn primary small-btn" disabled={busy !== null || length === 0 || length > TAKEOVER_TEXT_MAX} onClick={() => void run("say")}>
+          {busy === "say" ? <><Icon name="loader" size={14} class="spin" />正在发送…</> : <><Icon name="send" size={14} />停止机器人并发送</>}</button>
+      </div>
+      {note && <p class={`takeover-note ${note.tone === "danger" ? "danger-text" : note.tone === "warn" ? "warn-text" : "ok-text"}`} role="status">{note.text}</p>}
+      <p class="footnote">发送前会先停下机器人对这位成员正在进行的回答和排队的消息；发出的话会记进这段会话，机器人之后能看到。成员的下一条消息仍由机器人回答。</p>
+    </footer>
   );
 }
 
@@ -665,6 +739,18 @@ function EntryRow({ entry, identity, target, onFull }: { entry: EntryView; ident
       </div>
     );
   }
+  if (entry.kind === OPERATOR_NOTE_KIND) {
+    // An operator answered in the bot's place (takeover); the text is as the model reads it afterwards.
+    return (
+      <div class={`push-note operator-note${mark}`} data-entry={entry.id}>
+        <Icon name="user" size={14} />
+        <div class="push-note-main">
+          <div class="push-note-head"><span>人工回复</span><When entry={entry} /></div>
+          <Parts entry={entry} markdown={false} onFull={onFull} />
+        </div>
+      </div>
+    );
+  }
   if (entry.role === "user" || entry.role === "assistant") {
     const user = entry.role === "user";
     return (
@@ -750,7 +836,7 @@ function BoundaryMenu({ view, member, onJump, onProblem }: { view: string; membe
 // ─── Search ────────────────────────────────────────────────────────────────
 
 const KIND_LABEL: Record<string, string> = { "pi.user": "用户", "pi.assistant": "机器人", "pi.tool-result": "工具结果", "pi.compaction": "压缩摘要",
-  [PUSH_NOTE_KIND]: "推送备注" };
+  [PUSH_NOTE_KIND]: "推送备注", [OPERATOR_NOTE_KIND]: "人工回复" };
 
 /** The snippet with every occurrence of the search terms marked (the bot gives the terms lower-cased). */
 function Snippet({ text, terms }: { text: string; terms: string[] }) {

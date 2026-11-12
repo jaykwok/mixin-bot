@@ -1,6 +1,7 @@
 /** @jsxImportSource preact */
 // The conversations and stats pages under happy-dom with a scripted console API: safe Markdown, reading and paging a
-// conversation, identity mode switches (complete numbers need a confirmation and keep the member), bot-offline and
+// conversation, taking it over (stop the bot, answer in its place), identity mode switches (complete numbers need a
+// confirmation and keep the member), bot-offline and
 // expired views, run records that never claim a message was read, search, the member list refresh, exports (including
 // late answers after a login change) and the stats page.
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
@@ -201,6 +202,83 @@ test("会话：命令以非零退出码结束标“退出码 N”，工具本身
   const rows = [...container.querySelectorAll(".tool-result")].map(row => [row.getAttribute("data-entry"), row.className.replace("tool-result", "").trim(),
     row.querySelector("summary .muted")!.textContent]);
   expect(rows).toEqual([["21", "", "结果"], ["22", "exited", "退出码 1"], ["23", "failed", "失败"]]);
+});
+
+test("接管对话：只停止、停止并发送；发完重读会话并显示人工回复；送达不确定、只发出一部分、被拒绝各有说明；匿名模式不能接管", async () => {
+  const note: EntryView = { id: 16, kind: "mixin.operator-note", at: T, chars: 1, role: "user",
+    parts: [{ type: "text", text: "[人工回复] 管理员以你的名义直接回复了这位用户，用户已经看到：\n稍后电话答复" }] };
+  let said = 0, mode: "default" | "anonymous" = "default";
+  const answers: Reply[] = [
+    { status: 200, body: { sent: "sent", recorded: true } }, { status: 200, body: { sent: "uncertain", recorded: false } },
+    { status: 200, body: { sent: "partial", recorded: true, segments: { sent: 1, total: 2 } } },
+    { status: 409, body: { error: "这位成员已不在机器人同步的通讯录范围内，不能接管。", code: "input" } }];
+  routes = {
+    ...base(),
+    "GET /api/spaces": () => ({ status: 200, body: spaces }),
+    "POST /api/views/space": () => ({ status: 200, body: viewOf(mode === "default" ? "v1" : "v2", mode) }),
+    "POST /api/conversation/activity": () => ({ status: 200, body: { members: viewOf("v1", "default").members, added: 0, truncated: false, observedAt: NOW } satisfies MembersResponse }),
+    "POST /api/conversation/entries": call => ({ status: 200, body: call.body!.cursor === null ? { items: said ? [note, ...newestFirst.items] : newestFirst.items, next: 10 } : { items: [], next: null } }),
+    "POST /api/conversation/stop": () => ({ status: 200, body: { ok: true } }),
+    "POST /api/conversation/say": () => answers[said++]!,
+  };
+  mount("conversations");
+  await until(() => container.querySelector(".space-card") !== null, "空间卡片");
+  container.querySelector<HTMLButtonElement>(".space-card")!.click();
+  await shows("张三");
+  container.querySelector<HTMLButtonElement>(".member-row")!.click();
+  await shows("压缩后的摘要");
+  // Closed until asked for.
+  expect(count(".takeover")).toBe(0);
+  click("接管对话");
+  await until(() => count(".takeover") === 1, "接管区");
+  const box = () => container.querySelector<HTMLTextAreaElement>(".takeover textarea")!;
+  const type = (value: string) => { box().value = value; box().dispatchEvent(new Event("input", { bubbles: true })); };
+  /** Typed and taken by the page: the send button is live. */
+  const write = async (value: string) => { type(value); await until(() => !button("停止机器人并发送")!.disabled, "可以发送"); };
+  expect(button("停止机器人并发送")!.disabled).toBe(true);
+
+  click("只停止机器人");
+  await shows("机器人已经停下");
+  expect(callsTo("/api/conversation/stop").map(call => [call.body, call.headers["X-Console-Intent"]])).toEqual([[{ view: "v1", member: "v1-a" }, "user"]]);
+
+  await write("稍后电话答复");
+  const reads = callsTo("/api/conversation/entries").length;
+  click("停止机器人并发送");
+  await shows("已发给成员。成员的下一条消息仍由机器人回答。");
+  expect(callsTo("/api/conversation/say")[0]!.body).toEqual({ view: "v1", member: "v1-a", text: "稍后电话答复" });
+  expect(box().value).toBe("");
+  // The conversation is read again and shows the operator's entry as its own kind.
+  await until(() => callsTo("/api/conversation/entries").length > reads && count(".operator-note") === 1, "人工回复");
+  expect(container.querySelector(".operator-note")!.textContent).toContain("人工回复");
+  expect(container.querySelector(".operator-note")!.textContent).toContain("稍后电话答复");
+
+  await write("第二条");
+  click("停止机器人并发送");
+  await shows("平台没有确认这条消息是否送达，成员可能已经收到；确认没收到再重发。这段话没能记进会话，机器人之后回答时不知道你说过什么。");
+  expect(box().value).toBe("");
+  await write("很长的第三条");
+  click("停止机器人并发送");
+  await shows("只发出了前 1 段（共 2 段），后面的没有发出去，请把剩下的内容再发一次。");
+  expect(box().value).toBe("很长的第三条");
+  await until(() => !button("停止机器人并发送")!.disabled, "可以再发");
+  click("停止机器人并发送");
+  await shows("这位成员已不在机器人同步的通讯录范围内，不能接管。");
+  expect(box().value).toBe("很长的第三条");
+  // Over the limit: counted, not sent.
+  type("字".repeat(4_001));
+  await shows("4,001 / 4,000 字");
+  expect(button("停止机器人并发送")!.disabled).toBe(true);
+  click("收起接管");
+  await until(() => count(".takeover") === 0, "接管区收起");
+
+  // Anonymous mode: the page does not name the member, so there is nobody to speak to.
+  mode = "anonymous";
+  [...container.querySelectorAll<HTMLButtonElement>(".segmented button")].find(item => item.textContent === "匿名")!.click();
+  await shows("成员 A3");
+  container.querySelector<HTMLButtonElement>(".member-row")!.click();
+  await until(() => button("接管对话") !== undefined, "接管按钮");
+  expect(button("接管对话")!.disabled).toBe(true);
+  expect(count(".takeover")).toBe(0);
 });
 
 test("完整身份需要本次确认；切换模式保留当前成员并重新读取，返回列表后回到默认", async () => {

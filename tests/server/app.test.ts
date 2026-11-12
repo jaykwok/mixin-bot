@@ -141,3 +141,35 @@ test("a caller that goes away cancels the department lookups it started: queued 
     expect(asked).toEqual(["100", "101", "102", "103"]);
   } finally { release.resolve(); await server.stop(true); }
 });
+
+test("takeover routes need the instance token and a takeover; malformed parameters answer 400, a refusal 409 with its code, anything else 500", async () => {
+  const calls: unknown[][] = [];
+  const refused = Object.assign(new Error("这位成员在这里还没有和机器人的对话。"), { name: "TakeoverRefused" });
+  const taking = createApp({ isStopping: () => false, adminToken: "test-admin-token", shutdown: () => {},
+    takeover: {
+      stop: async (space, phone) => { calls.push(["stop", space, phone]); if (phone === "13800000009") throw refused; if (phone === "13800000008") throw new Error("storage"); },
+      say: async (space, phone, text) => { calls.push(["say", space, phone, text]); return { sent: "partial", recorded: true, segments: { sent: 1, total: 2 } }; },
+    } });
+  const post = (target: ReturnType<typeof createApp>, path: string, body: unknown, token = "test-admin-token") =>
+    target.request(path, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const member = { space: "direct", phone: "13800000001" };
+  for (const path of ["/_admin/conversation/stop", "/_admin/conversation/say"]) {
+    expect((await post(taking, path, { ...member, text: "x" }, "wrong")).status).toBe(404);
+    expect((await post(app(), path, { ...member, text: "x" })).status).toBe(404);
+    for (const body of [{ phone: member.phone, text: "x" }, { space: "direct", text: "x" }, { space: "direct", phone: "138 0000", text: "x" }, { space: "x".repeat(81), phone: member.phone, text: "x" }, [member]]) {
+      const response = await post(taking, path, body);
+      expect([response.status, await response.json()]).toEqual([400, { status: "error", message: "参数无效" }]);
+    }
+  }
+  expect((await post(taking, "/_admin/conversation/say", member)).status).toBe(400);
+  expect(calls).toEqual([]);
+  const stopped = await post(taking, "/_admin/conversation/stop", member);
+  expect([stopped.status, await stopped.json()]).toEqual([200, { status: "ok" }]);
+  const said = await post(taking, "/_admin/conversation/say", { space: "groups/100", phone: member.phone, text: "你好" });
+  expect([said.status, await said.json()]).toEqual([200, { status: "ok", sent: "partial", recorded: true, segments: { sent: 1, total: 2 } }]);
+  expect(calls).toEqual([["stop", "direct", "13800000001"], ["say", "groups/100", "13800000001", "你好"]]);
+  const no = await post(taking, "/_admin/conversation/stop", { space: "direct", phone: "13800000009" });
+  expect([no.status, await no.json()]).toEqual([409, { status: "error", code: "TakeoverRefused", message: "这位成员在这里还没有和机器人的对话。" }]);
+  const broken = await post(taking, "/_admin/conversation/stop", { space: "direct", phone: "13800000008" });
+  expect([broken.status, await broken.json()]).toEqual([500, { status: "error", message: "内部服务器错误" }]);
+});

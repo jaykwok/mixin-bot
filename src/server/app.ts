@@ -29,6 +29,7 @@ import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { openModelSelection } from "../durable/models.ts";
 import { DurableService } from "../durable/service.ts";
+import { Takeover } from "../durable/takeover.ts";
 import { slowSqlLog, watchSql } from "../durable/sql-timing.ts";
 import { ReadChannel } from "../durable/read/client.ts";
 import { codemodeWorkers } from "../durable/codemode/workers.ts";
@@ -38,7 +39,7 @@ import { McpTools } from "../integrations/mcp.ts";
 import { configuredRootlessTasks } from "../core/task-backend.ts";
 import { PushService } from "../push/service.ts";
 import { PushStore } from "../push/store.ts";
-import { PUSH_EXTENSION, pushExtension } from "../push/tools.ts";
+import { pushExtensions, pushSelection } from "../push/tools.ts";
 
 import { applicationBinding, assertDataVersion } from "../core/data-version.ts";
 import { APP_BUILD, APP_VERSION, DATA_VERSION } from "../core/version.ts";
@@ -58,6 +59,7 @@ let stream: StreamConnection | undefined;
 let reads: ReadChannel | undefined;
 let router: InboundRouter | undefined;
 let push: PushService | undefined;
+let takeover: Takeover | undefined;
 let dailyScan: ReturnType<typeof setTimeout> | undefined;
 const instanceFile = join(STATE_DIR, "instance.json");
 const adminToken = randomBytes(32).toString("hex");
@@ -152,6 +154,7 @@ try {
       return status === "unchanged" ? { status } : { status, departments: checked };
     },
     // The server listens only once everything below exists.
+    takeover: { stop: (space, phone) => takeover!.stop(space, phone), say: (space, phone, text) => takeover!.say(space, phone, text) },
     push: { settings: () => push!.settings(), saveSettings: roles => push!.saveSettings(roles), list: query => push!.list(query), detail: id => push!.detail(id),
       remind: (id, members) => push!.remind(id, members), setCc: (id, people) => push!.setCc(id, people), remove: id => push!.remove(id),
       package: (id, member, signal) => push!.package(id, member, signal), groups: () => push!.groups(), saveGroup: (id, change) => push!.saveGroup(id, change) } });
@@ -179,11 +182,13 @@ try {
   const venvDir = documentEnv ? resolve(documentEnv) : undefined;
   messages = new DurableService({
     layout: LAYOUT, selection, modules, relay: getRelayConfig(), outbound,
-    // Pushes start from the direct chat, and only pushers' conversations get the push tools.
+    // Pushers get the tools to push; members and groups a live push reached get the ones to answer it.
     memberExtensions: {
-      install: scope => scope.kind === "direct" ? [pushExtension(pushes, { layout: LAYOUT, ...(venvDir ? { venvDir } : {}) })] : [],
-      selected: (scope, phone) => scope.kind === "direct" && pushes.isPusher(phone) ? [PUSH_EXTENSION] : [],
+      install: scope => pushExtensions(pushes, scope, { layout: LAYOUT, ...(venvDir ? { venvDir } : {}) }),
+      selected: (scope, phone) => pushSelection(pushes, scope, phone),
     },
+    // A message the model could not answer is the reply to the one push waiting for it.
+    unanswered: request => pushes.failed(request),
     attachments: { source: (fileId, destination, options) => downloadFile(client, fileId, destination, options) },
     ...(venvDir ? { venvDir } : {}),
     auxiliary: readAuxiliaryConfig(),
@@ -203,6 +208,9 @@ try {
   if (resumed.length) log.info(`恢复 ${resumed.length} 个空间的未完成工作`);
   application.signal.throwIfAborted();
   const service = messages;
+  // The console's takeover: an operator stops the bot's work for a member and answers in its place.
+  takeover = new Takeover({ host: service, outbound, directory, layout: LAYOUT, signal: application.signal,
+    onReport: (error) => log.error("接管记录写入失败: " + String(error)) });
   // Card sends, reminders, deadlines, summaries and conversation notes pick up from the state database.
   pushes.bind(service);
   pushes.start();

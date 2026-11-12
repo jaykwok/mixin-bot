@@ -74,8 +74,7 @@ function push(mode: Push["mode"], options: string[] = []): Push {
 
 function recipient(member: string, name: string, change: Partial<Recipient> = {}): Recipient {
   return { pushId: "abcd2345", member, name, receiveId: `im-${member}`, sendState: "sent", sendAttempts: 1, sendError: null, sentAt: 1, retryAt: null,
-    card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, replyState: "none", draft: 0, submitted: 0, submittedAt: null, activityAt: null,
-    remindedAt: null, hintedAt: null, ...change };
+    card: null, version: 0, ackedAt: null, clicks: 0, choice: null, choiceAt: null, submitted: 0, submittedAt: null, ...change };
 }
 
 let itemId = 0;
