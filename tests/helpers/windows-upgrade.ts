@@ -141,7 +141,8 @@ export async function windowsUpgradeFixture(running: boolean, options: FixtureOp
     throw new Error("Unexpected command boundary: " + command.command);
   };
   const input: WindowsUpgradeInput = { original, target, branch: originalBranch, plan, ...(options.directory ? { directoryPlan } : {}) };
-  const run = (value = input) => runWindowsLifecycle(value, { project, source, native, output: () => {}, readyTimeoutMs: 25,
+  // The wait for the fixture's own server: long enough for one probe on a busy machine (25 ms was missed on a CI runner).
+  const run = (value = input) => runWindowsLifecycle(value, { project, source, native, output: () => {}, readyTimeoutMs: 250,
     async verify() {}, async finish(result) { results.push(result); } });
   return { project, plan, input, run, events, results, get running() { return service; }, get head() { return head; },
     preflight: (value = input) => preflightWindowsUpgrade(value, { project, source, native }),

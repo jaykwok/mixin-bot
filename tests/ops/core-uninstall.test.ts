@@ -108,7 +108,8 @@ test("控制台卸载在锁内核对接单记录、执行版本和计划；终�
 
 const gitBash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
 const posix = (value: string) => process.platform === "win32" ? value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase()) : value;
-for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "windows" ? process.platform !== "win32" : !gitBash || !existsSync(gitBash))(
+// The Linux entry's functions need GNU coreutils (realpath -m); macOS has its own entry and does not run them.
+for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "windows" ? process.platform !== "win32" : process.platform === "darwin" || !gitBash || !existsSync(gitBash))(
   `${platform} 控制台卸载不提问：按确认的选择执行并写结构化结果；锁被占用或卸载前检查未通过时为拒绝，什么都不做`, async () => {
     const f = await tempFixture("core-uninstall-console-");
     try {
