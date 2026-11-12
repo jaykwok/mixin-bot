@@ -2,7 +2,8 @@
 // is one row, with who replied; a push handed on names by whom and to whom), and per recipient a folder with the reply
 // text and the reply attachments. Phones are masked everywhere in it: it goes to the pusher, the CCs and the console. A package
 // larger than one file may be (the native limit, or the relay's when one is configured) is split into numbered
-// archives; an attachment that alone does not fit is listed as not packed.
+// archives; an attachment that alone does not fit is listed as not packed. With nothing but the workbook in it (a push
+// that asked for a confirmation or a choice, or got no reply), the chat gets the workbook itself.
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { access, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -27,13 +28,16 @@ export type SummaryInput = {
   dir: string;
   /** Largest archive one send may carry. */
   partBytes: number;
+  /** A package of the workbook alone is the workbook, not an archive of it. */
+  bare?: boolean;
   now: number;
   /** Stops the copying into the archives. */
   signal?: AbortSignal;
 };
 
 export type SummaryPart = { path: string; name: string; size: number };
-export type SummaryPackage = { parts: SummaryPart[]; missingFiles: number };
+/** `bare`: the one part is the workbook itself. */
+export type SummaryPackage = { parts: SummaryPart[]; missingFiles: number; bare: boolean };
 
 const SEND_LABEL: Record<Recipient["sendState"], string> = { pending: "未发出", sending: "未发出", sent: "已发出", uncertain: "可能已发出", failed: "发送失败" };
 
@@ -135,7 +139,9 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
     rows.push(row);
   }
   await writeWorkbook(workbook, { name: "汇总", columns, rows }, now);
-  entries.unshift({ name: workbookName, size: (await stat(workbook)).size, path: workbook });
+  const sheet = { name: workbookName, size: (await stat(workbook)).size, path: workbook };
+  if (input.bare && !entries.length) return { parts: [sheet], missingFiles, bare: true };
+  entries.unshift(sheet);
 
   // Entries in order; a new archive starts when the next entry would not fit.
   const paths: string[] = [];
@@ -158,5 +164,5 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   } catch (error) { await zip?.abort(); throw error; }
   const parts = await Promise.all(paths.map(async (path, at) => ({ path, size: (await stat(path)).size,
     name: paths.length === 1 ? `${base}.zip` : `${base}-${at + 1}of${paths.length}.zip` })));
-  return { parts, missingFiles };
+  return { parts, missingFiles, bare: false };
 }

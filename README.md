@@ -242,6 +242,10 @@ Windows 和 macOS 自动打开浏览器；Linux 打印 SSH 转发命令和一次
 
 基于 Bun、Hono 和 Pi（Durable 引擎，全部单聊一个、每个群一个 SQLite 空间库）。
 
+## 许可
+
+本项目以 [Apache License 2.0](LICENSE) 发布。
+
 ## 反馈与支持
 
 使用中遇到问题或有改进建议，欢迎提 [Issue](https://github.com/jaykwok/mixin-bot/issues)。

@@ -107,7 +107,7 @@ export type PreviewView = {
   sent?: { done: number; total: number; delivered: Reach; failed: Reach };
 };
 
-const PREVIEW_NAMES = 50;
+const PREVIEW_NAMES = 50, UNMATCHED_NAMES = 20;
 
 function peopleText(people: PreviewView["people"], max = PREVIEW_NAMES): string {
   const shown = people.slice(0, max).map(person => `${escapeInline(person.name)}（尾号 ${phoneTail(person.member)}）`).join("、");
@@ -122,14 +122,15 @@ function targetLines(push: Push, list: PreviewView["people"]): string[] {
   const people = list.filter(each => memberGroup(each.member) === undefined), groups = list.filter(each => memberGroup(each.member) !== undefined);
   const reach = [...(people.length ? [peopleText(people)] : []), ...(groups.length ? [groupsText(groups)] : [])].join("；");
   if (target.of) return [`**对象**：推送编号 ${target.of} 中没有答复的${groups.length ? "" : "人"}：${reach}`];
-  if (!target.departments.length && !target.everyone) return [`**对象**：${reach}`];
+  const left = target.unmatched?.length ? [`**没有对上、未包含**：${target.unmatched.slice(0, UNMATCHED_NAMES).map(escapeInline).join("、")}${target.unmatched.length > UNMATCHED_NAMES ? ` 等 ${target.unmatched.length} 人` : ""}`] : [];
+  if (!target.departments.length && !target.everyone) return [`**对象**：${reach}`, ...left];
   const asked = [
     ...(target.everyone ? ["全员（同步范围内的所有人）"] : []),
     ...target.departments.map(department => `部门 ${escapeInline(department.path)}${department.children ? "（含下级）" : "（不含下级）"}`),
     ...(target.people.length ? [`个人 ${peopleText(target.people.map(person => ({ name: person.name, member: person.phone })), 20)}`] : []),
     ...(target.groups?.length ? [groupsText(target.groups)] : []),
   ];
-  return [`**对象**：${asked.join("；")}`, `**名单**：${people.length ? peopleText(people) : "没有人"}（按点「确认推送」时的通讯录展开，不含你自己）`];
+  return [`**对象**：${asked.join("；")}`, `**名单**：${people.length ? peopleText(people) : "没有人"}（按点「确认推送」时的通讯录展开，不含你自己）`, ...left];
 }
 
 export function previewCard(view: PreviewView, now = Date.now()): CardContent {

@@ -101,8 +101,9 @@ export const PUSH_LIMITS = {
   /** A known group's "last @-mentioned" time is written at most this often. */
   groupSeenMs: 10 * 60_000,
   cc: 10,
-  /** People one directory_lookup answer lists. */
+  /** People one directory_lookup answer lists, and the names one call asks for. */
   lookup: 50,
+  lookupNames: 20,
   subjectChars: 40,
   bodyChars: 3000,
   options: [2, 6] as readonly [number, number],
@@ -155,10 +156,10 @@ export type PrepareInput = {
   cc?: readonly { name: string; phone: string }[];
 };
 
-/** What directory_lookup passes on (./tools.ts): at least one of name, phone and department; together they narrow down. */
+/** What directory_lookup passes on (./tools.ts): at least one of names, phone and department; together they narrow down. */
 export type LookupInput = {
-  /** Part of the name. */
-  name?: string;
+  /** Parts of names: each is looked up on its own. */
+  names?: readonly string[];
   phone?: string;
   /** By name or path; `children: false` leaves the sub-departments out. */
   department?: string;
@@ -176,6 +177,9 @@ export type ReplyInput = { push: string; action: "add" | "replace" | "withdraw";
 
 /** What push_forward passes on (./tools.ts): the push and the person it should go to. */
 export type ForwardInput = { push: string; to: { name: string; phone: string } };
+
+/** Someone named for a push who is not in the address book as named: for the preview card (`who`) and for the model (`why`). */
+type Unmatched = { who: string; why: string };
 
 /** A refusal the model passes on to the member. */
 export class PushRefused extends Error { override name = "PushRefused"; }
@@ -472,9 +476,11 @@ export class PushService {
       else { deadline = parsed; defaultDeadline = false; }
     }
     const before = problems.length;
-    const target = this.#checkTarget(role, input, problems);
+    // People who do not match are left out and named, as long as someone is left to push to.
+    const unmatched: Unmatched[] = [];
+    const target = this.#checkTarget(role, input, problems, unmatched);
     const people = problems.length > before ? [] : this.#expand(target, caller.phone);
-    if (problems.length === before && !people.length) {
+    if (problems.length === before && !people.length && !unmatched.length) {
       problems.push(target.departments.length || target.everyone ? "按部门或全员展开后没有可以接收的人（不含你自己）" : "至少要有一个推送对象");
     }
     if (people.length > limits.recipients) {
@@ -483,7 +489,8 @@ export class PushService {
     // The pusher gets the summary anyway.
     const cc = this.#checkPeople(input.cc ?? [], "抄送人", problems).filter(person => person.phone !== caller.phone);
     if (cc.length > limits.cc) problems.push(`抄送人最多 ${limits.cc} 个`);
-    if (problems.length) throw new PushRefused(`推送未准备：\n- ${problems.join("\n- ")}`);
+    // Refused for another reason, or nobody is left: the people who do not match are named with the rest.
+    if (problems.length || !people.length) throw new PushRefused(`推送未准备：\n- ${[...problems, ...unmatched.map(each => each.why)].join("\n- ")}`);
     this.#checkLimit(role, now);
     const pusher = this.#directory.byPhone(caller.phone);
     const push = this.#newPush({ pusher: caller.phone, pusherName: pusher?.name ?? caller.reply.name ?? caller.phone, pusherIm: pusher?.imUserId ?? caller.reply.receiveId,
@@ -492,6 +499,7 @@ export class PushService {
     const outcome = await this.#createPreview(push, people);
     log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}，等待推送人确认`);
     return `已把推送预览卡片发给你（推送编号 ${push.id}，${reachText(reachOf(people))}${cc.length ? `，抄送 ${cc.length} 人` : ""}，截止 ${defaultDeadline ? "确认发出后 3 天（未指定截止时间）" : shortTime(deadline, now)}）。`
+      + (unmatched.length ? `名单里有 ${unmatched.length} 人没有对上，没有放进这次推送：\n- ${unmatched.map(each => each.why).join("\n- ")}\n把这几个人告诉成员：先发给其余的人就在卡片上确认；要补上他们，核对后带着完整名单重新准备。\n` : "")
       + "请在卡片上核对，点「确认推送」才会发出；点之前不会发给任何人。"
       + (target.departments.length || target.everyone ? "部门和全员的名单在点「确认推送」时按当时的通讯录重新展开。" : "")
       + (earlier ? `之前准备、还没有确认的 ${earlier} 条预览在确认这一条后清理，旧卡片不再有效。` : "")
@@ -529,8 +537,8 @@ export class PushService {
   }
 
   /** The target as asked: people checked against the address book, departments found by name or path, all within the grants. */
-  #checkTarget(role: PushRole, input: PrepareInput, problems: string[]): PushTarget {
-    const people = this.#checkPeople(input.recipients ?? [], "对象", problems);
+  #checkTarget(role: PushRole, input: PrepareInput, problems: string[], unmatched: Unmatched[]): PushTarget {
+    const people = this.#checkPeople(input.recipients ?? [], "对象", problems, unmatched);
     if (people.length > this.#limits.people) problems.push(`一次最多列出 ${this.#limits.people} 个人；更多的人请按部门推送`);
     const asked = input.departments ?? [], tree = this.#directory.departments;
     const departments: TargetDepartment[] = [];
@@ -549,7 +557,7 @@ export class PushService {
     }
     const groups = this.#checkGroups(role, input, problems);
     const target: PushTarget = { people: people.map(({ phone, name }) => ({ phone, name })), departments, everyone: input.everyone === true,
-      ...(groups.length ? { groups } : {}) };
+      ...(groups.length ? { groups } : {}), ...(unmatched.length ? { unmatched: unmatched.map(each => each.who) } : {}) };
     problems.push(...this.#grantProblems(role, target));
     return target;
   }
@@ -609,15 +617,21 @@ export class PushService {
     return [...[...list.values()].map(personReached), ...groups];
   }
 
-  #checkPeople(list: readonly { name: string; phone: string }[], label: string, problems: string[]): (Person & { imUserId: string })[] {
+  /**
+   * The people of `list` as the address book has them. One that is not there as named is a problem, or with `unmatched`
+   * is left out and listed there.
+   */
+  #checkPeople(list: readonly { name: string; phone: string }[], label: string, problems: string[], unmatched?: Unmatched[]): (Person & { imUserId: string })[] {
     const people = new Map<string, Person & { imUserId: string }>();
     for (const entry of list) {
       const phone = String(entry?.phone ?? "").replace(/[\s-]/g, ""), name = oneLine(String(entry?.name ?? ""));
-      if (!phone) { problems.push(`${label}「${name || "（无姓名）"}」缺少手机号`); continue; }
-      const found = this.#directory.byPhone(phone);
-      if (!found) { problems.push(`${label} ${name || ""}（${phone}）不在机器人同步的通讯录范围内`); continue; }
-      if (name && !sameName(name, found.name)) { problems.push(`${label}手机号 ${phone} 在通讯录里是「${found.name}」，与「${name}」不符`); continue; }
-      people.set(phone, { phone, name: found.name, imUserId: found.imUserId });
+      const found = phone ? this.#directory.byPhone(phone) : undefined;
+      const why = !phone ? `${label}「${name || "（无姓名）"}」缺少手机号`
+        : !found ? `${label} ${name || ""}（${phone}）不在机器人同步的通讯录范围内`
+        : name && !sameName(name, found.name) ? `${label}手机号 ${phone} 在通讯录里是「${found.name}」，与「${name}」不符` : undefined;
+      if (why === undefined) people.set(phone, { phone, name: found!.name, imUserId: found!.imUserId });
+      else if (unmatched) unmatched.push({ who: `${name || "（无姓名）"}${phone ? `（尾号 ${phoneTail(phone)}）` : ""}`, why });
+      else problems.push(why);
     }
     return [...people.values()];
   }
@@ -705,15 +719,20 @@ export class PushService {
   // ---- directory_lookup -----------------------------------------------------------------------------------------------
 
   /**
-   * People in the synced address book, for a pusher or a recipient of a live push: by part of the name, by phone, or in a department (with its
-   * sub-departments unless `children` is false); given together they narrow down. Each comes with the full phone and
-   * the departments, at most `lookup` of them. The model's answer.
+   * People in the synced address book, for a pusher or a recipient of a live push: by part of a name (several names are
+   * looked up one by one), by phone, or in a department (with its sub-departments unless `children` is false); given
+   * together they narrow down. Each comes with the full phone and the departments, at most `lookup` of them. The
+   * model's answer.
    */
   lookup(phone: string, input: LookupInput): string {
     if (!this.isPusher(phone) && !this.#store.reached(phone).length) throw new PushRefused("查通讯录是给推送人和收到推送的人用的，这位成员现在两样都不是。");
     const tree = this.#directory.departments;
-    const name = compactName(input.name ?? ""), number = (input.phone ?? "").replace(/[\s-]/g, ""), department = oneLine(input.department ?? "");
-    if (!name && !number && !department) throw new PushRefused("请给出姓名（可以只写其中几个字）、手机号或部门，至少一项。");
+    // Each name once, as it was first written.
+    const names = new Map<string, string>();
+    for (const name of input.names ?? []) if (compactName(String(name ?? "")) && !names.has(compactName(String(name)))) names.set(compactName(String(name)), oneLine(String(name)));
+    const number = (input.phone ?? "").replace(/[\s-]/g, ""), department = oneLine(input.department ?? "");
+    if (!names.size && !number && !department) throw new PushRefused("请给出姓名（可以只写其中几个字）、手机号或部门，至少一项。");
+    if (names.size > this.#limits.lookupNames) throw new PushRefused(`一次最多查 ${this.#limits.lookupNames} 个名字，请分几次查。`);
     const lines: string[] = [];
     let people: readonly DirectoryIdentity[];
     if (department) {
@@ -727,14 +746,22 @@ export class PushService {
         + (below.length ? `，下级部门：${below.slice(0, 30).join("、")}${below.length > 30 ? ` 等 ${below.length} 个` : ""}` : "，没有下级部门"));
       people = tree.members([found.id], children);
     } else people = number ? [this.#directory.byPhone(number)].filter(person => person !== undefined) : tree.everyone();
-    const matched = people.filter(person => (!name || compactName(person.name).includes(name)) && (!number || person.phone === number));
-    if (!matched.length) return [...lines, "没有找到符合的人（只查机器人同步的通讯录范围）。"].join("\n");
-    const limit = this.#limits.lookup, shown = matched.slice(0, limit), places = tree.departmentsOf(shown.map(person => person.phone));
-    lines.push(matched.length > limit ? `找到 ${matched.length} 人，只列出前 ${limit} 人；可以加上姓名或改查下级部门缩小范围：` : `找到 ${matched.length} 人：`);
-    for (const person of shown) {
-      const paths = places.get(person.phone) ?? [];
-      lines.push(`- ${person.name}，手机号 ${person.phone}${paths.length ? `，部门：${paths.join("；")}` : ""}`);
+    const pool = people.filter(person => !number || person.phone === number);
+    // One list, or one per name; the names share what an answer may list.
+    const several = names.size > 1, limit = several ? Math.max(5, Math.floor(this.#limits.lookup / names.size)) : this.#limits.lookup;
+    for (const [key, asked] of names.size ? names : [["", ""] as const]) {
+      const matched = pool.filter(person => !key || compactName(person.name).includes(key)), head = several ? `「${asked}」` : "";
+      if (!matched.length) { lines.push(several ? `${head}没有找到。` : "没有找到符合的人（只查机器人同步的通讯录范围）。"); continue; }
+      const shown = matched.slice(0, limit), places = tree.departmentsOf(shown.map(person => person.phone));
+      lines.push(matched.length <= limit ? `${head}找到 ${matched.length} 人：`
+        : several ? `${head}找到 ${matched.length} 人，只列出前 ${limit} 人；把名字写全或加上部门可以缩小范围：`
+        : `找到 ${matched.length} 人，只列出前 ${limit} 人；可以加上姓名或改查下级部门缩小范围：`);
+      for (const person of shown) {
+        const paths = places.get(person.phone) ?? [];
+        lines.push(`- ${person.name}，手机号 ${person.phone}${paths.length ? `，部门：${paths.join("；")}` : ""}`);
+      }
     }
+    if (several) lines.push("只查机器人同步的通讯录范围。");
     return lines.join("\n");
   }
 
@@ -1673,7 +1700,7 @@ export class PushService {
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const forwards = this.#store.forwards(pushId, "confirmed"), handed = new Set(forwards.map(forward => forward.from));
-      const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, now: this.#now(), signal: this.#signal });
+      const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes: this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES, bare: true, now: this.#now(), signal: this.#signal });
       const tally = this.#tally(push, recipients);
       const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && !this.#answered(push, recipient, handed))
         .map(recipient => memberGroup(recipient.member) === undefined ? recipient.name : `群 ${recipient.name}`);
@@ -1682,8 +1709,7 @@ export class PushService {
         ...(unknown ? [`有 ${unknown} 张卡片发送结果未知，按已发出统计`] : []),
         ...(missing.length ? [`${push.mode === "reply" ? "未回复" : push.mode === "ack" ? "未确认" : "未选择"}：${missing.slice(0, 30).join("、")}${missing.length > 30 ? ` 等 ${missing.length} 个` : ""}`] : []),
         ...(pack.missingFiles ? [`有 ${pack.missingFiles} 个附件没能打包（原因见汇总表）`] : []),
-        // Only a push asking for replies has anything but the workbook.
-        pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : `${push.mode === "reply" ? "汇总表和回复内容" : "汇总表"}见下面的压缩包。`];
+        pack.bare ? "汇总表见下面的文件。" : pack.parts.length > 1 ? `汇总表和回复内容分成 ${pack.parts.length} 个压缩包，见下面。` : "汇总表和回复内容见下面的压缩包。"];
       this.#store.updatePush(pushId, { summaryText: lines.join("\n") });
       const failures: { name: string; reason: string }[] = [];
       for (const person of [{ phone: push.pusher, name: push.pusherName, im: push.pusherIm }, ...push.cc.map(cc => ({ ...cc, im: this.#directory.byPhone(cc.phone)?.imUserId }))]) {
@@ -1701,8 +1727,8 @@ export class PushService {
         }
         this.#store.updatePush(pushId, { summaryDone: [...this.#store.push(pushId)!.summaryDone.filter(done => !done.startsWith(`${person.phone}|`)), person.phone] });
         this.#note(DIRECT_SCOPE, person.phone, `summary:${push.id}`, cc
-          ? `[推送汇总抄送] ${push.pusherName} 推送的「${quoted(push.subject)}」：${tally}，汇总包已发出。推送编号 ${push.id}`
-          : `[推送汇总]「${quoted(push.subject)}」：${tally}，汇总包已发出。推送编号 ${push.id}`, { push: push.id, event: cc ? "summary-cc" : "summary" });
+          ? `[推送汇总抄送] ${push.pusherName} 推送的「${quoted(push.subject)}」：${tally}，${pack.bare ? "汇总表" : "汇总包"}已发出。推送编号 ${push.id}`
+          : `[推送汇总]「${quoted(push.subject)}」：${tally}，${pack.bare ? "汇总表" : "汇总包"}已发出。推送编号 ${push.id}`, { push: push.id, event: cc ? "summary-cc" : "summary" });
       }
       if (failures.length) {
         // The log names no one.
@@ -1731,7 +1757,7 @@ export class PushService {
   }
 
   /**
-   * One person's summary: the message and the archives (each by link when above the native size; only a relay allows
+   * One person's summary: the message and the workbook or the archives (each by link when above the native size; only a relay allows
    * that). What went out is recorded under `<phone>|<step>`, so a retry sends the rest. An uncertain send counts as sent,
    * as for cards; a process that ends between a send and its record sends that step again.
    */

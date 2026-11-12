@@ -22,7 +22,7 @@ import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { application } from "../core/lifecycle.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
-import { assertTaskPathAllowed, configuredRootlessTasks } from "../core/task-backend.ts";
+import { assertTaskPathAllowed } from "../core/task-backend.ts";
 import { downloadPublicBytes, DownloadTooLarge } from "../core/public-download.ts";
 
 const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? RUNTIME_DEFAULTS.BOT_ATTACHMENT_CONCURRENCY));
@@ -85,7 +85,7 @@ function oversizeError(kind: string, size: number): Error {
   );
 }
 
-/** Redirects followed where tasks are not isolated; the isolated mode takes the final URL only. */
+/** Redirects followed, each hop checked and pinned like the first request. */
 const REMOTE_REDIRECTS = 5;
 
 /**
@@ -98,7 +98,7 @@ async function fetchRemoteBytes(
 ): Promise<Uint8Array> {
   const budget = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT), ...(signal ? [signal] : [])]);
   try {
-    return await downloadPublicBytes(url, NATIVE_FILE_MAX_BYTES, budget, configuredRootlessTasks() ? 0 : REMOTE_REDIRECTS);
+    return await downloadPublicBytes(url, NATIVE_FILE_MAX_BYTES, budget, REMOTE_REDIRECTS);
   } catch (error) {
     if (error instanceof DownloadTooLarge) throw oversizeError("远程文件", error.size);
     throw error;

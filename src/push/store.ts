@@ -48,9 +48,10 @@ export type TargetGroup = { id: string; name: string };
  * What the pusher asked for, as the preview card shows it: people by name and phone, departments, everyone in the sync scope,
  * registered groups. The recipient rows are the list it expands to, again at 「确认推送」 (the address book and the group
  * registrations of that moment). `of`: this push reminds the recipients of push `of` who did not answer (the 「提醒未回复」
- * button on its summary).
+ * button on its summary). `unmatched`: people the pusher named who are not in the address book as named; they are not on
+ * the list, and the preview says so.
  */
-export type PushTarget = { people: Person[]; departments: TargetDepartment[]; everyone: boolean; groups?: TargetGroup[]; of?: string };
+export type PushTarget = { people: Person[]; departments: TargetDepartment[]; everyone: boolean; groups?: TargetGroup[]; of?: string; unmatched?: string[] };
 
 /** A group's recipient row: one per group, answered by anyone in it (`member` is `group:<group ID>`). */
 export const groupMember = (groupId: string) => `group:${groupId}`;

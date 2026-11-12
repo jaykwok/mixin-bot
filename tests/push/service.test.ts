@@ -320,11 +320,12 @@ test("ack: a click updates the card in place; a stale click only refreshes; all 
     expect(summaryOf(h).tailFields).toEqual([]);
     expect(h.texts(WANG)[0]).toContain("推送人 推送的汇总抄送给你");
     expect(h.texts(WANG)[0]).toContain("已确认 2，未确认 0");
-    expect(h.files(PUSHER)).toEqual([`推送汇总-机房盘点-${id}.zip`]);
-    expect(h.files(WANG)).toEqual([`推送汇总-机房盘点-${id}.zip`]);
-    const zip = join(fixture.root, `zip-${id}.zip`);
-    await writeFile(zip, h.uploads[0]!.data);
-    expect(readZip(zip).map(entry => entry.name)).toEqual([`推送汇总-机房盘点-${id}.xlsx`]);
+    // Only a confirmation was asked for: the summary is the workbook itself, not an archive of it.
+    expect(h.files(PUSHER)).toEqual([`推送汇总-机房盘点-${id}.xlsx`]);
+    expect(h.files(WANG)).toEqual([`推送汇总-机房盘点-${id}.xlsx`]);
+    const workbook = join(fixture.root, `book-${id}.xlsx`);
+    await writeFile(workbook, h.uploads[0]!.data);
+    expect(readZip(workbook).map(entry => entry.name)).toContain("xl/worksheets/sheet1.xml");
     // The recipients' cards show the end; the pusher and the CC get summary notes.
     expect(h.card(ZHANG).invalid).toBe(true);
     expect(h.notes.filter(note => note.requestId === `push-note:summary:${id}`).map(note => note.phone).sort()).toEqual([PUSHER, WANG].sort());
@@ -402,8 +403,8 @@ test("what a conversation is told: the live pushes that reached the member and w
     expect(told).toContain("推送「通知」，要求确认收到（成员在卡片上点「已收到」），截止 11-06 09:00。已确认。");
     expect(h.service.attachmentAsk(ZHANG)).toBeUndefined();
     // A recipient of a live push may look people up; others who are not pushers may not.
-    expect(h.service.lookup(ZHANG, { name: "王" })).toContain("王五，手机号 13800000003");
-    expect(() => h.service.lookup(WANG, { name: "张" })).toThrow("查通讯录是给推送人和收到推送的人用的");
+    expect(h.service.lookup(ZHANG, { names: ["王"] })).toContain("王五，手机号 13800000003");
+    expect(() => h.service.lookup(WANG, { names: ["张"] })).toThrow("查通讯录是给推送人和收到推送的人用的");
     // Texts are kept while a push waits for replies: the newest few of a member, for a day; commands and outsiders' texts never.
     for (const text of ["一", "二", "三", "四"]) h.say(ZHANG, text);
     h.say(ZHANG, "/status");
@@ -606,6 +607,41 @@ const previewOf = (h: Harness, id: string) => h.cards(PUSHER).filter(each => eac
 // Departments: 技术部 (2) with 研发组 (4) below it, 财务部 (3) with its own 研发组 (5).
 const TREE = { tops: { "2": "技术部", "3": "财务部" }, nodes: { "4": ["研发组", "2"], "5": ["研发组", "3"] } } as const;
 
+test("push_prepare leaves out the people who do not match the address book and names them; the rest is prepared", async () => {
+  const h = harness();
+  try {
+    const list = [{ name: "张三", phone: ZHANG }, { name: "李五", phone: LI }, { name: "外人", phone: "13900000000" }];
+    const answer = await h.prepare({ recipients: list });
+    const id = h.pushId(answer);
+    expect(answer).toContain(`推送编号 ${id}，1 人`);
+    expect(answer).toContain("名单里有 2 人没有对上，没有放进这次推送：\n- 对象手机号 13800000002 在通讯录里是「李四」，与「李五」不符\n- 对象 外人（13900000000）不在机器人同步的通讯录范围内\n");
+    // The preview names who is on the list and who was left out; full phones stay out of the card.
+    const preview = h.card(PUSHER, id);
+    expect(preview.content).toContain("**对象**：张三（尾号 0001），共 1 人\n**没有对上、未包含**：李五（尾号 0002）、外人（尾号 0000）");
+    expect(preview.content).not.toContain("13900000000");
+    expect(h.store.recipients(id).map(recipient => recipient.member)).toEqual([ZHANG]);
+    // Confirmed as it is: the card goes to the one who matched, and the preview keeps the line.
+    h.click(PUSHER, preview, "确认推送", `preview-${id}`);
+    await h.settle();
+    expect([h.cards(ZHANG).length, h.cards(LI).length]).toEqual([1, 0]);
+    expect(h.card(PUSHER, id).content).toContain("**没有对上、未包含**：李五（尾号 0002）、外人（尾号 0000）");
+    // With departments the rest is prepared too.
+    h.grant({ department: { any: true } });
+    h.tree({ "3": [WANG] });
+    const mixed = await h.prepare({ recipients: [{ name: "外人", phone: "13900000000" }], departments: [{ name: "财务部" }] });
+    expect(mixed).toContain("名单里有 1 人没有对上");
+    expect(h.card(PUSHER, h.pushId(mixed)).content).toContain("**没有对上、未包含**：外人（尾号 0000）");
+    // Refused for another reason: the people who do not match are named with it, and nothing is sent.
+    const before = h.sent.length;
+    const refused = await h.prepare({ recipients: list, deadline: "下周五" }).then(() => undefined, (error: unknown) => error as Error);
+    for (const reason of ["无法识别", "与「李五」不符", "不在机器人同步的通讯录范围内"]) expect(refused!.message).toContain(reason);
+    // Nobody matches: refused.
+    await expect(h.prepare({ recipients: list.slice(1) })).rejects.toThrow("推送未准备：\n- 对象手机号 13800000002 在通讯录里是「李四」，与「李五」不符\n- 对象 外人（13900000000）不在机器人同步的通讯录范围内");
+    expect(h.sent.length).toBe(before);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
 test("department and everyone pushes: grants, names and paths, duplicates and near misses; the pusher is left out", async () => {
   const h = harness();
   try {
@@ -645,17 +681,24 @@ test("department and everyone pushes: grants, names and paths, duplicates and ne
   } finally { await h.close(); }
 });
 
-test("directory_lookup: by part of the name, phone or department, together narrowing down; full phones and departments; capped", async () => {
+test("directory_lookup: by parts of names, phone or department, together narrowing down; full phones and departments; capped", async () => {
   const h = harness({ limits: { lookup: 2 }, people: [{ phone: "13800000004", name: "张 三丰", imUserId: im("13800000004") }] });
   try {
     // Before the tree is synced: names and phones work, departments wait.
-    expect(h.service.lookup(PUSHER, { name: "李" })).toBe("找到 1 人：\n- 李四，手机号 13800000002");
+    expect(h.service.lookup(PUSHER, { names: ["李"] })).toBe("找到 1 人：\n- 李四，手机号 13800000002");
     expect(h.service.lookup(PUSHER, { department: "技术部" })).toContain("还没有同步到部门信息");
     h.tree({ "2": [PUSHER, ZHANG], "4": [LI, ZHANG], "3": [WANG] });
     expect(() => h.service.lookup(PUSHER, {})).toThrow("至少一项");
-    expect(() => h.service.lookup(PUSHER, { name: "  " })).toThrow(PushRefused);
+    expect(() => h.service.lookup(PUSHER, { names: ["  "] })).toThrow(PushRefused);
     // By part of the name (white space does not count), each person with every department they are in.
-    expect(h.service.lookup(PUSHER, { name: "张三" })).toBe(["找到 2 人：", "- 张 三丰，手机号 13800000004", "- 张三，手机号 13800000001，部门：技术部；技术部/研发组"].join("\n"));
+    expect(h.service.lookup(PUSHER, { names: ["张三"] })).toBe(["找到 2 人：", "- 张 三丰，手机号 13800000004", "- 张三，手机号 13800000001，部门：技术部；技术部/研发组"].join("\n"));
+    // Several names in one call: each is looked up on its own (a name given twice once), and one that is not there says so.
+    expect(h.service.lookup(PUSHER, { names: ["张三", "赵六", "王", " 张 三 "] })).toBe(["「张三」找到 2 人：", "- 张 三丰，手机号 13800000004", "- 张三，手机号 13800000001，部门：技术部；技术部/研发组",
+      "「赵六」没有找到。", "「王」找到 1 人：", "- 王五，手机号 13800000003，部门：财务部", "只查机器人同步的通讯录范围。"].join("\n"));
+    // Within a department too; more names than a call takes are refused.
+    expect(h.service.lookup(PUSHER, { department: "财务部", names: ["王", "张"] })).toBe(["部门 财务部（含下级），下级部门：研发组", "「王」找到 1 人：", "- 王五，手机号 13800000003，部门：财务部",
+      "「张」没有找到。", "只查机器人同步的通讯录范围。"].join("\n"));
+    expect(() => h.service.lookup(PUSHER, { names: Array.from({ length: 21 }, (_, index) => `名字${index}`) })).toThrow("一次最多查 20 个名字");
     // By phone (spaces and dashes do not count); only the synced address book.
     expect(h.service.lookup(PUSHER, { phone: "138-0000-0003" })).toBe("找到 1 人：\n- 王五，手机号 13800000003，部门：财务部");
     expect(h.service.lookup(PUSHER, { phone: "13900000000" })).toBe("没有找到符合的人（只查机器人同步的通讯录范围）。");
@@ -663,14 +706,14 @@ test("directory_lookup: by part of the name, phone or department, together narro
     expect(h.service.lookup(PUSHER, { department: "技术部" })).toBe(["部门 技术部（含下级），下级部门：研发组", "找到 3 人，只列出前 2 人；可以加上姓名或改查下级部门缩小范围：",
       "- 张三，手机号 13800000001，部门：技术部；技术部/研发组", "- 推送人，手机号 13800000009，部门：技术部"].join("\n"));
     // Without sub-departments, by path, narrowed by name.
-    expect(h.service.lookup(PUSHER, { department: "技术部", children: false, name: "李" })).toBe("部门 技术部（不含下级），下级部门：研发组\n没有找到符合的人（只查机器人同步的通讯录范围）。");
-    expect(h.service.lookup(PUSHER, { department: "技术部 / 研发组", name: "李" })).toBe("部门 技术部/研发组（含下级），没有下级部门\n找到 1 人：\n- 李四，手机号 13800000002，部门：技术部/研发组");
+    expect(h.service.lookup(PUSHER, { department: "技术部", children: false, names: ["李"] })).toBe("部门 技术部（不含下级），下级部门：研发组\n没有找到符合的人（只查机器人同步的通讯录范围）。");
+    expect(h.service.lookup(PUSHER, { department: "技术部 / 研发组", names: ["李"] })).toBe("部门 技术部/研发组（含下级），没有下级部门\n找到 1 人：\n- 李四，手机号 13800000002，部门：技术部/研发组");
     // The same name twice, or no such department: the paths to choose from, or the near misses.
     expect(h.service.lookup(PUSHER, { department: "研发组" })).toBe("有 2 个部门叫「研发组」，请用完整路径再查：技术部/研发组；财务部/研发组。");
     expect(h.service.lookup(PUSHER, { department: "研发" })).toBe("找不到部门「研发」，是不是：技术部/研发组、财务部/研发组。");
     // No department grant is needed (people are pushed to one by one); the pusher role is, or a live push received.
     h.store.replaceRoles([], h.clock.now);
-    expect(() => h.service.lookup(PUSHER, { name: "李" })).toThrow("查通讯录是给推送人和收到推送的人用的");
+    expect(() => h.service.lookup(PUSHER, { names: ["李"] })).toThrow("查通讯录是给推送人和收到推送的人用的");
     expect(h.sent).toEqual([]);
   } finally { await h.close(); }
 });
@@ -1163,8 +1206,8 @@ test("summary card: 「提醒未回复」 prepares one follow-up for the people 
     let summary = summaryOf(h);
     expect(summary.content).toContain("推送「机房盘点」已截止");
     expect(summary.content).toContain("未确认：李四");
-    // Only a confirmation was asked for: the package is the workbook, and no reply is mentioned.
-    expect(summary.content).toContain("汇总表见下面的压缩包。");
+    // Only a confirmation was asked for: the workbook is sent as it is, and no reply is mentioned.
+    expect(summary.content).toContain("汇总表见下面的文件。");
     expect(summary.content).not.toContain("回复内容");
     expect(summary.tailFields.map(button => button.name)).toEqual(["提醒未回复"]);
     expect(h.texts(WANG)[0]).toContain("推送人 推送的汇总抄送给你");
