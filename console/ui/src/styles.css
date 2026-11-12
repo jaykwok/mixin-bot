@@ -372,6 +372,9 @@ select, .select {
   appearance: none; -webkit-appearance: none; padding-right: 32px; cursor: pointer; max-width: 100%;
   background-image: var(--select-chevron); background-repeat: no-repeat; background-position: right 11px center; background-size: 12px;
 }
+/* The list of options is the browser's own popup. It takes the select's text colour, but not its translucent background:
+   on a dark page that left light text on the popup's white. Both are given, opaque, so the list reads in either theme. */
+select option, select optgroup { color: var(--text); background-color: var(--elevated); }
 select:hover:not(:disabled), :where(input):hover:not(:disabled, :focus) { border-color: color-mix(in srgb, var(--input-border) 60%, var(--muted)); }
 
 input[type="checkbox"]:not([role="switch"]), input[type="radio"] {
