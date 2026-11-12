@@ -268,9 +268,10 @@ test("push_prepare's attachments are files of the shared materials or the member
   await mkdir(dirname(own), { recursive: true });
   await writeFile(own, "notice");
   await writeFile(outside, "secret");
-  const prepare = (path: string, id: string) => () => fauxAssistantMessage([fauxToolCall("push_prepare", { subject: "notice", body: "please read", mode: "ack",
-    recipients: [{ name: "Carol", phone: "13800000003" }], attachments: [path] }, { id })], { stopReason: "toolUse" });
-  const m = model([prepare(own, "prepare-1"), () => fauxAssistantMessage("sent the preview"), prepare(outside, "prepare-2")]);
+  const prepare = (path: string | string[], id: string) => () => fauxAssistantMessage([fauxToolCall("push_prepare", { subject: "notice", body: "please read", mode: "ack",
+    recipients: [{ name: "Carol", phone: "13800000003" }], attachments: [path].flat() }, { id })], { stopReason: "toolUse" });
+  const m = model([prepare(own, "prepare-1"), () => fauxAssistantMessage("sent the preview"), prepare(outside, "prepare-2"), () => fauxAssistantMessage("refused"),
+    prepare(Array(9).fill(own), "prepare-3")]);
   const service = open(where, m, out.outbound, withPushes(where, fake));
   try {
     await service.admit(ask(out, ALICE, "push this file to Carol"));
@@ -280,6 +281,11 @@ test("push_prepare's attachments are files of the shared materials or the member
     await until(() => replyTexts(out.sent).length === 2, "the answer after the refusal");
     expect(fake.calls).toHaveLength(1);
     expect(m.requests.at(-1)!.some(message => message.role === "toolResult" && text(message).includes("只能发送共享资料 workspace 或当前调用用户 tmp 目录内的文件"))).toBe(true);
+    // More files than a push takes: refused with the number that was given.
+    await service.admit(ask(out, ALICE, "and these nine"));
+    await until(() => replyTexts(out.sent).length === 3, "the answer after the count refusal");
+    expect(fake.calls).toHaveLength(1);
+    expect(m.requests.at(-1)!.some(message => message.role === "toolResult" && text(message).includes("附件最多 5 个，现在是 9 个"))).toBe(true);
   } finally { await service.close(); }
 });
 

@@ -8,7 +8,7 @@ import { materialsRoutes } from "../../console/server/materials-routes.ts";
 import type { RouteContext } from "../../console/server/routes.ts";
 import type { MaterialExclusionsResponse, MaterialFoldersResponse } from "../../console/ui/src/contract.ts";
 import { materialExclusions, materialFolders, parseExclusionRules, saveExclusionRules } from "../../src/agent/materials-exclusions.ts";
-import { ensureMaterialsIndex } from "../../src/agent/materials-index.ts";
+import { refreshMaterialsIndex } from "../../src/agent/materials-index.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -17,14 +17,14 @@ const context = (body?: unknown) => ({ body, signal: new AbortController().signa
 test("排除规则经服务读写：页面读到规则和索引，逐层列出文件夹，保存后索引按新规则生成；审计只记条数", async () => {
   const f = await tempFixture("console-materials-");
   const workspaceDir = join(f.root, "workspace"), ignorePath = join(f.root, "data/config/materials-ignore.txt"), indexPath = join(f.root, "data/index/materials.md");
-  for (const dir of ["workspace/产品资料", "workspace/归档/2023", "workspace/sync-tools", "data/config", "data/index", "data/state"]) mkdirSync(join(f.root, dir), { recursive: true });
+  for (const dir of ["workspace/产品资料", "workspace/归档/2023", "workspace/sync-tools", "data/config", "data/state"]) mkdirSync(join(f.root, dir), { recursive: true });
   for (const file of ["产品资料/介绍.pptx", "归档/2023/手册.pdf", "sync-tools/tool.exe"]) writeFileSync(join(workspaceDir, file), "x".repeat(100));
   const paths = { workspaceDir, ignorePath, indexPath };
   let built: Promise<unknown> = Promise.resolve();
   // Wired as the service wires it (src/server/app.ts).
   const service = createApp({ isStopping: () => false, adminToken: "materials-token", shutdown: () => {}, materials: {
     exclusions: () => materialExclusions(ignorePath, indexPath),
-    save: async rules => { await saveExclusionRules(ignorePath, parseExclusionRules(rules)); built = ensureMaterialsIndex(paths); return materialExclusions(ignorePath, indexPath); },
+    save: async rules => { await saveExclusionRules(ignorePath, parseExclusionRules(rules)); built = refreshMaterialsIndex(paths, true); return materialExclusions(ignorePath, indexPath); },
     folders: path => materialFolders(workspaceDir, path),
   } });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: service.fetch });

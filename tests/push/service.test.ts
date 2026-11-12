@@ -2070,6 +2070,35 @@ test("files: a process that ended while a recipient's files were going out sends
   } finally { await h.close(); }
 });
 
+test("files: a push that ends while a recipient's files are going out does not send the card, and the reason says whether every file was out", async () => {
+  const h = harness();
+  try {
+    const a = pushSource(h, "a.txt", "first"), b = pushSource(h, "b.txt", "second");
+    /** A push to one person whose first try fails; on the second the push ends as the file `name` goes out. */
+    const endedAt = async (person: { name: string; phone: string }, name: string) => {
+      const file = (item: { to: string; message: { msgType: string } }) => item.to === im(person.phone) && item.message.msgType === "file";
+      let refusals = 0;
+      h.failing.when = item => file(item) && refusals++ === 0 ? { status: "failed", reason: "HTTP 500" } : undefined;
+      const id = await confirmed(h, { attachments: [a, b], recipients: [person] });
+      h.failing.when = (item) => {
+        if (file(item) && (item.message.content as { fileName: string }).fileName === name) {
+          h.store.updatePush(id, { state: "closed", closedAt: h.clock.now, closeReason: "deadline", summaryState: "sent", released: true });
+        }
+        return undefined;
+      };
+      const before = kindsTo(h, im(person.phone)).length;
+      h.clock.now += 60_000;
+      h.service.tick();
+      await h.settle();
+      const row = h.store.recipient(id, person.phone)!;
+      return [row.sendState, row.filesSent, row.sendError, kindsTo(h, im(person.phone)).slice(before)];
+    };
+    expect(await endedAt({ name: "张三", phone: ZHANG }, "a.txt")).toEqual(["failed", 1, "截止前没有发完附件", ["file"]]);
+    expect(await endedAt({ name: "李四", phone: LI }, "b.txt")).toEqual(["failed", 2, "附件已发出，卡片没有赶在截止前发出", ["file", "file"]]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
 // ---- what a push says for each recipient alone -----------------------------------------------------------------------
 
 /** The sheet of an uploaded workbook, as text. */

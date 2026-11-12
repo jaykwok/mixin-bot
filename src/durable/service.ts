@@ -34,7 +34,7 @@
 // every member's storage identity is checked and delivery parts left `sending` become uncertain; then the controls run
 // again, the workers start and open delivery parts are sent (failed ones when their retry is due).
 import { randomUUID } from "node:crypto";
-import { access, lstat, mkdir } from "node:fs/promises";
+import { access, lstat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord/context";
@@ -50,7 +50,7 @@ import { deleteSnapshots, fallbackSlots, fileDigest, releasableSnapshots } from 
 import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming, type RecordWriter } from "./closeout.ts";
 import { describeRequestFailure, modelRequestError, RequestStopped } from "../agent/failure.ts";
-import { ensureMaterialsIndex } from "../agent/materials-index.ts";
+import { refreshMaterialsIndex } from "../agent/materials-index.ts";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
 import { ensureStorageIdentities, ensureStorageIdentity } from "../agent/storage-identity.ts";
 import { openStatsLedger, pruneAskIds, settledAsks } from "../agent/stats-ledger.ts";
@@ -1801,11 +1801,8 @@ export class DurableService {
       name: "mixin.materials",
       hooks: [hook(GenerationTask, {
         async beforeRequest(_request, _api, context: Context) {
-          // The default workspace is created on demand; an external one must exist (the index reports its own errors).
-          const workspaceDir = resolve(layout.workspace);
-          const refresh = Promise.all([...layout.externalWorkspace ? [] : [workspaceDir], layout.index].map((dir) => mkdir(dir, { recursive: true })))
-            .catch(() => {})
-            .then(() => ensureMaterialsIndex({ workspaceDir, indexPath: resolve(layout.materialsIndex), ignorePath: resolve(layout.materialsIgnore) }));
+          const refresh = refreshMaterialsIndex({ workspaceDir: resolve(layout.workspace), indexPath: resolve(layout.materialsIndex), ignorePath: resolve(layout.materialsIgnore) },
+            !layout.externalWorkspace);
           await waitFor(Promise.race([refresh, Bun.sleep(MATERIALS_WAIT_MS)]), context.abortSignal);
           return undefined;
         },

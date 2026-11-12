@@ -1,8 +1,8 @@
 // 应用共享资料清单写在 workspace 之外，避免被外部同步覆盖。
 // 提示词只提供清单路径；概览和正文按需检索，不随扫描结果改变缓存前缀。
-import { readFile, readdir, rename, lstat, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, lstat, writeFile, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
   MATERIALS_INDEX_MAX_DEPTH,
@@ -313,6 +313,15 @@ function rememberSummary(key: string, entry: CacheEntry): void {
   cache.delete(key);
   if (cache.size >= 128) cache.delete(cache.keys().next().value!);
   cache.set(key, entry);
+}
+
+/**
+ * The index as the running service keeps it: the index directory, and the default workspace (`createWorkspace`), are made
+ * on demand. An external workspace must exist already; the index reports what it could not read.
+ */
+export async function refreshMaterialsIndex(options: EnsureOptions, createWorkspace: boolean): Promise<MaterialsIndexSummary | null> {
+  await Promise.all([...createWorkspace ? [options.workspaceDir] : [], dirname(options.indexPath)].map(dir => mkdir(dir, { recursive: true }))).catch(() => {});
+  return ensureMaterialsIndex(options);
 }
 
 /**

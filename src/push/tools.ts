@@ -141,8 +141,10 @@ function pusherSpecs(push: PushTools): MemberToolSpec[] {
     async run(params, member, call) {
       const who = await caller(member, call, "推送");
       // The files are checked like those of send_file: inside the shared materials or the member's own tmp.
-      const attachments: { path: string; size: number }[] = [];
-      for (const path of (params.attachments ?? []).slice(0, PUSH_LIMITS.files + 1)) {
+      const attachments: { path: string; size: number }[] = [], listed = params.attachments ?? [];
+      // Too many is said with the real number, before any of the files is looked at.
+      if (listed.length > PUSH_LIMITS.files) throw new Error(`推送未准备：附件最多 ${PUSH_LIMITS.files} 个，现在是 ${listed.length} 个`);
+      for (const path of listed) {
         const source = await resolveSource(String(path), member.places.workspaceDir, member.places.tempDir, call.signal);
         if (source.kind !== "local") throw new Error("推送的附件只能是文件：成员发来的、共享资料里的或这次任务生成的；链接请直接写进正文");
         attachments.push({ path: source.path, size: source.size });

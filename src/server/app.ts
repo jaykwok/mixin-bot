@@ -26,7 +26,7 @@ import { downloadFile } from "../integrations/open-platform/files.ts";
 import { InboundRouter } from "./inbound.ts";
 import { loadModuleDefinitions } from "../agent/modules.ts";
 import { materialExclusions, materialFolders, parseExclusionRules, saveExclusionRules } from "../agent/materials-exclusions.ts";
-import { ensureMaterialsIndex } from "../agent/materials-index.ts";
+import { refreshMaterialsIndex } from "../agent/materials-index.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { openModelSelection } from "../durable/models.ts";
@@ -161,7 +161,7 @@ try {
       save: async (rules) => {
         await saveExclusionRules(materialPaths.ignorePath, parseExclusionRules(rules));
         // The index follows at once rather than with the next conversation; a failure is the index's own to report.
-        void ensureMaterialsIndex(materialPaths);
+        void refreshMaterialsIndex(materialPaths, !LAYOUT.externalWorkspace).catch(() => {});
         return materialExclusions(materialPaths.ignorePath, materialPaths.indexPath);
       },
       folders: path => materialFolders(materialPaths.workspaceDir, path),

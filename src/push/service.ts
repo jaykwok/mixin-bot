@@ -1819,7 +1819,10 @@ export class PushService {
       }
       if (this.#store.recipient(push.id, recipient.member)?.sendState !== "sending") return { status: "failed", reason: "截止后一直没有得到发送结果" };
       this.#store.updateRecipient(push.id, recipient.member, { filesSent: index + 1 });
-      if (!LIVE_STATES.includes(this.#store.push(push.id)?.state ?? "closed")) return { status: "failed", reason: "截止前没有发完附件" };
+      if (!LIVE_STATES.includes(this.#store.push(push.id)?.state ?? "closed")) {
+        // Ended after this recipient's last file: the files arrived, the card is what did not go.
+        return { status: "failed", reason: index + 1 < push.files.length ? "截止前没有发完附件" : "附件已发出，卡片没有赶在截止前发出" };
+      }
     }
     return undefined;
   }
