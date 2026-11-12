@@ -174,30 +174,41 @@ export type PreviewView = {
   sent?: { done: number; total: number; delivered: Reach; failed: Reach };
 };
 
-const PREVIEW_NAMES = 50, UNMATCHED_NAMES = 20;
+/**
+ * The most names a preview lists in one place, tried in this order: a long body with many long names, file names and people
+ * left out would not fit the card otherwise (`previewCard`).
+ */
+const PREVIEW_NAMES = [50, 20, 10, 5] as const, UNMATCHED_NAMES = 20, ASKED_PEOPLE = 20;
 
-function peopleText(people: PreviewView["people"], max = PREVIEW_NAMES): string {
+function peopleText(people: PreviewView["people"], max: number): string {
   const shown = people.slice(0, max).map(person => `${escapeInline(person.name)}（尾号 ${phoneTail(person.member)}）`).join("、");
   return people.length > max ? `${shown} 等 ${people.length} 人` : `${shown}，共 ${people.length} 人`;
 }
 
-const groupsText = (groups: readonly { name: string }[]) => `群 ${groups.map(group => escapeInline(group.name)).join("、")}`;
+function groupsText(groups: readonly { name: string }[], max: number): string {
+  const shown = groups.slice(0, max).map(group => escapeInline(group.name)).join("、");
+  return `群 ${shown}${groups.length > max ? ` 等 ${groups.length} 个` : ""}`;
+}
 
-/** The object lines: the people and groups for a list of them; what was asked for and the expanded list otherwise. */
-function targetLines(push: Push, list: PreviewView["people"]): string[] {
+/**
+ * The object lines: the people and groups for a list of them; what was asked for and the expanded list otherwise. `names`:
+ * the most names listed in one place.
+ */
+function targetLines(push: Push, list: PreviewView["people"], names: number): string[] {
   const { target } = push;
   const people = list.filter(each => memberGroup(each.member) === undefined), groups = list.filter(each => memberGroup(each.member) !== undefined);
-  const reach = [...(people.length ? [peopleText(people)] : []), ...(groups.length ? [groupsText(groups)] : [])].join("；");
+  const reach = [...(people.length ? [peopleText(people, names)] : []), ...(groups.length ? [groupsText(groups, names)] : [])].join("；");
   if (target.of) return [`**对象**：推送编号 ${target.of} 中没有答复的${groups.length ? "" : "人"}：${reach}`];
-  const left = target.unmatched?.length ? [`**没有对上、未包含**：${target.unmatched.slice(0, UNMATCHED_NAMES).map(escapeInline).join("、")}${target.unmatched.length > UNMATCHED_NAMES ? ` 等 ${target.unmatched.length} 人` : ""}`] : [];
+  const unmatched = Math.min(UNMATCHED_NAMES, names);
+  const left = target.unmatched?.length ? [`**没有对上、未包含**：${target.unmatched.slice(0, unmatched).map(escapeInline).join("、")}${target.unmatched.length > unmatched ? ` 等 ${target.unmatched.length} 人` : ""}`] : [];
   if (!target.departments.length && !target.everyone) return [`**对象**：${reach}`, ...left];
   const asked = [
     ...(target.everyone ? ["全员（同步范围内的所有人）"] : []),
     ...target.departments.map(department => `部门 ${escapeInline(department.path)}${department.children ? "（含下级）" : "（不含下级）"}`),
-    ...(target.people.length ? [`个人 ${peopleText(target.people.map(person => ({ name: person.name, member: person.phone })), 20)}`] : []),
-    ...(target.groups?.length ? [groupsText(target.groups)] : []),
+    ...(target.people.length ? [`个人 ${peopleText(target.people.map(person => ({ name: person.name, member: person.phone })), Math.min(ASKED_PEOPLE, names))}`] : []),
+    ...(target.groups?.length ? [groupsText(target.groups, names)] : []),
   ];
-  return [`**对象**：${asked.join("；")}`, `**名单**：${people.length ? peopleText(people) : "没有人"}（按点「确认推送」时的通讯录展开，不含你自己）`, ...left];
+  return [`**对象**：${asked.join("；")}`, `**名单**：${people.length ? peopleText(people, names) : "没有人"}（按点「确认推送」时的通讯录展开，不含你自己）`, ...left];
 }
 
 /** What happens on the way: when the pusher hears of the progress, and whether the card goes again to those who have not answered. */
@@ -213,12 +224,12 @@ function progressLine(push: Push, now: number): string[] {
 const PREVIEW_VALUE_CHARS = 1200, PREVIEW_TAIL_CHARS = 300;
 
 /** The preview's lines before the body's rule, without the recipients' own values. */
-function previewHead(view: PreviewView, now: number): string[] {
+function previewHead(view: PreviewView, now: number, names: number): string[] {
   const { push } = view;
   const deadline = `${shortTime(push.deadline, now)}${push.defaultDeadline ? "（未指定，默认发出后 3 天）" : ""}`;
   const cc = push.cc.length ? push.cc.map(person => `${escapeInline(person.name)}（尾号 ${phoneTail(person.phone)}）`).join("、") : "无抄送";
   return [
-    ...targetLines(push, view.people),
+    ...targetLines(push, view.people, names),
     `**抄送**：${cc}`,
     `**要求**：${escapeInline(requirementText(push))}`,
     `**截止**：${deadline}`,
@@ -231,10 +242,10 @@ function previewHead(view: PreviewView, now: number): string[] {
  * The recipients' own values as the preview lists them, one line a person in list order: as many as fit beside the rest of
  * the card. All of them are in the check sheet the service sends after the card (./service.ts).
  */
-function valueLines(view: PreviewView, now: number): string[] {
+function valueLines(view: PreviewView, now: number, names: number): string[] {
   const { push } = view;
   if (!push.fields.length) return [];
-  const rest = [...previewHead(view, now), push.body].join("\n").length + PREVIEW_TAIL_CHARS;
+  const rest = [...previewHead(view, now, names), push.body].join("\n").length + PREVIEW_TAIL_CHARS;
   const budget = Math.min(PREVIEW_VALUE_CHARS, CARD_MAX_CHARS - rest);
   const lines: string[] = [];
   let used = 0;
@@ -248,10 +259,20 @@ function valueLines(view: PreviewView, now: number): string[] {
 }
 
 export function previewCard(view: PreviewView, now = Date.now()): CardContent {
+  let made: CardContent | undefined;
+  // Fewer names until it fits; the service refuses a push whose preview does not fit even then (./service.ts).
+  for (const names of PREVIEW_NAMES) {
+    made = previewWith(view, now, names);
+    if ([...made.content].length <= CARD_MAX_CHARS) break;
+  }
+  return made!;
+}
+
+function previewWith(view: PreviewView, now: number, names: number): CardContent {
   const { push } = view;
-  const listed = valueLines(view, now);
+  const listed = valueLines(view, now, names);
   const lines = [
-    ...previewHead(view, now),
+    ...previewHead(view, now, names),
     ...(push.fields.length ? [`**每人不同的内容**：${push.fields.map(ownText).join("、")}；每人的卡片上只有自己的。全部内容在随后发给你的核对表里，请逐人核对`, ...listed,
       ...(listed.length < view.people.length ? [`……共 ${view.people.length} 人`] : [])] : []),
     "",

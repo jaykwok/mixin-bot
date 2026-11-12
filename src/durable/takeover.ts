@@ -100,6 +100,22 @@ export class Takeover {
     return texts;
   }
 
+  /**
+   * An entry told the model of these. Only they go: a stop from another console session while the text was going out
+   * kept more, and those wait for the next entry.
+   */
+  #told(key: string, texts: readonly string[]): void {
+    const kept = this.#unseen.get(key);
+    if (!kept) return;
+    const rest = [...kept.texts];
+    for (const text of texts) {
+      const at = rest.indexOf(text);
+      if (at >= 0) rest.splice(at, 1);
+    }
+    if (rest.length) this.#unseen.set(key, { texts: rest, at: kept.at });
+    else this.#unseen.delete(key);
+  }
+
   /** The member of a conversation that exists, with the platform ID messages go to. */
   async #member(space: string, phone: string): Promise<{ scope: Scope; identity: DirectoryIdentity }> {
     const scope = scopeOfSpace(space);
@@ -144,7 +160,7 @@ export class Takeover {
     }, signal);
     // What the member has is what the bot is told.
     const recorded = await this.#record(scope, phone, delivered.join("\n"), waiting);
-    if (recorded) this.#unseen.delete(key);
+    if (recorded) this.#told(key, waiting);
     return { sent: outcome, recorded, ...(outcome === "partial" ? { segments: { sent: delivered.length, total: segments.length } } : {}) };
   }
 

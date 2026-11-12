@@ -60,8 +60,11 @@ export function readDataVersion(path: string): DataVersion | null {
   if (typeof value.appVersion !== "string" || !SEMVER.test(value.appVersion) || typeof value.build !== "string")
     throw new Error(`版本标记没有程序版本（标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
   // A format this program does not know may name its application differently: the format decides first.
-  if (value.dataVersion !== DATA_VERSION)
-    throw new UnsupportedDataFormat(`数据格式 ${value.dataVersion}（程序 ${value.appVersion}）不受当前程序支持（数据格式 ${DATA_VERSION}）；现场已保留`);
+  // An earlier format is never converted (docs/data-migrations.md): the way on from it is a fresh deployment.
+  if (value.dataVersion !== DATA_VERSION) {
+    throw new UnsupportedDataFormat(`数据格式 ${value.dataVersion}（程序 ${value.appVersion}）不受当前程序支持（数据格式 ${DATA_VERSION}）；`
+      + (value.dataVersion! < DATA_VERSION ? `更早的数据格式不能原地升级，${FRESH_DIRECTORY}` : "现场已保留"));
+  }
   if (typeof value.application !== "string" || !/^[0-9a-f]{64}$/.test(value.application))
     throw new Error(`版本标记没有应用绑定（标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
   return value as DataVersion;

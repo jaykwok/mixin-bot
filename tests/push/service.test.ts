@@ -9,7 +9,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EntryDraft } from "@earendil-works/pi-durable";
 import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput, type Speaker } from "../../src/push/service.ts";
-import { clickData, clickShape } from "../../src/push/cards.ts";
+import { CARD_MAX_CHARS, clickData, clickShape } from "../../src/push/cards.ts";
 import { type Grants, PushStore } from "../../src/push/store.ts";
 import { DIRECT_SCOPE, scopeKey } from "../../src/core/layout.ts";
 import { DepartmentTree, emptyWalk } from "../../src/integrations/open-platform/department-tree.ts";
@@ -763,6 +763,28 @@ test("on the way: no reminder when the pusher turned it off, with everyone answe
     h.service.tick();
     await h.settle();
     expect([h.texts(PUSHER).length, h.store.push(full)!.checkpoints.length, h.store.push(full)!.state]).toEqual([told, 1, "open"]);
+    // Back at night after a moment went by: the notice and the cards wait for the morning, then go once.
+    h.clock.now = new Date(2026, 10, 10, 9, 0).getTime();
+    h.service.tick();
+    await h.settle();
+    const late = await confirmed(h, { deadline: "2026-11-11 10:00" });
+    const moments = [new Date(2026, 10, 10, 21, 30).getTime(), new Date(2026, 10, 11, 8, 0).getTime()];
+    expect(h.store.push(late)!.checkpoints).toEqual(moments);
+    const progress = () => h.texts(PUSHER).filter(text => text.startsWith("推送「") && text.endsWith(`（推送编号 ${late}）`)).length;
+    const before = h.cards(LI).length;
+    h.clock.now = new Date(2026, 10, 10, 23, 0).getTime();
+    await h.restart();
+    h.service.tick();
+    await h.settle();
+    expect([progress(), h.cards(LI).length, h.store.push(late)!.checkpoints]).toEqual([0, before, moments]);
+    h.clock.now = new Date(2026, 10, 11, 7, 59).getTime();
+    h.service.tick();
+    await h.settle();
+    expect(progress()).toBe(0);
+    h.clock.now = moments[1]!;
+    h.service.tick();
+    await h.settle();
+    expect([progress(), h.cards(LI).length, h.store.push(late)!.checkpoints, h.store.push(late)!.reminded]).toEqual([1, before + 1, [], 1]);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });
@@ -2286,6 +2308,35 @@ test("fields: refused without values for everyone, with departments or groups, o
     const answer = await h.prepare({ recipients: two([["1"], ["2"]]), fields: ["座位"] });
     expect(answer).toContain("每人不同的内容（座位）的核对表没有发出：把每个人的内容列给成员核对，再请成员确认。");
     expect(h.store.push(h.pushId(answer))!.state).toBe("preview");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("a long preview lists fewer names so that it fits the card, also once sent; one that does not fit even then is refused before anything is stored", async () => {
+  const digits = (index: number) => String(index).padStart(2, "0");
+  const people = Array.from({ length: 60 }, (_, index) => ({ phone: `139000000${digits(index)}`, name: `阿卜杜热合曼·买买提${digits(index)}`, imUserId: `im-139000000${digits(index)}` }));
+  const h = harness({ people, limits: { bodyChars: 4600 } });
+  try {
+    const listed = people.slice(0, 50).map(({ name, phone }) => ({ name, phone })), cc = people.slice(50).map(({ name, phone }) => ({ name, phone }));
+    const outside = Array.from({ length: 20 }, (_, index) => ({ name: `不在通讯录里的同事${digits(index)}`, phone: `1370000${digits(index)}00` }));
+    const files = Array.from({ length: 5 }, (_, index) => pushSource(h, `${"年度安全生产检查通知附件".repeat(6)}${index}.pdf`, `file ${index}`));
+    // A short body: every name is listed.
+    const short = h.pushId(await h.prepare({ recipients: [...listed, ...outside], cc }));
+    expect(h.card(PUSHER, short).content).toContain("，共 50 人");
+    // The longest legal body (3000) beside fifty long names, twenty people left out, ten CCs and five long file names.
+    const long = h.pushId(await h.prepare({ recipients: [...listed, ...outside], cc, body: "检".repeat(3000), attachments: files }));
+    const preview = h.card(PUSHER, long).content;
+    expect([...preview].length).toBeLessThanOrEqual(CARD_MAX_CHARS);
+    expect(preview).toContain(" 等 50 人");
+    expect(preview).toContain("**没有对上、未包含**：");
+    h.click(PUSHER, h.card(PUSHER, long), "确认推送", `preview-${long}`);
+    await h.settle();
+    expect(h.store.push(long)!.state).toBe("open");
+    expect([...h.card(PUSHER, long).content].length).toBeLessThanOrEqual(CARD_MAX_CHARS);
+    // A body this test's limits allow, which fits a recipient's card but not the preview beside the CCs: refused, nothing kept.
+    const before = h.store.pushesOf(PUSHER, 100).length;
+    await expect(h.prepare({ recipients: listed, cc, body: "检".repeat(4600) })).rejects.toThrow("正文加上附件名、抄送和名单太长，预览卡片放不下");
+    expect(h.store.pushesOf(PUSHER, 100).length).toBe(before);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
 });

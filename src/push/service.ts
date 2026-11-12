@@ -64,7 +64,7 @@ import { cardMessage, type CardContent, type SendOutcome, splitText, type Target
 import type { StreamEvent } from "../integrations/open-platform/stream.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
-import { checkpoints } from "./reminders.ts";
+import { checkpoints, quietHours } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, clickShape, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
@@ -674,6 +674,9 @@ export class PushService {
     const longest = recipients.reduce((most, each) => size(each) > size(most) ? each : most, recipients[0]!);
     const sample = recipientCard({ push, recipient: longest, reply: { texts: 0, files: 0 } }, this.#now());
     if (chars(sample.content) > CARD_MAX_CHARS) throw new PushRefused("正文太长，卡片放不下，请精简或改为附件");
+    // The preview lists fewer names when it is long (./cards.ts); beside a long body, file names and CCs it may still not fit.
+    const preview = previewCard({ push, people: recipients.map(recipient => ({ name: recipient.name, member: recipient.member, values: recipient.values })) }, this.#now());
+    if (chars(preview.content) > CARD_MAX_CHARS) throw new PushRefused("正文加上附件名、抄送和名单太长，预览卡片放不下，请精简正文或附件名，或把长内容改为附件");
     this.#store.transaction(() => { this.#store.create(push, recipients); also?.(); });
     const outcome = await this.#outbound.send(this.#pusherTarget(push), cardMessage(this.#previewCard(push)), { signal: this.#signal });
     if (outcome.status === "failed") {
@@ -1167,8 +1170,9 @@ export class PushService {
 
   /**
    * A progress moment of an open push came (./reminders.ts): the pusher is told how it stands, and unless they turned
-   * that off the card goes again to whoever has not answered. Moments missed while the service was down count as one;
-   * with everyone answered, or within the last half hour, nothing is sent.
+   * that off the card goes again to whoever has not answered. Moments missed while the service was down count as one,
+   * and wait for the morning when the service is back at night (the tick); with everyone answered, or within the last
+   * half hour, nothing is sent.
    */
   #lookIn(push: Push): void {
     const now = this.#now(), rest = push.checkpoints.filter(at => at > now);
@@ -1728,7 +1732,7 @@ export class PushService {
       }
       for (const push of this.#store.pushesIn(LIVE_STATES)) {
         if (now >= push.deadline) { this.#close(push.id, "deadline"); continue; }
-        if (push.state === "open" && push.checkpoints.length && push.checkpoints[0]! <= now) this.#lookIn(push);
+        if (push.state === "open" && push.checkpoints.length && push.checkpoints[0]! <= now && !quietHours(now)) this.#lookIn(push);
         // Everyone replied a while ago and nobody added anything since.
         if (push.mode === "reply") this.#checkComplete(push.id);
       }

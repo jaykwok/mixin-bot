@@ -15,12 +15,20 @@ const REMINDERS = {
   evening: 21,
 };
 
+/**
+ * Whether `at` is in the quiet hours. The moments are never there; one that went by while the service was down waits
+ * for the morning rather than sending at night (./service.ts).
+ */
+export function quietHours(at: number): boolean {
+  const hour = new Date(at).getHours(), [from, to] = REMINDERS.quiet;
+  return hour >= from || hour < to;
+}
+
 /** `at` itself by day; at night the next morning, then the evening before. The first of them within `low` and `high`. */
 function awake(at: number, low: number, high: number): number | undefined {
   const date = new Date(at), hour = date.getHours(), [from, to] = REMINDERS.quiet;
-  const night = hour >= from || hour < to;
   const day = (offset: number, hours: number) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + offset, hours).getTime();
-  const candidates = !night ? [at] : hour >= from ? [day(1, to), day(0, REMINDERS.evening)] : [day(0, to), day(-1, REMINDERS.evening)];
+  const candidates = !quietHours(at) ? [at] : hour >= from ? [day(1, to), day(0, REMINDERS.evening)] : [day(0, to), day(-1, REMINDERS.evening)];
   return candidates.find(each => each >= low && each <= high);
 }
 

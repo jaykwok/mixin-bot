@@ -122,7 +122,9 @@ for (const [name, content, message] of [
   ["legacy marker without a program version", JSON.stringify({ dataVersion: 5, transaction: "old" }), "版本标记没有程序版本"],
   ["record missing fields", JSON.stringify({ dataVersion: DATA_VERSION, appVersion: "1.0.0", build: "x" }), "版本标记损坏"],
   ["unreadable record", "{not json", "无法读取版本状态"],
-  ["unsupported data format", JSON.stringify({ dataVersion: DATA_VERSION + 1, appVersion: "9.0.0", build: "", transaction: "deploy-future" }), "不受当前程序支持"],
+  ["unsupported data format", JSON.stringify({ dataVersion: DATA_VERSION + 1, appVersion: "9.0.0", build: "", transaction: "deploy-future" }), `不受当前程序支持（数据格式 ${DATA_VERSION}）；现场已保留`],
+  ["an earlier data format", JSON.stringify({ dataVersion: DATA_VERSION - 1, appVersion: "2.0.0", build: "", transaction: "deploy-old" }),
+    `数据格式 ${DATA_VERSION - 1}（程序 2.0.0）不受当前程序支持（数据格式 ${DATA_VERSION}）；更早的数据格式不能原地升级，请在新目录全新部署（参见 docs/data-migrations.md）；现场已保留`],
 ] as const)
   test(`${name}: an error; nothing is initialised and the record is kept`, async () => {
     const f = await tempFixture("current-bad-record-");

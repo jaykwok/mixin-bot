@@ -17,6 +17,7 @@ import { ReadChannel } from "../../src/durable/read/client.ts";
 import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { DIRECT_SPACE, recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import "../helpers/restore-spies.ts";
 
@@ -208,6 +209,34 @@ test("stop, then say: what the stop cancelled unseen is quoted in the entry of t
       "[人工回复] 管理员以你的名义直接回复了这位用户，用户已经看到：\n再补一句",
     ]);
   } finally { await h.close(); }
+});
+
+test("a stop from another console session while a text goes out: what it cancelled waits for the next entry", async () => {
+  const conversations = join(fixture.root, `sessions-${++counter}`, "conversations");
+  mkdirSync(join(conversations, "direct"), { recursive: true });
+  writeFileSync(join(conversations, "direct", "durable.sqlite"), "");
+  const halts = [["消息 A"], ["消息 B"]], notes: string[] = [];
+  let release = Promise.withResolvers<void>();
+  const takeover = new Takeover({
+    host: {
+      records: async () => ({ requests: { "request-1": {} } }) as never,
+      halt: async () => ({ waiting: halts.shift() ?? [] }),
+      note: async (_scope, _phone, _id, entry) => { notes.push(JSON.stringify(entry.model ?? [])); },
+    },
+    outbound: { sequence: async (_target: Target, work: (send: () => Promise<SendOutcome>) => Promise<unknown>) => work(async () => { await release.promise; return { status: "sent" }; }) } as never,
+    directory: { byPhone: phone => ({ phone, name: "张三", imUserId: `im-${phone}` }) as never },
+    layout: { conversations }, signal: new AbortController().signal, noteRetryMs: [],
+  });
+  const first = takeover.say("direct", ALICE, "第一条");
+  await Bun.sleep(10);
+  // The other session's stop lands while the first text is still going out.
+  await takeover.stop("direct", ALICE);
+  release.resolve();
+  expect(await first).toEqual({ sent: "sent", recorded: true });
+  release = Promise.withResolvers<void>();
+  release.resolve();
+  expect(await takeover.say("direct", ALICE, "第二条")).toEqual({ sent: "sent", recorded: true });
+  expect(notes.map(note => [note.includes("消息 A"), note.includes("消息 B")])).toEqual([[true, false], [false, true]]);
 });
 
 test("a group conversation: the operator's message goes to the group and names the member", async () => {
