@@ -9,6 +9,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EntryDraft } from "@earendil-works/pi-durable";
 import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput, type Speaker } from "../../src/push/service.ts";
+import { clickData, clickShape } from "../../src/push/cards.ts";
 import { type Grants, PushStore } from "../../src/push/store.ts";
 import { DIRECT_SCOPE, scopeKey } from "../../src/core/layout.ts";
 import { DepartmentTree, emptyWalk } from "../../src/integrations/open-platform/department-tree.ts";
@@ -1237,6 +1238,40 @@ test("a send the shutdown cancels after the deadline is not left to go out again
     await h.service.idle();
     expect(h.store.recipient(id, ZHANG)).toMatchObject({ sendState: "failed", sendError: "截止前没有发出", retryAt: null });
   } finally { held.open(); await h.close(); }
+});
+
+test("a deadline ten minutes away can be asked for: it is checked by the minute when prepared, and must be five minutes away when confirmed", async () => {
+  const h = harness();
+  try {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const minute = (at: number) => { const d = new Date(at); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+    // 37 seconds into a minute, as a request arrives.
+    h.clock.now += 37_000 - h.clock.now % 60_000;
+    await expect(h.prepare({ deadline: minute(h.clock.now + 9 * 60_000) })).rejects.toThrow("截止时间至少要在 10 分钟之后");
+    const id = h.pushId(await h.prepare({ deadline: minute(h.clock.now + 10 * 60_000) }));
+    // Confirmed a while later, with more than five minutes left: it goes out.
+    h.clock.now += 4 * 60_000;
+    h.click(PUSHER, h.card(PUSHER, id), "确认推送", `preview-${id}`);
+    await h.settle();
+    expect(h.store.push(id)!.state).toBe("open");
+    // With less than five minutes left it is cancelled, and the pusher is told why.
+    const late = h.pushId(await h.prepare({ deadline: minute(h.clock.now + 10 * 60_000) }));
+    h.clock.now += 5 * 60_000;
+    h.click(PUSHER, h.card(PUSHER, late), "确认推送", `preview-${late}`);
+    await h.settle();
+    expect(h.store.push(late)!.state).toBe("cancelled");
+    expect(h.texts(PUSHER).at(-1)).toBe("这条推送没有发出，已取消：截止时间已经过了，或离现在不到 5 分钟。请重新准备。");
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("clicks that are not a push card's are ignored, and their shape reads without their values", () => {
+  expect(clickData({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack", v: 0 }) })).toEqual({ push: "abcd1234", action: "ack", version: 0 });
+  expect(clickData({ data: { k: "push", p: "abcd1234", a: "ack" } })).toBeUndefined();
+  expect(clickShape({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack" }) })).toBe("{url=string method=string headers=object data=text:{k=string p=string a=string}}");
+  expect(clickShape(JSON.stringify({ data: { k: "push", "odd name": 1, list: [1], none: null } }))).toBe("text:{data={k=string odd?name=number list=array none=null}}");
+  expect(clickShape({ data: "secret words" })).toBe("{data=string(12)}");
+  expect(clickShape(undefined)).toBe("undefined");
 });
 
 test("confirming: a given deadline that has passed cancels the push; a default one starts now", async () => {

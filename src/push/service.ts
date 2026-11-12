@@ -66,7 +66,7 @@ import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
 import { checkpoints } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
-import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
+import { CARD_MAX_CHARS, clickData, type ClickData, clickShape, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
 import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage, writeCheckSheet } from "./summary.ts";
 import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
@@ -75,7 +75,10 @@ import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, me
 export const PUSH_LIMITS = {
   defaultDeadlineMs: 3 * 24 * 3600_000,
   maxDeadlineMs: 30 * 24 * 3600_000,
+  /** A given deadline is at least this far from the minute the push is prepared in (deadlines are whole minutes). */
   minDeadlineMs: 10 * 60_000,
+  /** ...and still this far away when the pusher confirms: reading the preview takes a moment. */
+  confirmDeadlineMs: 5 * 60_000,
   /** A preview not confirmed within this is void. */
   previewMs: 24 * 3600_000,
   /** A progress moment (./reminders.ts) this close to the deadline sends nothing: the summary follows. */
@@ -532,7 +535,7 @@ export class PushService {
     if (input.deadline !== undefined && input.deadline.trim()) {
       const parsed = parseDeadline(input.deadline);
       if (parsed === undefined) problems.push(`截止时间「${input.deadline}」无法识别，请写成 2026-11-07 18:00 这样的格式`);
-      else if (parsed < now + limits.minDeadlineMs) problems.push("截止时间至少要在 10 分钟之后");
+      else if (parsed < now - now % 60_000 + limits.minDeadlineMs) problems.push("截止时间至少要在 10 分钟之后");
       else if (parsed > now + limits.maxDeadlineMs) problems.push("截止时间不能超过 30 天之后");
       else { deadline = parsed; defaultDeadline = false; }
     }
@@ -946,7 +949,9 @@ export class PushService {
   click(event: StreamEvent): void {
     const payload = event.payload;
     const data = clickData(payload.content);
-    if (!data) { log.info("忽略不属于推送的卡片点击"); return; }
+    // Not a push card's click: what it looked like (field names and kinds only) tells a card of another feature from a
+    // click whose data arrived in a form this service does not read.
+    if (!data) { log.info(`忽略不属于推送的卡片点击（${clickShape(payload.content)}）`); return; }
     const userId = typeof payload.userId === "string" ? payload.userId : "", card = typeof payload.msgUid === "string" ? payload.msgUid : "";
     const groupId = typeof payload.groupId === "string" ? payload.groupId : "";
     if (!/^[\x21-\x7e]{1,128}$/.test(userId) || !/^[\x21-\x7e]{1,128}$/.test(card)) { log.warn("推送卡片点击缺少有效的 userId 或 msgUid，已丢弃"); return; }
@@ -1000,10 +1005,10 @@ export class PushService {
       return;
     }
     // A given deadline was checked when the push was prepared, up to a day ago. A default one starts now, as the card says.
-    if (!current.defaultDeadline && current.deadline < now + this.#limits.minDeadlineMs) {
+    if (!current.defaultDeadline && current.deadline < now + this.#limits.confirmDeadlineMs) {
       this.#store.movePush(push.id, ["preview"], { state: "cancelled", previewVersion: current.previewVersion + 1 });
       this.#previewSettled(push.id);
-      this.#text(this.#pusherTarget(push), "这条推送没有发出，已取消：截止时间已经过了，或离现在不到 10 分钟。请重新准备。");
+      this.#text(this.#pusherTarget(push), "这条推送没有发出，已取消：截止时间已经过了，或离现在不到 5 分钟。请重新准备。");
       return;
     }
     try { this.#checkLimit(role, now); }

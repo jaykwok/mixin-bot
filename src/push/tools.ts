@@ -52,7 +52,7 @@ const prepareParams = obj({
   mode: oneOf(["ack", "options", "reply"],
     { description: "要求：ack 只需确认收到；options 在给定选项中选一个；reply 需要回复（文字或附件）" }),
   options: opt(arr(str(), { description: `mode 为 options 时的选项，${PUSH_LIMITS.options[0]} 到 ${PUSH_LIMITS.options[1]} 个，每个不超过 ${PUSH_LIMITS.optionChars} 个字` })),
-  deadline: opt(str({ description: "截止时间，写成 2026-11-07 18:00；只写日期表示当天 23:59；不写默认 3 天后" })),
+  deadline: opt(str({ description: "截止时间，写成 2026-11-07 18:00，最早是 10 分钟之后；只写日期表示当天 23:59；不写默认 3 天后" })),
   cc: opt(arr(person, { description: `抄送人，只收到汇总；默认没有，最多 ${PUSH_LIMITS.cc} 人` })),
   remind: opt(bool({ description: "是否自动提醒没有答复的人；默认提醒，成员说不用提醒时写 false" })),
   attachments: opt(arr(str(), { description: `随推送发给每个接收人的附件：文件路径（成员发来的文件、共享资料里的文件，或这次任务生成的文件），最多 ${PUSH_LIMITS.files} 个，每个不超过 30 MB` })),

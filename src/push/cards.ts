@@ -73,6 +73,25 @@ export function clickData(content: unknown): ClickData | undefined {
 }
 
 /**
+ * What a click that `clickData` did not take looked like, for the log: the names of its fields and the kinds of their
+ * values, never the values. A JSON text is looked into as `clickData` does; of another text, its length and which
+ * punctuation of an encoding (JSON, a form, a URL) occurs in it.
+ */
+export function clickShape(content: unknown, depth = 0): string {
+  if (typeof content === "string") {
+    let inner: unknown;
+    const plain = () => `string(${content.length}${content ? ` ${[..."{[=&%:\"'"].filter(mark => content.includes(mark)).join("")}`.trimEnd() : ""})`;
+    try { inner = JSON.parse(content); } catch { return plain(); }
+    return inner && typeof inner === "object" && depth < 3 ? `text:${clickShape(inner, depth + 1)}` : plain();
+  }
+  if (Array.isArray(content)) return `array(${content.length})`;
+  if (!content || typeof content !== "object") return content === null ? "null" : typeof content;
+  const fields = Object.entries(content).slice(0, 12).map(([name, value]) =>
+    `${name.replace(/[^\w.-]/g, "?").slice(0, 24)}=${name === "data" && depth < 3 ? clickShape(value, depth + 1) : value === null ? "null" : Array.isArray(value) ? "array" : typeof value}`);
+  return `{${fields.join(" ")}}`.slice(0, 300);
+}
+
+/**
  * A line of the pusher's own on a card: a file's name, a field's title, a recipient's value. It is the pusher's text like
  * the body, one line already: only what would open emphasis, code or a link is escaped, so an ordinary name or number
  * (dots, dashes, underscores, brackets) reads as it is.
