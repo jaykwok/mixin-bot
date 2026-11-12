@@ -71,11 +71,13 @@ test("重部署表单保留显式端口和目录选择，Linux 重建修复与 W
   try {
     // Opening the section reads the saved settings; the Linux operation is a segmented choice.
     render(<DeployForm />, root); root.querySelector<HTMLButtonElement>(".disclosure-head")!.click(); await until(() => !!find(root, "预览重新部署"));
-    expect(find(root, "预览重新部署").disabled).toBe(true);
+    // A saved directory scope is used as it is: nothing to choose.
+    expect(root.querySelector('[aria-label="重部署通讯录范围"]')).toBeNull(); expect(root.textContent).not.toContain("通讯录范围");
+    expect(find(root, "预览重新部署").disabled).toBe(false);
     const choose = (label: string, value: string) => { const input = root.querySelector<HTMLInputElement | HTMLSelectElement>(`[aria-label="${label}"]`)!; input.value = value;
       input.dispatchEvent(new Event(input.tagName === "SELECT" ? "change" : "input", { bubbles: true })); };
     root.querySelector<HTMLButtonElement>('[aria-label="部署操作"] [role="radio"][data-value="repair"]')!.click();
-    choose("机器人端口", "2022"); choose("共享资料目录", ""); choose("重部署通讯录范围", "saved");
+    choose("机器人端口", "2022"); choose("共享资料目录", "");
     await until(() => !!find(root, "预览重建修复") && !find(root, "预览重建修复").disabled); find(root, "预览重建修复").click();
     await until(() => !!root.querySelector('[role="dialog"]'));
     expect(requests[0]).toEqual({ operation: "repair", params: { port: 2022, workspace: "", directory: "saved" } });
@@ -96,8 +98,8 @@ test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检�
   try {
     render(<UpgradeForm />, root); expect(requests).toEqual([]); find(root, "检查更新").click();
     await until(() => !!find(root, "预览升级")); expect(find(root, "预览升级").disabled).toBe(true);
-    const choose = (selector: string, value: string) => { const select = root.querySelector<HTMLSelectElement>(selector)!; select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
-    choose('[aria-label="升级通讯录范围"]', "saved");
+    // A saved directory scope is used as it is; switching to main still has to be allowed.
+    expect(root.querySelector('[aria-label="升级通讯录范围"]')).toBeNull();
     await Bun.sleep(20); expect(find(root, "预览升级").disabled).toBe(true);
     root.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     await until(() => !find(root, "预览升级").disabled); find(root, "预览升级").click(); await until(() => !!root.querySelector('[role="dialog"]'));

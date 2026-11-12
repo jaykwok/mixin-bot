@@ -363,14 +363,18 @@ function UninstallForm({ platform }: { platform?: ConsoleInfo["platform"] }) {
   </>;
 }
 
-/** The directory scope a deployment or upgrade uses: the saved one, or chosen here when there is none. */
+/**
+ * The directory scope of a deployment or upgrade that has none saved. A saved one is used as it is, with nothing to choose:
+ * the directory page changes it, applied to the running robot without a deployment.
+ */
 function ScopeChoice({ label, hasDirectory, value, onChange, onSelection }: {
   label: string; hasDirectory: boolean; value: string; onChange: (value: string) => void; onSelection: (value: DeploymentSelection | null) => void;
 }) {
+  if (hasDirectory) return null;
   return <>
-    <Row title="通讯录范围" detail={hasDirectory ? "沿用已保存的同步范围。" : "还没有保存的同步范围：选择整个通讯录或部分部门。"}>
+    <Row title="通讯录范围" detail="还没有保存的同步范围：选择整个通讯录或部分部门。">
       <select aria-label={label} value={value} onChange={event => { onChange(event.currentTarget.value); onSelection(null); }}>
-        <option value="">请选择</option>{hasDirectory ? <option value="saved">沿用已保存的同步范围</option> : <><option value="all">整个通讯录</option><option value="departments">选择部分部门</option></>}
+        <option value="">请选择</option><option value="all">整个通讯录</option><option value="departments">选择部分部门</option>
       </select>
     </Row>
     {value === "departments" && <div class="row-body flush-top"><DeploymentDirectoryPicker onChange={onSelection} /></div>}
@@ -394,6 +398,7 @@ export function DeployForm() {
   };
   const toggle = (next: boolean) => { setOpen(next); if (next && !saved && !busy) void load(); };
   const portValid = /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+  const scope = saved?.hasDirectory ? "saved" : directory;
   return <Disclosure title="重新部署与修复" icon="wrench" tint="graphite" open={open} onToggle={toggle}
     detail="使用当前代码和已保存的配置重新部署，完成后启动机器人。服务已被删除（卸载时保留了数据）时，重新部署会重新创建它。">
     <div class="action-row">
@@ -415,8 +420,8 @@ export function DeployForm() {
       </Row>
       <ScopeChoice label="重部署通讯录范围" hasDirectory={saved.hasDirectory} value={directory} onChange={setDirectory} onSelection={setSelected} />
       <Row title={operation === "repair" ? "重建修复" : "重新部署"} detail="预览列出将要执行的步骤，确认后在后台运行。">
-        <TaskAction operation={operation} params={{ port: Number(port), workspace, directory: directory === "departments" ? selected : directory }} primary
-          disabled={!portValid || !directory || directory === "departments" && !selected} onStarted={() => setSaved(null)}>
+        <TaskAction operation={operation} params={{ port: Number(port), workspace, directory: scope === "departments" ? selected : scope }} primary
+          disabled={!portValid || !scope || scope === "departments" && !selected} onStarted={() => setSaved(null)}>
           {operation === "repair" ? "预览重建修复" : "预览重新部署"}</TaskAction>
       </Row>
     </div>}
@@ -438,6 +443,7 @@ export function UpgradeForm() {
     catch (error) { if (live.current) setError(message(error)); }
     finally { lock.current = false; if (live.current) setBusy(false); }
   };
+  const scope = version?.hasDirectory ? "saved" : directory;
   return <Section title="软件更新" footer="升级沿用模型、机器人凭据和运行参数；完成后请重新运行 bun run console。">
     <Row icon="cloud" tint="blue" title="检查 origin/main" detail="取得最新提交后选择升级方式，再预览确认。">
       <button type="button" class="btn" disabled={busy} onClick={() => void check()}>{busy ? <><Icon name="loader" size={14} class="spin" />正在检查版本…</> : "检查更新"}</button>
@@ -449,8 +455,8 @@ export function UpgradeForm() {
       <ScopeChoice label="升级通讯录范围" hasDirectory={version.hasDirectory} value={directory} onChange={setDirectory} onSelection={setSelected} />
       {version.branch !== "main" && <div class="row"><Toggle label="允许切换到 main 分支" detail={`当前在 ${version.branch} 分支；升级会切换到 main。`} checked={switchMain} onChange={setSwitchMain} /></div>}
       <Row title="升级" detail="预览列出目标提交和步骤，确认后在后台运行。">
-        <TaskAction operation="update" params={{ target: version.target, switchMain, directory: directory === "departments" ? selected : directory }} primary
-          disabled={!directory || directory === "departments" && !selected || (version.branch !== "main" && !switchMain)} onStarted={() => setVersion(null)}>预览升级</TaskAction>
+        <TaskAction operation="update" params={{ target: version.target, switchMain, directory: scope === "departments" ? selected : scope }} primary
+          disabled={!scope || scope === "departments" && !selected || (version.branch !== "main" && !switchMain)} onStarted={() => setVersion(null)}>预览升级</TaskAction>
       </Row>
     </>}
   </Section>;
