@@ -155,7 +155,7 @@ test("缺少应用机器人凭据时先填写 AppID/AppSecret，再配置模型�
 test("已部署的目录只接受原应用：另一个 AppID 被拒绝并重新填写，部署记录不变", async () => {
   const files = await tempFixture("pi-configure-app-bot-bound-");
   try {
-    const record = JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true });
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     const result = await runConfigure(files.root, {
@@ -441,7 +441,7 @@ test("部署停机前的模型向导只写暂存：项目文件不变，不取�
   const files = await tempFixture("pi-configure-stage-");
   try {
     const originals = await existingConfiguration(files.root), stage = join(files.root, "stage");
-    const record = JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true }); await mkdir(stage);
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     const result = await runConfigure(files.root, BUILTIN, { args: ["--stage", stage] });
@@ -505,7 +505,7 @@ test("首次部署停机前先暂存应用机器人凭据、再暂存模型配�
 test("单独暂存应用机器人凭据：已部署的目录只接受原应用，基准是现有文件，项目文件不变", async () => {
   const files = await tempFixture("pi-configure-stage-app-");
   try {
-    const record = JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true });
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     await mkdir(join(files.root, "data", "config"), { recursive: true });

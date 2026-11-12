@@ -642,6 +642,113 @@ test("push_prepare leaves out the people who do not match the address book and n
   } finally { await h.close(); }
 });
 
+test("on the way: at its progress moments the pusher hears how the push stands and the card goes again to whoever has not answered", async () => {
+  const h = harness();
+  try {
+    const everyone = [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }, { name: "王五", phone: WANG }];
+    const answer = await h.prepare({ recipients: everyone, deadline: "2026-11-04 09:00" });
+    const id = h.pushId(answer);
+    expect(h.card(PUSHER, id).content).toContain("**提醒**：时间过半和临近截止时把进度发给你，并把卡片再发一次给还没有答复的人");
+    h.click(PUSHER, h.card(PUSHER, id), "确认推送", `preview-${id}`);
+    await h.settle();
+    // A day from 09:00: half way would be 21:00, the second moment moves from the night to 08:00.
+    const moments = [new Date(2026, 10, 3, 21, 0).getTime(), new Date(2026, 10, 4, 8, 0).getTime()];
+    expect([h.store.push(id)!.checkpoints, h.store.push(id)!.reminded]).toEqual([moments, 0]);
+    expect(h.card(LI).content).not.toContain("提醒");
+    h.click(ZHANG, h.card(ZHANG), "已收到", "card-zhang");
+    await h.settle();
+    const before = { zhang: h.cards(ZHANG).length, li: h.cards(LI).length, pusher: h.texts(PUSHER).length };
+    // Before the moment nothing happens.
+    h.clock.now = moments[0]! - 60_000;
+    h.service.tick();
+    await h.settle();
+    expect([h.cards(LI).length, h.texts(PUSHER).length]).toEqual([before.li, before.pusher]);
+    // The first moment: the pusher's notice, and a new card to the two who have not confirmed; none to the one who did.
+    h.clock.now = moments[0]!;
+    h.service.tick();
+    await h.settle();
+    expect(h.texts(PUSHER).at(-1)).toBe(`推送「机房盘点」的进度：共 3 人；已确认 1，未确认 2。11-04 09:00 截止。已把卡片再发给没有答复的 2 人。（推送编号 ${id}）`);
+    expect([h.cards(ZHANG).length, h.cards(LI).length, h.cards(WANG).length]).toEqual([before.zhang, before.li + 1, 2]);
+    expect(h.card(LI).content).toContain("**提醒：这条推送还在等你确认。**");
+    expect(h.card(LI).tailFields.map(button => button.name)).toEqual(["已收到"]);
+    expect([h.store.push(id)!.checkpoints, h.store.push(id)!.reminded, h.store.push(id)!.state]).toEqual([[moments[1]], 1, "open"]);
+    expect(h.notes.filter(note => note.phone === PUSHER).map(note => note.requestId)).toContain(`push-note:progress:${id}:1:1`);
+    // The same tick again sends nothing more; the new card works like the first.
+    h.service.tick();
+    await h.settle();
+    expect(h.cards(LI).length).toBe(before.li + 1);
+    h.click(LI, h.card(LI), "已收到", "card-li-2");
+    await h.settle();
+    expect(h.store.recipient(id, LI)!.ackedAt).not.toBeNull();
+    expect(h.card(LI).content).not.toContain("提醒：");
+    // The second moment: only the one still missing.
+    const li = h.cards(LI).length;
+    h.clock.now = moments[1]!;
+    h.service.tick();
+    await h.settle();
+    expect(h.texts(PUSHER).at(-1)).toContain("已确认 2，未确认 1。11-04 09:00 截止。已把卡片再发给没有答复的 1 人。");
+    expect([h.cards(LI).length, h.cards(WANG).length, h.store.push(id)!.checkpoints, h.store.push(id)!.reminded]).toEqual([li, 3, [], 2]);
+    h.click(WANG, h.card(WANG), "已收到", "card-wang-3");
+    await h.settle();
+    expect([h.store.push(id)!.state, h.store.push(id)!.closeReason]).toEqual(["closed", "complete"]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
+test("on the way: no reminder when the pusher turned it off, with everyone answered, for a short push, or twice for moments missed", async () => {
+  const h = harness();
+  try {
+    // Reminders off: the pusher still hears of the progress, no card goes again.
+    const quiet = h.pushId(await h.prepare({ deadline: "2026-11-03 15:00", remind: false }));
+    expect(h.card(PUSHER, quiet).content).toContain("**提醒**：时间过半时把进度发给你；不自动提醒没有答复的人");
+    h.click(PUSHER, h.card(PUSHER, quiet), "确认推送", `preview-${quiet}`);
+    await h.settle();
+    expect(h.store.push(quiet)!.checkpoints).toEqual([new Date(2026, 10, 3, 12, 0).getTime()]);
+    const cards = h.cards(ZHANG).length;
+    h.clock.now = new Date(2026, 10, 3, 12, 0).getTime();
+    h.service.tick();
+    await h.settle();
+    expect(h.texts(PUSHER).at(-1)).toBe(`推送「机房盘点」的进度：共 2 人；已确认 0，未确认 2。11-03 15:00 截止。（推送编号 ${quiet}）`);
+    expect([h.cards(ZHANG).length, h.store.push(quiet)!.reminded, h.store.push(quiet)!.checkpoints]).toEqual([cards, 0, []]);
+    expect(h.card(ZHANG).content).not.toContain("提醒：");
+    h.clock.now = new Date(2026, 10, 3, 15, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    // A push of an hour has no moment, and its preview no line about one.
+    const short = h.pushId(await h.prepare({ deadline: "2026-11-03 16:00" }));
+    expect(h.card(PUSHER, short).content).not.toContain("**提醒**");
+    h.click(PUSHER, h.card(PUSHER, short), "确认推送", `preview-${short}`);
+    await h.settle();
+    expect(h.store.push(short)!.checkpoints).toEqual([]);
+    h.clock.now = new Date(2026, 10, 3, 16, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    // Three days, and the service was down over both moments: one notice and one reminder when it is back.
+    const long = await confirmed(h, { mode: "reply" });
+    expect(h.store.push(long)!.checkpoints).toHaveLength(2);
+    await h.service.reply(h.say(ZHANG, "张三的回复"), { push: long, action: "add" });
+    const texts = h.texts(PUSHER).length, sent = h.cards(LI).length;
+    h.clock.now = h.store.push(long)!.deadline - 2 * 3600_000;
+    await h.restart();
+    h.service.tick();
+    await h.settle();
+    expect(h.texts(PUSHER).length).toBe(texts + 1);
+    expect(h.texts(PUSHER).at(-1)).toContain("已确认 1，已回复 1，未回复 1");
+    expect([h.cards(LI).length, h.store.push(long)!.reminded, h.store.push(long)!.checkpoints]).toEqual([sent + 1, 1, []]);
+    expect(h.card(LI).content).toContain("**提醒：这条推送还在等你回复。**");
+    // Everyone answered (the push waits for additions): the moment passes without a word.
+    const full = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-09 18:00" });
+    await h.service.reply(h.say(ZHANG, "都好了"), { push: full, action: "add" });
+    const told = h.texts(PUSHER).length;
+    h.clock.now = h.store.push(full)!.checkpoints[0]!;
+    h.store.updateRecipient(full, ZHANG, { repliedAt: h.clock.now });
+    h.service.tick();
+    await h.settle();
+    expect([h.texts(PUSHER).length, h.store.push(full)!.checkpoints.length, h.store.push(full)!.state]).toEqual([told, 1, "open"]);
+    expect(h.reports).toEqual([]);
+  } finally { await h.close(); }
+});
+
 test("department and everyone pushes: grants, names and paths, duplicates and near misses; the pusher is left out", async () => {
   const h = harness();
   try {

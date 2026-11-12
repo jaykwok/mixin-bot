@@ -7,6 +7,7 @@
 // recipient writes to the bot and the conversation records the reply (./tools.ts push_reply).
 import type { CardButton, CardContent } from "../integrations/open-platform/messages.ts";
 import { escapeInline } from "../durable/outbound.ts";
+import { checkpoints } from "./reminders.ts";
 import { type Forward, memberGroup, type Push, type Recipient } from "./store.ts";
 
 export type PreviewAction = "confirm" | "cancel";
@@ -133,6 +134,15 @@ function targetLines(push: Push, list: PreviewView["people"]): string[] {
   return [`**对象**：${asked.join("；")}`, `**名单**：${people.length ? peopleText(people) : "没有人"}（按点「确认推送」时的通讯录展开，不含你自己）`, ...left];
 }
 
+/** What happens on the way: when the pusher hears of the progress, and whether the card goes again to those who have not answered. */
+function progressLine(push: Push, now: number): string[] {
+  // Before the confirmation the moments are those of a push confirmed now.
+  const from = push.confirmedAt ?? now, moments = checkpoints(from, push.confirmedAt === null && push.defaultDeadline ? from + (push.deadline - push.createdAt) : push.deadline).length;
+  if (!moments) return [];
+  const when = moments > 1 ? "时间过半和临近截止时" : "时间过半时";
+  return [`**提醒**：${when}把进度发给你${push.remind ? "，并把卡片再发一次给还没有答复的人" : "；不自动提醒没有答复的人"}`];
+}
+
 export function previewCard(view: PreviewView, now = Date.now()): CardContent {
   const { push } = view;
   const deadline = `${shortTime(push.deadline, now)}${push.defaultDeadline ? "（未指定，默认发出后 3 天）" : ""}`;
@@ -142,6 +152,7 @@ export function previewCard(view: PreviewView, now = Date.now()): CardContent {
     `**抄送**：${cc}`,
     `**要求**：${escapeInline(requirementText(push))}`,
     `**截止**：${deadline}`,
+    ...progressLine(push, now),
     "",
     "---",
     "",
@@ -205,13 +216,14 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   if (group) return groupCard(view, make, now);
   const ended = endedText(push);
   const handed = view.forwardedTo?.length ? [`已转给 ${view.forwardedTo.map(escapeInline).join("、")}。`] : [];
+  const nudge = (what: string) => push.reminded > 0 && !handed.length ? [`**提醒：这条推送还在等你${what}。**`] : [];
   // Handed on and not answered: the push is off this recipient's hands, the buttons stay.
   const waiting = (name: string) => handed.length ? { name: "已转派", color: COLOR.done } : { name, color: COLOR.waiting };
 
   if (push.mode === "ack") {
     if (recipient.ackedAt !== null) return make({ name: "已确认收到", color: closed ? COLOR.closed : COLOR.done }, [`已于 ${shortTime(recipient.ackedAt, now)} 确认收到。`, ...handed], [], closed);
     if (closed) return make({ name: handed.length ? "已转派" : "已截止", color: COLOR.closed }, [...handed, "已截止。"], [], true);
-    return make(waiting("待确认"), [...handed, "请点「已收到」确认。", ...(handed.length ? [] : [FORWARD_HINT])], [button(push, v, 1, "已收到", "ack", 1)]);
+    return make(waiting("待确认"), [...nudge("确认"), ...handed, "请点「已收到」确认。", ...(handed.length ? [] : [FORWARD_HINT])], [button(push, v, 1, "已收到", "ack", 1)]);
   }
 
   if (push.mode === "options") {
@@ -223,7 +235,7 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
     const buttons = push.options.map((option, index) => button(push, v, index + 1, index === recipient.choice ? `✓ ${option}` : option, "choose",
       index === recipient.choice ? 1 : 2, { option: index }));
     return chosen === undefined
-      ? make(waiting("待选择"), [...handed, "请点选一项；推送结束前可以改选。", ...(handed.length ? [] : [FORWARD_HINT])], buttons)
+      ? make(waiting("待选择"), [...nudge("选择"), ...handed, "请点选一项；推送结束前可以改选。", ...(handed.length ? [] : [FORWARD_HINT])], buttons)
       : make({ name: `已选择：${chosen}`, color: COLOR.done }, [`已选择「${escapeInline(chosen)}」（${shortTime(recipient.choiceAt!, now)}）；推送结束前可以改选。`, ...handed], buttons);
   }
 
@@ -236,7 +248,7 @@ export function recipientCard(view: RecipientView, now = Date.now()): CardConten
   if (replied) return make({ name: "已回复", color: COLOR.done }, [`${replied}。`, ...handed, "要补充、修改或者撤回，直接发消息告诉我。"], []);
   const acked = recipient.ackedAt === null ? [] : [`已于 ${shortTime(recipient.ackedAt, now)} 确认收到。`];
   const buttons = recipient.ackedAt === null ? [button(push, v, 1, "已收到", "ack", 2)] : [];
-  return make(waiting(recipient.ackedAt === null ? "待回复" : "已确认，待回复"), [...acked, ...handed, "", REPLY_HINT, ...(handed.length ? [] : [FORWARD_HINT])], buttons);
+  return make(waiting(recipient.ackedAt === null ? "待回复" : "已确认，待回复"), [...nudge("回复"), ...acked, ...handed, "", REPLY_HINT, ...(handed.length ? [] : [FORWARD_HINT])], buttons);
 }
 
 type Make = (status: { name: string; color: string }, extra: string[], buttons: CardButton[], invalid?: boolean) => CardContent;
@@ -249,10 +261,11 @@ function groupCard(view: RecipientView, make: Make, now: number): CardContent {
   const { push, recipient } = view, v = recipient.version, closed = push.state === "closed", ended = endedText(push);
   const acked = recipient.ackedAt === null ? [] : [`已收到：首次 ${shortTime(recipient.ackedAt, now)}，共点击 ${recipient.clicks} 次。`];
   const ack = (style: 1 | 2) => button(push, v, 1, "已收到", "ack", style);
+  const nudge = (what: string) => push.reminded > 0 ? [`**提醒：这条推送还在等本群${what}。**`] : [];
   if (push.mode !== "reply") {
     if (closed) return make({ name: recipient.ackedAt === null ? "已截止" : "已收到", color: COLOR.closed }, recipient.ackedAt === null ? ["已截止，没有人确认。"] : [...acked, `${ended}。`], [], true);
     return make({ name: recipient.ackedAt === null ? "待确认" : "已收到", color: recipient.ackedAt === null ? COLOR.waiting : COLOR.done },
-      recipient.ackedAt === null ? ["请点「已收到」确认，群里谁点都可以。"] : acked, [ack(recipient.ackedAt === null ? 1 : 2)]);
+      recipient.ackedAt === null ? [...nudge("确认"), "请点「已收到」确认，群里谁点都可以。"] : acked, [ack(recipient.ackedAt === null ? 1 : 2)]);
   }
   const replied = recipient.repliedAt !== null ? `已回复（${groupReplyText(view.senders ?? [], view.reply)}）· ${shortTime(recipient.repliedAt, now)}` : undefined;
   if (closed) {
@@ -260,7 +273,7 @@ function groupCard(view: RecipientView, make: Make, now: number): CardContent {
       : make({ name: "已回复", color: COLOR.closed }, [`${replied}。${ended}。`], [], true);
   }
   if (replied) return make({ name: "已回复", color: COLOR.done }, [...acked, `${replied}。`, "要补充就继续 @机器人 发；改或者撤回自己发的内容，@机器人 说一声。"], [ack(2)]);
-  return make({ name: "待回复", color: COLOR.waiting }, [...acked, "", GROUP_REPLY_HINT], [ack(2)]);
+  return make({ name: "待回复", color: COLOR.waiting }, [...nudge("回复"), ...acked, "", GROUP_REPLY_HINT], [ack(2)]);
 }
 
 // ---- handing a push on ----------------------------------------------------------------------------------------------

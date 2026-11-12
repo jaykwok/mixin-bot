@@ -27,7 +27,7 @@ test("共用配置窗口使用实际草稿、校验、发布及恢复工具；�
       for (const tree of ["data/config", "data/state"]) await mkdir(join(f.root, tree), { recursive: true });
       await writeFile(config, JSON.stringify({ appId: "fixture", environment: "production", appSecret: oldKey }));
       const original = await readFile(config, "utf8");
-      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "fixture",
+      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "fixture",
         transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
       prepareConsoleDir(join(f.root, ".console"));
       await symlink(join(project, "node_modules"), join(f.root, "node_modules"), process.platform === "win32" ? "junction" : "dir");

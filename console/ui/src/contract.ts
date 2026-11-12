@@ -288,6 +288,8 @@ export interface PushDetailView extends PushListItemView {
   /** What the pusher asked for, one line each (everyone, departments, people). */
   target: string[];
   cc: PushPersonView[]; summaryError: string | null; summaryAt: number | null;
+  /** On the way: whether the card goes again to those who have not answered, how often it did, and the next progress moment. */
+  reminders: { recipients: boolean; sent: number; next: number | null };
 }
 export interface PushDetailResponse { view: string; push: PushDetailView; recipients: PushRecipientView[] }
 export interface PushTicket { url: string; filename: string; expiresAt: number }

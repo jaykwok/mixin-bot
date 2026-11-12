@@ -58,6 +58,7 @@ import { cardMessage, type CardContent, splitText, type Target, textMessage } fr
 import type { StreamEvent } from "../integrations/open-platform/stream.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
+import { checkpoints } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
@@ -71,6 +72,8 @@ export const PUSH_LIMITS = {
   minDeadlineMs: 10 * 60_000,
   /** A preview not confirmed within this is void. */
   previewMs: 24 * 3600_000,
+  /** A progress moment (./reminders.ts) this close to the deadline sends nothing: the summary follows. */
+  remindLeadMs: 30 * 60_000,
   /**
    * A push asking for replies ends early once everyone answered and nobody added to a reply for this long: a reply may come
    * in several messages.
@@ -154,6 +157,8 @@ export type PrepareInput = {
   options?: readonly string[];
   deadline?: string;
   cc?: readonly { name: string; phone: string }[];
+  /** False: the card does not go again to those who have not answered. */
+  remind?: boolean;
 };
 
 /** What directory_lookup passes on (./tools.ts): at least one of names, phone and department; together they narrow down. */
@@ -210,7 +215,7 @@ export type PushRecipientDetail = Pick<Recipient, "member" | "name" | "sendState
   forwardedBy: string | null;
   forwardedTo: string[];
 };
-export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "summaryError" | "summaryAt">;
+export type PushDetail = { push: PushListItem & Pick<Push, "body" | "options" | "defaultDeadline" | "target" | "cc" | "summaryError" | "summaryAt" | "remind" | "reminded" | "checkpoints">;
   recipients: PushRecipientDetail[] };
 
 /** A group as the console lists it: who registered it by name (null: the console did, or nobody yet). */
@@ -494,7 +499,7 @@ export class PushService {
     this.#checkLimit(role, now);
     const pusher = this.#directory.byPhone(caller.phone);
     const push = this.#newPush({ pusher: caller.phone, pusherName: pusher?.name ?? caller.reply.name ?? caller.phone, pusherIm: pusher?.imUserId ?? caller.reply.receiveId,
-      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })) });
+      subject, body, mode: input.mode, options, deadline, defaultDeadline, target, cc: cc.map(({ phone, name }) => ({ phone, name })), remind: input.remind !== false });
     const earlier = this.#store.pushesOf(caller.phone, 50).filter(each => each.state === "preview" && !each.target.of).length;
     const outcome = await this.#createPreview(push, people);
     log.info(`推送 ${push.id} 已准备：${reachText(reachOf(people))}，等待推送人确认`);
@@ -507,10 +512,10 @@ export class PushService {
   }
 
   /** A push in `preview`, with nothing confirmed, sent or summarised yet. */
-  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc">): Push {
+  #newPush(fields: Pick<Push, "pusher" | "pusherName" | "pusherIm" | "subject" | "body" | "mode" | "options" | "deadline" | "defaultDeadline" | "target" | "cc" | "remind">): Push {
     return { id: this.#newId(), ...fields, state: "preview", createdAt: this.#now(), confirmedAt: null, closedAt: null, closeReason: null, previewCard: null,
       previewVersion: 0, summaryState: null, summaryAttempts: 0, summaryAt: null, summaryError: null, summaryDone: [], summaryText: null, summaryCard: null,
-      summaryVersion: 0, followUp: null, released: false };
+      summaryVersion: 0, followUp: null, checkpoints: [], reminded: 0, released: false };
   }
 
   #recipientRow(pushId: string, reached: Reached): Recipient {
@@ -844,9 +849,10 @@ export class PushService {
         : `现在是 ${reachText(reach)}${reach.groups ? "（一个群算一人）" : ""}，超过一次 ${this.#limits.recipients} 人的上限`}。`);
       return;
     }
+    const deadline = current.defaultDeadline ? now + this.#limits.defaultDeadlineMs : current.deadline;
     const confirmed = this.#store.transaction(() => {
-      if (!this.#store.movePush(push.id, ["preview"], { state: "sending", confirmedAt: now, previewVersion: current.previewVersion + 1,
-        ...(current.defaultDeadline ? { deadline: now + this.#limits.defaultDeadlineMs } : {}) })) return false;
+      if (!this.#store.movePush(push.id, ["preview"], { state: "sending", confirmedAt: now, previewVersion: current.previewVersion + 1, deadline,
+        checkpoints: checkpoints(now, deadline) })) return false;
       this.#store.replaceRecipients(push.id, people.map(person => this.#recipientRow(push.id, person)));
       this.#dropSuperseded();
       return true;
@@ -920,7 +926,7 @@ export class PushService {
     const push = this.#newPush({ pusher: original.pusher, pusherName: pusher?.name ?? original.pusherName, pusherIm: pusher?.imUserId ?? original.pusherIm,
       subject: original.subject, body: original.body, mode: original.mode, options: original.options, deadline: now + this.#limits.defaultDeadlineMs,
       defaultDeadline: true, target: { people: people.map(({ phone, name }) => ({ phone, name })), departments: [], everyone: false, ...(groups.length ? { groups } : {}),
-        of: original.id }, cc: original.cc });
+        of: original.id }, cc: original.cc, remind: original.remind });
     await this.#createPreview(push, reached, () => this.#store.updatePush(original.id, { followUp: push.id, summaryVersion: original.summaryVersion + 1 }));
     log.info(`推送 ${original.id} 的补推送 ${push.id} 已准备：${reachText(reachOf(reached))}`);
     return push.id;
@@ -957,14 +963,45 @@ export class PushService {
     }
     if (this.#closeIfDue(push)) throw new PushRefused("这条推送已经截止，请刷新后再补推送");
     if (!LIVE_STATES.includes(push.state)) throw new PushRefused("这条推送没有发出，不能补推送");
-    const chosen = this.#unanswered(push).filter(recipient => (!members || members.includes(recipient.member))
-      && recipient.sendState !== "pending" && recipient.sendState !== "sending");
-    // A new card message each (`card: null`); the old card keeps working, a click on it makes it the one updated again.
-    this.#store.transaction(() => {
-      for (const recipient of chosen) this.#store.updateRecipient(pushId, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null });
-    });
+    const chosen = this.#resend(push, members);
     if (chosen.length) { log.info(`推送 ${pushId}：补推送 ${chosen.length} 张卡片`); this.#pump(); }
     return { resent: chosen.length };
+  }
+
+  /**
+   * The card of a live push goes again to the recipients who have not answered (`members`: only these of them), failed
+   * cards included: a new card message each (`card: null`); the old card keeps working, a click on it makes it the one
+   * updated again. The caller starts the sends.
+   */
+  #resend(push: Push, members?: readonly string[]): Recipient[] {
+    const chosen = this.#unanswered(push).filter(recipient => (!members || members.includes(recipient.member))
+      && recipient.sendState !== "pending" && recipient.sendState !== "sending");
+    this.#store.transaction(() => {
+      for (const recipient of chosen) this.#store.updateRecipient(push.id, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null });
+    });
+    return chosen;
+  }
+
+  /**
+   * A progress moment of an open push came (./reminders.ts): the pusher is told how it stands, and unless they turned
+   * that off the card goes again to whoever has not answered. Moments missed while the service was down count as one;
+   * with everyone answered, or within the last half hour, nothing is sent.
+   */
+  #lookIn(push: Push): void {
+    const now = this.#now(), rest = push.checkpoints.filter(at => at > now);
+    const waiting = this.#unanswered(push).filter(recipient => recipient.sendState !== "pending" && recipient.sendState !== "sending");
+    if (!waiting.length || push.deadline - now < this.#limits.remindLeadMs) { this.#store.updatePush(push.id, { checkpoints: rest }); return; }
+    const tally = this.#tally(push, this.#store.recipients(push.id));
+    const reminded = this.#atomic(() => {
+      this.#store.updatePush(push.id, { checkpoints: rest, reminded: push.reminded + (push.remind ? 1 : 0) });
+      return push.remind ? this.#resend(this.#store.push(push.id)!) : [];
+    });
+    const told = reminded.length ? `已把卡片再发给没有答复的 ${reachText(reachOf(reminded))}。` : "";
+    log.info(`推送 ${push.id} 的进度已告知推送人${reminded.length ? `，提醒 ${reminded.length} 张卡片` : ""}`);
+    this.#text(this.#pusherTarget(push), `推送「${push.subject}」的进度：${tally}。${shortTime(push.deadline, now)} 截止。${told}（推送编号 ${push.id}）`);
+    this.#note(DIRECT_SCOPE, push.pusher, `progress:${push.id}:${push.checkpoints.length - rest.length}:${rest.length}`,
+      `[推送进度]「${quoted(push.subject)}」：${tally}；截止 ${shortTime(push.deadline, now)}。${told}推送编号 ${push.id}`, { push: push.id, event: "progress" });
+    if (reminded.length) this.#pump();
   }
 
   /** Change the CCs until the summary goes out (the console); the people are checked as push_prepare checks them. */
@@ -1004,7 +1041,7 @@ export class PushService {
     const handed = new Set(forwards.map(forward => forward.from));
     return {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
-        summaryError: push.summaryError, summaryAt: push.summaryAt },
+        summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
       recipients: recipients.map(recipient => {
         const own = replyItems(recipient, items), text = replyText(own);
         return { member: recipient.member, name: recipient.name, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
@@ -1506,9 +1543,10 @@ export class PushService {
         }
       }
       for (const push of this.#store.pushesIn(LIVE_STATES)) {
-        if (now >= push.deadline) this.#close(push.id, "deadline");
+        if (now >= push.deadline) { this.#close(push.id, "deadline"); continue; }
+        if (push.state === "open" && push.checkpoints.length && push.checkpoints[0]! <= now) this.#lookIn(push);
         // Everyone replied a while ago and nobody added anything since.
-        else if (push.mode === "reply") this.#checkComplete(push.id);
+        if (push.mode === "reply") this.#checkComplete(push.id);
       }
       this.#store.forgetHeard(now - this.#limits.heardMs);
       this.#pump();

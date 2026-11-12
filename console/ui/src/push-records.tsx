@@ -182,6 +182,8 @@ function PushDetailCard({ id, onChanged, onDeleted }: { id: string; onChanged: (
           <dt>答复</dt><dd>共 {reach(push.counts.total, push.counts.groups)}，已送达 {push.counts.delivered}，已答复 {push.counts.answered}{push.counts.failed ? `，发送失败 ${push.counts.failed}` : ""}</dd>
           <dt>汇总</dt><dd>{push.summaryState === "sent" ? `已发出${push.summaryAt ? `（${dateTime(push.summaryAt)}）` : ""}` : push.summaryState === "failed" ? `没有发出：${push.summaryError ?? "原因未知"}`
             : push.summaryState === "pending" ? "待发" : "截止或全部答复后发给推送人和抄送人"}</dd>
+          {(push.reminders.sent > 0 || push.reminders.next !== null) && <><dt>提醒</dt><dd>{push.reminders.recipients ? `已自动提醒 ${push.reminders.sent} 次` : "不自动提醒接收人"}
+            {push.reminders.next !== null && live(push.state) ? `，下一次进度通知${push.reminders.recipients ? "和提醒" : ""} ${dateTime(push.reminders.next)}` : ""}</dd></>}
           {push.of && <><dt>补推送</dt><dd>推送编号 {push.of} 中没有答复的人</dd></>}
           {push.followUp && <><dt>已补推送</dt><dd>推送编号 {push.followUp}</dd></>}
           <dt>抄送</dt><dd>{cc === null ? <>{push.cc.length ? push.cc.map(person => `${person.name} · ${person.phone}`).join("、") : "无"}

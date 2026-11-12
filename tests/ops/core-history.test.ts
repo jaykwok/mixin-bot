@@ -35,7 +35,7 @@ async function fixture() {
   await writeFile(join(f.root, "scripts/fixture.ts"), "export {};\n");
   await writeFile(join(f.root, "ops/tools/history-admin.ts"), `import {writeFileSync} from "node:fs";
 writeFileSync("data/action.json",JSON.stringify(process.argv.slice(2))); console.log("会话维护合成步骤完成");`);
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 3, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
   const body = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...body, port: server.port }));

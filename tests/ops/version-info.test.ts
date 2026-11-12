@@ -17,12 +17,12 @@ async function project(version: string, record?: unknown): Promise<string> {
   if (record !== undefined) await writeFile(join(root, "data", "state", "data-version.json"), typeof record === "string" ? record : JSON.stringify(record));
   return root;
 }
-const deployed = { dataVersion: 3, appVersion: "2.0.0", build: "abc1234def5678", transaction: "deploy-x" };
+const deployed = { dataVersion: 4, appVersion: "2.0.0", build: "abc1234def5678", transaction: "deploy-x" };
 
 test("the running service names the version; the same local tool adds no row", async () => {
   const root = await project("2.0.0", deployed);
   const rows = versionRows(versionFacts(root, { appVersion: "2.0.0", build: "abc1234def5678" }, "abc1234def5678"));
-  expect(rows).toEqual([["应用机器人", "v2.0.0"], ["构建", "abc1234"], ["数据格式", "3"]]);
+  expect(rows).toEqual([["应用机器人", "v2.0.0"], ["构建", "abc1234"], ["数据格式", "4"]]);
 });
 
 test("a newer local tool is shown next to the running service, never in its place", async () => {

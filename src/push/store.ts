@@ -110,6 +110,12 @@ export type Push = {
   summaryVersion: number;
   /** The push its summary's 「提醒未回复」 prepared. */
   followUp: string | null;
+  /** At its progress moments the card goes again to whoever has not answered (the pusher is told the progress either way). */
+  remind: boolean;
+  /** The progress moments still to come (./reminders.ts), set when the push is confirmed. */
+  checkpoints: number[];
+  /** How often the card went again so. */
+  reminded: number;
   /** Reply attachments were released (after the summary went out). */
   released: boolean;
 };
@@ -201,7 +207,8 @@ CREATE TABLE IF NOT EXISTS pushes (
   target TEXT NOT NULL, cc TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER,
   closed_at INTEGER, close_reason TEXT, preview_card TEXT, preview_version INTEGER NOT NULL, summary_state TEXT,
   summary_attempts INTEGER NOT NULL, summary_at INTEGER, summary_error TEXT, summary_done TEXT NOT NULL, summary_text TEXT, summary_card TEXT,
-  summary_version INTEGER NOT NULL, follow_up TEXT, released INTEGER NOT NULL) STRICT;
+  summary_version INTEGER NOT NULL, follow_up TEXT, remind INTEGER NOT NULL, checkpoints TEXT NOT NULL, reminded INTEGER NOT NULL,
+  released INTEGER NOT NULL) STRICT;
 CREATE INDEX IF NOT EXISTS pushes_by_pusher ON pushes (pusher, created_at);
 CREATE INDEX IF NOT EXISTS pushes_by_state ON pushes (state);
 CREATE TABLE IF NOT EXISTS push_recipients (
@@ -235,7 +242,7 @@ const PUSH_COLUMNS = {
   createdAt: "created_at", confirmedAt: "confirmed_at", closedAt: "closed_at", closeReason: "close_reason", previewCard: "preview_card",
   previewVersion: "preview_version", summaryState: "summary_state", summaryAttempts: "summary_attempts", summaryAt: "summary_at",
   summaryError: "summary_error", summaryDone: "summary_done", summaryText: "summary_text", summaryCard: "summary_card", summaryVersion: "summary_version", followUp: "follow_up",
-  released: "released",
+  remind: "remind", checkpoints: "checkpoints", reminded: "reminded", released: "released",
 } as const satisfies Record<keyof Push, string>;
 
 const RECIPIENT_COLUMNS = {
@@ -244,8 +251,8 @@ const RECIPIENT_COLUMNS = {
   choice: "choice", choiceAt: "choice_at", repliedAt: "replied_at",
 } as const satisfies Record<keyof Recipient, string>;
 
-const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "summaryDone"]);
-const BOOLEAN_PUSH_FIELDS = new Set<keyof Push>(["defaultDeadline", "released"]);
+const JSON_PUSH_FIELDS = new Set<keyof Push>(["options", "target", "cc", "summaryDone", "checkpoints"]);
+const BOOLEAN_PUSH_FIELDS = new Set<keyof Push>(["defaultDeadline", "remind", "released"]);
 
 function encodePush<K extends keyof Push>(key: K, value: Push[K]): string | number | null {
   if (JSON_PUSH_FIELDS.has(key)) return JSON.stringify(value);

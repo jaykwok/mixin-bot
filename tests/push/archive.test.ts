@@ -69,7 +69,7 @@ function push(mode: Push["mode"], options: string[] = []): Push {
   return { id: "abcd2345", pusher: "13800000009", pusherName: "推送人", pusherIm: "im-9", subject: "机房盘点", body: "请回复", mode, options,
     deadline: 2_000_000_000_000, defaultDeadline: false, target: { people: [], departments: [], everyone: false }, cc: [], state: "closed", createdAt: 1, confirmedAt: 1,
     closedAt: 2, closeReason: "deadline", previewCard: null, previewVersion: 0, summaryState: "pending", summaryAttempts: 0, summaryAt: null,
-    summaryError: null, summaryDone: [], summaryText: null, summaryCard: null, summaryVersion: 0, followUp: null, released: false };
+    summaryError: null, summaryDone: [], summaryText: null, summaryCard: null, summaryVersion: 0, followUp: null, remind: true, checkpoints: [], reminded: 0, released: false };
 }
 
 function recipient(member: string, name: string, change: Partial<Recipient> = {}): Recipient {

@@ -128,13 +128,15 @@ export class PushPage {
       ...target.departments.map(department => `部门 ${department.path}${department.children ? "（含下级）" : "（不含下级）"}`),
       ...(target.people.length ? [`个人 ${target.people.slice(0, 50).map(each => who(each.name, each.phone)).join("、")}${target.people.length > 50 ? ` 等 ${target.people.length} 人` : ""}`] : []),
       ...(groups.length ? [`群 ${groups.map(group => group.name).join("、")}`] : []),
+      ...(target.unmatched?.length ? [`没有对上、未包含：${target.unmatched.slice(0, 50).join("、")}${target.unmatched.length > 50 ? ` 等 ${target.unmatched.length} 人` : ""}`] : []),
     ];
     const recipients: PushRecipientView[] = detail.recipients.map(recipient => ({ ...person(recipient.member, recipient.name),
       group: memberGroup(recipient.member) !== undefined, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
       ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice, choiceAt: recipient.choiceAt,
       repliedAt: recipient.repliedAt, answered: recipient.answered, reply: recipient.reply, forwardedBy: recipient.forwardedBy, forwardedTo: recipient.forwardedTo }));
     return { view: key, recipients, push: { ...this.#listItem(push), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: lines,
-      cc: push.cc.map(each => person(each.phone, each.name)), summaryError: push.summaryError, summaryAt: push.summaryAt } };
+      cc: push.cc.map(each => person(each.phone, each.name)), summaryError: push.summaryError, summaryAt: push.summaryAt,
+      reminders: { recipients: push.remind, sent: push.reminded, next: push.checkpoints[0] ?? null } } };
   }
 
   #view(session: string, key: unknown, id: string): DetailView {
