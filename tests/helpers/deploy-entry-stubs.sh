@@ -6,6 +6,10 @@
 
 fixture_event() { printf '%s\n' "$*" >> "$FIXTURE_EVENTS"; }
 
+# The port probe: free unless the test names the port taken, so a service listening on the host (a running deployment on
+# the default port) does not change a fixture's outcome.
+local_port_in_use() { [ "$1" = "${FIXTURE_TAKEN:-}" ]; }
+
 require_deploy_operator() { DOCKER_ROOTLESS=1; fixture_event operator; }
 ops_bun() { printf '%s\n' "$FIXTURE_BUN"; }
 check_build_disk_space() { fixture_event build-space; }
