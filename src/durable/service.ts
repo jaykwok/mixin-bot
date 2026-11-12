@@ -260,7 +260,8 @@ function openTimingText(scope: Scope, { kept, total, steps, sql }: SpaceOpenTimi
 }
 type ControlReceipt = { scope: Scope; phone: string; requestId: string; ticket?: ControlTicket };
 /** Where a /stop or /clear came from: the receipt key that makes a redelivery a no-op, and the member's message when it was one. */
-type ControlSource = { msgUid: string; reply?: ReplyContext };
+/** `waiting` collects the texts of the messages the control cancels before they were started. */
+type ControlSource = { msgUid: string; reply?: ReplyContext; waiting?: string[] };
 /** Held while maintenance reclaims a group's results. A waiting message or command sets `yield`. */
 type ReclamationGate = { promise: Promise<void>; resolve: () => void; yield: boolean };
 
@@ -683,10 +684,10 @@ export class DurableService {
   }
 
   /**
-   * An operator's stop (the console's takeover, src/server/takeover.ts): the member's running task and the messages
+   * An operator's stop (the console's takeover, src/durable/takeover.ts): the member's running task and the messages
    * waiting behind it are cancelled exactly as the member's own /stop cancels them; the member gets no receipt.
-   * Resolves once the conversation is idle, with the texts of the messages that were still waiting: the model never saw
-   * those (the one it was answering stays in the conversation).
+   * Resolves once the conversation is idle, with the texts of the messages it cancelled before they were started: the
+   * model never saw those (the one it was answering stays in the conversation).
    */
   async halt(scope: Scope, phone: string): Promise<{ waiting: string[] }> {
     this.#assertRunning();
@@ -695,14 +696,8 @@ export class DurableService {
     try {
       const receivedAt = this.#arrival();
       member.lastUsed = Date.now();
-      const handle = await this.#spaces.acquire(scope);
-      let waiting: string[];
-      try {
-        member.conversationId ??= (await handle.harness.snapshot(MemberDirectory, phone, this.#context))?.conversationId;
-        const items = member.conversationId === undefined ? [] : await inboxItems(handle.harness, member.conversationId, this.#context);
-        waiting = items.filter(item => !item.cancelled && item.startedAt === undefined).map(item => item.content);
-      } finally { handle.release(); }
-      await this.#stopOrClear(member, "/stop", receivedAt, { msgUid: `operator:${randomUUID()}` });
+      const waiting: string[] = [];
+      await this.#stopOrClear(member, "/stop", receivedAt, { msgUid: `operator:${randomUUID()}`, waiting });
       return { waiting };
     } finally { member.uses--; this.#pruneMember(member); }
   }
@@ -753,7 +748,7 @@ export class DurableService {
           (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId)?.seq);
         throw error;
       }
-      await this.#execute(harness, member, command, requestId, reply);
+      await this.#execute(harness, member, command, requestId, reply, source.waiting);
       return true;
     } finally { handle.release(); }
   }
@@ -762,11 +757,12 @@ export class DurableService {
    * Run a control that is in the stream, then remove it (idempotent: startup runs waiting ones again). It cancels the
    * messages received before it; later ones (admitted while it waited or ran) stay.
    */
-  async #execute(harness: Harness, member: MemberState, command: ControlCommand, requestId: string, reply: ReplyContext | undefined): Promise<void> {
+  async #execute(harness: Harness, member: MemberState, command: ControlCommand, requestId: string, reply: ReplyContext | undefined,
+    waiting?: string[]): Promise<void> {
     try {
       for (let attempt = 0; ; attempt++) {
         try {
-          await this.#executeOnce(harness, member, command, requestId);
+          await this.#executeOnce(harness, member, command, requestId, waiting);
           member.controlRetry = undefined;
           return;
         } catch (error) {
@@ -781,7 +777,7 @@ export class DurableService {
     } finally { this.#kick(member); }
   }
 
-  async #executeOnce(harness: Harness, member: MemberState, command: ControlCommand, requestId: string): Promise<void> {
+  async #executeOnce(harness: Harness, member: MemberState, command: ControlCommand, requestId: string, waiting?: string[]): Promise<void> {
     const door = this.#runtimes.get(scopeKey(member.scope))!.door;
     // The caller holds the worker (#hold). A start that passed the gate before is finished first: its item arrived
     // before this control, so the cancel below covers it and the abort reaches its run.
@@ -793,15 +789,22 @@ export class DurableService {
     const conversation = member.conversationId === undefined ? undefined
       : await harness.conversation(member.conversationId as ConversationId, this.#context);
     if (conversation !== undefined) {
-      const voided = await harness.commit(async (tx) => {
+      const { voided, unstarted } = await harness.commit(async (tx) => {
         const inbox = await tx.doc(InboxDoc, conversation.id);
-        const cancelled = new Set<string>();
-        for (const item of inbox.items) if (receivedBefore(item, pending)) { item.cancelled = true; cancelled.add(item.requestId); }
+        const cancelled = new Set<string>(), unstarted: string[] = [];
+        for (const item of inbox.items) if (receivedBefore(item, pending)) {
+          // The worker is held and a start under way has finished (above): an item without a start never reached the model.
+          if (!item.cancelled && item.startedAt === undefined) unstarted.push(item.content);
+          item.cancelled = true; cancelled.add(item.requestId);
+        }
         // Attachments go with the requests that bound them; a /clear also voids the unbound ones received before it.
         // Held ones are part of a push reply, which a control of the model's work does not touch.
-        return voidWhere(await recordsOf(tx, member.phone), attachment => attachment.heldBy !== undefined ? false
+        const voided = voidWhere(await recordsOf(tx, member.phone), attachment => attachment.heldBy !== undefined ? false
           : attachment.boundTo !== undefined ? cancelled.has(attachment.boundTo) : command === "/clear" && arrivedBefore(attachment, pending), Date.now());
+        return { voided, unstarted };
       }, this.#context);
+      // A second attempt finds them cancelled already and adds nothing.
+      waiting?.push(...unstarted);
       // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
       await conversation.abort(this.#context, { background: true });
       this.#discard(member.scope, member.phone, voided);

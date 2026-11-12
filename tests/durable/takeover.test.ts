@@ -180,6 +180,36 @@ test("stop alone: the task and the waiting messages are cancelled, the member is
   } finally { await h.close(); }
 });
 
+test("stop, then say: what the stop cancelled unseen is quoted in the entry of the operator's next text, once; a text that could not be sent keeps it", async () => {
+  const h = harness();
+  try {
+    await h.service.start();
+    await h.ask(ALICE, "first question");
+    await until(() => h.answers().length === 1, "the first answer");
+    const { promise, resolve } = Promise.withResolvers<void>();
+    h.state.hold = promise;
+    await h.ask(ALICE, "second question");
+    await until(() => h.requests.length === 2, "the second request at the model");
+    await h.ask(ALICE, "third question");
+    // The operator stops the bot first and writes then.
+    await h.takeover.stop("direct", ALICE);
+    resolve();
+    h.state.hold = undefined;
+    const notes = async () => (await entries(h, "direct", ALICE)).filter(entry => entry.kind === OPERATOR_NOTE_KIND).map(entry => entry.parts.map(part => part.text ?? "").join(""));
+    expect(await notes()).toEqual([]);
+    h.failing.when = () => ({ status: "failed", reason: "平台拒绝" });
+    await expect(h.takeover.say("direct", ALICE, "我来处理")).rejects.toThrow("消息没有发出去");
+    expect(await notes()).toEqual([]);
+    delete h.failing.when;
+    expect(await h.takeover.say("direct", ALICE, "我来处理")).toEqual({ sent: "sent", recorded: true });
+    expect(await h.takeover.say("direct", ALICE, "再补一句")).toEqual({ sent: "sent", recorded: true });
+    expect(await notes()).toEqual([
+      "[人工回复] 用户发来的这些消息你没有处理，由管理员接手：\n「third question」\n管理员以你的名义直接回复了这位用户，用户已经看到：\n我来处理",
+      "[人工回复] 管理员以你的名义直接回复了这位用户，用户已经看到：\n再补一句",
+    ]);
+  } finally { await h.close(); }
+});
+
 test("a group conversation: the operator's message goes to the group and names the member", async () => {
   const h = harness();
   try {

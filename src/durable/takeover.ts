@@ -65,6 +65,8 @@ export function scopeOfSpace(space: string): Scope | undefined {
 
 /** Waiting messages quoted in the entry: this many, each this long. */
 const WAITING_SHOWN = 5, WAITING_CHARS = 500;
+/** Messages a stop cancelled unseen are quoted in the entry of a text the operator sends within this time. */
+const UNSEEN_KEPT_MS = 30 * 60_000;
 
 /**
  * The entry: what the operator told the member, after the member's messages the operator answered in the bot's place
@@ -81,8 +83,22 @@ export function operatorNote(text: string, at: number, waiting: readonly string[
 
 export class Takeover {
   readonly #options: TakeoverOptions;
+  /**
+   * By space and member: the messages stops cancelled before the model saw them, until an entry tells the model of them
+   * (the operator stops first and writes then, or a text could not be sent). In memory only.
+   */
+  readonly #unseen = new Map<string, { texts: string[]; at: number }>();
 
   constructor(options: TakeoverOptions) { this.#options = options; }
+
+  /** The member's unseen messages with these added. */
+  #keep(key: string, added: readonly string[]): string[] {
+    const now = (this.#options.now ?? Date.now)();
+    for (const [each, kept] of this.#unseen) if (now - kept.at > UNSEEN_KEPT_MS) this.#unseen.delete(each);
+    const texts = [...this.#unseen.get(key)?.texts ?? [], ...added].slice(-WAITING_SHOWN);
+    if (texts.length) this.#unseen.set(key, { texts, at: now });
+    return texts;
+  }
 
   /** The member of a conversation that exists, with the platform ID messages go to. */
   async #member(space: string, phone: string): Promise<{ scope: Scope; identity: DirectoryIdentity }> {
@@ -97,7 +113,7 @@ export class Takeover {
 
   async stop(space: string, phone: string): Promise<void> {
     const { scope } = await this.#member(space, phone);
-    await this.#options.host.halt(scope, phone);
+    this.#keep(`${space}\n${phone}`, (await this.#options.host.halt(scope, phone)).waiting);
   }
 
   async say(space: string, phone: string, raw: string): Promise<SayResult> {
@@ -106,7 +122,8 @@ export class Takeover {
     if ([...text].length > OPERATOR_TEXT_MAX) throw new TakeoverRefused(`一次最多发 ${OPERATOR_TEXT_MAX} 个字，请分几次发。`);
     const { scope, identity } = await this.#member(space, phone);
     // First the bot stops: its answer must not land beside the operator's.
-    const { waiting } = await this.#options.host.halt(scope, phone);
+    const key = `${space}\n${phone}`;
+    const waiting = this.#keep(key, (await this.#options.host.halt(scope, phone)).waiting);
     const { outbound, signal } = this.#options;
     const target: Target = scope.kind === "direct" ? { kind: "direct", receiveId: identity.imUserId } : { kind: "group", receiveId: scope.groupId };
     const segments = splitText(text);
@@ -127,6 +144,7 @@ export class Takeover {
     }, signal);
     // What the member has is what the bot is told.
     const recorded = await this.#record(scope, phone, delivered.join("\n"), waiting);
+    if (recorded) this.#unseen.delete(key);
     return { sent: outcome, recorded, ...(outcome === "partial" ? { segments: { sent: delivered.length, total: segments.length } } : {}) };
   }
 

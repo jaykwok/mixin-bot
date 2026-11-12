@@ -41,9 +41,9 @@ test.skipIf(process.platform !== "win32")("真实 PowerShell 服务函数和分�
     await writeFile(join(root, "snapshot.sqlite"), "synthetic");
     await writeFile(join(root, "ops/core/cli.ts"), "console.log(JSON.stringify(process.argv.slice(2))); process.exitCode=Number(process.env.FIXTURE_EXIT);\n");
     await writeFile(driver, "\ufeff" + [
-      "param([string]$Action,[switch]$Extra)", "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+      "param([string]$Action,[switch]$Surplus)", "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
       `. ${ps(join(repo, "scripts/lib/common.ps1"))}`,
-      `$Project=${ps(root)}; $OpsSource=$Project; $Command=$Action; $script:OpsInputNames=@('Command'); if($Extra){$script:OpsInputNames+='Group'}`,
+      `$Project=${ps(root)}; $OpsSource=$Project; $Command=$Action; $script:OpsInputNames=@('Command'); if($Surplus){$script:OpsInputNames+='Group'}`,
       `function Get-BunPath { ${ps(process.execPath)} }; function Err($text) { [Console]::Error.WriteLine($text) }`,
       `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(${ps(join(repo, "scripts/ops.ps1"))},[ref]$tokens,[ref]$errors); if($errors){throw 'syntax'}`,
       "function Test-PendingTransaction { return $false }",
@@ -90,10 +90,12 @@ test.skipIf(process.platform !== "win32")("真实 PowerShell 服务函数和分�
       const value = await run([action], 17); expect(value.exit, value.err).toBe(17);
       expect(JSON.parse(value.out)).toEqual([...target, "--project", root]);
     }
-    const extra = await run(["stop", "-Extra"], 0);
+    // The switch is not named with a leading E: security software that takes "-ExecutionPolicy Bypass ... -E..." for an encoded
+    // command holds such a process until the test's time is up.
+    const extra = await run(["stop", "-Surplus"], 0);
     expect(extra.exit).toBe(1); expect(extra.out).toBe(""); expect(extra.err).toContain("不适用的参数");
     for (const action of ["backup-scan", "backup-clean", "relay-ls", "relay-test", "relay-purge"]) {
-      const value = await run([action, "-Extra"], 0);
+      const value = await run([action, "-Surplus"], 0);
       expect(value.exit).toBe(1); expect(value.out).toBe(""); expect(value.err).toContain("不适用的参数");
     }
     const bytes = await readFile(join(repo, "scripts/ops.ps1")); expect([...bytes.subarray(0, 3)]).toEqual([239, 187, 191]);
