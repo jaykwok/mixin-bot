@@ -44,10 +44,7 @@ export function requirementText(push: Pick<Push, "mode" | "options">): string {
   return push.mode === "ack" ? "确认收到" : push.mode === "options" ? `选择：${push.options.join(" / ")}` : "需要回复（文字或附件）";
 }
 
-/**
- * A button and what its click brings back. Every value is a text: a client that keeps a button's data as texts sends
- * none of it once a number is among them (seen on the real platform: the click arrived with `data: null`).
- */
+/** A button and what its click brings back: an object of texts (`clickData` reads a version or an option either way). */
 function button(push: Pick<Push, "id">, version: number, index: number, name: string, action: CardAction, style: 1 | 2,
   extra: { option?: number; forward?: string } = {}): CardButton {
   return { name, type: "button", index, show: true, disabled: false, value: { placeholder: "action", value: action, style, url: "", method: "POST",
@@ -78,22 +75,22 @@ export function clickData(content: unknown): ClickData | undefined {
 }
 
 /**
- * What a click that `clickData` did not take looked like, for the log: the names of its fields and the kinds of their
- * values, never the values. A JSON text is looked into as `clickData` does; of another text, its length and which
- * punctuation of an encoding (JSON, a form, a URL) occurs in it.
+ * What a click event that `clickData` did not take looked like, for the log: the names of its fields and the kinds of
+ * their values, never the values, four levels deep. A JSON text is looked into as `clickData` does; of another text, its
+ * length and which punctuation of an encoding (JSON, a form, a URL) occurs in it.
  */
-export function clickShape(content: unknown, depth = 0): string {
-  if (typeof content === "string") {
+export function clickShape(value: unknown, depth = 0): string {
+  if (typeof value === "string") {
     let inner: unknown;
-    const plain = () => `string(${content.length}${content ? ` ${[..."{[=&%:\"'"].filter(mark => content.includes(mark)).join("")}`.trimEnd() : ""})`;
-    try { inner = JSON.parse(content); } catch { return plain(); }
+    const plain = () => `string(${value.length}${value ? ` ${[..."{[=&%:\"'"].filter(mark => value.includes(mark)).join("")}`.trimEnd() : ""})`;
+    try { inner = JSON.parse(value); } catch { return plain(); }
     return inner && typeof inner === "object" && depth < 3 ? `text:${clickShape(inner, depth + 1)}` : plain();
   }
-  if (Array.isArray(content)) return `array(${content.length})`;
-  if (!content || typeof content !== "object") return content === null ? "null" : typeof content;
-  const fields = Object.entries(content).slice(0, 12).map(([name, value]) =>
-    `${name.replace(/[^\w.-]/g, "?").slice(0, 24)}=${name === "data" && depth < 3 ? clickShape(value, depth + 1) : value === null ? "null" : Array.isArray(value) ? "array" : typeof value}`);
-  return `{${fields.join(" ")}}`.slice(0, 300);
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (!value || typeof value !== "object") return value === null ? "null" : typeof value;
+  if (depth > 3) return "object";
+  const fields = Object.entries(value).slice(0, 16).map(([name, inner]) => `${name.replace(/[^\w.-]/g, "?").slice(0, 24)}=${clickShape(inner, depth + 1)}`);
+  return `{${fields.join(" ")}}`.slice(0, 800);
 }
 
 /**

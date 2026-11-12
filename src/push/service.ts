@@ -949,10 +949,13 @@ export class PushService {
   click(event: StreamEvent): void {
     const payload = event.payload;
     const data = clickData(payload.content);
-    // Not a push card's click: what it looked like (field names and kinds only) tells a card of another feature from a
-    // click whose data arrived in a form this service does not read.
-    if (!data) { log.info(`忽略不属于推送的卡片点击（${clickShape(payload.content)}）`); return; }
     const userId = typeof payload.userId === "string" ? payload.userId : "", card = typeof payload.msgUid === "string" ? payload.msgUid : "";
+    // Not a push card's click: the card's message ID and what the event looked like (field names and kinds only) tell a
+    // card of another feature from a click whose data arrived in a form or a place this service does not read.
+    if (!data) {
+      log.info(`忽略不属于推送的卡片点击（卡片 ${/^[\x21-\x7e]{1,128}$/.test(card) ? card : "?"}）：${clickShape(payload)}`);
+      return;
+    }
     const groupId = typeof payload.groupId === "string" ? payload.groupId : "";
     if (!/^[\x21-\x7e]{1,128}$/.test(userId) || !/^[\x21-\x7e]{1,128}$/.test(card)) { log.warn("推送卡片点击缺少有效的 userId 或 msgUid，已丢弃"); return; }
     if (groupId && !GROUP_ID.test(groupId)) { log.warn("推送卡片点击的群号无效，已丢弃"); return; }

@@ -1290,13 +1290,19 @@ test("a button's click data is texts only, in every kind of card; a click whose 
     expect(h.store.recipient(id, ZHANG)!.choice).toBe(1);
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
-  expect(clickShape({ url: "", method: "POST", headers: {}, data: null })).toBe("{url=string method=string headers=object data=null}");
+  expect(clickShape({ url: "", method: "POST", headers: {}, data: null })).toBe("{url=string(0) method=string(4) headers={} data=null}");
   expect(clickData({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack", v: 0 }) })).toEqual({ push: "abcd1234", action: "ack", version: 0 });
   expect(clickData({ data: { k: "push", p: "abcd1234", a: "ack" } })).toBeUndefined();
-  expect(clickShape({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack" }) })).toBe("{url=string method=string headers=object data=text:{k=string p=string a=string}}");
-  expect(clickShape(JSON.stringify({ data: { k: "push", "odd name": 1, list: [1], none: null } }))).toBe("text:{data={k=string odd?name=number list=array none=null}}");
+  expect(clickShape({ url: "", method: "POST", headers: {}, data: JSON.stringify({ k: "push", p: "abcd1234", a: "ack" }) }))
+    .toBe("{url=string(0) method=string(4) headers={} data=text:{k=string(4) p=string(8) a=string(3)}}");
+  expect(clickShape(JSON.stringify({ data: { k: "push", "odd name": 1, list: [1], none: null } }))).toBe("text:{data={k=string(4) odd?name=number list=array(1) none=null}}");
   expect(clickShape({ data: "secret words" })).toBe("{data=string(12)}");
   expect(clickShape(undefined)).toBe("undefined");
+  // A whole event: every field, the extension fields looked into, a number-like ID a text; never a value.
+  expect(clickShape({ appId: 1929, userId: "6251174531257914689", msgUid: "CT4D-C3CN", content: { url: "", headers: { "x-a": "b" }, data: null },
+    extra: { button: { data: { k: "push" } } }, extraContent: JSON.stringify({ sessionId: "", action: { deep: { deeper: {} } } }) }))
+    .toBe("{appId=number userId=string(19) msgUid=string(9) content={url=string(0) headers={x-a=string(1)} data=null} "
+      + "extra={button={data={k=string(4)}}} extraContent=text:{sessionId=string(0) action={deep=object}}}");
 });
 
 test("confirming: a given deadline that has passed cancels the push; a default one starts now", async () => {
