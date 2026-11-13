@@ -5,14 +5,15 @@ import manifest from "../../package.json";
 export const APP_VERSION: string = manifest.version;
 
 /**
- * Data format version: whether this program can open the existing databases and directories. It changes only with the
- * storage format, not with every release.
+ * Data format version: whether this program can open the existing databases and directories. It changes with the storage
+ * format, not with every release.
  *
- * 4: application-shared workspace, per-space conversation databases under data/conversations, data/tmp,
- * data/state/stats.sqlite, and the state database with the push tables as src/push/store.ts creates them. Deployments of
- * earlier formats are not upgraded: deploy fresh and restore the statistics.
+ * 5: application-shared workspace, per-space conversation databases under data/conversations, data/tmp,
+ * data/state/stats.sqlite, and the state database with the push tables as src/push/store.ts creates them. Raised with
+ * 2.1.0, from which upgrades follow release tags: deployments of earlier versions, which upgraded from main, are deployed
+ * fresh instead. Deployments of earlier formats are not upgraded: deploy fresh and restore the statistics.
  */
-export const DATA_VERSION = 4;
+export const DATA_VERSION = 5;
 
 /**
  * Build identity: the commit the running code was built from, `-dirty` when built from a modified working tree. Set by

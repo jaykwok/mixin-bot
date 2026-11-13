@@ -57,7 +57,7 @@ for (const entry of ["current-data", ...(process.platform === "win32" ? ["powers
       if (entry !== "current-data") expect(text).toContain(`operation finished; exit=${status}`);
       if (status) expect(text).toContain("目录中已有数据但没有有效的版本标记");
       else {
-        expect(result.text).toContain("数据格式 4：全新安装");
+        expect(result.text).toContain(`数据格式 ${DATA_VERSION}：全新安装`);
         expect(result.text).not.toContain('"decisions"');
         expect(text).toContain("action=preview");
       }

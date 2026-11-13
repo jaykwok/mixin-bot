@@ -22,7 +22,7 @@ async function deployed(root: string): Promise<void> {
   await mkdir(join(root, "data/config"), { recursive: true });
   await mkdir(join(root, "data/state"), { recursive: true });
   await writeFile(join(root, "data/config/app-bot.json"), "{}");
-  await writeFile(join(root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "abcdef1234567890" }));
+  await writeFile(join(root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 5, appVersion: "2.0.0", build: "abcdef1234567890" }));
 }
 
 test("命令提示：控制台里指向页面，终端里是各平台自己的命令；没有页面的命令在控制台里也给命令", () => {

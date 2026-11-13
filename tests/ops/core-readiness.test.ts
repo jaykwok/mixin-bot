@@ -70,7 +70,7 @@ test("真实部署锁、磁盘维护状态和 HTTP 就绪通过后，服务控�
   try {
     await mkdir(join(f.root, "data/state"), { recursive: true });
     await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...body, port: server.port }));
-    await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+    await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 5, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
     const options: ServiceHostOptions = { project: f.root, source: f.root, readyTimeoutMs: 50,
       verify: async () => { expect(() => acquireDeploymentLock(f.root)).toThrow(); },
       finish: async result => { expect(() => acquireDeploymentLock(f.root)).toThrow(); published.push(result.outcome); },

@@ -2,26 +2,26 @@
 
 [返回运维手册](operations.md) · [部署与配置](deployment.md)
 
-**v2.0.1** 使用数据格式 4。更早的部署（使用数据格式 3 的 v2.0.0、v1.x 应用机器人，以及没有程序版本的 webhook 发布，代码见标签 `legacy-webhook`）**不能原地升级**：在新目录全新部署，会话、资料目录和配置都不迁移；v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](#恢复统计)），切换步骤见[从更早的版本切换](#从更早的版本切换)。
+**v2.1.0** 使用数据格式 5，从这个版本起升级只跟随正式发布（`vX.Y.Z` 标签）。更早的部署（使用数据格式 4 的 v2.0.1、数据格式 3 的 v2.0.0、v1.x 应用机器人，以及没有程序版本的 webhook 发布，代码见标签 `legacy-webhook`）**不能原地升级**：在新目录全新部署，会话、资料目录和配置都不迁移；v2.0.1、v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](#恢复统计)），切换步骤见[从更早的版本切换](#从更早的版本切换)。
 
 ## 版本与存储格式
 
 | 名称 | 来源 | 用途 |
 | --- | --- | --- |
-| 程序版本 | `package.json` 的 `version`（当前 2.0.1） | 发布与升级判断、控制台显示 |
-| 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 4） | 程序能否打开现有数据 |
+| 程序版本 | `package.json` 的 `version`（当前 2.1.0） | 发布与升级判断、控制台显示 |
+| 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 5） | 程序能否打开现有数据 |
 | 构建 | Git 提交（12 位，有已跟踪改动时带 `-dirty`） | 区分同一版本号的不同构建 |
 | 会话存储 schema | Pi Durable 的 SQLite schema（当前 2） | 依赖库内部格式，由数据格式一并约束 |
 | 统计 schema | 统计账本自己的版本（当前 3） | 统计账本格式，独立维护 |
 
-这几个数字互不对应：数据格式 4 与会话存储 schema 2、统计 schema 3 都没有关系，Pi 的包版本也不是数据格式。
+这几个数字互不对应：数据格式 5 与会话存储 schema 2、统计 schema 3 都没有关系，Pi 的包版本也不是数据格式。
 
 Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版程序无法再打开。本程序不使用这项自动升级：服务、离线维护和诊断在官方打开会话库之前先核对 schema，已有的会话库不是当前 schema 2（例如 Pi 1.3 时期未发布的测试库，或不是会话库的文件）就拒绝并原样保留文件，新库照常创建。部署和升级的数据校验、验证实例和最终提交也以只读连接逐个核对 `data/conversations/` 下已有的会话库（无法读取的同样拒绝），所以不兼容的库在提交之前就被拒绝，发布仍可回滚，而不是提交后业务启动才失败。未发布的测试数据请在新目录全新部署。
 
 部署提交时把**实际部署**的版本和数据所属的应用写入部署记录 `data/state/data-version.json`：
 
 ```json
-{ "dataVersion": 4, "appVersion": "2.0.1", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
+{ "dataVersion": 5, "appVersion": "2.1.0", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
 ```
 
 `application` 是平台环境与 AppID 的 SHA-256 摘要（不含 AppSecret，不保存 AppID 原文）。整个数据目录属于这一个应用：会话、成员身份、通讯录和待交付消息都不能跨应用或跨环境沿用。部署预检、验证实例、提交和服务启动都核对它，在打开通讯录、会话库或恢复任务之前拒绝不一致的配置；配置向导也不接受另一个 AppID 或环境。更换同一应用的 AppSecret 不受影响。要改用另一个应用，在新目录全新部署。
@@ -59,11 +59,11 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
 
 ## 从更早的版本切换
 
-旧目录的会话历史、资料目录、成员 tmp、索引和配置都不迁移；统计按[恢复统计](#恢复统计)恢复。旧目录里的命令按旧版本的目录结构执行：v2.0.0 从控制台（`bun run console`）管理，命令行入口是 `scripts/ops.sh` 和 `scripts\ops.ps1`；v1.x 和 webhook 发布的运维入口都是 `scripts/ops/ops.sh` 和 `scripts\ops\ops.ps1`。旧目录保留不动，确认新部署运行正常后再自行处理。
+旧目录的会话历史、资料目录、成员 tmp、索引和配置都不迁移；统计按[恢复统计](#恢复统计)恢复。旧目录里的命令按旧版本的目录结构执行：v2.0.1 和 v2.0.0 从控制台（`bun run console`）管理，命令行入口是 `scripts/ops.sh` 和 `scripts\ops.ps1`；v1.x 和 webhook 发布的运维入口都是 `scripts/ops/ops.sh` 和 `scripts\ops\ops.ps1`。旧目录保留不动，确认新部署运行正常后再自行处理。
 
-1. **处理旧外链对象**（配置过大文件外链时）：在旧目录用 `bun run relay list`（v1.x 的 Linux 为 `bash scripts/ops/ops.sh relay-ls`；v2.0.0 也可以在控制台「外链」页查看）查看仍在册的对象。旧服务停止后不会再按期删除它们：要么先用 `relay purge --all`（`relay-purge --all`）删除，要么确认存储桶的生命周期规则会清理，或稍后在对象存储控制台手动删除。新部署的外链账本不认识旧对象。
-2. **停止并删除旧部署**：仍在运行的旧服务会和新部署争用机器人端口，并用同一个应用机器人接收消息，所以必须先停止并删除。v2.0.0 的服务与新部署同名（`mixin-bot`）；v1.x 和 webhook 发布的容器和 Windows 计划任务都叫 `mixin-chatbot`。
-   - v2.0.0：在旧目录启动控制台（`bun run console`），在维护页「危险操作」中卸载（命令行为 `bash scripts/ops.sh uninstall`，Windows 以管理员运行 `scripts\ops.ps1 uninstall`）。它停止并删除服务；勾选“同时归档 `data/` 和 `logs/`”时它们移入旧目录的 `backup/rm`（统计账本随之在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`），不勾选则原样保留。
+1. **处理旧外链对象**（配置过大文件外链时）：在旧目录用 `bun run relay list`（v1.x 的 Linux 为 `bash scripts/ops/ops.sh relay-ls`；v2.0.1 和 v2.0.0 也可以在控制台「外链」页查看）查看仍在册的对象。旧服务停止后不会再按期删除它们：要么先用 `relay purge --all`（`relay-purge --all`）删除，要么确认存储桶的生命周期规则会清理，或稍后在对象存储控制台手动删除。新部署的外链账本不认识旧对象。
+2. **停止并删除旧部署**：仍在运行的旧服务会和新部署争用机器人端口，并用同一个应用机器人接收消息，所以必须先停止并删除。v2.0.1 和 v2.0.0 的服务与新部署同名（`mixin-bot`）；v1.x 和 webhook 发布的容器和 Windows 计划任务都叫 `mixin-chatbot`。
+   - v2.0.1 和 v2.0.0：在旧目录启动控制台（`bun run console`），在维护页「危险操作」中卸载（命令行为 `bash scripts/ops.sh uninstall`，Windows 以管理员运行 `scripts\ops.ps1 uninstall`）。它停止并删除服务；勾选“同时归档 `data/` 和 `logs/`”时它们移入旧目录的 `backup/rm`（统计账本随之在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`），不勾选则原样保留。
    - v1.x：在旧目录运行 `bash scripts/ops/ops.sh uninstall`（Windows 以管理员运行 `scripts\ops\ops.ps1 uninstall`）。它停止并删除实例；问到是否删除 `data/` 和 `logs/` 时，选“是”会把它们移入旧目录的 `backup/rm`（统计账本随之在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`），选“否”则原样保留。
    - webhook 发布：在旧目录运行 `bash scripts/ops/ops.sh stop` 或 `scripts\ops\ops.ps1 stop`，再退役旧入口并删除实例：
      - Cloudflare 模式：Windows 在旧目录以管理员运行 `scripts\ops\ops.ps1 uninstall-tunnel`（删除 `Cloudflared` 服务）；Linux 结束旧连接器进程（PID 记在旧目录 `data/state/cloudflared.pid`，先用 `ps -p <PID> -o args=` 核对是旧项目根目录下的 `cloudflared`）。随后在 Cloudflare 控制台删除机器人子域名的公开路由、对应 DNS 记录和不再使用的隧道。
@@ -76,9 +76,9 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
 
 ### 恢复统计
 
-导入工具把保存下来的统计账本（统计 schema 3，即 v1.x、v2.0.0 和当前版本的 `stats.sqlite`）恢复到新部署的**空账本**：按天、按成员的提问数，以及按天、按成员、按模型和工具的 token 用量汇总。会话不会恢复。webhook 发布的统计（schema 2）本版本不接受：需要时先用 v1.0.1 部署导入它，再从那份账本恢复。
+导入工具把保存下来的统计账本（统计 schema 3，即 v1.x、v2.0.0、v2.0.1 和当前版本的 `stats.sqlite`）恢复到新部署的**空账本**：按天、按成员的提问数，以及按天、按成员、按模型和工具的 token 用量汇总。会话不会恢复。webhook 发布的统计（schema 2）本版本不接受：需要时先用 v1.0.1 部署导入它，再从那份账本恢复。
 
-1. 找到账本：v2.0.0 和 v1.x 的都是旧目录的 `data/state/stats.sqlite`（卸载时归档了 `data/` 的，在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`）；旧服务须已停止。不用复制或改名；同目录有 `stats.sqlite-wal` 时一并选择。
+1. 找到账本：v2.0.1、v2.0.0 和 v1.x 的都是旧目录的 `data/state/stats.sqlite`（卸载时归档了 `data/` 的，在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`）；旧服务须已停止。不用复制或改名；同目录有 `stats.sqlite-wal` 时一并选择。
 2. 选择文件并导入，任选一种：
    - 控制台 **统计** 页的“导入统计”：填写运行控制台的宿主机上的文件路径，或从自己的电脑上传数据库（有 `-wal` 时一并选择）。先只读预览将导入的提问数、成员日、token 和日期范围，确认后执行。
    - Windows 运行 `scripts\ops.ps1 stat-import`，不带路径时弹出系统“打开文件”对话框；也可以直接 `scripts\ops.ps1 stat-import <路径>`。

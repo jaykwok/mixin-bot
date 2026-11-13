@@ -37,7 +37,7 @@ async function fixture() {
   const f = await tempFixture("core-runtime-");
   for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
   for (const dir of ["data/config", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 4, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 5, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
   const config = join(f.root, "data/config/runtime.json"); await writeFile(config, original);
   const draft = await writeRuntimeDraft(await readRuntimeSettings(config), { BOT_MAX_ACTIVE_REQUESTS: "64" }, config);
   prepareConsoleDir(join(f.root, ".console"));
