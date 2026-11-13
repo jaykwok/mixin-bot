@@ -309,17 +309,19 @@ export class TaskStore {
   eventReader(id: string, after: number, window = Infinity): () => TaskEvent[] {
     if (!number(after)) throw new Error("事件序号无效");
     const path = join(this.dir(id), "events.jsonl");
-    let offset = 0, seq = 0, inode: number | undefined;
+    // The file's identity in full: an NTFS file ID is wider than a JavaScript number keeps exactly.
+    let offset = 0, seq = 0, inode: bigint | undefined;
     return () => {
       let stat;
-      try { stat = lstatSync(path); }
+      try { stat = lstatSync(path, { bigint: true }); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT" && inode === undefined) return []; throw error; }
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > EVENT_LIMIT || stat.size < offset || (inode !== undefined && stat.ino !== inode)) {
+      const size = Number(stat.size);
+      if (!stat.isFile() || stat.isSymbolicLink() || size > EVENT_LIMIT || size < offset || (inode !== undefined && stat.ino !== inode)) {
         throw new Error("事件文件无效");
       }
       inode = stat.ino;
-      if (stat.size === offset) return [];
-      const added = Buffer.alloc(stat.size - offset), fd = openSync(path, "r");
+      if (size === offset) return [];
+      const added = Buffer.alloc(size - offset), fd = openSync(path, "r");
       let length = 0;
       try { for (let got = 1; got && length < added.length; length += got) got = readSync(fd, added, length, added.length - length, offset + length); }
       finally { closeSync(fd); }

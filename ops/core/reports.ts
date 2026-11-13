@@ -4,14 +4,15 @@ import { validateOpsReports, type OpsReports } from "../../src/contracts/ops-rep
 
 export const reportsPath = (project: string) => join(project, "tmp/backup-cleanup");
 function directory(path: string) {
-  const info = lstatSync(path);
+  // The identity in full: an NTFS file ID is wider than a JavaScript number keeps exactly.
+  const info = lstatSync(path, { bigint: true });
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("备份报告路径不是普通目录，未改变权限");
   return info;
 }
 export function inspectReports(project: string): OpsReports {
   directory(join(project, "tmp")); const info = directory(reportsPath(project));
-  if (process.platform !== "win32" && info.mode & 0o022) throw new Error("备份报告目录允许其他身份写入，未改变权限");
-  return { dev: String(info.dev), ino: String(info.ino), uid: info.uid, gid: info.gid };
+  if (process.platform !== "win32" && info.mode & 0o022n) throw new Error("备份报告目录允许其他身份写入，未改变权限");
+  return { dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid), gid: Number(info.gid) };
 }
 export function checkReports(project: string, expected: OpsReports): void {
   validateOpsReports(expected);

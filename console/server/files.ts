@@ -202,8 +202,9 @@ async function list(host: Host, purpose: BrowsePurpose, dir: string, hidden: boo
   const deadline = Date.now() + LIST_BUDGET_MS, items: Item[] = [];
   // The entry the path names. Windows and macOS usually ignore case, so a typed path may differ in case from the listed
   // name; but a macOS volume (or a Windows directory) may tell case apart and hold both. The exact name wins, and a name
-  // differing only in case is the same entry only when it is the same file.
-  const target = keep === null ? null : await lstat(join(dir, keep)).catch(() => null);
+  // differing only in case is the same entry only when it is the same file (identity in full: an NTFS file ID is wider
+  // than a JavaScript number keeps exactly).
+  const target = keep === null ? null : await lstat(join(dir, keep), { bigint: true }).catch(() => null);
   const folded = keep !== null && target && host.platform !== "linux" ? keep.toLowerCase() : null;
   const aliases: Item[] = [];
   let truncated = false, kept: Item | null = null;
@@ -218,7 +219,7 @@ async function list(host: Host, purpose: BrowsePurpose, dir: string, hidden: boo
     }
   } catch (error) { throw unreadable(dir, error); }
   for (const alias of aliases) {
-    const info = kept ? null : await lstat(join(dir, alias.name)).catch(() => null);
+    const info = kept ? null : await lstat(join(dir, alias.name), { bigint: true }).catch(() => null);
     if (info && target && info.dev === target.dev && info.ino === target.ino) kept = alias;
     // Another file: listed like any other.
     else if (hidden || !hiddenName(alias.name, host.platform)) {

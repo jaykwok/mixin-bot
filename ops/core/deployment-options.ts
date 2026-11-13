@@ -202,7 +202,7 @@ export async function deploymentScope(project: string, operation: DeploymentOper
     const portFile = readFileSync(join(project, ".console/port"), "utf8");
     if (options.port === parsePort(portFile, "控制台 ")) throw new Error("机器人目标端口与控制台端口相同，未停止机器人");
     if (options.workspace) {
-      const path = realpathSync(options.workspace), stat = lstatSync(path);
+      const path = realpathSync(options.workspace), stat = lstatSync(path, { bigint: true });
       if (!stat.isDirectory()) throw new Error("共享资料目录不存在或不是目录");
       workspaceIdentity = [path, String(stat.dev), String(stat.ino)];
     }
@@ -242,7 +242,7 @@ export async function installScope(project: string, params: Record<string, unkno
   if (options.port === parsePort(readFileSync(join(project, ".console/port"), "utf8"), "控制台 ")) throw new Error("机器人端口与控制台端口相同，请换一个端口");
   let workspaceIdentity: unknown = null;
   if (options.workspace) {
-    const path = realpathSync(options.workspace), stat = lstatSync(path);
+    const path = realpathSync(options.workspace), stat = lstatSync(path, { bigint: true });
     if (!stat.isDirectory()) throw new Error("共享资料目录不存在或不是目录");
     workspaceIdentity = [path, String(stat.dev), String(stat.ino)];
   }
