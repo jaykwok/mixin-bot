@@ -68,9 +68,9 @@ import { checkpoints, quietHours } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
 import { CARD_MAX_CHARS, clickData, type ClickData, clickShape, countsText, type Counts, forwardCard, phoneTail, previewCard, type Reach, reachText, recipientCard,
   requirementText, shortTime, summaryCard } from "./cards.ts";
-import { buildSummary, type HeldFile, replyItems, replyText, senders, type SummaryPackage, writeCheckSheet } from "./summary.ts";
-import { type ChatGroup, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
-  type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, type TargetDepartment, type TargetGroup } from "./store.ts";
+import { buildSummary, type HeldFile, replyIndex, replyText, senders, type SummaryPackage, writeCheckSheet } from "./summary.ts";
+import { type ChatGroup, delivered, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
+  type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, shownSend, type TargetDepartment, type TargetGroup } from "./store.ts";
 
 export const PUSH_LIMITS = {
   defaultDeadlineMs: 3 * 24 * 3600_000,
@@ -353,6 +353,17 @@ export class PushService {
   readonly #fileIds = new Map<string, { id: Promise<string>; at: number }>();
   /** Pushes whose files are being copied: their directories have no record yet. */
   readonly #preparing = new Set<string>();
+  /**
+   * `<push>\n<member>`: reply attachments whose hold failed, tried again on the tick (and before the summary is built), or
+   * that another push still held while it released them, tried again once that release ended.
+   */
+  readonly #unheld = new Map<string, { pushId: string; member: string; ids: Set<string> }>();
+  /** `<member>\n<attachment>`: releases of withdrawn or replaced replies not yet ended (#release), how many. */
+  readonly #releasing = new Map<string, number>();
+  /** Holds under way, by push (#holdsSettled). */
+  readonly #holdsUnderWay = new Map<string, Set<Promise<boolean>>>();
+  /** The holds of the startup (#holdReplies); never rejects. */
+  #startupHolds: Promise<void> = Promise.resolve();
   #filesSweptAt: number | undefined;
   #host?: PushHost;
   #timer?: ReturnType<typeof setInterval>;
@@ -379,7 +390,8 @@ export class PushService {
     if (settled) log.warn(`推送：${settled} 张卡片在上次服务中断时正在发送，结果未知，按已发出处理`);
     this.#dropSuperseded();
     this.#sweepPackages();
-    this.#track(this.#holdReplies());
+    this.#startupHolds = this.#holdReplies().catch(error => { if (!this.#signal.aborted) this.#report(error); });
+    this.#track(this.#startupHolds);
     this.#timer = setInterval(() => this.tick(), this.#limits.tickMs);
     this.#timer.unref?.();
     this.tick();
@@ -840,12 +852,12 @@ export class PushService {
     if (id) {
       const push = this.#store.push(id.trim().toLowerCase());
       if (!push || push.pusher !== phone) throw new PushRefused(`没有你发起的推送 ${id}。`);
-      const recipients = this.#store.recipients(push.id), items = this.#store.items(push.id), forwards = this.#store.forwards(push.id, "confirmed");
+      const recipients = this.#store.recipients(push.id), replyOf = replyIndex(this.#store.items(push.id)), forwards = this.#store.forwards(push.id, "confirmed");
       const lines = [this.#statusLine(push, recipients, now), ""];
       for (const recipient of recipients.slice(0, 100)) {
         const who = memberGroup(recipient.member) === undefined ? `${recipient.name}（尾号 ${phoneTail(recipient.member)}）` : `群 ${recipient.name}`;
         const by = forwards.find(forward => forward.to === recipient.member), to = forwards.filter(forward => forward.from === recipient.member);
-        lines.push(`- ${who}${by ? `（${recipients.find(each => each.member === by.from)?.name ?? "别人"} 转来）` : ""}：${this.#personState(push, recipient, items)}`
+        lines.push(`- ${who}${by ? `（${recipients.find(each => each.member === by.from)?.name ?? "别人"} 转来）` : ""}：${this.#personState(push, recipient, replyOf(recipient))}`
           + (to.length ? `；已转给 ${to.map(forward => forward.toName).join("、")}` : "") + valuesNote(push, recipient.values, by ? "转来的内容" : "内容"));
       }
       if (recipients.length > 100) lines.push(`……共 ${reachText(reachOf(recipients))}，其余见控制台推送页。`);
@@ -866,32 +878,33 @@ export class PushService {
 
   /** Counts of a push, as the summary and push_status word them. */
   #tally(push: Push, recipients: readonly Recipient[]): string {
-    const delivered = recipients.filter(recipient => recipient.sendState === "sent" || recipient.sendState === "uncertain");
-    const failed = recipients.filter(recipient => recipient.sendState === "failed").length;
+    const reached = recipients.filter(delivered);
+    const failed = recipients.filter(recipient => recipient.sendState === "failed" && !delivered(recipient)).length;
     const head = `共 ${reachText(reachOf(recipients))}${failed ? `（发送失败 ${failed}）` : ""}`;
     // Handed on without an answer of their own: neither answered nor waited for.
     const handed = this.#handed(push.id), none = new Set<string>();
-    const passed = delivered.filter(recipient => handed.has(recipient.member) && !this.#answered(push, recipient, none)).length;
+    const passed = reached.filter(recipient => handed.has(recipient.member) && !this.#answered(push, recipient, none)).length;
     const also = passed ? `，已转派 ${passed}` : "";
     if (push.mode === "ack") {
-      const acked = delivered.filter(recipient => recipient.ackedAt !== null).length;
-      return `${head}；已确认 ${acked}${also}，未确认 ${delivered.length - acked - passed}`;
+      const acked = reached.filter(recipient => recipient.ackedAt !== null).length;
+      return `${head}；已确认 ${acked}${also}，未确认 ${reached.length - acked - passed}`;
     }
     if (push.mode === "options") {
-      const counts = push.options.map((option, index) => `${option} ${delivered.filter(recipient => recipient.choice === index).length}`);
-      return `${head}；${counts.join("，")}${also}，未选择 ${delivered.filter(recipient => recipient.choice === null).length - passed}`;
+      const counts = push.options.map((option, index) => `${option} ${reached.filter(recipient => recipient.choice === index).length}`);
+      return `${head}；${counts.join("，")}${also}，未选择 ${reached.filter(recipient => recipient.choice === null).length - passed}`;
     }
-    const acked = delivered.filter(recipient => recipient.ackedAt !== null).length, replied = delivered.filter(recipient => recipient.repliedAt !== null).length;
-    return `${head}；已确认 ${acked}，已回复 ${replied}${also}，未回复 ${delivered.length - replied - passed}`;
+    const acked = reached.filter(recipient => recipient.ackedAt !== null).length, replied = reached.filter(recipient => recipient.repliedAt !== null).length;
+    return `${head}；已确认 ${acked}，已回复 ${replied}${also}，未回复 ${reached.length - replied - passed}`;
   }
 
-  #personState(push: Push, recipient: Recipient, items: readonly ReplyItem[]): string {
-    if (recipient.sendState === "failed") return `发送失败（${recipient.sendError ?? "原因未知"}）`;
-    if (recipient.sendState === "pending" || recipient.sendState === "sending") return "未发出";
+  #personState(push: Push, recipient: Recipient, own: readonly ReplyItem[]): string {
+    if (!delivered(recipient)) {
+      if (recipient.sendState === "failed") return `发送失败（${recipient.sendError ?? "原因未知"}）`;
+      if (recipient.sendState === "pending" || recipient.sendState === "sending") return "未发出";
+    }
     const clicks = memberGroup(recipient.member) === undefined ? "" : `，群里共点击 ${recipient.clicks} 次`;
     if (push.mode === "ack") return recipient.ackedAt === null ? "未确认" : `已确认（${shortTime(recipient.ackedAt, this.#now())}${clicks}）`;
     if (push.mode === "options") return recipient.choice === null ? "未选择" : `选择「${push.options[recipient.choice]}」`;
-    const own = replyItems(recipient, items);
     if (!own.length) return recipient.ackedAt === null ? "未确认，未回复" : "已确认，未回复";
     const text = replyText(own), files = own.filter(item => item.kind !== "text").map(item => item.name ?? "附件");
     return `已回复：${text ? truncate(oneLine(text), 200) : "（没有文字）"}${files.length ? `；附件：${files.join("、")}` : ""}`;
@@ -1121,7 +1134,7 @@ export class PushService {
   /** Recipients without an answer: delivered and neither answered nor handed on, or never reached. */
   #unanswered(push: Push): Recipient[] {
     const handed = this.#handed(push.id);
-    return this.#store.recipients(push.id).filter(recipient => recipient.sendState === "failed" || !this.#answered(push, recipient, handed));
+    return this.#store.recipients(push.id).filter(recipient => (recipient.sendState === "failed" && !delivered(recipient)) || !this.#answered(push, recipient, handed));
   }
 
   /** Answered; whoever handed the push on (`handed`) counts as that too. */
@@ -1162,8 +1175,14 @@ export class PushService {
   #resend(push: Push, members?: readonly string[]): Recipient[] {
     const chosen = this.#unanswered(push).filter(recipient => (!members || members.includes(recipient.member))
       && recipient.sendState !== "pending" && recipient.sendState !== "sending");
+    const now = this.#now();
     this.#store.transaction(() => {
-      for (const recipient of chosen) this.#store.updateRecipient(push.id, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null });
+      // The card they have keeps counting whatever becomes of this send (`delivered`); one whose result was unknown
+      // (an interrupted send) gets the time it is known to count from.
+      for (const recipient of chosen) {
+        this.#store.updateRecipient(push.id, recipient.member, { sendState: "pending", sendAttempts: 0, retryAt: null, sendError: null, card: null,
+          ...(recipient.sentAt === null && delivered(recipient) ? { sentAt: now } : {}) });
+      }
     });
     return chosen;
   }
@@ -1224,20 +1243,20 @@ export class PushService {
   detail(id: string): PushDetail {
     const push = this.#store.push(id);
     if (!push) throw new PushRefused("推送不存在");
-    const recipients = this.#store.recipients(id), items = this.#store.items(id), forwards = this.#store.forwards(id, "confirmed");
-    const handed = new Set(forwards.map(forward => forward.from));
+    const recipients = this.#store.recipients(id), replyOf = replyIndex(this.#store.items(id)), forwards = this.#store.forwards(id, "confirmed");
+    const handed = new Set(forwards.map(forward => forward.from)), names = new Map(recipients.map(each => [each.member, each.name]));
     return {
       push: { ...this.#listItem(push, this.#store.recipientCounts([id]).get(id)), body: push.body, options: push.options, defaultDeadline: push.defaultDeadline, target: push.target, cc: push.cc,
         files: push.files, fields: push.fields, summaryError: push.summaryError, summaryAt: push.summaryAt, remind: push.remind, reminded: push.reminded, checkpoints: push.checkpoints },
       recipients: recipients.map(recipient => {
-        const own = replyItems(recipient, items), text = replyText(own);
-        return { member: recipient.member, name: recipient.name, values: recipient.values, sendState: recipient.sendState, sendError: recipient.sendError, sentAt: recipient.sentAt,
+        const own = replyOf(recipient), text = replyText(own);
+        return { member: recipient.member, name: recipient.name, values: recipient.values, ...shownSend(recipient), sentAt: recipient.sentAt,
           ackedAt: recipient.ackedAt, clicks: recipient.clicks, choice: recipient.choice === null ? null : push.options[recipient.choice] ?? null, choiceAt: recipient.choiceAt,
           repliedAt: recipient.repliedAt,
-          answered: (recipient.sendState === "sent" || recipient.sendState === "uncertain") && this.#answered(push, recipient, handed),
+          answered: delivered(recipient) && this.#answered(push, recipient, handed),
           reply: own.length ? { text: chars(text) > 2000 ? truncate(text, 2000) : text,
             files: own.filter(item => item.kind !== "text").map(item => ({ name: item.name ?? "附件", size: item.size, kind: item.kind })), senders: senders(own) } : null,
-          forwardedBy: forwards.flatMap(forward => forward.to === recipient.member ? [recipients.find(each => each.member === forward.from)?.name ?? forward.from] : [])[0] ?? null,
+          forwardedBy: forwards.flatMap(forward => forward.to === recipient.member ? [names.get(forward.from) ?? forward.from] : [])[0] ?? null,
           forwardedTo: forwards.filter(forward => forward.from === recipient.member).map(forward => forward.toName) };
       }),
     };
@@ -1348,6 +1367,7 @@ export class PushService {
     if (target.phone === speaker.phone) throw new PushRefused("不能转给成员自己。");
     if (target.phone === push.pusher) throw new PushRefused(`${target.name} 就是这条推送的推送人，不用转。`);
     if (this.#listed(push.id, target.phone)) throw new PushRefused(`${target.name} 已经在「${push.subject}」的名单里，不用转。`);
+    if (this.#ownValues(push, target.phone, recipient)) throw new PushRefused(this.#ownValuesText(push, target.name, "成员"));
     const now = this.#now();
     const forward: Forward = { id: this.#newId(id => this.#store.forward(id) !== undefined), pushId: push.id, from: speaker.phone, to: target.phone, toName: target.name,
       state: "pending", card: null, version: 0, createdAt: now, decidedAt: null };
@@ -1372,10 +1392,25 @@ export class PushService {
       + (outcome.status === "uncertain" ? "（确认卡片的发送结果不确定，成员没收到的话请重新提出。）" : "");
   }
 
+  /**
+   * The person was a recipient with their own values, whose card never got there: one row holds one person's values, so
+   * handing them the push would send them the values of who hands it on in place of their own (or the other way round).
+   */
+  #ownValues(push: Push, member: string, from: Recipient): boolean {
+    const row = this.#store.recipient(push.id, member);
+    return push.fields.length > 0 && row !== undefined && !delivered(row) && JSON.stringify(row.values) !== JSON.stringify(from.values);
+  }
+
+  /** `whose`: 成员 (the model's answer) or 你 (the member's own text). */
+  #ownValuesText(push: Push, name: string, whose: "成员" | "你"): string {
+    return `${name} 本来就在「${push.subject}」的名单里，有自己的一份内容，只是卡片没有发出去；不能再把${whose}的这一份转给 ${name}，没有转。`
+      + "可以转给别人，或者请推送人处理。";
+  }
+
   /** In the push's list already; a person whose card could not be delivered may be handed the push (again). */
   #listed(pushId: string, member: string): boolean {
     const row = this.#store.recipient(pushId, member);
-    return row !== undefined && !(row.sendState === "failed" && row.retryAt === null);
+    return row !== undefined && (delivered(row) || !(row.sendState === "failed" && row.retryAt === null));
   }
 
   /** 「确认转派」 or 「取消」 on the card that asked (only the recipient's click counts). */
@@ -1397,12 +1432,18 @@ export class PushService {
     else if (!recipient || !LIVE_STATES.includes(push.state)) drop(`「${push.subject}」已经结束，没有转给 ${forward.toName}。`);
     else if (!target) drop(`${forward.toName} 已经不在机器人同步的通讯录里，「${push.subject}」没有转出去。`);
     else if (this.#listed(push.id, forward.to)) drop(`${forward.toName} 已经在「${push.subject}」的名单里，没有再转。`);
+    else if (this.#ownValues(push, forward.to, recipient)) drop(this.#ownValuesText(push, forward.toName, "你"));
     else {
       this.#atomic(() => {
         this.#store.updateForward(forward.id, { state: "confirmed", decidedAt: now, version: forward.version + 1 });
-        // A card that could not be delivered before is tried afresh.
-        if (this.#store.recipient(push.id, forward.to)) this.#store.updateRecipient(push.id, forward.to, { sendState: "pending", sendAttempts: 0, sendError: null, retryAt: null });
-        else this.#store.addRecipient(this.#recipientRow(push.id, { ...personReached(target), values: recipient.values }));
+        // A card that could not be delivered before is tried afresh, as the directory knows the person now, with what
+        // the one handing it on has (the same values: #ownValues). The files that went out went to the ID they had then:
+        // to a new ID they all go again.
+        const { name, receiveId } = personReached(target), row = this.#store.recipient(push.id, forward.to);
+        if (row) {
+          this.#store.updateRecipient(push.id, forward.to, { name, receiveId, values: recipient.values, sendState: "pending", sendAttempts: 0, sendError: null, retryAt: null, card: null,
+            ...(row.receiveId !== receiveId ? { filesSent: 0 } : {}) });
+        } else this.#store.addRecipient(this.#recipientRow(push.id, { ...personReached(target), values: recipient.values }));
         const data = { push: push.id, event: "forward", forward: forward.id };
         this.#note(DIRECT_SCOPE, forward.from, `forward:${forward.id}`, `[推送转派] 已把 ${push.pusherName} 推送的「${quoted(push.subject)}」转给 ${target.name}。推送编号 ${push.id}`, data);
         this.#note(DIRECT_SCOPE, push.pusher, `forwarded:${forward.id}`, `[推送转派] ${recipient.name} 把「${quoted(push.subject)}」转给了 ${target.name}。推送编号 ${push.id}`, data);
@@ -1448,7 +1489,7 @@ export class PushService {
   #reachedPush(scope: Scope, phone: string, id: string): { push: Push; recipient: Recipient } {
     const found = this.#store.push(String(id ?? "").trim().toLowerCase());
     const recipient = found && this.#store.recipient(found.id, this.#memberOf(scope, phone));
-    if (!found || !recipient || (recipient.sendState !== "sent" && recipient.sendState !== "uncertain") || found.state === "preview") {
+    if (!found || !recipient || !delivered(recipient) || found.state === "preview") {
       throw new PushRefused(`没有发给${scope.kind === "group" ? "本群" : "这位成员"}的推送 ${String(id ?? "")}；编号见请求末尾“[推送]”一段。`);
     }
     if (this.#closeIfDue(found) || !LIVE_STATES.includes(found.state)) throw new PushRefused(`「${found.subject}」已经结束，不能再改了。`);
@@ -1617,22 +1658,113 @@ export class PushService {
     return { already: already && !replace, counts: countsOf(after), held: arrived.map(file => file.id), lost };
   }
 
-  /** The reply's attachments stay with the push until its summary went out (again at startup, should a process end before this). */
-  async #hold(pushId: string, member: string, ids: readonly string[]): Promise<void> {
-    if (!ids.length || memberGroup(member) !== undefined) return;
-    try { await this.#host!.holdAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids); }
-    catch (error) { if (!this.#signal.aborted) this.#report(error); }
+  /**
+   * The reply's attachments stay with the push until its summary went out (again at startup, should a process end before
+   * this). A hold that fails is tried again on the tick. One the records refuse because another push still holds the
+   * attachment while it releases it (the reply there was withdrawn or replaced) is tried again once that release ended;
+   * any other refusal (the attachment was voided, or another push holds it) is not, and the summary lists the file as
+   * missing. False when it failed or waits for such a release.
+   */
+  #hold(pushId: string, member: string, ids: readonly string[]): Promise<boolean> {
+    if (!ids.length || memberGroup(member) !== undefined) return Promise.resolve(true);
+    const run = this.#holdNow(pushId, member, ids);
+    const underWay = this.#holdsUnderWay.get(pushId) ?? new Set<Promise<boolean>>();
+    underWay.add(run);
+    this.#holdsUnderWay.set(pushId, underWay);
+    void run.finally(() => {
+      underWay.delete(run);
+      if (!underWay.size && this.#holdsUnderWay.get(pushId) === underWay) this.#holdsUnderWay.delete(pushId);
+    });
+    return run;
   }
 
-  /** At startup: the attachments of the replies to live pushes are held (a process may have ended between the record and the hold). */
+  /**
+   * The push's holds have settled: the startup's, those under way, and those that failed, tried once more. True while
+   * some still fail. A file the push does not hold is not in its summary, and a hold that ended after the release would
+   * stay for good: the summary and the release wait for this.
+   */
+  async #holdsSettled(pushId: string): Promise<boolean> {
+    await this.#holdsDone(pushId);
+    return this.#holdFailed(pushId);
+  }
+
+  /** The startup's holds and those of the push under way have ended (a release waits for them, or they land after it). */
+  async #holdsDone(pushId: string): Promise<void> {
+    await this.#startupHolds;
+    await Promise.all(this.#holdsUnderWay.get(pushId) ?? []);
+  }
+
+  async #holdNow(pushId: string, member: string, ids: readonly string[]): Promise<boolean> {
+    const key = `${pushId}\n${member}`;
+    // Read before the hold: a release that ends while it runs may have come before or after it.
+    const releasing = ids.filter(id => this.#releasing.has(`${member}\n${id}`));
+    try {
+      const held = await this.#host!.holdAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids);
+      const kept = this.#unheld.get(key);
+      if (kept) { for (const id of ids) kept.ids.delete(id); if (!kept.ids.size) this.#unheld.delete(key); }
+      const missed = ids.length - held, waiting = missed ? releasing : [];
+      if (missed > waiting.length) log.warn(`推送 ${pushId}：${missed - waiting.length} 个回复附件已经失效或在别的推送里，汇总里会缺这几个`);
+      if (!waiting.length) return true;
+      // Another push may still hold these until its release ends (#releaseEnded tries them again); one ended meanwhile.
+      this.#keepUnheld(pushId, member, waiting);
+      if (!waiting.some(id => this.#releasing.has(`${member}\n${id}`))) this.#track(this.#holdFailed(pushId));
+      return false;
+    } catch (error) {
+      if (this.#signal.aborted) return false;
+      this.#report(error);
+      this.#keepUnheld(pushId, member, ids);
+      return false;
+    }
+  }
+
+  #keepUnheld(pushId: string, member: string, ids: readonly string[]): void {
+    const key = `${pushId}\n${member}`, kept = this.#unheld.get(key) ?? { pushId, member, ids: new Set<string>() };
+    for (const id of ids) kept.ids.add(id);
+    this.#unheld.set(key, kept);
+  }
+
+  /** The tick: the holds that failed. */
+  async #holdAgain(): Promise<void> {
+    if (this.#holdingAgain || !this.#unheld.size) return;
+    this.#holdingAgain = true;
+    try { for (const pushId of new Set([...this.#unheld.values()].map(each => each.pushId))) await this.#holdFailed(pushId); }
+    finally { this.#holdingAgain = false; }
+  }
+  #holdingAgain = false;
+
+  /** The push's holds that failed, tried again for the attachments still in the reply (one withdrawn since is not); true while some still fail. */
+  async #holdFailed(pushId: string): Promise<boolean> {
+    let failing = false;
+    for (const [key, { pushId: id, member, ids }] of [...this.#unheld]) {
+      if (id !== pushId) continue;
+      // Once the summary is built a hold is no use, and one taken after the release would stay for good.
+      const wanted = this.#holdable(pushId) ? this.#store.items(pushId, member).flatMap(item => item.attachment && ids.has(item.attachment) ? [item.attachment] : []) : [];
+      if (!wanted.length) { this.#unheld.delete(key); continue; }
+      if (!await this.#hold(pushId, member, wanted)) failing = true;
+    }
+    return failing;
+  }
+
+  /**
+   * At startup: the attachments of the replies to pushes whose summary is still to be built are held (a process may have
+   * ended between the record and the hold, or while a failed hold waited for the tick).
+   */
   async #holdReplies(): Promise<void> {
     if (!this.#host) return;
-    for (const push of this.#store.pushesIn(LIVE_STATES)) {
-      const items = this.#store.items(push.id).filter(item => item.attachment !== null);
-      for (const member of new Set(items.map(item => item.member))) {
-        await this.#hold(push.id, member, items.flatMap(item => item.member === member ? [item.attachment!] : []));
+    for (const push of [...this.#store.pushesIn(LIVE_STATES), ...this.#store.pushesIn(["closed"]).filter(push => push.summaryState === "pending")]) {
+      const members = new Set(this.#store.items(push.id).flatMap(item => item.attachment !== null ? [item.member] : []));
+      for (const member of members) {
+        // Read again for each member: one may have withdrawn or replaced their reply while the holds before ran.
+        if (!this.#holdable(push.id)) break;
+        await this.#hold(push.id, member, this.#store.items(push.id, member).flatMap(item => item.attachment !== null ? [item.attachment] : []));
       }
     }
+  }
+
+  /** A hold still serves the push: it takes replies, or its summary is still to be built. */
+  #holdable(pushId: string): boolean {
+    const push = this.#store.push(pushId);
+    return push !== undefined && (LIVE_STATES.includes(push.state) || (push.state === "closed" && push.summaryState === "pending"));
   }
 
   /** Drop the reply: a person's whole reply, in a group what this member sent. */
@@ -1740,6 +1872,7 @@ export class PushService {
       this.#sweepFiles();
       this.#pump();
       this.#track(this.#drainNotes());
+      this.#track(this.#holdAgain());
       for (const push of this.#store.summariesDue()) this.#track(this.#summarize(push.id));
       for (const push of this.#store.unreleased()) this.#track(this.#releasePush(push.id));
     } catch (error) { this.#report(error); }
@@ -1775,6 +1908,11 @@ export class PushService {
     if (!push || !recipient || !LIVE_STATES.includes(push.state) || (recipient.sendState !== "pending" && recipient.sendState !== "failed")) return;
     // Past the deadline no card goes out: the push ends, its cards not sent yet count as failed.
     if (this.#closeIfDue(push)) return;
+    // Sent again to someone who answered since (or handed it on): the card they have is enough.
+    if (delivered(recipient) && this.#answered(push, recipient, this.#handed(push.id))) {
+      this.#store.updateRecipient(push.id, recipient.member, { sendState: "sent", retryAt: null, sendError: null });
+      return;
+    }
     const attempts = recipient.sendAttempts + 1;
     this.#store.updateRecipient(push.id, recipient.member, { sendState: "sending", sendAttempts: attempts, retryAt: null });
     let outcome: SendOutcome;
@@ -1798,7 +1936,8 @@ export class PushService {
       this.#store.updateRecipient(push.id, recipient.member, { sendState: "failed", sendError: outcome.reason, retryAt: retry });
       if (retry === null) {
         log.warn(`推送 ${push.id}：一张卡片发送失败（已试 ${attempts} 次）：${outcome.reason}`);
-        this.#forwardUndelivered(push, recipient);
+        // Only a card that never got there gives a push handed on back; one sent again leaves the card they have.
+        if (!delivered(recipient)) this.#forwardUndelivered(push, recipient);
       }
     } else {
       this.#store.updateRecipient(push.id, recipient.member, { sendState: outcome.status, sentAt: now, sendError: outcome.status === "uncertain" ? outcome.reason : null });
@@ -1866,7 +2005,7 @@ export class PushService {
     if (!this.#store.movePush(pushId, ["sending"], { state: "open" })) return;
     this.#progressAt.delete(pushId);
     const push = this.#store.push(pushId)!;
-    const failed = recipients.filter(recipient => recipient.sendState === "failed").length;
+    const failed = recipients.filter(recipient => recipient.sendState === "failed" && !delivered(recipient)).length;
     log.info(`推送 ${pushId} 已发出：${recipients.length - failed} 张，失败 ${failed} 张`);
     const cc = push.cc.length ? `，抄送 ${push.cc.map(person => person.name).join("、")}` : "";
     this.#note(DIRECT_SCOPE, push.pusher, `sent:${pushId}`, `[推送已发出]「${quoted(push.subject)}」${shortTime(push.confirmedAt!, this.#now())} 发出，`
@@ -1956,13 +2095,15 @@ export class PushService {
     this.#refreshing.set(key, { again: false });
     const dir = join(userTmp(this.options.layout, DIRECT_SCOPE, push.pusher), `push-${push.id}`);
     try {
-      const items = this.#store.items(pushId);
+      const items = this.#store.items(pushId), replyOf = replyIndex(items);
+      // A file the push does not hold is not in the summary: its holds settle first (#holdsSettled).
+      const holding = push.mode === "reply" && await this.#holdsSettled(pushId);
       const files = push.mode === "reply" ? await this.#heldFiles(pushId, items) : new Map<string, HeldFile>();
       // Read after the await, so a send that ended during it is in them.
       const current = this.#store.recipients(pushId);
-      // Waiting: a send or a registration that ends, or the timer, tries again.
+      // Waiting: a send, a registration or a hold that ends, or the timer, tries again.
       if (this.#now() - (push.closedAt ?? 0) < this.#limits.settleWaitMs
-        && current.some(recipient => recipient.sendState === "sending" || replyItems(recipient, items).some(item => unsettled(item, files)))) return;
+        && (holding || current.some(recipient => recipient.sendState === "sending" || replyOf(recipient).some(item => unsettled(item, files))))) return;
       // A card still without a result is unknown for good (#send leaves it so), then the counts below cannot change.
       this.#store.transaction(() => {
         for (const recipient of current) if (recipient.sendState === "sending") this.#store.updateRecipient(pushId, recipient.member, { sendState: "uncertain", sendError: "截止后一直没有得到发送结果" });
@@ -1974,7 +2115,7 @@ export class PushService {
       const partBytes = this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES;
       const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes, bare: true, split: true, now: this.#now(), signal: this.#signal });
       const tally = this.#tally(push, recipients);
-      const missing = recipients.filter(recipient => (recipient.sendState === "sent" || recipient.sendState === "uncertain") && !this.#answered(push, recipient, handed))
+      const missing = recipients.filter(recipient => delivered(recipient) && !this.#answered(push, recipient, handed))
         .map(recipient => memberGroup(recipient.member) === undefined ? recipient.name : `群 ${recipient.name}`);
       const unknown = recipients.filter(recipient => recipient.sendState === "uncertain").length;
       const lines = [`推送「${push.subject}」${push.closeReason === "complete" ? "已全部答复" : "已截止"}（推送编号 ${push.id}）`, tally,
@@ -2078,6 +2219,8 @@ export class PushService {
     if (this.#refreshing.has(key)) return;
     this.#refreshing.set(key, { again: false });
     try {
+      // A hold still under way would otherwise land after the release and stay.
+      await this.#holdsSettled(pushId);
       const items = this.#store.items(pushId).filter(item => item.kind !== "text");
       const files = await this.#heldFiles(pushId, items);
       // The records go; where the files are stays with the items, for the console's downloads until the tmp cleanup takes them.
@@ -2104,12 +2247,36 @@ export class PushService {
     else if (!push.released) this.#track(this.#releasePush(pushId));
   }
 
-  /** Release the attachments of replaced or withdrawn items now (best effort). */
+  /**
+   * Release the attachments of replaced or withdrawn items now (best effort). Until it ended, a hold of them by another
+   * push (the message recorded there meanwhile) waits for it (#holdNow).
+   */
   #release(pushId: string, member: string, items: readonly ReplyItem[]): void {
     const ids = items.flatMap(item => item.attachment ? [item.attachment] : []);
     if (!ids.length || !this.#host) return;
     const host = this.#host;
-    this.#effect(() => this.#track(host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids).catch(error => { if (!this.#signal.aborted) this.#report(error); })));
+    this.#effect(() => {
+      for (const id of ids) this.#releasing.set(`${member}\n${id}`, (this.#releasing.get(`${member}\n${id}`) ?? 0) + 1);
+      this.#track((async () => {
+        // A hold under way (the startup's, or a reply's) would land after this release and stay: it ends first. One the
+        // reply took up again meanwhile stays held.
+        await this.#holdsDone(pushId);
+        const kept = new Set(this.#store.items(pushId, member).flatMap(item => item.attachment !== null ? [item.attachment] : []));
+        const gone = ids.filter(id => !kept.has(id));
+        if (gone.length) await host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), gone);
+      })().catch(error => { if (!this.#signal.aborted) this.#report(error); }).finally(() => this.#releaseEnded(member, ids)));
+    });
+  }
+
+  /** A release of the member's attachments ended: the holds of other pushes that waited for it are tried again. */
+  #releaseEnded(member: string, ids: readonly string[]): void {
+    for (const id of ids) {
+      const key = `${member}\n${id}`, left = (this.#releasing.get(key) ?? 1) - 1;
+      if (left) this.#releasing.set(key, left);
+      else this.#releasing.delete(key);
+    }
+    const waiting = [...this.#unheld.values()].filter(each => each.member === member && ids.some(id => each.ids.has(id)));
+    for (const pushId of new Set(waiting.map(each => each.pushId))) this.#track(this.#holdFailed(pushId));
   }
 
   // ---- notes ----------------------------------------------------------------------------------------------------------
@@ -2153,12 +2320,12 @@ export class PushService {
 
   #previewCard(push: Push): CardContent {
     const recipients = this.#store.recipients(push.id);
-    const done = recipients.filter(recipient => recipient.sendState !== "pending" && recipient.sendState !== "sending").length;
-    const failed = recipients.filter(recipient => recipient.sendState === "failed");
-    const delivered = recipients.filter(recipient => recipient.sendState === "sent" || recipient.sendState === "uncertain");
+    const reached = recipients.filter(delivered);
+    const done = recipients.filter(recipient => delivered(recipient) || (recipient.sendState !== "pending" && recipient.sendState !== "sending")).length;
+    const failed = recipients.filter(recipient => recipient.sendState === "failed" && !delivered(recipient));
     return previewCard({ push, people: recipients.map(recipient => ({ name: recipient.name, member: recipient.member, values: recipient.values })),
       ...(push.state === "preview" || push.state === "cancelled" || push.state === "expired" ? {}
-        : { sent: { done, total: recipients.length, delivered: reachOf(delivered), failed: reachOf(failed) } }) }, this.#now());
+        : { sent: { done, total: recipients.length, delivered: reachOf(reached), failed: reachOf(failed) } }) }, this.#now());
   }
 
   #recipientCard(pushId: string, member: string): CardContent | undefined {

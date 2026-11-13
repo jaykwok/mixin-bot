@@ -117,4 +117,3 @@ if (import.meta.main && process.argv.includes("--health-stdin")) {
   try { running = healthProgram(JSON.parse(await Bun.stdin.text())); } catch { running = undefined; }
   for (const [name, value] of versionRows(versionFacts(process.cwd(), running))) console.log(`${name}\t${value}`);
 }
-

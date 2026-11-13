@@ -294,6 +294,8 @@ const RECIPIENT_KEYS = Object.keys(RECIPIENT_COLUMNS) as (keyof Recipient)[];
 const RECIPIENT_INSERT = `INSERT INTO push_recipients (${RECIPIENT_KEYS.map(key => RECIPIENT_COLUMNS[key]).join(", ")}) VALUES (${RECIPIENT_KEYS.map(() => "?").join(", ")})`;
 /** Handed on to someone (a confirmed forward of the row's member). */
 const FORWARDED = "EXISTS (SELECT 1 FROM push_forwards f WHERE f.push_id = r.push_id AND f.from_member = r.member AND f.state = 'confirmed')";
+/** `delivered` in SQL (a recipient row `r`). */
+const DELIVERED = "(r.send_state IN ('sent', 'uncertain') OR r.sent_at IS NOT NULL)";
 const FORWARD_SELECT = `SELECT id, push_id AS pushId, from_member AS "from", to_member AS "to", to_name AS toName, state, card, version,
   created_at AS createdAt, decided_at AS decidedAt FROM push_forwards`;
 
@@ -310,6 +312,19 @@ export type RecipientCounts = { total: number; groups: number; delivered: number
 
 /** States in which a push still takes clicks and replies. */
 export const LIVE_STATES: readonly PushState[] = ["sending", "open"];
+
+/**
+ * The card reached the recipient at least once. A card sent again (补推送, a reminder) puts the row back to `pending`
+ * and may fail, but the card they have keeps counting: `sentAt` stays from the send that reached them.
+ */
+export function delivered(recipient: Pick<Recipient, "sendState" | "sentAt">): boolean {
+  return recipient.sendState === "sent" || recipient.sendState === "uncertain" || recipient.sentAt !== null;
+}
+
+/** The send state to show: a card sent again that failed leaves the one the recipient has (`delivered`), so it shows as sent. */
+export function shownSend(recipient: Pick<Recipient, "sendState" | "sentAt" | "sendError">): Pick<Recipient, "sendState" | "sendError"> {
+  return recipient.sendState === "failed" && delivered(recipient) ? { sendState: "sent", sendError: null } : { sendState: recipient.sendState, sendError: recipient.sendError };
+}
 
 export class PushStore {
   constructor(readonly db: Database) {
@@ -419,7 +434,7 @@ export class PushStore {
       coalesce(sum(state != 'closed'), 0) AS live FROM pushes WHERE state IN ('sending', 'open', 'closed')`).get() as Pick<PushTotals, "sent" | "followUps" | "live">;
     const answers = this.db.query(`SELECT count(*) AS delivered, coalesce(sum(r.acked_at IS NOT NULL), 0) AS acked,
       coalesce(sum(p.mode = 'reply'), 0) AS replyDelivered, coalesce(sum(p.mode = 'reply' AND r.replied_at IS NOT NULL), 0) AS replied
-      FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE p.state = 'closed' AND r.send_state IN ('sent', 'uncertain')`).get() as
+      FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE p.state = 'closed' AND ${DELIVERED}`).get() as
       Omit<PushTotals, "sent" | "followUps" | "live">;
     return { ...pushes, ...answers };
   }
@@ -480,10 +495,10 @@ export class PushStore {
   recipientCounts(pushIds: readonly string[]): Map<string, RecipientCounts> {
     if (!pushIds.length) return new Map();
     const rows = this.db.query(`SELECT r.push_id AS pushId, count(*) AS total, sum(r.member LIKE 'group:%') AS groups,
-      sum(r.send_state IN ('sent', 'uncertain')) AS delivered, sum(r.send_state = 'failed') AS failed,
-      sum(r.send_state IN ('sent', 'uncertain') AND (CASE p.mode WHEN 'ack' THEN r.acked_at IS NOT NULL WHEN 'options' THEN r.choice IS NOT NULL
+      sum(${DELIVERED}) AS delivered, sum(r.send_state = 'failed' AND NOT ${DELIVERED}) AS failed,
+      sum(${DELIVERED} AND (CASE p.mode WHEN 'ack' THEN r.acked_at IS NOT NULL WHEN 'options' THEN r.choice IS NOT NULL
         ELSE r.replied_at IS NOT NULL END OR ${FORWARDED})) AS answered,
-      sum(r.send_state IN ('pending', 'sending') OR (r.send_state = 'failed' AND r.retry_at IS NOT NULL)) AS unsettled,
+      sum(NOT ${DELIVERED} AND (r.send_state IN ('pending', 'sending') OR (r.send_state = 'failed' AND r.retry_at IS NOT NULL))) AS unsettled,
       max(r.replied_at) AS repliedAt
       FROM push_recipients r JOIN pushes p ON p.id = r.push_id WHERE r.push_id IN (${pushIds.map(() => "?").join(", ")}) GROUP BY r.push_id`)
       .all(...pushIds) as (RecipientCounts & { pushId: string })[];
@@ -527,14 +542,14 @@ export class PushStore {
   /** The member's (or group's) rows in live pushes whose card reached them. */
   reached(member: string): Recipient[] {
     return (this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
-      WHERE r.member = ? AND p.state IN ('sending', 'open') AND r.send_state IN ('sent', 'uncertain') ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
+      WHERE r.member = ? AND p.state IN ('sending', 'open') AND ${DELIVERED} ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
   }
 
   /** Live pushes that want a reply from the member (or group) and have none yet, unless they handed the push on. */
   awaitingReply(member: string): Recipient[] {
     return (this.db.query(`SELECT r.* FROM push_recipients r JOIN pushes p ON p.id = r.push_id
       WHERE r.member = ? AND p.mode = 'reply' AND p.state IN ('sending', 'open') AND r.replied_at IS NULL AND NOT ${FORWARDED}
-      AND r.send_state IN ('sent', 'uncertain') ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
+      AND ${DELIVERED} ORDER BY p.created_at`).all(member) as Row[]).map(decodeRecipient);
   }
 
   /** Recipients whose card is due to be sent (pending, or failed with a retry time reached). */

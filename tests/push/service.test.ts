@@ -207,7 +207,7 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   };
   const groupText = (groupId: string, phone: string, value: string, context = groupReply(groupId, phone)) => service.groupText(groupId, byPhone.get(phone)!, context, value);
   return {
-    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, held, released, finishDownload, abort, reply, identity, cards, texts,
+    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, held, released, finishDownload, abort, reply, identity, cards, texts, host,
     files, card, buttonOf, click, say, groupSay,
     settle, prepare, pushId, tree, grant, groupReply, groupCards, groupTexts, groupClick, groupText, get service() { return service; },
     async restart() { await service.close(); service = make(); },
@@ -1204,16 +1204,41 @@ test("summary: a card still being sent at the deadline holds it back; delivered 
   } finally { held.open(); await h.close(); }
 });
 
-test("summary: a card refused after the deadline counts as failed and is not tried again; one uncertain counts as delivered and says so", async () => {
+/** The first card of a push (confirmed six minutes before its deadline) is still being sent when the deadline comes. */
+async function firstCardSendingAtDeadline(h: Harness, held: { open: () => void }): Promise<string> {
+  const id = h.pushId(await h.prepare({ recipients: [{ name: "张三", phone: ZHANG }], deadline: "2026-11-03 09:30" }));
+  h.clock.now = h.store.push(id)!.deadline - 6 * 60_000;
+  h.gate.held = new Promise(resolve => { held.open = () => { h.gate.held = null; resolve(); }; });
+  h.click(PUSHER, h.card(PUSHER, id), "确认推送", `preview-${id}`);
+  await Bun.sleep(100);
+  expect(h.store.recipient(id, ZHANG)!.sendState).toBe("sending");
+  h.clock.now = h.store.push(id)!.deadline;
+  h.service.tick();
+  await Bun.sleep(100);
+  expect(h.store.push(id)!.state).toBe("closed");
+  return id;
+}
+
+test("summary: a card refused after the deadline counts as failed and is not tried again; one sent again and refused leaves the card the person has; one uncertain counts as delivered and says so", async () => {
   const h = harness(), held = { open: () => {} };
   try {
-    const refused = await cardSendingAtDeadline(h, held);
+    const refused = await firstCardSendingAtDeadline(h, held);
     expect(h.store.push(refused)!.summaryState).toBe("pending");
     h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "failed", reason: "HTTP 500" } : undefined;
     held.open();
     await h.settle();
     expect(h.store.recipient(refused, ZHANG)).toMatchObject({ sendState: "failed", sendError: "HTTP 500", retryAt: null });
     expect(h.store.push(refused)!.summaryText).toContain("共 1 人（发送失败 1）；已确认 0，未确认 0");
+    h.failing.when = undefined;
+
+    h.clock.now = START;
+    const again = await cardSendingAtDeadline(h, held);
+    h.failing.when = item => item.message.msgType === "card" && item.to === im(ZHANG) ? { status: "failed", reason: "HTTP 500" } : undefined;
+    held.open();
+    await h.settle();
+    expect(h.store.recipient(again, ZHANG)).toMatchObject({ sendState: "failed", retryAt: null });
+    expect(h.store.push(again)!.summaryText).toContain("共 1 人；已确认 0，未确认 1");
+    expect(h.store.push(again)!.summaryText).toContain("未确认：张三");
     h.failing.when = undefined;
 
     h.clock.now = START;
@@ -2384,4 +2409,306 @@ test("summary: a reply attachment above the size of one file goes in segments ov
     await pack.done();
     expect(h.reports).toEqual([]);
   } finally { await h.close(); }
+});
+
+test("a card sent again that fails leaves the one the recipient has: they can reply, count as reached and show as sent, and the push does not end early", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    await h.service.reply(h.say(ZHANG, "张三的回复"), { push: id, action: "add" });
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    expect(await h.service.remind(id, [LI])).toEqual({ resent: 1 });
+    await h.settle();
+    expect(h.store.recipient(id, LI)!.sendState).toBe("failed");
+    // The card Li has still counts, in the console, push_status and the counts that end the push.
+    const li = h.service.detail(id).recipients.find(recipient => recipient.member === LI)!;
+    expect([li.sendState, li.sendError, li.answered]).toEqual(["sent", null, false]);
+    expect(h.service.status(PUSHER, id)).toContain("共 2 人；已确认 1，已回复 1，未回复 1");
+    expect(h.store.recipientCounts([id]).get(id)).toMatchObject({ delivered: 2, failed: 0, answered: 1, unsettled: 0 });
+    h.clock.now += 11 * 60_000;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.state).toBe("open");
+    expect(await h.service.reply(h.say(LI, "收到原卡片，现在回复"), { push: id, action: "add" })).toContain("记入");
+    expect(h.service.status(PUSHER, id)).toContain("已回复 2，未回复 0");
+  } finally { await h.close(); }
+});
+
+test("a reminder that fails to the person a push was handed on to leaves the push with them", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "王五", phone: WANG } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "forward-zhang");
+    await h.settle();
+    expect(h.store.recipient(id, WANG)!.sendState).toBe("sent");
+    const told = h.texts(ZHANG).length;
+    h.failing.when = item => item.to === im(WANG) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    expect(await h.service.remind(id, [WANG])).toEqual({ resent: 1 });
+    await h.settle();
+    expect(h.store.forwards(id, "confirmed").map(forward => forward.to)).toEqual([WANG]);
+    expect(h.texts(ZHANG).length).toBe(told);
+    expect(await h.service.reply(h.say(WANG, "王五来回复"), { push: id, action: "add" })).toContain("记入");
+  } finally { await h.close(); }
+});
+
+test("someone who answers while their reminder waits for another try gets no second card", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    await h.service.remind(id, [LI]);
+    await h.settle();
+    expect(h.store.recipient(id, LI)!.retryAt).not.toBeNull();
+    h.failing.when = undefined;
+    expect(await h.service.reply(h.say(LI, "李四的回复"), { push: id, action: "add" })).toContain("记入");
+    const cards = h.cards(LI).length;
+    h.clock.now += 2 * 60_000;
+    h.service.tick();
+    await h.settle();
+    expect(h.cards(LI).length).toBe(cards);
+    expect([h.store.recipient(id, LI)!.sendState, h.store.recipient(id, LI)!.retryAt]).toEqual(["sent", null]);
+  } finally { await h.close(); }
+});
+
+test("handing a push on to someone whose own card never got there: refused when they have values of their own; without values the row is taken over", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  try {
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const id = await confirmed(h, { fields: ["负责项目"], recipients: [{ name: "张三", phone: ZHANG, values: ["项目甲"] }, { name: "李四", phone: LI, values: ["项目乙"] }] });
+    expect(h.store.recipient(id, LI)!.sendState).toBe("failed");
+    await expect(h.service.forward({ phone: ZHANG }, { push: id, to: { name: "李四", phone: LI } }))
+      .rejects.toThrow("李四 本来就在「机房盘点」的名单里，有自己的一份内容，只是卡片没有发出去；不能再把成员的这一份转给 李四，没有转。");
+    expect([h.store.recipient(id, LI)!.values, h.store.forwards(id, "pending")]).toEqual([["项目乙"], []]);
+    // No values: Li's row is taken over and the card goes again.
+    const plain = await confirmed(h, { recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }] });
+    expect(h.store.recipient(plain, LI)!.sendState).toBe("failed");
+    h.failing.when = undefined;
+    await h.service.forward({ phone: ZHANG }, { push: plain, to: { name: "李四", phone: LI } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "forward-plain");
+    await h.settle();
+    expect([h.store.recipient(plain, LI)!.sendState, h.store.forwards(plain, "confirmed").map(forward => forward.to)]).toEqual(["sent", [LI]]);
+  } finally { await h.close(); }
+});
+
+test("a hold that fails is tried again on the tick and before the summary: the reply's file is in the console's package and the summary", async () => {
+  const h = harness();
+  try {
+    const hold = h.host.holdAttachments.bind(h.host);
+    let failures = 0;
+    h.host.holdAttachments = async (...args) => {
+      if (failures > 0) { failures--; throw new Error("disk busy"); }
+      return hold(...args);
+    };
+    const heldBy = (phone: string) => Object.values(h.records.get(phone)?.attachments ?? {}).filter(attachment => attachment.heldBy).length;
+    // On the tick.
+    const id = await confirmed(h, { mode: "reply" });
+    failures = 1;
+    expect(await h.service.reply(h.say(ZHANG, "附件是回复", ["盘点.xlsx"]), { push: id, action: "add" })).toContain("记入");
+    expect(heldBy(ZHANG)).toBe(0);
+    h.service.tick();
+    await h.settle();
+    expect(heldBy(ZHANG)).toBe(1);
+    const pack = await h.service.package(id);
+    try { expect(readZip(pack.path).map(entry => entry.name)).toContain("回复/001-张三-0001/01-盘点.xlsx"); }
+    finally { await pack.done(); }
+    // The push ends before a tick came: the summary holds it first.
+    const late = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00", recipients: [{ name: "李四", phone: LI }] });
+    failures = 1;
+    expect(await h.service.reply(h.say(LI, "李四的附件", ["清单.xlsx"]), { push: late, action: "add" })).toContain("记入");
+    h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(late)!.summaryState).toBe("sent");
+    expect(summaryOf(h).content).not.toContain("没能打包");
+    const zip = join(fixture.root, `zip-${late}.zip`);
+    await writeFile(zip, h.uploads.at(-1)!.data);
+    expect(readZip(zip).map(entry => entry.name)).toContain("回复/001-李四-0002/01-清单.xlsx");
+  } finally { await h.close(); }
+});
+
+test("a restart between the end of a push and its summary: the summary waits for the holds of the startup, and while they fail", async () => {
+  const h = harness();
+  try {
+    const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
+    const hold = h.host.holdAttachments.bind(h.host);
+    let failures = 1;
+    h.host.holdAttachments = async (...args) => {
+      if (failures > 0) { failures--; throw new Error("disk busy"); }
+      return hold(...args);
+    };
+    expect(await h.service.reply(h.say(ZHANG, "附件回复", ["清单.xlsx"]), { push: id, action: "add" })).toContain("记入");
+    await h.service.close();
+    // The process ended after the push did, before its summary was built. At the restart the hold of the startup fails,
+    // and the summary's own try too: it waits.
+    h.store.updatePush(id, { state: "closed", closedAt: h.clock.now, closeReason: "deadline", summaryState: "pending" });
+    failures = 2;
+    await h.restart();
+    await h.settle();
+    expect([h.store.push(id)!.summaryState, failures]).toEqual(["pending", 0]);
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)!.summaryState).toBe("sent");
+    expect(h.store.push(id)!.summaryText).not.toContain("没能打包");
+  } finally { await h.close(); }
+});
+
+test("handing a push on to a recipient whose card failed after the files went out: a new platform ID gets the files again, the same ID only the card", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  const target = h.identity(LI) as { imUserId: string }, previousId = target.imUserId;
+  try {
+    const path = join(h.root, "work", "通知.txt");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "notice");
+    const cardFails = (to: string) => (item: { to: string; message: OutboundMessage }) => item.to === to && item.message.msgType === "card" ? { status: "failed" as const, reason: "HTTP 500" } : undefined;
+    // The same ID: the file it has is not sent again.
+    h.failing.when = cardFails(im(LI));
+    const same = await confirmed(h, { attachments: [{ path, size: 6 }] });
+    expect(h.store.recipient(same, LI)).toMatchObject({ sendState: "failed", sentAt: null, filesSent: 1 });
+    h.failing.when = undefined;
+    const before = h.sent.filter(item => item.to === im(LI)).length;
+    await h.service.forward({ phone: ZHANG }, { push: same, to: { name: "李四", phone: LI } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "forward-same-id");
+    await h.settle();
+    expect(h.sent.filter(item => item.to === im(LI)).slice(before).map(item => item.message.msgType)).toEqual(["card"]);
+    // A new ID: the files go to it again, ahead of the card.
+    h.failing.when = cardFails(im(LI));
+    const fresh = await confirmed(h, { attachments: [{ path, size: 6 }] });
+    expect(h.store.recipient(fresh, LI)).toMatchObject({ sendState: "failed", sentAt: null, filesSent: 1 });
+    target.imUserId = "new-im-li";
+    h.failing.when = undefined;
+    await h.service.forward({ phone: ZHANG }, { push: fresh, to: { name: "李四", phone: LI } });
+    h.click(ZHANG, h.card(ZHANG), "确认转派", "forward-new-id");
+    await h.settle();
+    expect(h.sent.filter(item => item.to === "new-im-li").map(item => item.message.msgType)).toEqual(["file", "card"]);
+    expect(h.store.recipient(fresh, LI)).toMatchObject({ receiveId: "new-im-li", sendState: "sent", filesSent: 1 });
+  } finally { target.imUserId = previousId; await h.close(); }
+});
+
+test("a confirmation card asked before the person got values of their own is refused at the click, and their values stay", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  try {
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const id = await confirmed(h, { fields: ["项目"], recipients: [{ name: "张三", phone: ZHANG, values: ["甲"] }, { name: "李四", phone: LI, values: ["甲"] }] });
+    await h.service.forward({ phone: ZHANG }, { push: id, to: { name: "李四", phone: LI } });
+    const confirmation = h.card(ZHANG);
+    h.store.updateRecipient(id, LI, { values: ["乙"] });
+    h.failing.when = undefined;
+    h.click(ZHANG, confirmation, "确认转派", "forward-changed");
+    await h.settle();
+    expect([h.store.forwards(id, "confirmed"), h.store.recipient(id, LI)!.values]).toEqual([[], ["乙"]]);
+    expect(h.texts(ZHANG).at(-1)).toContain("有自己的一份内容");
+  } finally { await h.close(); }
+});
+
+test("a card whose result was unknown (an interrupted send) still counts after a reminder to it fails", async () => {
+  const h = harness({ limits: { sendAttempts: 1 } });
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    h.store.updateRecipient(id, LI, { sendState: "uncertain", sentAt: null });
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "card" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    await h.service.remind(id, [LI]);
+    await h.settle();
+    expect(h.store.recipient(id, LI)!.sentAt).not.toBeNull();
+    expect(await h.service.reply(h.say(LI, "来自原卡片的回复"), { push: id, action: "add" })).toContain("记入");
+  } finally { await h.close(); }
+});
+
+test("a reply withdrawn while the startup's holds are under way: its attachment is not held again, and nothing stays held after the release", async () => {
+  const h = harness();
+  let open = () => {};
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    const hold = h.host.holdAttachments.bind(h.host);
+    h.host.holdAttachments = async () => { throw new Error("disk busy"); };
+    await h.service.reply(h.say(ZHANG, "张三的附件", ["张三.xlsx"]), { push: id, action: "add" });
+    await h.service.reply(h.say(LI, "李四的附件", ["李四.xlsx"]), { push: id, action: "add" });
+    await h.service.close();
+    // At the restart Zhang's hold is held up; Li withdraws meanwhile.
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    const calls: string[] = [];
+    h.host.holdAttachments = async (...args) => {
+      calls.push(args[1]);
+      if (args[1] === ZHANG) await gate;
+      return hold(...args);
+    };
+    await h.restart();
+    await Bun.sleep(50);
+    expect(calls).toEqual([ZHANG]);
+    expect(await h.service.reply(h.say(LI, "撤回"), { push: id, action: "withdraw" })).toContain("已撤回");
+    await Bun.sleep(50);
+    expect(h.store.items(id, LI)).toEqual([]);
+    open();
+    await h.settle();
+    expect(calls).toEqual([ZHANG]);
+    expect(Object.values(h.records.get(LI)!.attachments).map(attachment => attachment.heldBy ?? null)).toEqual([null]);
+    h.clock.now = h.store.push(id)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(id)).toMatchObject({ summaryState: "sent", released: true });
+    for (const phone of [ZHANG, LI]) expect(Object.values(h.records.get(phone)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+  } finally { open(); await h.close(); }
+});
+
+test("a reply withdrawn while its own hold is under way: the release waits for the hold, so nothing stays held", async () => {
+  const h = harness();
+  let open = () => {};
+  try {
+    const id = await confirmed(h, { mode: "reply" });
+    const hold = h.host.holdAttachments.bind(h.host);
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    let calls = 0;
+    h.host.holdAttachments = async (...args) => {
+      calls++;
+      await gate;
+      return hold(...args);
+    };
+    const replied = h.service.reply(h.say(LI, "李四的附件", ["李四.xlsx"]), { push: id, action: "add" });
+    await Bun.sleep(50);
+    expect(calls).toBe(1);
+    expect(await h.service.reply(h.say(LI, "撤回"), { push: id, action: "withdraw" })).toContain("已撤回");
+    await Bun.sleep(50);
+    open();
+    expect(await replied).toContain("记入");
+    await h.settle();
+    expect(Object.values(h.records.get(LI)!.attachments).map(attachment => attachment.heldBy ?? null)).toEqual([null]);
+  } finally { open(); await h.close(); }
+});
+
+test("a reply withdrawn from one push while its release waits, then recorded to another: that push holds the file once the release ended", async () => {
+  const h = harness();
+  let open = () => {};
+  try {
+    const first = await confirmed(h, { mode: "reply" });
+    const second = await confirmed(h, { mode: "reply", subject: "第二条推送", recipients: [{ name: "李四", phone: LI }] });
+    await h.service.reply(h.say(ZHANG, "张三的附件", ["张三.xlsx"]), { push: first, action: "add" });
+    await h.service.reply(h.say(LI, "李四的回复", ["李四.xlsx"]), { push: first, action: "add" });
+    const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
+    await h.service.close();
+    // At the restart Zhang's hold is held up, so the release of Li's withdrawn reply waits; Li's message goes to the second push meanwhile.
+    const hold = h.host.holdAttachments.bind(h.host);
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    h.host.holdAttachments = async (...args) => {
+      if (args[1] === ZHANG) await gate;
+      return hold(...args);
+    };
+    await h.restart();
+    await Bun.sleep(50);
+    expect(await h.service.reply(h.say(LI, "撤回"), { push: first, action: "withdraw" })).toContain("已撤回");
+    expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: second, action: "add", quote: "李四的回复" })).toContain("记入");
+    expect(h.store.items(second, LI).map(item => item.attachment).filter(Boolean)).toEqual([file]);
+    // The first push still holds it; the tick meanwhile keeps the second one waiting.
+    h.service.tick();
+    await Bun.sleep(50);
+    expect(h.records.get(LI)!.attachments[file]!.heldBy).toBe(`push:${first}`);
+    open();
+    await h.settle();
+    expect(h.records.get(LI)!.attachments[file]!.heldBy).toBe(`push:${second}`);
+    h.clock.now = h.store.push(second)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+    expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
+    for (const phone of [ZHANG, LI]) expect(Object.values(h.records.get(phone)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+  } finally { open(); await h.close(); }
 });

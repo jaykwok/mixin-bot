@@ -219,7 +219,7 @@ test("a stop from another console session while a text goes out: what it cancell
   let release = Promise.withResolvers<void>();
   const takeover = new Takeover({
     host: {
-      records: async () => ({ requests: { "request-1": {} } }) as never,
+      hasConversation: async () => true,
       halt: async () => ({ waiting: halts.shift() ?? [] }),
       note: async (_scope, _phone, _id, entry) => { notes.push(JSON.stringify(entry.model ?? [])); },
     },
@@ -252,6 +252,22 @@ test("a group conversation: the operator's message goes to the group and names t
     expect((await entries(h, `groups/${GROUP}`, ALICE)).filter(entry => entry.kind === OPERATOR_NOTE_KIND).length).toBe(1);
     // The member's direct conversation is another one: nothing was written there (there is none).
     await expect(h.takeover.say("direct", ALICE, "x")).rejects.toThrow("没有这个会话空间");
+  } finally { await h.close(); }
+});
+
+test("a conversation whose request records are gone (a day after they closed) can still be taken over", async () => {
+  const h = harness();
+  try {
+    await h.service.start();
+    await h.ask(ALICE, "first question");
+    await until(() => h.answers().length === 1, "the first answer");
+    await until(async () => Object.values((await h.service.records(DIRECT_SCOPE, ALICE)).requests).every(record => record.closedAt !== undefined), "closed records");
+    await h.service.maintain(Date.now() + 25 * 3600_000);
+    expect(Object.keys((await h.service.records(DIRECT_SCOPE, ALICE)).requests)).toEqual([]);
+    expect((await entries(h, "direct", ALICE)).length).toBeGreaterThan(0);
+    expect(await h.takeover.say("direct", ALICE, "管理员补充回复")).toEqual({ sent: "sent", recorded: true });
+    const kept = (await entries(h, "direct", ALICE)).filter(entry => entry.kind === OPERATOR_NOTE_KIND);
+    expect(kept.map(entry => entry.parts.map(part => part.text ?? "").join("")).join("")).toContain("管理员补充回复");
   } finally { await h.close(); }
 });
 

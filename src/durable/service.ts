@@ -377,6 +377,13 @@ export class DurableService {
     finally { handle.release(); }
   }
 
+  /** Whether the member has a conversation in the space: the member directory keeps it for good, request records only a day. */
+  async hasConversation(scope: Scope, phone: string): Promise<boolean> {
+    const handle = await this.#spaces.acquire(scope);
+    try { return (await handle.harness.snapshot(MemberDirectory, phone, this.#context)) !== undefined; }
+    finally { handle.release(); }
+  }
+
   /**
    * Commit a message to the member's inbox with its receipt and run record; resolves once it is durable. Everything up to
    * the admission turn is synchronous: call it in arrival order.

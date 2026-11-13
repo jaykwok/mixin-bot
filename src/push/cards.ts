@@ -23,7 +23,7 @@ const ACTIONS: readonly CardAction[] = ["confirm", "cancel", "ack", "choose", "f
 
 export type ClickData = { push: string; action: CardAction; version: number; option?: number; forward?: string };
 
-const COLOR = { waiting: "#2D71FF", replying: "#D97706", done: "#16A34A", closed: "#8A8F99" } as const;
+const COLOR = { waiting: "#2D71FF", done: "#16A34A", closed: "#8A8F99" } as const;
 export const PUSH_ID = /^[a-z0-9]{8}$/;
 
 /** Card body limit (measured ~5000 characters); push texts are bounded well below it (./service.ts). */

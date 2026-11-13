@@ -89,7 +89,7 @@ test("a reply summary: each person's reply, its files, and why a file is not pac
   const files = new Map<string, HeldFile>([["att-1", { state: "ready", path: join(root, "plan.xlsx") }], ["att-2", { state: "ready", path: join(root, "gone.jpg") }],
     ["att-3", { state: "failed", error: "平台拒绝" }]]);
   const recipients = [recipient("13800000001", "张三", { repliedAt: 5, ackedAt: 3 }), recipient("13800000002", "李四"),
-    recipient("13800000003", "王五", { sendState: "failed" })];
+    recipient("13800000003", "王五", { sendState: "failed", sentAt: null })];
   const items = [
     item("13800000001", { text: "第一段" }), item("13800000001", { text: "第二段" }),
     item("13800000001", { kind: "file", attachment: "att-1", name: "盘点.xlsx" }),

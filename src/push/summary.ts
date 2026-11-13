@@ -10,7 +10,7 @@ import { access, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { safeFileName } from "../durable/attachments.ts";
 import { shortTime } from "./cards.ts";
-import { type Forward, memberGroup, type Push, type Recipient, type ReplyItem } from "./store.ts";
+import { type Forward, memberGroup, type Push, type Recipient, type ReplyItem, shownSend } from "./store.ts";
 import { writeWorkbook, type Sheet } from "./xlsx.ts";
 import { ZipWriter } from "./zip.ts";
 
@@ -51,9 +51,18 @@ const ZIP_MAX = 0xffff_ffff;
 /** Segments one attachment may go in (their names end in .001 to .999), and up to how many the join command names one by one. */
 const SEGMENTS_MAX = 999, SEGMENTS_LISTED = 6;
 
-/** A recipient's reply among a push's items. */
-export function replyItems(recipient: Pick<Recipient, "member">, items: readonly ReplyItem[]): ReplyItem[] {
-  return items.filter(item => item.member === recipient.member);
+/**
+ * Each recipient's reply among a push's items, in their order. One pass over the items, for a whole summary or detail:
+ * filtering them for every recipient took recipients × items.
+ */
+export function replyIndex(items: readonly ReplyItem[]): (recipient: Pick<Recipient, "member">) => ReplyItem[] {
+  const byMember = new Map<string, ReplyItem[]>();
+  for (const item of items) {
+    const own = byMember.get(item.member);
+    if (own) own.push(item);
+    else byMember.set(item.member, [item]);
+  }
+  return recipient => byMember.get(recipient.member) ?? [];
 }
 
 /** The texts of a reply; a group's name their senders (`张三：…`). */
@@ -102,11 +111,16 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   const workbookName = `${base}.xlsx`, workbook = join(input.dir, workbookName);
   const time = (at: number | null) => at === null ? null : shortTime(at, now);
   const groups = recipients.some(recipient => memberGroup(recipient.member) !== undefined);
-  const forwards = input.forwards ?? [];
-  const nameOf = (member: string) => recipients.find(recipient => recipient.member === member)?.name ?? phone(member);
+  const forwards = input.forwards ?? [], replyOf = replyIndex(items);
+  const names = new Map(recipients.map(recipient => [recipient.member, recipient.name]));
+  const nameOf = (member: string) => names.get(member) ?? phone(member);
+  const forwardsTo = new Map<string, string[]>(), forwardsFrom = new Map<string, string[]>();
+  for (const forward of forwards) {
+    forwardsTo.set(forward.to, [...forwardsTo.get(forward.to) ?? [], `由 ${nameOf(forward.from)} 转来`]);
+    forwardsFrom.set(forward.from, [...forwardsFrom.get(forward.from) ?? [], forward.toName]);
+  }
   /** `由 李四 转来；转给 王五`. */
-  const handed = (member: string) => [...forwards.filter(forward => forward.to === member).map(forward => `由 ${nameOf(forward.from)} 转来`),
-    ...(forwards.some(forward => forward.from === member) ? [`转给 ${forwards.filter(forward => forward.from === member).map(forward => forward.toName).join("、")}`] : [])].join("；");
+  const handed = (member: string) => [...forwardsTo.get(member) ?? [], ...(forwardsFrom.has(member) ? [`转给 ${forwardsFrom.get(member)!.join("、")}`] : [])].join("；");
   const columns: Sheet["columns"] = [
     { title: groups ? "姓名或群" : "姓名", width: 12 }, { title: "手机号", width: 15 },
     ...push.fields.map(title => ({ title, width: 18 })), { title: "发送", width: 10 }, { title: groups ? "确认时间（群为首次）" : "确认时间", width: 13 },
@@ -120,9 +134,9 @@ export async function buildSummary(input: SummaryInput): Promise<SummaryPackage>
   let missingFiles = 0, splitFiles = 0, index = 0;
   for (const recipient of recipients) {
     index++;
-    const own = replyItems(recipient, items), group = memberGroup(recipient.member) !== undefined;
+    const own = replyOf(recipient), group = memberGroup(recipient.member) !== undefined;
     const row: (string | number | null)[] = [recipient.name, group ? "群" : phone(recipient.member), ...push.fields.map((_, at) => recipient.values[at] ?? null),
-      SEND_LABEL[recipient.sendState], time(recipient.ackedAt)];
+      SEND_LABEL[shownSend(recipient).sendState], time(recipient.ackedAt)];
     if (groups) row.push(group ? recipient.clicks : null);
     if (push.mode === "options") row.push(recipient.choice === null ? null : push.options[recipient.choice] ?? null, time(recipient.choiceAt));
     if (push.mode === "reply") {

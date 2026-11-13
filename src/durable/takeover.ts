@@ -17,14 +17,14 @@ import type { DirectoryIdentity } from "../integrations/open-platform/identity-d
 import { markdownMessage, splitText, type Target } from "../integrations/open-platform/messages.ts";
 import { OPERATOR_NOTE_KIND, OPERATOR_NOTE_LABEL } from "./operator-note.ts";
 import type { Outbound } from "./outbound.ts";
-import type { MemberRecords } from "./records.ts";
 
 /** The longest text an operator sends at once (characters). */
 export const OPERATOR_TEXT_MAX = 4_000;
 
 /** What the takeover needs from the message service (src/durable/service.ts). */
 export interface TakeoverHost {
-  records(scope: Scope, phone: string): Promise<Readonly<MemberRecords>>;
+  /** The member has a conversation in the space (not its request records: those go a day after the request closed). */
+  hasConversation(scope: Scope, phone: string): Promise<boolean>;
   /** Resolves with the texts of the messages that waited behind the running one (the model never saw them). */
   halt(scope: Scope, phone: string): Promise<{ waiting: string[] }>;
   note(scope: Scope, phone: string, requestId: string, entry: EntryDraft): Promise<void>;
@@ -120,8 +120,7 @@ export class Takeover {
   async #member(space: string, phone: string): Promise<{ scope: Scope; identity: DirectoryIdentity }> {
     const scope = scopeOfSpace(space);
     if (!scope || !existsSync(spaceDatabase(this.#options.layout, scope))) throw new TakeoverRefused("没有这个会话空间。");
-    const records = await this.#options.host.records(scope, phone);
-    if (!Object.keys(records.requests).length) throw new TakeoverRefused("这位成员在这里还没有和机器人的对话。");
+    if (!await this.#options.host.hasConversation(scope, phone)) throw new TakeoverRefused("这位成员在这里还没有和机器人的对话。");
     const identity = this.#options.directory.byPhone(phone);
     if (!identity) throw new TakeoverRefused("这位成员已不在机器人同步的通讯录范围内，不能接管。");
     return { scope, identity };
