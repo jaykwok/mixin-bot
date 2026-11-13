@@ -83,7 +83,7 @@ import { conversationIds, idleSpaceReferences } from "./conversations.ts";
 import { lateMinutes, type Outbound, replyMessage, replySegments, sendNotice, targetOf } from "./outbound.ts";
 import { sendChannel } from "./send.ts";
 import { ATTACHMENT_LIMITS, AttachmentDownloads, type AttachmentEvent, type AttachmentLimits, type AttachmentSource, arrivedBefore, attachmentLabel,
-  attachmentPrompt, bindAttachments, expireAttachments, holdAttachments, newAttachmentId, releaseHeld, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
+  attachmentPrompt, bindAttachments, expireAttachments, type HeldDecision, newAttachmentId, removeAttachmentFiles, type SettledAttachment, settleHeld, unconsumed, voidWhere } from "./attachments.ts";
 import {
   type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, fileSendOutcome, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
   pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
@@ -370,7 +370,7 @@ export class DurableService {
     return this.#seen.has(msgUid);
   }
 
-  /** A read-only view of a member's request records (diagnostics). */
+  /** A read-only view of a member's request records as last published (diagnostics, the push service). */
   async records(scope: Scope, phone: string): Promise<Readonly<MemberRecords>> {
     const handle = await this.#spaces.acquire(scope);
     try { return structuredClone(await memberRecords(handle.harness, phone, this.#context)); }
@@ -528,21 +528,15 @@ export class DurableService {
     }
   }
 
-  /** A push holds these attachments of the member (attachments.ts `holdAttachments`): the ones a request bound whose message is now a reply. */
-  async holdAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number> {
+  /**
+   * Where these attachments of the member belong, the pushes' replies say (attachments.ts `settleHeld`). `decide` runs in
+   * the commit, after every commit queued before it, on the records as they are then; what it reads of the replies is
+   * current then too. `records` may lag behind it: a commit whose callback has run is published only once stored.
+   */
+  async settleAttachments(scope: Scope, phone: string, decide: HeldDecision): Promise<Map<string, SettledAttachment>> {
     this.#assertRunning();
-    if (!ids.length) return 0;
     const handle = await this.#spaces.acquire(scope);
-    try { return await handle.harness.commit(async tx => holdAttachments(await recordsOf(tx, phone), holder, ids), this.#context); }
-    finally { handle.release(); }
-  }
-
-  /** A holder lets its attachments go (attachments.ts `releaseHeld`); their files stay for the tmp lifecycle. */
-  async releaseAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number> {
-    this.#assertRunning();
-    if (!ids.length) return 0;
-    const handle = await this.#spaces.acquire(scope);
-    try { return await handle.harness.commit(async tx => releaseHeld(await recordsOf(tx, phone), holder, ids), this.#context); }
+    try { return await handle.harness.commit(async tx => settleHeld(await recordsOf(tx, phone), decide), this.#context); }
     finally { handle.release(); }
   }
 

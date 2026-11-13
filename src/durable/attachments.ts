@@ -74,32 +74,31 @@ export function unconsumed(records: Readonly<MemberRecords>): Attachment[] {
   return Object.values(records.attachments).filter(attachment => attachment.boundTo === undefined && attachment.heldBy === undefined && attachment.state !== "void");
 }
 
-/** The push holds these attachments of the member from now on; void ones and those of another holder are left. Returns how many it holds. */
-export function holdAttachments(records: MemberRecords, holder: string, ids: readonly string[]): number {
-  let held = 0;
-  for (const id of ids) {
-    const attachment = records.attachments[id];
-    if (!attachment || attachment.state === "void" || (attachment.heldBy !== undefined && attachment.heldBy !== holder)) continue;
-    attachment.heldBy = holder;
-    held++;
-  }
-  return held;
-}
+/** Where the holders want each attachment they settle: a holder, or undefined to let it go (`settleHeld`). */
+export type HeldDecision = (attachments: Readonly<Record<string, Readonly<Attachment>>>) => ReadonlyMap<string, string | undefined>;
+/** A settled attachment: its record as it was before (a released one's may be gone; its file stays) and its holder now. */
+export type SettledAttachment = { attachment: Attachment; heldBy: string | undefined };
 
 /**
- * The push released these: an attachment whose request still has its record is the request's alone again, the others'
- * records go (their files stay for the tmp lifecycle). Returns how many were released.
+ * In the commit: `decide` sees the member's attachments as they are and says where each one it names belongs. A holder
+ * holds it from now on, taking it over from any other (a void one is not held). One let go whose request still has its
+ * record is the request's alone again; the others' records go (`expireAttachments` would have dropped them with the
+ * request; their files stay for the tmp lifecycle). Returns the named ones that exist.
  */
-export function releaseHeld(records: MemberRecords, holder: string, ids: readonly string[]): number {
-  let released = 0;
-  for (const id of ids) {
+export function settleHeld(records: MemberRecords, decide: HeldDecision): Map<string, SettledAttachment> {
+  const settled = new Map<string, SettledAttachment>();
+  for (const [id, holder] of decide(records.attachments)) {
     const attachment = records.attachments[id];
-    if (attachment?.heldBy !== holder) continue;
-    if (attachment.boundTo !== undefined && records.requests[attachment.boundTo] !== undefined) delete attachment.heldBy;
-    else delete records.attachments[id];
-    released++;
+    if (!attachment) continue;
+    const before = copy(attachment);
+    if (holder !== undefined) { if (attachment.state !== "void") attachment.heldBy = holder; }
+    else if (attachment.heldBy !== undefined) {
+      if (attachment.boundTo !== undefined && records.requests[attachment.boundTo] !== undefined) delete attachment.heldBy;
+      else delete records.attachments[id];
+    }
+    settled.set(id, { attachment: before, heldBy: records.attachments[id]?.heldBy });
   }
-  return released;
+  return settled;
 }
 
 /** Arrived before the given point (an inbox item or a control): an older epoch, or the same one and not later. */

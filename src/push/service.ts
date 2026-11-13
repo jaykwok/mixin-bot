@@ -55,6 +55,7 @@ import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { DIRECT_SCOPE, groupScope, parseScopeKey, pushFile, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
 import { log } from "../core/log.ts";
 import { NATIVE_FILE_MAX_BYTES } from "../core/transfer-limits.ts";
+import type { HeldDecision, SettledAttachment } from "../durable/attachments.ts";
 import { fileUpload, type Outbound, sendNotice, uploadedFile } from "../durable/outbound.ts";
 import type { Attachment, MemberRecords, ReplyContext } from "../durable/records.ts";
 import { sendChannel } from "../durable/send.ts";
@@ -70,7 +71,7 @@ import { CARD_MAX_CHARS, clickData, type ClickData, clickShape, countsText, type
   requirementText, shortTime, summaryCard } from "./cards.ts";
 import { buildSummary, type HeldFile, replyIndex, replyText, senders, type SummaryPackage, writeCheckSheet } from "./summary.ts";
 import { type ChatGroup, delivered, type Forward, type Grants, groupMember, LIVE_STATES, memberGroup, type Person, type Push, type PushFile, type PushMode, type PushRole, type PushState, type PushStore,
-  type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, shownSend, type TargetDepartment, type TargetGroup } from "./store.ts";
+  type PushTarget, type PushTotals, type Recipient, type RecipientCounts, type ReplyItem, shownSend, type TargetDepartment, type TargetGroup, type LostFile } from "./store.ts";
 
 export const PUSH_LIMITS = {
   defaultDeadlineMs: 3 * 24 * 3600_000,
@@ -137,10 +138,13 @@ export type PushLimits = typeof PUSH_LIMITS;
 
 /** What the push needs from the message service (src/durable/service.ts). */
 export interface PushHost {
+  /** The member's records as last published: a commit whose callback has run may not be in them yet. */
   records(scope: Scope, phone: string): Promise<Readonly<MemberRecords>>;
-  /** The attachments a reply took from a request are the push's from now on (the same call again changes nothing). */
-  holdAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number>;
-  releaseAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number>;
+  /**
+   * In one commit of the member's records, where the attachments `decide` names belong: it runs in the commit, on them as
+   * they are then (src/durable/attachments.ts `settleHeld`), after every commit queued before it.
+   */
+  settleAttachments(scope: Scope, phone: string, decide: HeldDecision): Promise<Map<string, SettledAttachment>>;
   note(scope: Scope, phone: string, requestId: string, entry: EntryDraft): Promise<void>;
 }
 
@@ -251,6 +255,8 @@ export type PushGroupRow = ChatGroup & { registeredByName: string | null };
 export type PushAdmin = Pick<PushService, "settings" | "saveSettings" | "list" | "detail" | "remind" | "setCc" | "remove" | "package" | "groups" | "saveGroup">;
 
 export const holderOf = (pushId: string) => `push:${pushId}`;
+/** The push an attachment's holder names (holderOf). */
+const holdingPush = (holder: string | undefined) => /^push:([a-z0-9]{8})$/.exec(holder ?? "")?.[1];
 /** A name as names are compared: no white space, lower case. */
 const compactName = (text: string) => text.replace(/\s+/g, "").toLowerCase();
 const sameName = (a: string, b: string) => compactName(a) === compactName(b);
@@ -354,15 +360,17 @@ export class PushService {
   /** Pushes whose files are being copied: their directories have no record yet. */
   readonly #preparing = new Set<string>();
   /**
-   * `<push>\n<member>`: reply attachments whose hold failed, tried again on the tick (and before the summary is built), or
-   * that another push still held while it released them, tried again once that release ended.
+   * By member: attachments whose settling failed (#settle), tried again on the tick and before a summary, each with the
+   * count of settles when it failed. A settle decided later has settled it.
    */
-  readonly #unheld = new Map<string, { pushId: string; member: string; ids: Set<string> }>();
-  /** `<member>\n<attachment>`: releases of withdrawn or replaced replies not yet ended (#release), how many. */
-  readonly #releasing = new Map<string, number>();
-  /** Holds under way, by push (#holdsSettled). */
-  readonly #holdsUnderWay = new Map<string, Set<Promise<boolean>>>();
-  /** The holds of the startup (#holdReplies); never rejects. */
+  readonly #unsettled = new Map<string, Map<string, number>>();
+  /** Settles decided so far (#unsettled). */
+  #settles = 0;
+  /** Settles under way; a summary waits for them (#settlesDone). */
+  readonly #settling = new Set<Promise<unknown>>();
+  /** The settles tried again (#settleAgain), while they run. */
+  #settlingAgain: Promise<void> | undefined;
+  /** The settles of the startup (#holdReplies); never rejects. */
   #startupHolds: Promise<void> = Promise.resolve();
   #filesSweptAt: number | undefined;
   #host?: PushHost;
@@ -1584,16 +1592,18 @@ export class PushService {
     const source = this.#source(speaker, recipient.member, input.quote);
     // A group takes texts only; the attachments of a direct message are the ones its request bound.
     const files = group ? [] : await this.#boundFiles(speaker.phone, source.msgUid);
-    const recorded = this.#atomic(() => this.#record(push.id, recipient.member, speaker.phone, source, files, input.action === "replace"));
-    await this.#hold(push.id, recipient.member, recorded.held);
+    const recorded = this.#atomic(() => this.#record(push.id, recipient.member, speaker.phone, source, files, input.action === "replace", speaker.message.msgUid));
+    const gone = await this.#hold(push.id, recipient.member, recorded.held);
     this.#refreshCard(push.id, recipient.member);
     this.#checkComplete(push.id);
     log.info(`推送 ${push.id}：${group ? "一个群" : "一位接收人"}${recorded.already ? "的回复没有变化" : input.action === "replace" ? "改了回复" : "回复了"}`);
-    const total = group ? `本群的回复现在共 ${recorded.counts.texts} 段文字` : `回复现在共有${countsText(recorded.counts)}`;
+    const counts = gone.length ? countsOf(this.#store.items(push.id, recipient.member)) : recorded.counts;
+    const total = group ? `本群的回复现在共 ${counts.texts} 段文字` : counts.texts + counts.files ? `回复现在共有${countsText(counts)}` : "回复现在还没有内容";
     return (recorded.already ? `这条消息已经在「${push.subject}」的回复里了，没有重复记。` : `已把成员的这条消息${input.action === "replace" ? "记为" : "记入"} ${push.pusherName} 推送的「${push.subject}」的回复`
       + `${input.action === "replace" ? (group ? "，这位成员之前发的不算了" : "，之前记的不算了") : ""}。`)
       + `${total}。`
-      + (recorded.lost.length ? `这些附件没有收到，没有记进去，请成员重发：${recorded.lost.join("、")}。` : "");
+      + (recorded.lost.length ? `这些附件没有收到，没有记进去，请成员重发：${recorded.lost.join("、")}。` : "")
+      + (gone.length ? `这些附件已经失效，没有记进去，请成员重发：${gone.join("、")}。成员也会另外收到重发提醒。` : "");
   }
 
   /** The message a reply is recorded from: the request's, or the speaker's latest kept text that contains `quote`. */
@@ -1605,7 +1615,10 @@ export class PushService {
     return { msgUid: found.msgUid, text: found.text, receivedAt: found.receivedAt };
   }
 
-  /** The attachments the request of message `msgUid` bound, in arrival order. */
+  /**
+   * The attachments the request of message `msgUid` bound, in arrival order, as last published: a commit may since have
+   * let one go or removed its record, so the hold of the reply checks them in its own commit (#hold).
+   */
   async #boundFiles(phone: string, msgUid: string): Promise<Attachment[]> {
     const records = await this.#host!.records(DIRECT_SCOPE, phone);
     const request = Object.values(records.requests).find(record => record.reply.msgUid === msgUid);
@@ -1616,10 +1629,10 @@ export class PushService {
 
   /**
    * In one transaction: the message's text and files become items of the reply (`replace`: instead of what the sender
-   * had there). A message is part of one reply only. `held`: the attachments to hold for the push; `lost`: files that
-   * did not arrive.
+   * had there), each with `request`, the message of the request that records them. A message is part of one reply only.
+   * `held`: the attachments to hold for the push; `lost`: files that did not arrive.
    */
-  #record(pushId: string, member: string, sender: string, source: Speaker["message"], files: readonly Attachment[], replace: boolean):
+  #record(pushId: string, member: string, sender: string, source: Speaker["message"], files: readonly Attachment[], replace: boolean, request: string):
     { already: boolean; counts: Counts; held: string[]; lost: string[] } {
     const push = this.#store.push(pushId), recipient = this.#store.recipient(pushId, member);
     if (!push || !recipient || !LIVE_STATES.includes(push.state)) throw new PushRefused(`「${push?.subject ?? pushId}」已经结束，不能再改了。`);
@@ -1639,19 +1652,19 @@ export class PushService {
     if (replace) {
       const dropped = current.filter(item => (group ? item.sender === sender : true) && !uids.includes(item.msgUid));
       this.#store.removeItems(dropped.map(item => item.id));
-      this.#release(pushId, member, dropped);
+      this.#release(member, dropped);
     } else if (already) {
       return { already, counts: countsOf(current), held: [], lost };
     }
     const name = group ? this.#directory.byPhone(sender)?.name ?? sender : null;
     if (source.text.trim() && !have.has(source.msgUid)) {
       this.#store.addItem({ pushId, member, msgUid: source.msgUid, kind: "text", text: source.text, attachment: null, name: null, size: null,
-        receivedAt: source.receivedAt, sender: group ? sender : null, senderName: name });
+        receivedAt: source.receivedAt, sender: group ? sender : null, senderName: name, request });
     }
     for (const file of arrived) {
       if (have.has(file.msgUid)) continue;
       this.#store.addItem({ pushId, member, msgUid: file.msgUid, kind: file.kind, text: null, attachment: file.id, name: file.name, size: file.actualSize ?? file.size ?? null,
-        receivedAt: file.receivedAt, sender: null, senderName: null });
+        receivedAt: file.receivedAt, sender: null, senderName: null, request });
     }
     this.#store.updateRecipient(pushId, member, { repliedAt: now, ackedAt: recipient.ackedAt ?? now, version: recipient.version + 1 });
     const after = this.#store.items(pushId, member);
@@ -1659,106 +1672,205 @@ export class PushService {
   }
 
   /**
-   * The reply's attachments stay with the push until its summary went out (again at startup, should a process end before
-   * this). A hold that fails is tried again on the tick. One the records refuse because another push still holds the
-   * attachment while it releases it (the reply there was withdrawn or replaced) is tried again once that release ended;
-   * any other refusal (the attachment was voided, or another push holds it) is not, and the summary lists the file as
-   * missing. False when it failed or waits for such a release.
+   * The reply's attachments go to the push (#settle) and stay with it until its summary went out (again at startup, should
+   * a process end before this). The reply was recorded from the records as last published (#boundFiles); the hold is
+   * decided in its commit, on them as they are then, and a file found gone there is taken out of the reply again
+   * (#dropGone). Returns the names of those, for the tool's answer. A failed commit is tried again (#settleAgain), which
+   * takes such a file out the same way.
    */
-  #hold(pushId: string, member: string, ids: readonly string[]): Promise<boolean> {
-    if (!ids.length || memberGroup(member) !== undefined) return Promise.resolve(true);
-    const run = this.#holdNow(pushId, member, ids);
-    const underWay = this.#holdsUnderWay.get(pushId) ?? new Set<Promise<boolean>>();
-    underWay.add(run);
-    this.#holdsUnderWay.set(pushId, underWay);
-    void run.finally(() => {
-      underWay.delete(run);
-      if (!underWay.size && this.#holdsUnderWay.get(pushId) === underWay) this.#holdsUnderWay.delete(pushId);
+  async #hold(pushId: string, member: string, ids: readonly string[]): Promise<string[]> {
+    if (!ids.length) return [];
+    const settled = await this.#settle(member, ids);
+    return (settled?.dropped ?? []).filter(item => item.pushId === pushId).map(item => item.name ?? "附件");
+  }
+
+  /**
+   * Settle where these attachments of the member belong, in one commit of their records (#ownerOf): with the push whose
+   * reply has the message, taken over from another push in that commit, so the record stays whatever became of its
+   * request; otherwise let go. It is decided in the commit, after every commit queued before it, so it follows every
+   * change of the replies made before it: the last one leaves the files where the replies say, and each change of a reply
+   * settles its files after it. A push letting a ready file go keeps where it is with its item first (#keepPath).
+   * `alsoHeldBy`: every file that holder holds is settled too (a push's release). A file the commit found gone is taken
+   * out of a reply that still takes replies (#dropGone). A failure is tried again on the tick (#settleAgain). Resolves to
+   * what the commit settled, or undefined when it failed.
+   */
+  #settle(member: string, ids: readonly string[], alsoHeldBy?: string): Promise<Settled | undefined> {
+    if (!this.#host || memberGroup(member) !== undefined) return Promise.resolve({ attachments: new Map(), dropped: [] });
+    const run = this.#settleNow(member, ids, alsoHeldBy);
+    this.#settling.add(run);
+    void run.finally(() => this.#settling.delete(run));
+    return run;
+  }
+
+  async #settleNow(member: string, ids: readonly string[], alsoHeldBy?: string): Promise<Settled | undefined> {
+    const named = new Set(ids);
+    let decided = Infinity;
+    try {
+      const settled = await this.#host!.settleAttachments(DIRECT_SCOPE, member, attachments => {
+        decided = ++this.#settles;
+        if (alsoHeldBy !== undefined) for (const [id, attachment] of Object.entries(attachments)) if (attachment.heldBy === alsoHeldBy) named.add(id);
+        const wanted = new Map<string, string | undefined>();
+        for (const id of named) {
+          const attachment = attachments[id], from = holdingPush(attachment?.heldBy);
+          // One held by something other than a push is not the pushes' to settle.
+          if (!attachment || (attachment.heldBy !== undefined && from === undefined)) continue;
+          const holder = this.#ownerOf(member, id, attachment);
+          wanted.set(id, holder);
+          if (from !== undefined && holder !== attachment.heldBy && attachment.state === "ready" && attachment.path) this.#keepPath(from, member, id, attachment.path);
+        }
+        return wanted;
+      });
+      // A failure before this commit decided is settled by it.
+      const failed = this.#unsettled.get(member);
+      for (const id of named) if ((failed?.get(id) ?? Infinity) < decided) failed!.delete(id);
+      if (failed && !failed.size) this.#unsettled.delete(member);
+      return { attachments: settled, dropped: this.#dropGone(member, named, settled) };
+    } catch (error) {
+      if (this.#signal.aborted) return undefined;
+      this.#report(error);
+      const failed = this.#unsettled.get(member) ?? new Map<string, number>();
+      for (const id of ids) failed.set(id, ++this.#settles);
+      this.#unsettled.set(member, failed);
+      return undefined;
+    }
+  }
+
+  /**
+   * Files a commit found gone or voided (no push held one when its request's record went) can never be packed: each still
+   * in the reply of a push that takes replies is taken out of it again and kept as lost, with the request that recorded
+   * it, and the member is told to send it again (#tellLost, and the answer of that request should it fail, #lostLine).
+   * In the reply of a push that has ended it stays, missing from its summary.
+   */
+  #dropGone(member: string, ids: Iterable<string>, settled: ReadonlyMap<string, SettledAttachment>): ReplyItem[] {
+    const dropped: ReplyItem[] = [];
+    for (const id of ids) {
+      // Not settled: its record is gone (or held by something other than a push, which no push can take).
+      if ((settled.get(id)?.attachment.state ?? "void") !== "void") continue;
+      const item = this.#store.itemWithAttachment(member, id);
+      if (!item) continue;
+      if (LIVE_STATES.includes(this.#store.push(item.pushId)?.state ?? "closed")) dropped.push(item);
+      else log.warn(`推送 ${item.pushId}：一个回复附件已经失效，汇总里会缺它`);
+    }
+    if (!dropped.length) return [];
+    const pushes = [...new Set(dropped.map(item => item.pushId))];
+    this.#atomic(() => {
+      this.#store.removeItems(dropped.map(item => item.id));
+      for (const pushId of pushes) {
+        const recipient = this.#store.recipient(pushId, member)!;
+        const left = this.#store.items(pushId, member).length;
+        this.#store.updateRecipient(pushId, member, { repliedAt: left ? recipient.repliedAt : null, version: recipient.version + 1 });
+      }
+      this.#store.addLost(dropped.map(item => ({ msgUid: item.msgUid, member, pushId: item.pushId, name: item.name ?? "附件", request: item.request })), this.#now());
     });
+    for (const pushId of pushes) {
+      this.#refreshCard(pushId, member);
+      log.warn(`推送 ${pushId}：${dropped.filter(item => item.pushId === pushId).length} 个回复附件已经失效，从回复里去掉了，会提醒成员重发`);
+    }
+    this.#track(this.#tellLost());
+    return dropped;
+  }
+
+  /**
+   * The line a failed request's answer gives of the files it recorded that were taken out of replies again (#dropGone),
+   * "" when none. It does not stand in for their reminders (#tellLost): an answer is sent later, or never (a /stop or
+   * /clear withdraws one still unsent), so a reminder stays due until it goes out itself or its retries give up, and the
+   * member may hear of a file twice.
+   */
+  #lostLine(member: string, request: string): string {
+    const lost = this.#store.lostIn(member, request);
+    return lost.length ? lostText(lost, pushId => this.#store.push(pushId)?.subject) : "";
+  }
+
+  /**
+   * Remind members of the files taken out of their replies (#dropGone): one text to the member by push, the kept ones
+   * again at startup; a failed send is tried again with a growing wait, given up after ten.
+   */
+  async #tellLost(): Promise<void> {
+    if (this.#telling) { this.#tellAgain = true; return; }
+    if (this.#closing) return;
+    this.#telling = true;
+    try {
+      do {
+        this.#tellAgain = false;
+        for (let [first] = this.#store.lostDue(this.#now(), 1); first && !this.#closing; [first] = this.#store.lostDue(this.#now(), 1)) {
+          const files = this.#store.lostDue(this.#now(), 500).filter(file => file.member === first!.member && file.pushId === first!.pushId);
+          const ids = files.map(file => file.msgUid), push = this.#store.push(first.pushId), recipient = this.#store.recipient(first.pushId, first.member);
+          if (!push || !recipient) { this.#store.markLostTold(ids, this.#now()); continue; }
+          let outcome: SendOutcome;
+          try { outcome = await this.#outbound.send(this.#memberTarget(recipient), textMessage(lostText(files, () => push.subject)), { signal: this.#signal }); }
+          catch (error) { if (this.#signal.aborted) return; outcome = { status: "failed", reason: String(error) }; }
+          if (this.#signal.aborted) return;
+          // Uncertain: the platform may have it; sent again it could arrive twice.
+          if (outcome.status !== "failed") { this.#store.markLostTold(ids, this.#now()); continue; }
+          const attempts = Math.max(...files.map(file => file.attempts));
+          if (attempts >= 9) {
+            this.#store.markLostTold(ids, this.#now());
+            log.error(`推送 ${push.id}：失效附件的重发提醒多次没有发出，已放弃：${outcome.reason}`);
+            continue;
+          }
+          this.#store.deferLost(ids, this.#now() + Math.min(3600_000, 30_000 * 2 ** attempts));
+          log.warn(`推送 ${push.id}：失效附件的重发提醒没有发出：${outcome.reason}`);
+        }
+      } while (this.#tellAgain && !this.#closing);
+    } finally { this.#telling = false; }
+  }
+
+  /**
+   * Push `pushId` lets the member's ready attachment `id` go: where the file is stays with the push's item, for the
+   * console's downloads until the tmp cleanup takes it (src/push/summary.ts reads it once the push holds the file no
+   * more). Kept in the commit's decision, before the commit: should the commit fail, the push still holds the file and
+   * its record wins; should the process end after it, where the file is was kept already.
+   */
+  #keepPath(pushId: string, member: string, id: string, path: string): void {
+    const item = this.#store.items(pushId, member).find(each => each.attachment === id);
+    if (item && item.path !== path) this.#store.keepItemPath(item.id, path);
+  }
+
+  /**
+   * The holder an attachment of the member belongs to now: the push whose reply has the message (a message is part of one
+   * reply), while that push takes replies or builds its summary. After that a file still downloading stays with it until
+   * the download ends, so its release keeps where the file is (#releasePush); otherwise none.
+   */
+  #ownerOf(member: string, id: string, attachment: Readonly<Attachment>): string | undefined {
+    const pushId = this.#store.itemWithAttachment(member, id)?.pushId;
+    if (pushId === undefined) return undefined;
+    if (this.#holdable(pushId)) return holderOf(pushId);
+    return attachment.state === "pending" && attachment.heldBy === holderOf(pushId) ? attachment.heldBy : undefined;
+  }
+
+  /**
+   * The settles under way have ended (the startup's too) and those that failed were tried again. True while one of a file
+   * in the push's reply still fails: a file the push does not hold is not in its summary.
+   */
+  async #settlesDone(pushId: string): Promise<boolean> {
+    await this.#startupHolds;
+    await Promise.all(this.#settling);
+    await this.#settleAgain();
+    return [...this.#unsettled].some(([member, failed]) => [...failed.keys()].some(id => this.#store.itemWithAttachment(member, id)?.pushId === pushId));
+  }
+
+  /** The settles that failed, tried again (the tick, a summary); one run at a time, which the callers share. */
+  #settleAgain(): Promise<void> {
+    if (this.#settlingAgain || !this.#unsettled.size) return this.#settlingAgain ?? Promise.resolve();
+    const run = (async () => {
+      try { for (const [member, failed] of [...this.#unsettled]) await this.#settle(member, [...failed.keys()]); }
+      finally { this.#settlingAgain = undefined; }
+    })();
+    this.#settlingAgain = run;
     return run;
   }
 
   /**
-   * The push's holds have settled: the startup's, those under way, and those that failed, tried once more. True while
-   * some still fail. A file the push does not hold is not in its summary, and a hold that ended after the release would
-   * stay for good: the summary and the release wait for this.
-   */
-  async #holdsSettled(pushId: string): Promise<boolean> {
-    await this.#holdsDone(pushId);
-    return this.#holdFailed(pushId);
-  }
-
-  /** The startup's holds and those of the push under way have ended (a release waits for them, or they land after it). */
-  async #holdsDone(pushId: string): Promise<void> {
-    await this.#startupHolds;
-    await Promise.all(this.#holdsUnderWay.get(pushId) ?? []);
-  }
-
-  async #holdNow(pushId: string, member: string, ids: readonly string[]): Promise<boolean> {
-    const key = `${pushId}\n${member}`;
-    // Read before the hold: a release that ends while it runs may have come before or after it.
-    const releasing = ids.filter(id => this.#releasing.has(`${member}\n${id}`));
-    try {
-      const held = await this.#host!.holdAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids);
-      const kept = this.#unheld.get(key);
-      if (kept) { for (const id of ids) kept.ids.delete(id); if (!kept.ids.size) this.#unheld.delete(key); }
-      const missed = ids.length - held, waiting = missed ? releasing : [];
-      if (missed > waiting.length) log.warn(`推送 ${pushId}：${missed - waiting.length} 个回复附件已经失效或在别的推送里，汇总里会缺这几个`);
-      if (!waiting.length) return true;
-      // Another push may still hold these until its release ends (#releaseEnded tries them again); one ended meanwhile.
-      this.#keepUnheld(pushId, member, waiting);
-      if (!waiting.some(id => this.#releasing.has(`${member}\n${id}`))) this.#track(this.#holdFailed(pushId));
-      return false;
-    } catch (error) {
-      if (this.#signal.aborted) return false;
-      this.#report(error);
-      this.#keepUnheld(pushId, member, ids);
-      return false;
-    }
-  }
-
-  #keepUnheld(pushId: string, member: string, ids: readonly string[]): void {
-    const key = `${pushId}\n${member}`, kept = this.#unheld.get(key) ?? { pushId, member, ids: new Set<string>() };
-    for (const id of ids) kept.ids.add(id);
-    this.#unheld.set(key, kept);
-  }
-
-  /** The tick: the holds that failed. */
-  async #holdAgain(): Promise<void> {
-    if (this.#holdingAgain || !this.#unheld.size) return;
-    this.#holdingAgain = true;
-    try { for (const pushId of new Set([...this.#unheld.values()].map(each => each.pushId))) await this.#holdFailed(pushId); }
-    finally { this.#holdingAgain = false; }
-  }
-  #holdingAgain = false;
-
-  /** The push's holds that failed, tried again for the attachments still in the reply (one withdrawn since is not); true while some still fail. */
-  async #holdFailed(pushId: string): Promise<boolean> {
-    let failing = false;
-    for (const [key, { pushId: id, member, ids }] of [...this.#unheld]) {
-      if (id !== pushId) continue;
-      // Once the summary is built a hold is no use, and one taken after the release would stay for good.
-      const wanted = this.#holdable(pushId) ? this.#store.items(pushId, member).flatMap(item => item.attachment && ids.has(item.attachment) ? [item.attachment] : []) : [];
-      if (!wanted.length) { this.#unheld.delete(key); continue; }
-      if (!await this.#hold(pushId, member, wanted)) failing = true;
-    }
-    return failing;
-  }
-
-  /**
-   * At startup: the attachments of the replies to pushes whose summary is still to be built are held (a process may have
-   * ended between the record and the hold, or while a failed hold waited for the tick).
+   * At startup: the attachments of the replies to pushes whose summary is still to be built are settled (a process may have
+   * ended between the record and the hold, or while a failed settle waited for the tick).
    */
   async #holdReplies(): Promise<void> {
     if (!this.#host) return;
+    const byMember = new Map<string, string[]>();
     for (const push of [...this.#store.pushesIn(LIVE_STATES), ...this.#store.pushesIn(["closed"]).filter(push => push.summaryState === "pending")]) {
-      const members = new Set(this.#store.items(push.id).flatMap(item => item.attachment !== null ? [item.member] : []));
-      for (const member of members) {
-        // Read again for each member: one may have withdrawn or replaced their reply while the holds before ran.
-        if (!this.#holdable(push.id)) break;
-        await this.#hold(push.id, member, this.#store.items(push.id, member).flatMap(item => item.attachment !== null ? [item.attachment] : []));
-      }
+      for (const item of this.#store.items(push.id)) if (item.attachment !== null) byMember.set(item.member, [...byMember.get(item.member) ?? [], item.attachment]);
     }
+    for (const [member, ids] of byMember) await this.#settle(member, ids);
   }
 
   /** A hold still serves the push: it takes replies, or its summary is still to be built. */
@@ -1776,7 +1888,7 @@ export class PushService {
       const own = group ? current.filter(item => item.sender === sender) : current;
       if (!own.length) return undefined;
       this.#store.removeItems(own.map(item => item.id));
-      this.#release(push.id, asked.member, own);
+      this.#release(asked.member, own);
       const rest = current.length - own.length;
       this.#store.updateRecipient(push.id, asked.member, { repliedAt: rest ? this.#now() : null, version: recipient.version + 1 });
       return rest;
@@ -1795,19 +1907,24 @@ export class PushService {
    */
   async failed(speaker: Speaker): Promise<string | undefined> {
     const group = speaker.scope.kind === "group", member = this.#memberOf(speaker.scope, speaker.phone), now = this.#now();
-    const existing = this.#store.itemOf(speaker.message.msgUid), recorded = existing && this.#store.push(existing.pushId);
-    if (recorded) return `这条消息已经记进「${recorded.subject}」的回复了，不用重发。`;
+    // Files this request recorded that were taken out of replies again are named in every answer (#lostLine).
+    const request = speaker.message.msgUid;
+    const existing = this.#store.itemOf(request), recorded = existing && this.#store.push(existing.pushId);
+    if (recorded) {
+      const lost = this.#lostLine(member, request);
+      return `这条消息已经记进「${recorded.subject}」的回复了${lost ? `；${lost}` : "，不用重发。"}`;
+    }
     const waiting = this.#store.awaitingReply(member).map(recipient => this.#store.push(recipient.pushId)!).filter(push => now < push.deadline);
-    if (!waiting.length) return undefined;
+    if (!waiting.length) return this.#lostLine(member, request) || undefined;
     if (waiting.length > 1) {
       return `${group ? "本群" : "你"}有 ${waiting.length} 条推送等着回复（${waiting.slice(0, 5).map(push => `「${push.subject}」`).join("、")}${waiting.length > 5 ? " 等" : ""}），`
-        + "这条消息没有记进去；是回复的话，请过一会儿再发一次。";
+        + "这条消息没有记进去；是回复的话，请过一会儿再发一次。" + this.#lostLine(member, request);
     }
     const push = waiting[0]!;
     try {
       const files = group ? [] : await this.#boundFiles(speaker.phone, speaker.message.msgUid);
       const done = this.#atomic(() => {
-        const result = this.#record(push.id, member, speaker.phone, speaker.message, files, false);
+        const result = this.#record(push.id, member, speaker.phone, speaker.message, files, false, request);
         this.#note(speaker.scope, speaker.phone, `reply:${push.id}:${speaker.message.msgUid}`, `[推送回复] 上面那条没有答上来的消息，系统已经记为${group ? "本群" : ""}对 ${push.pusherName} 推送的`
           + `「${quoted(push.subject)}」的回复。推送编号 ${push.id}`, { push: push.id, event: "reply" });
         return result;
@@ -1816,10 +1933,10 @@ export class PushService {
       this.#refreshCard(push.id, member);
       this.#checkComplete(push.id);
       log.info(`推送 ${push.id}：模型没有答上来的一条消息记为回复`);
-      return `这条消息我先记进「${push.subject}」的回复了；不是回复的话，回头跟我说一声“撤回”。`;
+      return `这条消息我先记进「${push.subject}」的回复了；不是回复的话，回头跟我说一声“撤回”。` + this.#lostLine(member, request);
     } catch (error) {
       if (!(error instanceof PushRefused) && !this.#signal.aborted) this.#report(error);
-      return undefined;
+      return this.#lostLine(member, request) || undefined;
     }
   }
 
@@ -1869,10 +1986,12 @@ export class PushService {
         if (push.mode === "reply") this.#checkComplete(push.id);
       }
       this.#store.forgetHeard(now - this.#limits.heardMs);
+      this.#store.forgetLost(now - this.#limits.heardMs, now - 7 * 24 * 3600_000);
       this.#sweepFiles();
       this.#pump();
       this.#track(this.#drainNotes());
-      this.#track(this.#holdAgain());
+      this.#track(this.#tellLost());
+      this.#track(this.#settleAgain());
       for (const push of this.#store.summariesDue()) this.#track(this.#summarize(push.id));
       for (const push of this.#store.unreleased()) this.#track(this.#releasePush(push.id));
     } catch (error) { this.#report(error); }
@@ -2096,8 +2215,8 @@ export class PushService {
     const dir = join(userTmp(this.options.layout, DIRECT_SCOPE, push.pusher), `push-${push.id}`);
     try {
       const items = this.#store.items(pushId), replyOf = replyIndex(items);
-      // A file the push does not hold is not in the summary: its holds settle first (#holdsSettled).
-      const holding = push.mode === "reply" && await this.#holdsSettled(pushId);
+      // A file the push does not hold is not in the summary: the settles of its files end first (#settlesDone).
+      const holding = push.mode === "reply" && await this.#settlesDone(pushId);
       const files = push.mode === "reply" ? await this.#heldFiles(pushId, items) : new Map<string, HeldFile>();
       // Read after the await, so a send that ended during it is in them.
       const current = this.#store.recipients(pushId);
@@ -2210,31 +2329,28 @@ export class PushService {
   }
 
   /**
-   * Release the held attachments of a push whose summary is done (sent or given up). A reply's file still downloading
-   * stays held until the download ends, so where it is gets kept: the push counts as released only once none is left
-   * (the timer tries again).
+   * Release what the push holds once its summary is done (sent or given up): in one commit by member, each file it holds
+   * (a withdrawn or replaced reply's whose settle failed or was lost to a process end too) goes where the replies say now
+   * (#settle), to the push whose reply has it or nowhere. A reply's file still downloading stays held until the download
+   * ends; a file let go keeps where it is with its item (#keepPath). The push counts as released only once a commit left
+   * it none (the tick tries again): no file stays with it for good.
    */
   async #releasePush(pushId: string): Promise<void> {
     const key = `release:${pushId}`;
     if (this.#refreshing.has(key)) return;
     this.#refreshing.set(key, { again: false });
     try {
-      // A hold still under way would otherwise land after the release and stay.
-      await this.#holdsSettled(pushId);
-      const items = this.#store.items(pushId).filter(item => item.kind !== "text");
-      const files = await this.#heldFiles(pushId, items);
-      // The records go; where the files are stays with the items, for the console's downloads until the tmp cleanup takes them.
-      const byMember = new Map<string, string[]>();
-      let waiting = false;
-      for (const item of items) {
-        const file = item.attachment ? files.get(item.attachment) : undefined;
-        if (unsettled(item, files)) { waiting = true; continue; }
-        if (!file) continue;
-        if (file.state === "ready" && file.path && item.path !== file.path) this.#store.keepItemPath(item.id, file.path);
-        byMember.set(item.member, [...byMember.get(item.member) ?? [], item.attachment!]);
+      const holder = holderOf(pushId), own = new Map<string, string[]>();
+      for (const item of this.#store.items(pushId)) if (item.attachment !== null) own.set(item.member, [...own.get(item.member) ?? [], item.attachment]);
+      // Only a person whose reply was recorded can have a file held: the first recorded reply sets `ackedAt`, which nothing clears.
+      const replied = this.#store.push(pushId)?.mode !== "reply" ? [] : this.#store.recipients(pushId).filter(recipient => recipient.ackedAt !== null).map(recipient => recipient.member);
+      let released = true;
+      for (const member of new Set([...own.keys(), ...replied])) {
+        if (memberGroup(member) !== undefined) continue;
+        const settled = await this.#settle(member, own.get(member) ?? [], holder);
+        if (!settled || [...settled.attachments.values()].some(({ heldBy }) => heldBy === holder)) released = false;
       }
-      for (const [member, ids] of byMember) await this.#host!.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), ids);
-      if (!waiting) this.#store.updatePush(pushId, { released: true });
+      if (released) this.#store.updatePush(pushId, { released: true });
     } catch (error) { if (!this.#signal.aborted) this.#report(error); }
     finally { this.#refreshing.delete(key); }
   }
@@ -2247,36 +2363,10 @@ export class PushService {
     else if (!push.released) this.#track(this.#releasePush(pushId));
   }
 
-  /**
-   * Release the attachments of replaced or withdrawn items now (best effort). Until it ended, a hold of them by another
-   * push (the message recorded there meanwhile) waits for it (#holdNow).
-   */
-  #release(pushId: string, member: string, items: readonly ReplyItem[]): void {
+  /** The attachments of replaced or withdrawn items go where the replies say now (#settle): nowhere, or to the push the message moved to. */
+  #release(member: string, items: readonly ReplyItem[]): void {
     const ids = items.flatMap(item => item.attachment ? [item.attachment] : []);
-    if (!ids.length || !this.#host) return;
-    const host = this.#host;
-    this.#effect(() => {
-      for (const id of ids) this.#releasing.set(`${member}\n${id}`, (this.#releasing.get(`${member}\n${id}`) ?? 0) + 1);
-      this.#track((async () => {
-        // A hold under way (the startup's, or a reply's) would land after this release and stay: it ends first. One the
-        // reply took up again meanwhile stays held.
-        await this.#holdsDone(pushId);
-        const kept = new Set(this.#store.items(pushId, member).flatMap(item => item.attachment !== null ? [item.attachment] : []));
-        const gone = ids.filter(id => !kept.has(id));
-        if (gone.length) await host.releaseAttachments(DIRECT_SCOPE, member, holderOf(pushId), gone);
-      })().catch(error => { if (!this.#signal.aborted) this.#report(error); }).finally(() => this.#releaseEnded(member, ids)));
-    });
-  }
-
-  /** A release of the member's attachments ended: the holds of other pushes that waited for it are tried again. */
-  #releaseEnded(member: string, ids: readonly string[]): void {
-    for (const id of ids) {
-      const key = `${member}\n${id}`, left = (this.#releasing.get(key) ?? 1) - 1;
-      if (left) this.#releasing.set(key, left);
-      else this.#releasing.delete(key);
-    }
-    const waiting = [...this.#unheld.values()].filter(each => each.member === member && ids.some(id => each.ids.has(id)));
-    for (const pushId of new Set(waiting.map(each => each.pushId))) this.#track(this.#holdFailed(pushId));
+    if (ids.length && this.#host) this.#effect(() => this.#track(this.#settle(member, ids)));
   }
 
   // ---- notes ----------------------------------------------------------------------------------------------------------
@@ -2288,6 +2378,9 @@ export class PushService {
   }
 
   #draining = false;
+  /** A reminder run (#tellLost) is under way; another was asked for meanwhile. */
+  #telling = false;
+  #tellAgain = false;
   async #drainNotes(): Promise<void> {
     if (this.#draining || !this.#host || this.#closing) return;
     this.#draining = true;
@@ -2432,6 +2525,16 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", done, { once: true });
     function done() { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); }
   });
+}
+
+/** What a settle's commit did (#settle): each attachment it settled, and the reply items it took out again (#dropGone). */
+type Settled = { attachments: Map<string, SettledAttachment>; dropped: ReplyItem[] };
+
+/** The member's line of the files taken out of their replies: by push, each named. */
+function lostText(files: readonly LostFile[], subjectOf: (pushId: string) => string | undefined): string {
+  const byPush = new Map<string, string[]>();
+  for (const file of files) byPush.set(file.pushId, [...byPush.get(file.pushId) ?? [], `「${file.name}」`]);
+  return [...byPush].map(([pushId, names]) => `附件${names.join("、")}已经失效，没有记进「${subjectOf(pushId) ?? pushId}」的回复，请再发一次。`).join("");
 }
 
 function countsOf(items: readonly ReplyItem[]): Counts {

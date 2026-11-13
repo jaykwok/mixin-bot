@@ -179,6 +179,8 @@ export type ReplyItem = {
   /** Who sent a group's reply text: phone and name; null in a direct chat. */
   sender: string | null;
   senderName: string | null;
+  /** The message of the request that recorded the item (its reply tool, or its failure): a file found gone later is that request's to tell of. */
+  request: string;
 };
 
 /**
@@ -207,6 +209,13 @@ export type Heard = { msgUid: string; member: string; sender: string; text: stri
 /** `scope`: the conversation's scope key (src/core/layout.ts scopeKey): `direct`, or `group:<ID>` for a member's group conversation. */
 export type PushNote = { scope: string; requestId: string; phone: string; text: string; data: string; attempts: number; nextAt: number; createdAt: number };
 
+/**
+ * A file taken out of a member's reply because its record was gone when the push came to hold it (`msgUid`: the file's
+ * message). `request`: the message of the request that recorded it (ReplyItem). `told`: the reminder to send it again went
+ * out, or was given up; a row is kept a day after that.
+ */
+export type LostFile = { msgUid: string; member: string; pushId: string; name: string; request: string; told: boolean; attempts: number; nextAt: number; createdAt: number };
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS push_roles (
   phone TEXT PRIMARY KEY, admin INTEGER NOT NULL, pusher INTEGER NOT NULL, grants TEXT NOT NULL, daily_limit INTEGER,
@@ -233,7 +242,7 @@ CREATE INDEX IF NOT EXISTS push_recipients_by_member ON push_recipients (member)
 CREATE TABLE IF NOT EXISTS push_reply_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT, push_id TEXT NOT NULL, member TEXT NOT NULL,
   msg_uid TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, text TEXT, attachment TEXT, name TEXT, size INTEGER,
-  received_at INTEGER NOT NULL, path TEXT, sender TEXT, sender_name TEXT) STRICT;
+  received_at INTEGER NOT NULL, path TEXT, sender TEXT, sender_name TEXT, request TEXT NOT NULL) STRICT;
 CREATE INDEX IF NOT EXISTS push_reply_items_by_reply ON push_reply_items (push_id, member);
 CREATE TABLE IF NOT EXISTS push_forwards (
   id TEXT PRIMARY KEY, push_id TEXT NOT NULL, from_member TEXT NOT NULL, to_member TEXT NOT NULL, to_name TEXT NOT NULL, state TEXT NOT NULL,
@@ -245,6 +254,11 @@ CREATE INDEX IF NOT EXISTS push_heard_by_member ON push_heard (member, sender, r
 CREATE TABLE IF NOT EXISTS push_notes (
   scope TEXT NOT NULL, phone TEXT NOT NULL, request_id TEXT NOT NULL, text TEXT NOT NULL, data TEXT NOT NULL, attempts INTEGER NOT NULL,
   next_at INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (scope, phone, request_id)) STRICT;
+CREATE TABLE IF NOT EXISTS push_lost_files (
+  msg_uid TEXT PRIMARY KEY, member TEXT NOT NULL, push_id TEXT NOT NULL, name TEXT NOT NULL, request TEXT NOT NULL, told INTEGER NOT NULL,
+  attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, created_at INTEGER NOT NULL) STRICT;
+CREATE INDEX IF NOT EXISTS push_lost_files_due ON push_lost_files (told, next_at);
+CREATE INDEX IF NOT EXISTS push_lost_files_by_request ON push_lost_files (member, request);
 `;
 
 type Row = Record<string, string | number | null>;
@@ -300,7 +314,7 @@ const FORWARD_SELECT = `SELECT id, push_id AS pushId, from_member AS "from", to_
   created_at AS createdAt, decided_at AS decidedAt FROM push_forwards`;
 
 const ITEM_SELECT = `SELECT id, push_id AS pushId, member, msg_uid AS msgUid, kind, text, attachment, name, size,
-  received_at AS receivedAt, path, sender, sender_name AS senderName FROM push_reply_items`;
+  received_at AS receivedAt, path, sender, sender_name AS senderName, request FROM push_reply_items`;
 const GROUP_SELECT = `SELECT group_id AS id, name, state, first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, registered_at AS registeredAt,
   registered_by AS registeredBy FROM chat_groups`;
 
@@ -579,14 +593,19 @@ export class PushStore {
   /** The new item's ID; undefined when the message was recorded before (a redelivery). */
   addItem(item: Omit<ReplyItem, "id" | "path">): number | undefined {
     const result = this.db.query(`INSERT OR IGNORE INTO push_reply_items (push_id, member, msg_uid, kind, text, attachment, name, size,
-      received_at, sender, sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(item.pushId, item.member, item.msgUid, item.kind,
-      item.text, item.attachment, item.name, item.size, item.receivedAt, item.sender, item.senderName);
+      received_at, sender, sender_name, request) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(item.pushId, item.member, item.msgUid, item.kind,
+      item.text, item.attachment, item.name, item.size, item.receivedAt, item.sender, item.senderName, item.request);
     return result.changes ? Number(result.lastInsertRowid) : undefined;
   }
 
   /** The item a message became, if any. */
   itemOf(msgUid: string): ReplyItem | undefined {
     return (this.db.query(`${ITEM_SELECT} WHERE msg_uid = ?`).get(msgUid) as ReplyItem | null) ?? undefined;
+  }
+
+  /** The reply item that has this attachment of the member: a message, with its files, is part of one reply only. */
+  itemWithAttachment(member: string, attachment: string): ReplyItem | undefined {
+    return (this.db.query(`${ITEM_SELECT} WHERE member = ? AND attachment = ?`).get(member, attachment) as ReplyItem | null) ?? undefined;
   }
 
   removeItems(ids: readonly number[]): void {
@@ -675,6 +694,47 @@ export class PushStore {
     this.db.query("UPDATE push_notes SET attempts = attempts + 1, next_at = ? WHERE scope = ? AND phone = ? AND request_id = ?")
       .run(nextAt, note.scope, note.phone, note.requestId);
   }
+
+  // ---- lost reply files -----------------------------------------------------------------------------------------------
+
+  /** Files taken out of replies, the member to be told; one already kept stays as it was. */
+  addLost(files: readonly Pick<LostFile, "msgUid" | "member" | "pushId" | "name" | "request">[], now: number): void {
+    const insert = this.db.query(`INSERT OR IGNORE INTO push_lost_files (msg_uid, member, push_id, name, request, told, attempts, next_at, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)`);
+    for (const file of files) insert.run(file.msgUid, file.member, file.pushId, file.name, file.request, now, now);
+  }
+
+  /** The files whose member is still to be told, due now, oldest first. */
+  lostDue(now: number, limit: number): LostFile[] {
+    return (this.db.query(`${LOST_SELECT} WHERE told = 0 AND next_at <= ? ORDER BY created_at, rowid LIMIT ?`).all(now, limit) as Row[]).map(lostOf);
+  }
+
+  /** The files this request of the member recorded and that were taken out again, told or not. */
+  lostIn(member: string, request: string): LostFile[] {
+    return (this.db.query(`${LOST_SELECT} WHERE member = ? AND request = ? ORDER BY created_at, rowid`).all(member, request) as Row[]).map(lostOf);
+  }
+
+  /** The member was told, or will not be (`now`: when). */
+  markLostTold(msgUids: readonly string[], now: number): void {
+    const update = this.db.query("UPDATE push_lost_files SET told = 1, next_at = ? WHERE msg_uid = ?");
+    for (const msgUid of msgUids) update.run(now, msgUid);
+  }
+
+  deferLost(msgUids: readonly string[], nextAt: number): void {
+    const update = this.db.query("UPDATE push_lost_files SET attempts = attempts + 1, next_at = ? WHERE msg_uid = ?");
+    for (const msgUid of msgUids) update.run(nextAt, msgUid);
+  }
+
+  /** Rows the member was told of before `before`, and any older than `stale`. */
+  forgetLost(before: number, stale: number): void {
+    this.db.query("DELETE FROM push_lost_files WHERE (told = 1 AND next_at < ?) OR created_at < ?").run(before, stale);
+  }
+}
+
+const LOST_SELECT = "SELECT msg_uid, member, push_id, name, request, told, attempts, next_at, created_at FROM push_lost_files";
+function lostOf(row: Row): LostFile {
+  return { msgUid: String(row.msg_uid), member: String(row.member), pushId: String(row.push_id), name: String(row.name), request: String(row.request),
+    told: row.told === 1, attempts: Number(row.attempts), nextAt: Number(row.next_at), createdAt: Number(row.created_at) };
 }
 
 function roleOf(row: Row): PushRole {

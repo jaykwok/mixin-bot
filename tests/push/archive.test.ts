@@ -80,7 +80,7 @@ function recipient(member: string, name: string, change: Partial<Recipient> = {}
 let itemId = 0;
 function item(member: string, change: Partial<ReplyItem>): ReplyItem {
   return { id: ++itemId, pushId: "abcd2345", member, msgUid: `m-${itemId}`, kind: "text", text: null, attachment: null, name: null, size: null,
-    receivedAt: 1, path: null, sender: null, senderName: null, ...change };
+    receivedAt: 1, path: null, sender: null, senderName: null, request: "", ...change };
 }
 
 test("a reply summary: each person's reply, its files, and why a file is not packed", async () => {

@@ -7,7 +7,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { EntryDraft } from "@earendil-works/pi-durable";
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { createSession, type EntryDraft, type Tx } from "@earendil-works/pi-durable";
 import { PUSH_LIMITS, type PushCursor, PushRefused, PushService, type PushHost, type PushLimits, type PrepareInput, type Speaker } from "../../src/push/service.ts";
 import { CARD_MAX_CHARS, clickData, clickShape } from "../../src/push/cards.ts";
 import { type Grants, PushStore } from "../../src/push/store.ts";
@@ -15,8 +16,10 @@ import { DIRECT_SCOPE, scopeKey } from "../../src/core/layout.ts";
 import { DepartmentTree, emptyWalk } from "../../src/integrations/open-platform/department-tree.ts";
 import type { CardButton, CardContent, OutboundMessage, SendOptions, SendOutcome } from "../../src/integrations/open-platform/messages.ts";
 import type { Outbound } from "../../src/durable/outbound.ts";
-import { holdAttachments, releaseHeld } from "../../src/durable/attachments.ts";
-import type { Attachment, MemberRecords, ReplyContext, RequestRecord } from "../../src/durable/records.ts";
+import { expireAttachments, settleHeld } from "../../src/durable/attachments.ts";
+import { type Attachment, type MemberRecords, memberRecords as durableRecords, pruneRecords, recordsOf as durableRecordsOf, type ReplyContext,
+  type RequestRecord } from "../../src/durable/records.ts";
+import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import type { DirectoryIdentity } from "../../src/integrations/open-platform/identity-directory.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { readZip } from "../helpers/zip-reader.ts";
@@ -84,11 +87,21 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
     departments.replace(walk, clock.now);
   };
   const grant = (grants: Grants) => store.replaceRoles([{ phone: PUSHER, admin: false, pusher: true, grants, dailyLimit: options.dailyLimit ?? null }], clock.now);
-  // The message service: request and attachment records per member, holds as it keeps them (src/durable/attachments.ts),
-  // passive notes (deduplicated by request ID).
+  // The message service: request and attachment records per member, holds as it settles them (src/durable/attachments.ts
+  // `settleHeld`), passive notes (deduplicated by request ID). Its commits run one at a time on a line, as the durable
+  // session's do (`onLine` puts other work there, a maintenance commit); `commits.gate` holds a member's settle before it
+  // queues. A settle that would hold or take over a file fails while `commits.holds`, one that would let one go while
+  // `commits.releases`, the next `commits.failNext` fail whatever they do; a failed one changes nothing.
   const records = new Map<string, MemberRecords>();
   const notes: { scope: string; phone: string; requestId: string; entry: EntryDraft }[] = [];
   const held: { phone: string; holder: string; ids: string[] }[] = [], released: { phone: string; holder: string; ids: string[] }[] = [];
+  const commits = { holds: false, releases: false, failNext: 0, gate: undefined as ((phone: string) => Promise<void> | void) | undefined };
+  let line: Promise<unknown> = Promise.resolve();
+  const onLine = <T,>(work: () => T | Promise<T>): Promise<T> => {
+    const run = line.then(work);
+    line = run.then(() => {}, () => {});
+    return run;
+  };
   const recordsOf = (phone: string) => {
     const own = records.get(phone) ?? { requests: {}, attachments: {} };
     records.set(phone, own);
@@ -96,13 +109,27 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   };
   const host: PushHost = {
     records: async (_scope, phone) => structuredClone(records.get(phone) ?? { requests: {}, attachments: {} }),
-    async holdAttachments(_scope, phone, holder, ids) {
-      held.push({ phone, holder, ids: [...ids] });
-      return holdAttachments(recordsOf(phone), holder, ids);
-    },
-    async releaseAttachments(_scope, phone, holder, ids) {
-      released.push({ phone, holder, ids: [...ids] });
-      return releaseHeld(recordsOf(phone), holder, ids);
+    async settleAttachments(_scope, phone, decide) {
+      await commits.gate?.(phone);
+      return onLine(() => {
+        const settled = settleHeld(recordsOf(phone), attachments => {
+          const wanted = decide(attachments), changes = [...wanted].filter(([id, holder]) => attachments[id] && holder !== attachments[id].heldBy);
+          if (commits.failNext > 0) { commits.failNext--; throw new Error("disk busy"); }
+          if ((commits.holds && changes.some(([, holder]) => holder !== undefined)) || (commits.releases && changes.some(([, holder]) => holder === undefined))) throw new Error("disk busy");
+          return wanted;
+        });
+        // Logged by holder: what each one took, and what each one let go.
+        const changed = new Map<string, { log: typeof held; holder: string; ids: string[] }>();
+        for (const [id, { attachment, heldBy }] of settled) {
+          if (heldBy === attachment.heldBy) continue;
+          const log = heldBy !== undefined ? held : released, holder = heldBy ?? attachment.heldBy!, key = `${heldBy !== undefined}|${holder}`;
+          const entry = changed.get(key) ?? { log, holder, ids: [] };
+          entry.ids.push(id);
+          changed.set(key, entry);
+        }
+        for (const { log, holder, ids } of changed.values()) log.push({ phone, holder, ids });
+        return settled;
+      });
     },
     async note(scope, phone, requestId, entry) {
       const key = scopeKey(scope);
@@ -207,7 +234,7 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   };
   const groupText = (groupId: string, phone: string, value: string, context = groupReply(groupId, phone)) => service.groupText(groupId, byPhone.get(phone)!, context, value);
   return {
-    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, held, released, finishDownload, abort, reply, identity, cards, texts, host,
+    root, db, store, sent, uploads, reports, clock, failing, gate, records, notes, held, released, commits, onLine, finishDownload, abort, reply, identity, cards, texts, host,
     files, card, buttonOf, click, say, groupSay,
     settle, prepare, pushId, tree, grant, groupReply, groupCards, groupTexts, groupClick, groupText, get service() { return service; },
     async restart() { await service.close(); service = make(); },
@@ -2494,16 +2521,10 @@ test("handing a push on to someone whose own card never got there: refused when 
 test("a hold that fails is tried again on the tick and before the summary: the reply's file is in the console's package and the summary", async () => {
   const h = harness();
   try {
-    const hold = h.host.holdAttachments.bind(h.host);
-    let failures = 0;
-    h.host.holdAttachments = async (...args) => {
-      if (failures > 0) { failures--; throw new Error("disk busy"); }
-      return hold(...args);
-    };
     const heldBy = (phone: string) => Object.values(h.records.get(phone)?.attachments ?? {}).filter(attachment => attachment.heldBy).length;
     // On the tick.
     const id = await confirmed(h, { mode: "reply" });
-    failures = 1;
+    h.commits.failNext = 1;
     expect(await h.service.reply(h.say(ZHANG, "附件是回复", ["盘点.xlsx"]), { push: id, action: "add" })).toContain("记入");
     expect(heldBy(ZHANG)).toBe(0);
     h.service.tick();
@@ -2514,7 +2535,7 @@ test("a hold that fails is tried again on the tick and before the summary: the r
     finally { await pack.done(); }
     // The push ends before a tick came: the summary holds it first.
     const late = await confirmed(h, { mode: "reply", deadline: "2026-11-04 18:00", recipients: [{ name: "李四", phone: LI }] });
-    failures = 1;
+    h.commits.failNext = 1;
     expect(await h.service.reply(h.say(LI, "李四的附件", ["清单.xlsx"]), { push: late, action: "add" })).toContain("记入");
     h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
     h.service.tick();
@@ -2531,21 +2552,16 @@ test("a restart between the end of a push and its summary: the summary waits for
   const h = harness();
   try {
     const id = await confirmed(h, { mode: "reply", recipients: [{ name: "张三", phone: ZHANG }] });
-    const hold = h.host.holdAttachments.bind(h.host);
-    let failures = 1;
-    h.host.holdAttachments = async (...args) => {
-      if (failures > 0) { failures--; throw new Error("disk busy"); }
-      return hold(...args);
-    };
+    h.commits.failNext = 1;
     expect(await h.service.reply(h.say(ZHANG, "附件回复", ["清单.xlsx"]), { push: id, action: "add" })).toContain("记入");
     await h.service.close();
     // The process ended after the push did, before its summary was built. At the restart the hold of the startup fails,
     // and the summary's own try too: it waits.
     h.store.updatePush(id, { state: "closed", closedAt: h.clock.now, closeReason: "deadline", summaryState: "pending" });
-    failures = 2;
+    h.commits.failNext = 2;
     await h.restart();
     await h.settle();
-    expect([h.store.push(id)!.summaryState, failures]).toEqual(["pending", 0]);
+    expect([h.store.push(id)!.summaryState, h.commits.failNext]).toEqual(["pending", 0]);
     h.service.tick();
     await h.settle();
     expect(h.store.push(id)!.summaryState).toBe("sent");
@@ -2614,33 +2630,35 @@ test("a card whose result was unknown (an interrupted send) still counts after a
   } finally { await h.close(); }
 });
 
-test("a reply withdrawn while the startup's holds are under way: its attachment is not held again, and nothing stays held after the release", async () => {
+test("a reply withdrawn while the startup's settles are under way: its attachment is not held again, and nothing stays held after the release", async () => {
   const h = harness();
   let open = () => {};
   try {
     const id = await confirmed(h, { mode: "reply" });
-    const hold = h.host.holdAttachments.bind(h.host);
-    h.host.holdAttachments = async () => { throw new Error("disk busy"); };
+    h.commits.holds = true;
     await h.service.reply(h.say(ZHANG, "张三的附件", ["张三.xlsx"]), { push: id, action: "add" });
     await h.service.reply(h.say(LI, "李四的附件", ["李四.xlsx"]), { push: id, action: "add" });
     await h.service.close();
-    // At the restart Zhang's hold is held up; Li withdraws meanwhile.
+    h.commits.holds = false;
+    // At the restart Zhang's settle is held up, Li's comes after it; Li withdraws meanwhile.
     const gate = new Promise<void>(resolve => { open = resolve; });
     const calls: string[] = [];
-    h.host.holdAttachments = async (...args) => {
-      calls.push(args[1]);
-      if (args[1] === ZHANG) await gate;
-      return hold(...args);
+    h.commits.gate = async phone => {
+      calls.push(phone);
+      if (phone === ZHANG) await gate;
     };
     await h.restart();
     await Bun.sleep(50);
     expect(calls).toEqual([ZHANG]);
+    const holds = h.held.length;
     expect(await h.service.reply(h.say(LI, "撤回"), { push: id, action: "withdraw" })).toContain("已撤回");
     await Bun.sleep(50);
     expect(h.store.items(id, LI)).toEqual([]);
     open();
     await h.settle();
-    expect(calls).toEqual([ZHANG]);
+    // The withdrawal's settle and then the startup's: decided after the withdrawal, it holds nothing.
+    expect(calls).toEqual([ZHANG, LI, LI]);
+    expect(h.held.slice(holds).map(hold => hold.phone)).toEqual([ZHANG]);
     expect(Object.values(h.records.get(LI)!.attachments).map(attachment => attachment.heldBy ?? null)).toEqual([null]);
     h.clock.now = h.store.push(id)!.deadline + 1;
     h.service.tick();
@@ -2650,18 +2668,16 @@ test("a reply withdrawn while the startup's holds are under way: its attachment 
   } finally { open(); await h.close(); }
 });
 
-test("a reply withdrawn while its own hold is under way: the release waits for the hold, so nothing stays held", async () => {
+test("a reply withdrawn while its own hold waits: the hold, decided in its commit, finds the reply withdrawn, so nothing stays held", async () => {
   const h = harness();
   let open = () => {};
   try {
     const id = await confirmed(h, { mode: "reply" });
-    const hold = h.host.holdAttachments.bind(h.host);
     const gate = new Promise<void>(resolve => { open = resolve; });
     let calls = 0;
-    h.host.holdAttachments = async (...args) => {
+    h.commits.gate = async () => {
       calls++;
       await gate;
-      return hold(...args);
     };
     const replied = h.service.reply(h.say(LI, "李四的附件", ["李四.xlsx"]), { push: id, action: "add" });
     await Bun.sleep(50);
@@ -2675,7 +2691,7 @@ test("a reply withdrawn while its own hold is under way: the release waits for t
   } finally { open(); await h.close(); }
 });
 
-test("a reply withdrawn from one push while its release waits, then recorded to another: that push holds the file once the release ended", async () => {
+test("a reply withdrawn from one push and recorded to another while the startup's settles wait: the second push holds the file at once, and nothing stays held", async () => {
   const h = harness();
   let open = () => {};
   try {
@@ -2685,22 +2701,18 @@ test("a reply withdrawn from one push while its release waits, then recorded to 
     await h.service.reply(h.say(LI, "李四的回复", ["李四.xlsx"]), { push: first, action: "add" });
     const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
     await h.service.close();
-    // At the restart Zhang's hold is held up, so the release of Li's withdrawn reply waits; Li's message goes to the second push meanwhile.
-    const hold = h.host.holdAttachments.bind(h.host);
+    // At the restart Zhang's settle is held up, Li's after it; Li's message goes to the second push meanwhile.
     const gate = new Promise<void>(resolve => { open = resolve; });
-    h.host.holdAttachments = async (...args) => {
-      if (args[1] === ZHANG) await gate;
-      return hold(...args);
-    };
+    h.commits.gate = async phone => { if (phone === ZHANG) await gate; };
     await h.restart();
     await Bun.sleep(50);
     expect(await h.service.reply(h.say(LI, "撤回"), { push: first, action: "withdraw" })).toContain("已撤回");
     expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: second, action: "add", quote: "李四的回复" })).toContain("记入");
     expect(h.store.items(second, LI).map(item => item.attachment).filter(Boolean)).toEqual([file]);
-    // The first push still holds it; the tick meanwhile keeps the second one waiting.
+    // The startup's settles still wait; the second push holds the file already.
     h.service.tick();
     await Bun.sleep(50);
-    expect(h.records.get(LI)!.attachments[file]!.heldBy).toBe(`push:${first}`);
+    expect(h.records.get(LI)!.attachments[file]!.heldBy).toBe(`push:${second}`);
     open();
     await h.settle();
     expect(h.records.get(LI)!.attachments[file]!.heldBy).toBe(`push:${second}`);
@@ -2711,4 +2723,640 @@ test("a reply withdrawn from one push while its release waits, then recorded to 
     expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
     for (const phone of [ZHANG, LI]) expect(Object.values(h.records.get(phone)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
   } finally { open(); await h.close(); }
+});
+
+/**
+ * Li's reply with a file to a first push, withdrawn while releases fail; a second push to Li ends a day before the first.
+ * `mend` ends the failures.
+ */
+async function releaseFailing(h: Harness) {
+  const first = await confirmed(h, { mode: "reply", recipients: [{ name: "李四", phone: LI }] });
+  const second = await confirmed(h, { mode: "reply", subject: "第二条推送", deadline: "2026-11-04 18:00", recipients: [{ name: "李四", phone: LI }] });
+  await h.service.reply(h.say(LI, "李四的回复", ["清单.xlsx"]), { push: first, action: "add" });
+  const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
+  h.commits.releases = true;
+  expect(await h.service.reply(h.say(LI, "撤回"), { push: first, action: "withdraw" })).toContain("已撤回");
+  await h.settle();
+  const heldBy = () => h.records.get(LI)!.attachments[file]?.heldBy ?? null;
+  expect(heldBy()).toBe(`push:${first}`);
+  return { first, second, file, heldBy, mend: () => { h.commits.releases = false; } };
+}
+
+/** The entries of the push's summary package as sent. */
+async function packedOf(h: Harness, pushId: string): Promise<string[]> {
+  const sent = h.uploads.filter(upload => upload.name.includes(pushId) && upload.name.endsWith(".zip")).at(-1)!;
+  const zip = join(fixture.root, `zip-${pushId}-${++counter}.zip`);
+  await writeFile(zip, sent.data);
+  return readZip(zip).map(entry => entry.name);
+}
+
+/** The second push ends first, with the file in its summary and package; then the first. Nothing stays held. */
+async function secondEndsFirst(h: Harness, { first, second }: { first: string; second: string }): Promise<void> {
+  h.clock.now = new Date(2026, 10, 4, 18, 0, 1).getTime();
+  h.service.tick();
+  await h.settle();
+  expect(h.store.push(first)!.state).toBe("open");
+  expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+  expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
+  expect(await packedOf(h, second)).toContain("回复/001-李四-0002/01-清单.xlsx");
+  h.clock.now = h.store.push(first)!.deadline + 1;
+  h.service.tick();
+  await h.settle();
+  expect(h.store.push(first)).toMatchObject({ summaryState: "sent", released: true });
+  expect(Object.values(h.records.get(LI)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+}
+
+/** A day of the message service's maintenance after the request of Li's file closed: the request's record goes. */
+function expireRequest(h: Harness, file: string): void {
+  const own = h.records.get(LI)!, requestId = own.attachments[file]!.boundTo!;
+  own.requests[requestId]!.closedAt = h.clock.now;
+  h.clock.now += 25 * 3600_000;
+  pruneRecords(own, h.clock.now, candidates => new Set(candidates.map(record => record.requestId)));
+  expireAttachments(own, h.clock.now);
+  expect(own.requests[requestId]).toBeUndefined();
+  expect(own.attachments[file]).toBeDefined();
+}
+
+test("a withdrawn reply's release that fails is tried again on the tick: the file is its request's alone again", async () => {
+  const h = harness();
+  try {
+    const left = await releaseFailing(h);
+    h.service.tick();
+    await h.settle();
+    expect(left.heldBy()).toBe(`push:${left.first}`);
+    left.mend();
+    h.service.tick();
+    await h.settle();
+    expect(left.heldBy()).toBe(null);
+    expect(h.records.get(LI)!.attachments[left.file]!.state).toBe("ready");
+    expect(new Set(h.reports.map(String))).toEqual(new Set(["Error: disk busy"]));
+  } finally { await h.close(); }
+});
+
+test("a message moved while the first push's release fails: the second push takes the file over at once and keeps it when its request's record goes", async () => {
+  const h = harness();
+  try {
+    const moved = await releaseFailing(h);
+    expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: moved.second, action: "add", quote: "李四的回复" })).toContain("记入");
+    await h.settle();
+    expect(moved.heldBy()).toBe(`push:${moved.second}`);
+    expireRequest(h, moved.file);
+    expect(moved.heldBy()).toBe(`push:${moved.second}`);
+    // On the next tick the first push's release, tried again, leaves the second push's hold; the second push, answered by
+    // everyone a while ago, ends on it.
+    moved.mend();
+    h.service.tick();
+    await h.settle();
+    await answeredWithFile(h, moved);
+  } finally { await h.close(); }
+});
+
+/**
+ * The second push ended answered by everyone, the file in its summary and package; released, the file's record went with
+ * its request's. Then the first push ends and nothing is left.
+ */
+async function answeredWithFile(h: Harness, { first, second, file }: { first: string; second: string; file: string }): Promise<void> {
+  expect(h.store.push(second)).toMatchObject({ closeReason: "complete", summaryState: "sent", released: true });
+  expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
+  expect(await packedOf(h, second)).toContain("回复/001-李四-0002/01-清单.xlsx");
+  expect(h.records.get(LI)!.attachments[file]).toBeUndefined();
+  h.clock.now = h.store.push(first)!.deadline + 1;
+  h.service.tick();
+  await h.settle();
+  expect(h.store.push(first)).toMatchObject({ summaryState: "sent", released: true });
+  expect(Object.values(h.records.get(LI)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+}
+
+test("the first push's retried release while the second push's hold still fails and the request's record is gone: the file is left for the second push", async () => {
+  const h = harness();
+  try {
+    const moved = await releaseFailing(h);
+    h.commits.holds = true;
+    expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: moved.second, action: "add", quote: "李四的回复" })).toContain("记入");
+    await h.settle();
+    expect(moved.heldBy()).toBe(`push:${moved.first}`);
+    expireRequest(h, moved.file);
+    // Releases work again: the settle tried again would hand the file to the second push, and that still fails, so the
+    // first keeps it; a release would have dropped the record with its request's. The second push ends and its summary waits.
+    moved.mend();
+    h.service.tick();
+    await h.settle();
+    expect(moved.heldBy()).toBe(`push:${moved.first}`);
+    expect(h.store.push(moved.second)).toMatchObject({ state: "closed", summaryState: "pending" });
+    h.commits.holds = false;
+    h.service.tick();
+    await h.settle();
+    await answeredWithFile(h, moved);
+  } finally { await h.close(); }
+});
+
+test("a withdrawn reply's release lost to a restart: the push the message moves to then takes the file over from the first one", async () => {
+  const h = harness();
+  try {
+    const moved = await releaseFailing(h);
+    moved.mend();
+    await h.restart();
+    expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: moved.second, action: "add", quote: "李四的回复" })).toContain("记入");
+    await h.settle();
+    expect(moved.heldBy()).toBe(`push:${moved.second}`);
+    await secondEndsFirst(h, moved);
+  } finally { await h.close(); }
+});
+
+test("a message moved while releases and holds fail, its request's record gone, then a restart: the startup's settle takes the file over with its record", async () => {
+  const h = harness();
+  try {
+    const moved = await releaseFailing(h);
+    h.commits.holds = true;
+    expect(await h.service.reply(h.say(LI, "改记到第二条"), { push: moved.second, action: "add", quote: "李四的回复" })).toContain("记入");
+    await h.settle();
+    expect(moved.heldBy()).toBe(`push:${moved.first}`);
+    expireRequest(h, moved.file);
+    moved.mend();
+    h.commits.holds = false;
+    // The restart's first tick ends the second push, answered by everyone a while ago; its summary waits for the startup's
+    // settle, which takes the file over.
+    await h.restart();
+    await h.settle();
+    await answeredWithFile(h, moved);
+  } finally { await h.close(); }
+});
+
+test("the first push's end hands its left-over file to the push the message moved to, and that fails: the first push is not released, and once the second push's reply is withdrawn the file goes nowhere", async () => {
+  const h = harness();
+  try {
+    const first = await confirmed(h, { mode: "reply", deadline: "2026-11-03 09:20" });
+    const second = await confirmed(h, { mode: "reply", subject: "第二条推送" });
+    await h.service.reply(h.say(LI, "李四原始附件", ["清单.xlsx"]), { push: first, action: "add" });
+    const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
+    const heldBy = () => h.records.get(LI)!.attachments[file]?.heldBy ?? null;
+    h.commits.releases = true;
+    expect(await h.service.reply(h.say(LI, "撤回 A"), { push: first, action: "withdraw" })).toContain("已撤回");
+    await h.settle();
+    h.commits.holds = true;
+    expect(await h.service.reply(h.say(LI, "改记 B"), { push: second, action: "add", quote: "李四原始附件" })).toContain("记入");
+    h.commits.releases = false;
+    // The first push ends; its release would hand the file to the second push, which fails: it keeps the file and is not released.
+    h.clock.now = h.store.push(first)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(first)).toMatchObject({ summaryState: "sent", released: false });
+    expect(heldBy()).toBe(`push:${first}`);
+    // The second push's reply is withdrawn before it could take the file: that settle lets it go, and the first push's
+    // release, tried again, finds nothing left.
+    expect(await h.service.reply(h.say(LI, "撤回 B"), { push: second, action: "withdraw" })).toContain("已撤回");
+    await h.settle();
+    expect(heldBy()).toBe(null);
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(first)!.released).toBe(true);
+    h.commits.holds = false;
+    h.clock.now = h.store.push(second)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    await h.restart();
+    await h.settle();
+    expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+    expect([heldBy(), h.records.get(LI)!.attachments[file]!.state]).toEqual([null, "ready"]);
+  } finally { await h.close(); }
+});
+
+test("a withdrawn reply's release queued behind a maintenance commit, the message recorded to another push meanwhile: the release hands the file over in its commit, so its record stays after the request's went", async () => {
+  const h = harness();
+  let openMaintenance = () => {};
+  try {
+    const first = await confirmed(h, { mode: "reply" });
+    const second = await confirmed(h, { mode: "reply", subject: "第二条推送" });
+    await h.service.reply(h.say(LI, "李四原始附件", ["清单.xlsx"]), { push: first, action: "add" });
+    const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
+    const own = h.records.get(LI)!, requestId = own.attachments[file]!.boundTo!;
+    const heldBy = () => own.attachments[file]?.heldBy ?? null;
+    // The request is a day past its end; the message service's maintenance commit is queued first and waits.
+    own.requests[requestId]!.closedAt = h.clock.now;
+    h.clock.now += 24 * 3600_000 + 1;
+    const pruneAt = h.clock.now, maintenance = new Promise<void>(resolve => { openMaintenance = resolve; });
+    const pruned = h.onLine(async () => {
+      await maintenance;
+      pruneRecords(own, pruneAt, candidates => new Set(candidates.map(record => record.requestId)));
+      expireAttachments(own, pruneAt);
+    });
+    // The member withdraws the reply: its release queues behind the maintenance. Then the message goes to the second push,
+    // read from the records as they were; its hold queues behind the release.
+    expect(await h.service.reply(h.say(LI, "撤回 A"), { push: first, action: "withdraw" })).toContain("已撤回");
+    const moved = h.service.reply(h.say(LI, "改记 B"), { push: second, action: "add", quote: "李四原始附件" });
+    for (let round = 0; round < 100 && !h.store.items(second, LI).some(item => item.attachment === file); round++) await Bun.sleep(5);
+    expect(h.store.items(second, LI).some(item => item.attachment === file)).toBe(true);
+    expect(heldBy()).toBe(`push:${first}`);
+    openMaintenance();
+    await pruned;
+    expect(await moved).toContain("记入");
+    await h.settle();
+    expect(own.requests[requestId]).toBeUndefined();
+    expect(heldBy()).toBe(`push:${second}`);
+    h.clock.now = h.store.push(second)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+    expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
+    expect(await packedOf(h, second)).toContain("回复/002-李四-0002/01-清单.xlsx");
+  } finally { openMaintenance(); await h.close(); }
+});
+
+test("the first push's release decides in its commit: a push that withdrew the message and ended while the release waited gets nothing, the push that has the other message takes it", async () => {
+  const h = harness();
+  let open = () => {};
+  try {
+    const first = await confirmed(h, { mode: "reply", deadline: "2026-11-03 09:20" });
+    const second = await confirmed(h, { mode: "reply", subject: "第二条推送" });
+    const third = await confirmed(h, { mode: "reply", subject: "第三条推送", deadline: "2026-11-03 09:30" });
+    await h.service.reply(h.say(LI, "第一份原始附件", ["第一份.xlsx"]), { push: first, action: "add" });
+    await h.service.reply(h.say(LI, "第二份原始附件", ["第二份.xlsx"]), { push: first, action: "add" });
+    const [one, two] = h.store.items(first, LI).filter(item => item.attachment !== null).map(item => item.attachment!);
+    const heldBy = (id: string) => h.records.get(LI)!.attachments[id!]?.heldBy ?? null;
+    // Both files stay with the first push: its release fails, and so do the holds of the pushes the messages move to.
+    h.commits.releases = true;
+    await h.service.reply(h.say(LI, "撤回 A"), { push: first, action: "withdraw" });
+    await h.settle();
+    h.commits.holds = true;
+    await h.service.reply(h.say(LI, "第一份记 B"), { push: second, action: "add", quote: "第一份原始附件" });
+    await h.service.reply(h.say(LI, "第二份记 C"), { push: third, action: "add", quote: "第二份原始附件" });
+    h.commits.releases = false;
+    expect([heldBy(one!), heldBy(two!)]).toEqual([`push:${first}`, `push:${first}`]);
+    // The first push ends; its release waits before its commit.
+    let entered = () => {}, waited = false;
+    const atRelease = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { open = resolve; });
+    h.commits.gate = async () => {
+      if (waited || h.store.push(first)!.summaryState !== "sent") return;
+      waited = true; entered();
+      await gate;
+    };
+    h.clock.now = h.store.push(first)!.deadline + 1;
+    h.service.tick();
+    await atRelease;
+    // Meanwhile the third push's reply is withdrawn (its settle fails, the first push keeps the file) and the third push
+    // ends: its summary waits for the release under way, which could hand it a file.
+    h.commits.releases = true;
+    expect(await h.service.reply(h.say(LI, "撤回 C"), { push: third, action: "withdraw" })).toContain("已撤回");
+    h.clock.now = h.store.push(third)!.deadline + 1;
+    h.service.tick();
+    await Bun.sleep(50);
+    expect(h.store.push(third)).toMatchObject({ state: "closed", summaryState: "pending" });
+    expect(heldBy(two!)).toBe(`push:${first}`);
+    // The release decides now: the first file goes to the second push, the second nowhere (no reply has it).
+    h.commits.releases = false; h.commits.holds = false;
+    open();
+    await h.settle();
+    expect([heldBy(one!), heldBy(two!)]).toEqual([`push:${second}`, null]);
+    // The third push, done, never held it.
+    expect(h.held.filter(hold => hold.holder === `push:${third}`)).toEqual([]);
+    expect(h.store.push(first)!.released).toBe(true);
+    expect(h.store.push(third)).toMatchObject({ summaryState: "sent", released: true });
+    h.clock.now = h.store.push(second)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    await h.restart();
+    await h.settle();
+    expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+    expect(await packedOf(h, second)).toContain("回复/002-李四-0002/01-第一份.xlsx");
+    expect(Object.values(h.records.get(LI)!.attachments).filter(attachment => attachment.heldBy)).toEqual([]);
+  } finally { open(); await h.close(); }
+});
+
+test("a withdrawn reply's release lost to a restart, the message moved nowhere: the push's own release at its end lets the file go", async () => {
+  const h = harness();
+  try {
+    const left = await releaseFailing(h);
+    left.mend();
+    await h.restart();
+    h.clock.now = h.store.push(left.first)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(left.first)).toMatchObject({ summaryState: "sent", released: true });
+    expect(left.heldBy()).toBe(null);
+    expect(h.records.get(LI)!.attachments[left.file]!.state).toBe("ready");
+  } finally { await h.close(); }
+});
+
+test("a withdrawn reply taken up again by the same push while its release fails: the retry keeps the file held, the summary packs it", async () => {
+  const h = harness();
+  try {
+    const back = await releaseFailing(h);
+    expect(await h.service.reply(h.say(LI, "还是记回去"), { push: back.first, action: "add", quote: "李四的回复" })).toContain("记入");
+    back.mend();
+    h.service.tick();
+    await h.settle();
+    expect(back.heldBy()).toBe(`push:${back.first}`);
+    h.clock.now = h.store.push(back.first)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(back.first)).toMatchObject({ summaryState: "sent", released: true });
+    expect(h.store.push(back.first)!.summaryText).not.toContain("没能打包");
+    expect(await packedOf(h, back.first)).toContain("回复/001-李四-0002/01-清单.xlsx");
+    expect(back.heldBy()).toBe(null);
+  } finally { await h.close(); }
+});
+
+for (const expired of [false, true]) {
+  test(`a push's release that fails at its end and is let go by the retry on the tick: the console's package still has the file${expired ? ", its request's record gone too" : ""}`, async () => {
+    const h = harness();
+    try {
+      const id = await confirmed(h, { mode: "reply", recipients: [{ name: "李四", phone: LI }] });
+      await h.service.reply(h.say(LI, "李四的回复", ["清单.xlsx"]), { push: id, action: "add" });
+      const file = h.store.items(id, LI).find(item => item.attachment !== null)!.attachment!, path = h.records.get(LI)!.attachments[file]!.path!;
+      h.commits.releases = true;
+      h.clock.now = h.store.push(id)!.deadline + 1;
+      h.service.tick();
+      await h.settle();
+      expect(h.store.push(id)).toMatchObject({ summaryState: "sent", released: false });
+      if (expired) expireRequest(h, file);
+      // The tick's retry of the failed settle lets the file go before the push's own release comes to it.
+      h.commits.releases = false;
+      h.service.tick();
+      await h.settle();
+      expect(h.store.push(id)!.released).toBe(true);
+      expect(h.records.get(LI)!.attachments[file]?.heldBy).toBeUndefined();
+      expect(h.records.get(LI)!.attachments[file] === undefined).toBe(expired);
+      expect(h.store.items(id, LI).find(item => item.attachment === file)!.path).toBe(path);
+      const pack = await h.service.package(id);
+      try { expect(readZip(pack.path).find(entry => entry.name === "回复/001-李四-0002/01-清单.xlsx")?.data.toString("utf8")).toBe("content of 清单.xlsx"); }
+      finally { await pack.done(); }
+    } finally { await h.close(); }
+  });
+}
+
+/**
+ * The harness's records moved into a durable Session over SQLite, which the push service uses from then on: a commit's
+ * callback runs on the records as they are then, and what it changed is published once stored. `storeLate`: the next
+ * commit's write waits for `publish` (resolves once it waits); what is read meanwhile is the records as last published.
+ */
+async function durableHost(h: Harness) {
+  const storage = await openGroupStorage(join(h.root, "durable.sqlite"));
+  const session = createSession(storage);
+  for (const [phone, own] of h.records) await session.commit(async tx => { Object.assign(await durableRecordsOf(tx, phone), structuredClone(own)); }, context);
+  h.host.records = async (_scope, phone) => durableRecords(session, phone, context);
+  h.host.settleAttachments = async (_scope, phone, decide) => session.commit(async tx => settleHeld(await durableRecordsOf(tx, phone), decide), context);
+  const write = storage.commit.bind(storage);
+  let publish = () => {};
+  return {
+    records: (phone: string) => durableRecords(session, phone, context),
+    commit: (work: (tx: Tx) => Promise<void>) => session.commit(work, context),
+    storeLate(): Promise<void> {
+      const published = new Promise<void>(resolve => { publish = resolve; });
+      return new Promise<void>(waiting => {
+        storage.commit = async (...args) => {
+          storage.commit = write;
+          waiting();
+          await published;
+          return write(...args);
+        };
+      });
+    },
+    publish: () => publish(),
+    async close() { publish(); await session.close(context); },
+  };
+}
+
+/**
+ * Li's reply with a file to a first push, its request a day past its end; a second push to Li, and Li's message asking to
+ * move the reply. Then the records go into a durable Session (durableHost), and the withdrawal's release is stored late.
+ */
+async function releasedLate(h: Harness) {
+  const first = await confirmed(h, { mode: "reply" });
+  const second = await confirmed(h, { mode: "reply", subject: "第二条推送" });
+  await h.service.reply(h.say(LI, "原始清单", ["清单.xlsx"]), { push: first, action: "add" });
+  const file = h.store.items(first, LI).find(item => item.attachment !== null)!.attachment!;
+  const requestId = h.records.get(LI)!.attachments[file]!.boundTo!;
+  h.records.get(LI)!.requests[requestId]!.closedAt = h.clock.now;
+  h.clock.now += 24 * 3600_000 + 1;
+  const caller = h.say(LI, "把刚才的附件从第一条改记到第二条"), pruneAt = h.clock.now;
+  const durable = await durableHost(h);
+  const stored = durable.storeLate();
+  expect(await h.service.reply(caller, { push: first, action: "withdraw" })).toContain("已撤回");
+  await stored;
+  // The release's commit is decided; the records as last published still have the file held by the first push.
+  expect((await durable.records(LI)).attachments[file]!.heldBy).toBe(`push:${first}`);
+  /** The message service's maintenance: the request's record goes, and with it an attachment's no push holds. */
+  const maintenance = () => durable.commit(async tx => {
+    const own = await durableRecordsOf(tx, LI);
+    pruneRecords(own, pruneAt, candidates => new Set(candidates.map(record => record.requestId)));
+    expireAttachments(own, pruneAt);
+  });
+  /** The message moves to the second push, recorded from the records as last published; resolves once it is recorded, to the answer to come. */
+  const move = async () => {
+    const moved = h.service.reply(caller, { push: second, action: "add", quote: "原始清单" });
+    for (let round = 0; round < 100 && !h.store.items(second, LI).some(item => item.attachment === file); round++) await Bun.sleep(5);
+    expect(h.store.items(second, LI).some(item => item.attachment === file)).toBe(true);
+    return { answer: moved };
+  };
+  /** The second push ends; its summary is sent and it is released. */
+  const ended = async () => {
+    h.clock.now = h.store.push(second)!.deadline + 1;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.push(second)).toMatchObject({ summaryState: "sent", released: true });
+    expect(h.store.push(second)!.summaryText).not.toContain("没能打包");
+  };
+  return { second, file, requestId, caller, durable, maintenance, move, ended };
+}
+
+test("a withdrawn reply's release stored late, a maintenance commit queued behind it, the message recorded to another push from the records as last published: the hold finds the record gone, so the reply drops the file and asks for it again", async () => {
+  const h = harness();
+  let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+  try {
+    const late = await releasedLate(h);
+    durable = late.durable;
+    const pruned = late.maintenance();
+    const { answer: moved } = await late.move();
+    durable.publish();
+    await pruned;
+    const answer = await moved;
+    expect(answer).toContain("记入");
+    expect(answer).toContain("这些附件已经失效，没有记进去，请成员重发：清单.xlsx。");
+    expect(answer).toContain("回复现在共有文字 1 段");
+    await h.settle();
+    const records = await durable.records(LI);
+    expect(records.requests[late.requestId]).toBeUndefined();
+    expect(records.attachments[late.file]).toBeUndefined();
+    expect(h.store.items(late.second, LI).map(item => item.kind)).toEqual(["text"]);
+    await late.ended();
+    expect((await packedOf(h, late.second)).filter(name => name.includes("清单.xlsx"))).toEqual([]);
+  } finally { durable?.publish(); await h.close(); await durable?.close(); }
+});
+
+test("a withdrawn reply's release stored late, the message recorded to another push from the records as last published, a maintenance commit queued after its hold: the hold takes the file over, its record stays after its request's went", async () => {
+  const h = harness();
+  let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+  try {
+    const late = await releasedLate(h);
+    durable = late.durable;
+    const { answer: moved } = await late.move();
+    await Bun.sleep(20);
+    const pruned = late.maintenance();
+    durable.publish();
+    await pruned;
+    expect(await moved).not.toContain("失效");
+    await h.settle();
+    const records = await durable.records(LI);
+    expect([records.requests[late.requestId], records.attachments[late.file]?.heldBy]).toEqual([undefined, `push:${late.second}`]);
+    await late.ended();
+    expect(await packedOf(h, late.second)).toContain("回复/002-李四-0002/01-清单.xlsx");
+  } finally { durable?.publish(); await h.close(); await durable?.close(); }
+});
+
+/** Li's successful texts that name the file, after `from` (an index into the sends). */
+const reminders = (h: Harness, from = 0) => h.sent.slice(from).filter(item => item.to === im(LI) && item.message.msgType === "text")
+  .map(item => (item.message.content as { content: string }).content).filter(text => text.includes("清单.xlsx"));
+
+/** The first settle of Li's records fails before its commit, as a host that cannot commit for a moment. */
+function failFirstSettle(h: Harness): void {
+  const settle = h.host.settleAttachments;
+  let fail = true;
+  h.host.settleAttachments = async (...args) => {
+    if (fail) { fail = false; throw new Error("disk busy"); }
+    return settle(...args);
+  };
+}
+
+for (const recovery of ["tick", "restart"] as const) {
+  test(`a reply's first hold fails and its file's record goes meanwhile: ${recovery === "tick" ? "the retry on the tick" : "the startup's settle"} takes the file out of the reply and reminds the member once to send it again`, async () => {
+    const h = harness();
+    let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+    try {
+      const late = await releasedLate(h);
+      durable = late.durable;
+      const pruned = late.maintenance();
+      failFirstSettle(h);
+      const { answer } = await late.move();
+      expect(await answer).toContain("回复现在共有文字 1 段，附件 1 个");
+      durable.publish();
+      await pruned;
+      expect((await durable.records(LI)).attachments[late.file]).toBeUndefined();
+      if (recovery === "restart") await h.restart();
+      else h.service.tick();
+      await h.settle();
+      expect(h.store.push(late.second)!.state).toBe("open");
+      expect(h.store.items(late.second, LI).map(item => item.kind)).toEqual(["text"]);
+      expect(reminders(h)).toEqual(["附件「清单.xlsx」已经失效，没有记进「第二条推送」的回复，请再发一次。"]);
+      // Told once: neither the next tick nor a restart sends it again.
+      h.clock.now += 3600_000;
+      h.service.tick();
+      await h.settle();
+      await h.restart();
+      await h.settle();
+      expect(reminders(h)).toHaveLength(1);
+      const pack = await h.service.package(late.second);
+      try { expect(readZip(pack.path).some(entry => entry.data.toString("utf8").includes("附件记录已不存在"))).toBe(false); }
+      finally { await pack.done(); }
+      await late.ended();
+      expect((await packedOf(h, late.second)).filter(name => name.includes("清单.xlsx"))).toEqual([]);
+    } finally { durable?.publish(); await h.close(); await durable?.close(); }
+  });
+}
+
+test("a reminder of a file taken out of a reply that cannot be sent is tried again later and after a restart, then sent once", async () => {
+  const h = harness();
+  let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+  try {
+    const late = await releasedLate(h);
+    durable = late.durable;
+    const pruned = late.maintenance();
+    failFirstSettle(h);
+    const { answer } = await late.move();
+    await answer;
+    durable.publish();
+    await pruned;
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "text" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.items(late.second, LI).map(item => item.kind)).toEqual(["text"]);
+    const tried = h.sent.length;
+    expect(reminders(h)).toHaveLength(1);
+    // Not due yet: nothing is sent.
+    h.service.tick();
+    await h.settle();
+    expect(h.sent.length).toBe(tried);
+    // Due, and failing again.
+    h.clock.now += 31_000;
+    h.service.tick();
+    await h.settle();
+    expect(reminders(h, tried)).toHaveLength(1);
+    // Sends work again; the process is restarted before the reminder is due.
+    h.failing.when = undefined;
+    await h.restart();
+    await h.settle();
+    const restarted = h.sent.length;
+    h.clock.now += 61_000;
+    h.service.tick();
+    await h.settle();
+    expect(reminders(h, restarted)).toEqual(["附件「清单.xlsx」已经失效，没有记进「第二条推送」的回复，请再发一次。"]);
+    h.clock.now += 3600_000;
+    h.service.tick();
+    await h.settle();
+    expect(reminders(h, restarted)).toHaveLength(1);
+  } finally { durable?.publish(); await h.close(); await durable?.close(); }
+});
+
+test("a request whose reply tool took a file out of the reply again ends without an answer, after a restart: the failure answer names the file instead of saying no resend is needed, and the reminder still waiting goes out once sends work", async () => {
+  const h = harness();
+  let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+  try {
+    const late = await releasedLate(h);
+    durable = late.durable;
+    // In the same request the model records the member's text, then the earlier message with its file.
+    expect(await h.service.reply(late.caller, { push: late.second, action: "add" })).toContain("记入");
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "text" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    const pruned = late.maintenance();
+    const { answer } = await late.move();
+    durable.publish();
+    await pruned;
+    expect(await answer).toContain("这些附件已经失效，没有记进去，请成员重发：清单.xlsx。");
+    await h.settle();
+    expect(h.store.items(late.second, LI).map(item => item.kind)).toEqual(["text", "text"]);
+    // The reminder failed and waits; the process ends before the request is closed out, then the run is found failed.
+    await h.restart();
+    await h.settle();
+    expect(await h.service.failed(late.caller))
+      .toBe("这条消息已经记进「第二条推送」的回复了；附件「清单.xlsx」已经失效，没有记进「第二条推送」的回复，请再发一次。");
+    // The answer may go out late or never (a /stop or /clear withdraws one still unsent): the reminder stays due.
+    expect(h.store.lostIn(LI, late.caller.message.msgUid).map(file => file.told)).toEqual([false]);
+    h.failing.when = undefined;
+    const answered = h.sent.length;
+    h.clock.now += 3600_000;
+    h.service.tick();
+    await h.settle();
+    await h.restart();
+    await h.settle();
+    expect(reminders(h, answered)).toEqual(["附件「清单.xlsx」已经失效，没有记进「第二条推送」的回复，请再发一次。"]);
+    // A request whose reply tools took nothing out says no resend is needed, as before.
+    const plain = h.say(LI, "补充一句");
+    expect(await h.service.reply(plain, { push: late.second, action: "add" })).toContain("记入");
+    expect(await h.service.failed(plain)).toBe("这条消息已经记进「第二条推送」的回复了，不用重发。");
+  } finally { durable?.publish(); await h.close(); await durable?.close(); }
+});
+
+test("a reply's first hold fails, the retry on the tick takes the file out and its reminder cannot be sent yet: the failure answer of the request that recorded it, quoting an earlier message, names the file", async () => {
+  const h = harness();
+  let durable: Awaited<ReturnType<typeof durableHost>> | undefined;
+  try {
+    const late = await releasedLate(h);
+    durable = late.durable;
+    // The request records its own text, then the earlier message with its file; that hold fails before its commit.
+    expect(await h.service.reply(late.caller, { push: late.second, action: "add" })).toContain("记入");
+    const pruned = late.maintenance();
+    failFirstSettle(h);
+    const { answer } = await late.move();
+    expect(await answer).toContain("回复现在共有文字 2 段，附件 1 个");
+    durable.publish();
+    await pruned;
+    h.failing.when = item => item.to === im(LI) && item.message.msgType === "text" ? { status: "failed", reason: "HTTP 500" } : undefined;
+    h.service.tick();
+    await h.settle();
+    expect(h.store.items(late.second, LI).map(item => item.kind)).toEqual(["text", "text"]);
+    expect(h.store.lostIn(LI, late.caller.message.msgUid).map(file => [file.name, file.told])).toEqual([["清单.xlsx", false]]);
+    // After a restart too: the request is kept with the reply's items, not with the settle.
+    await h.restart();
+    await h.settle();
+    expect(await h.service.failed(late.caller))
+      .toBe("这条消息已经记进「第二条推送」的回复了；附件「清单.xlsx」已经失效，没有记进「第二条推送」的回复，请再发一次。");
+  } finally { durable?.publish(); await h.close(); await durable?.close(); }
 });

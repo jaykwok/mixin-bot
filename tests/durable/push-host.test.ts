@@ -5,7 +5,7 @@ import { afterAll, expect, test } from "bun:test";
 import type { Message, Models } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import type { ModelRef } from "@earendil-works/pi-durable";
-import { type AttachmentEvent, type AttachmentSource, holdAttachments, releaseHeld } from "../../src/durable/attachments.ts";
+import { type AttachmentEvent, type AttachmentSource, type SettledAttachment, settleHeld } from "../../src/durable/attachments.ts";
 import type { ModelSelection } from "../../src/durable/models.ts";
 import type { Outbound } from "../../src/durable/outbound.ts";
 import type { Attachment, MemberRecords } from "../../src/durable/records.ts";
@@ -107,19 +107,31 @@ function declared(messages: Message[]) {
   return { tools, sections };
 }
 
-test("holding and releasing: one holder at a time; released, a file is its request's alone again, and its record goes when the request's is gone", () => {
+test("settling held files: the decision, made in the commit, names a holder or none; a holder takes a file over from any other, never a void one; let go, a file is its request's alone again, and its record goes when the request's is gone", () => {
   const file = (id: string, extra: Partial<Attachment> = {}): Attachment => ({ id, msgUid: `m-${id}`, receivedAt: 1, epoch: 0, fileId: `f-${id}`, kind: "file", name: `${id}.txt`,
     reply: { kind: "direct", receiveId: "im", senderImUserId: "im", msgUid: `m-${id}`, summary: "", receivedAt: 1 }, state: "ready", path: `/tmp/${id}`, at: 1, ...extra });
   const records: MemberRecords = { requests: { "req-1": { requestId: "req-1", reply: file("x").reply, createdAt: 1, notes: [], deliverables: [], files: [], events: {} } },
-    attachments: { a: file("a", { boundTo: "req-1" }), b: file("b", { boundTo: "req-gone" }), c: file("c", { state: "void" }), d: file("d", { heldBy: "push:p2" }) } };
-  // Void ones, missing ones and those another holder has are left; holding again is the same hold.
-  expect(holdAttachments(records, "push:p1", ["a", "b", "c", "d", "missing"])).toBe(2);
-  expect(holdAttachments(records, "push:p1", ["a"])).toBe(1);
-  expect(Object.values(records.attachments).map(each => each.heldBy)).toEqual(["push:p1", "push:p1", undefined, "push:p2"]);
-  expect(releaseHeld(records, "push:p2", ["a", "b"])).toBe(0);
-  expect(releaseHeld(records, "push:p1", ["a", "b", "c", "missing"])).toBe(2);
-  expect(Object.keys(records.attachments)).toEqual(["a", "c", "d"]);
-  expect([records.attachments.a!.heldBy, records.attachments.a!.boundTo]).toEqual([undefined, "req-1"]);
+    attachments: { a: file("a", { boundTo: "req-1" }), b: file("b", { boundTo: "req-gone", heldBy: "push:p1" }), c: file("c", { state: "void" }), d: file("d", { boundTo: "req-gone", heldBy: "push:p2" }),
+      e: file("e", { heldBy: "push:p3" }) } };
+  const outcome = (settled: Map<string, SettledAttachment>) => [...settled].map(([id, { attachment, heldBy }]) => [id, attachment.heldBy ?? null, heldBy ?? null]);
+  // The decision sees the attachments as they are. Missing ones are not settled, void ones not held; a holder takes the others.
+  const seen: string[] = [];
+  expect(outcome(settleHeld(records, attachments => {
+    seen.push(...Object.entries(attachments).map(([id, attachment]) => `${id}:${attachment.heldBy ?? "-"}`));
+    return new Map([["a", "push:p1"], ["b", "push:p2"], ["c", "push:p1"], ["missing", "push:p1"]]);
+  }))).toEqual([["a", null, "push:p1"], ["b", "push:p1", "push:p2"], ["c", null, null]]);
+  expect(seen).toEqual(["a:-", "b:push:p1", "c:-", "d:push:p2", "e:push:p3"]);
+  // Taken over, the record stays though its request is gone. Let go, a file with its request's record is the request's
+  // alone again and the others' records go; the record as it was comes back (where the file is).
+  const released = settleHeld(records, () => new Map([["a", undefined], ["d", undefined], ["c", undefined]]));
+  expect(outcome(released)).toEqual([["a", "push:p1", null], ["d", "push:p2", null], ["c", null, null]]);
+  expect(released.get("d")!.attachment.path).toBe("/tmp/d");
+  expect(Object.keys(records.attachments)).toEqual(["a", "b", "c", "e"]);
+  expect([records.attachments.a!.heldBy, records.attachments.a!.boundTo, records.attachments.b!.heldBy]).toEqual([undefined, "req-1", "push:p2"]);
+  // A decision that fails changes nothing.
+  const before = structuredClone(records);
+  expect(() => settleHeld(records, () => { throw new Error("no decision"); })).toThrow("no decision");
+  expect(records).toEqual(before);
 });
 
 test("a push holds the files of a recorded reply: /clear and a day of maintenance leave them, until the holder releases them; a waiting push changes what the member is asked", async () => {
@@ -137,8 +149,12 @@ test("a push holds the files of a recorded reply: /clear and a day of maintenanc
     expect(userTexts(m.requests[0]!).at(-1)!).toContain("reply.txt");
     const bound = (await stateOf(service, sent.reply.msgUid))!;
     expect(bound.boundTo).toBeDefined();
-    expect(await service.holdAttachments(DIRECT_SCOPE, ALICE, "push:p1", [bound.id, "missing"])).toBe(1);
-    expect(await service.holdAttachments(DIRECT_SCOPE, ALICE, "push:p2", [bound.id])).toBe(0);
+    const settled = await service.settleAttachments(DIRECT_SCOPE, ALICE, () => new Map([[bound.id, "push:p1"], ["missing", "push:p1"]]));
+    expect([...settled].map(([id, each]) => [id, each.heldBy])).toEqual([[bound.id, "push:p1"]]);
+    // The decision runs in the commit, on the records as they are.
+    let seen: string | undefined;
+    expect((await service.settleAttachments(DIRECT_SCOPE, ALICE, attachments => { seen = attachments[bound.id]?.heldBy; return new Map(); })).size).toBe(0);
+    expect(seen).toBe("push:p1");
     // The member's own limit is one unconsumed attachment: neither a consumed nor a held one takes it.
     const own = attachment(out, ALICE, { fileId: upload("own", "own.txt"), name: "own.txt" });
     expect(await service.attach(own)).toMatchObject({ status: "accepted" });
@@ -151,10 +167,10 @@ test("a push holds the files of a recorded reply: /clear and a day of maintenanc
     const kept = (await stateOf(service, sent.reply.msgUid))!;
     expect(kept).toMatchObject({ state: "ready", heldBy: "push:p1" });
     const file = kept.path!.split(/[\\/]/).at(-1)!;
-    // Only its holder releases it; the file is left to the tmp lifecycle.
-    expect(await service.releaseAttachments(DIRECT_SCOPE, ALICE, "push:p2", [kept.id])).toBe(0);
-    expect(await service.releaseAttachments(DIRECT_SCOPE, ALICE, "push:p1", [kept.id, "missing"])).toBe(1);
-    expect((await stateOf(service, sent.reply.msgUid))?.heldBy).toBeUndefined();
+    // Let go after its request's record went: the record goes, the file is left to the tmp lifecycle.
+    const released = await service.settleAttachments(DIRECT_SCOPE, ALICE, () => new Map([[kept.id, undefined], ["missing", undefined]]));
+    expect([...released].map(([id, each]) => [id, each.attachment.heldBy, each.heldBy])).toEqual([[kept.id, "push:p1", undefined]]);
+    expect(await stateOf(service, sent.reply.msgUid)).toBeUndefined();
     expect(await received(where)).toContain(file);
     expect(await service.attach(sent)).toEqual({ status: "duplicate" });
   } finally { await service.close(); }
@@ -374,3 +390,29 @@ test("a request that ends without an answer is offered to the push service, and 
     expect(replyTexts(out.sent)[1]).not.toContain("周报");
   } finally { await service.close(); }
 });
+
+for (const control of ["/stop", "/clear"]) {
+  test(`a failed request's answer with the push service's line, cancelled by ${control} while the line is prepared: the request closes and nothing is sent`, async () => {
+    const where = root(), out = recordingOutbound();
+    const failed = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 invalid api key" });
+    const m = model([failed, failed]);
+    let asked = () => {}, resume = () => {};
+    const asking = new Promise<void>(resolve => { asked = resolve; }), resumed = new Promise<void>(resolve => { resume = resolve; });
+    const service = open(where, m, out.outbound, {
+      unanswered: async () => { asked(); await resumed; return "附件「清单.xlsx」已经失效，没有记进「周报」的回复，请再发一次。"; },
+    });
+    try {
+      const said = ask(out, ALICE, "周报：本周完成了迁移");
+      await service.admit(said);
+      await asking;
+      await service.control(ask(out, ALICE, control));
+      resume();
+      await until(async () => Object.values((await service.records(DIRECT_SCOPE, ALICE)).requests)
+        .some(record => record.reply.msgUid === said.reply.msgUid && record.closedAt !== undefined), "the request closed");
+      const record = Object.values((await service.records(DIRECT_SCOPE, ALICE)).requests).find(each => each.reply.msgUid === said.reply.msgUid)!;
+      expect(record.delivery).toBeUndefined();
+      await Bun.sleep(50);
+      expect(replyTexts(out.sent).filter(text => text.includes("清单.xlsx"))).toEqual([]);
+    } finally { resume(); await service.close(); }
+  });
+}
