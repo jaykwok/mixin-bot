@@ -297,13 +297,13 @@ fresh_upgrade() {
             ask_yes_no "切换到 main 并继续升级？[y/N] " || { print_warning "已取消升级"; exit 1; }
         fi
     fi
-    # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
-    ORIGINAL_MAIN="$(git_here rev-parse --verify --quiet refs/heads/main)" || { print_error "本地 main 分支不存在，请先建立 main 后重试"; exit 1; }
+    # 只接受快进。本地 main 有目标没有的提交时停下来，而不是替用户决定怎么合并。
+    ORIGINAL_MAIN="$(git_here rev-parse --verify --quiet refs/heads/main)" || { print_error "本地 main 分支不存在：请在项目目录运行 git switch -c main（以当前提交建立 main）后重试"; exit 1; }
     if ! git_here merge-base --is-ancestor "$ORIGINAL_MAIN" "$TARGET_SHA"; then
         print_error "本地 main 无法快进到目标提交 ${TARGET_SHA:0:7}"
-        print_warning "本地独有的提交："
+        print_warning "本地 main 上有、目标提交没有的提交："
         git_here log --oneline "$TARGET_SHA..main" | sed 's/^/      /'
-        print_warning "请先推送或丢弃这些提交后重试"
+        print_warning "目标不包含这些提交：丢弃它们，或等包含它们的发布后再升级"
         exit 1
     fi
     if [ "$ORIGINAL_SHA" = "$TARGET_SHA" ]; then

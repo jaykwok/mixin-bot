@@ -430,7 +430,7 @@ export function DeployForm() {
 
 export function UpgradeForm() {
   const [selected, setSelected] = useState<DeploymentSelection | null>(null);
-  const [version, setVersion] = useState<{ branch: string; hasDirectory: boolean; target: string } | null>(null);
+  const [version, setVersion] = useState<{ branch: string; hasDirectory: boolean; target: string; release: string } | null>(null);
   const [directory, setDirectory] = useState(""), [switchMain, setSwitchMain] = useState(false);
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const live = useRef(true), controller = useRef<AbortController | null>(null), lock = useRef(false);
@@ -445,11 +445,12 @@ export function UpgradeForm() {
   };
   const scope = version?.hasDirectory ? "saved" : directory;
   return <Section title="软件更新" footer="升级沿用模型、机器人凭据和运行参数；完成后请重新运行 bun run console。">
-    <Row icon="cloud" tint="blue" title="检查 origin/main" detail="取得最新提交后选择升级方式，再预览确认。">
+    <Row icon="cloud" tint="blue" title="检查最新发布" detail="取得最新的正式发布后选择升级方式，再预览确认。">
       <button type="button" class="btn" disabled={busy} onClick={() => void check()}>{busy ? <><Icon name="loader" size={14} class="spin" />正在检查版本…</> : "检查更新"}</button>
     </Row>
     {error && <div class="group-note form-error" role="alert">{error}</div>}
     {version && <>
+      <Row class="value" title="目标版本">{version.release}</Row>
       <Row class="value" title="目标提交"><code>{version.target}</code></Row>
       <Row class="value" title="当前分支">{version.branch}</Row>
       <ScopeChoice label="升级通讯录范围" hasDirectory={version.hasDirectory} value={directory} onChange={setDirectory} onSelection={setSelected} />

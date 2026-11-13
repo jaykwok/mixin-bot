@@ -272,16 +272,18 @@ test.skipIf(process.platform !== "win32")("Windows upgrade removes only its own 
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops.ps1"))},[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
-$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Update'},$true)
-Invoke-Expression $definition.Extent.Text
+foreach($name in @('Get-LatestRelease','Invoke-Update')) {
+    $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+    Invoke-Expression $definition.Extent.Text
+}
 $Project=Join-Path $PSScriptRoot 'project dir'
 New-Item -ItemType Directory -Force -Path (Join-Path $Project 'tmp/keep') | Out-Null
 Set-Content -LiteralPath (Join-Path $Project 'tmp/keep/evidence') 'original'
 function Test-Administrator { $true }; function Get-GitPath { 'fixture-git' }; function Get-BunPath { 'C:\\fixture bun\\say "bun"\\' }
-function Err($message) { Write-Host $message }; function Warn($message) { throw $message }
+function Err($message) { Write-Host $message }; function Warn($message) { throw $message }; function Step($message) { Write-Host $message }
 function Invoke-GitCapture([string[]]$GitArgs) {
     if($GitArgs[0] -eq 'archive') { return @{ExitCode=$(if($env:UPGRADE_CASE -eq 'export'){1}else{0});Text='fixture export'} }
-    $text=if($GitArgs -contains '--abbrev-ref'){'main'}elseif($GitArgs[0] -eq 'rev-parse'){'1'*40}else{''}
+    $text=if($GitArgs -contains '--abbrev-ref'){'main'}elseif($GitArgs[0] -eq 'for-each-ref'){'v1.0.0'}elseif($GitArgs[0] -eq 'rev-parse'){'1'*40}else{''}
     return @{ExitCode=0;Text=$text}
 }
 function Expand-Archive($LiteralPath,$DestinationPath) {

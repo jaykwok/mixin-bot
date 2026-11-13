@@ -4,6 +4,7 @@ import { readFileSync, lstatSync } from "node:fs";
 import { loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { fields } from "../../ops/core/operations.ts";
 import { assertLifecycleTarget } from "../../ops/core/recovery-plan.ts";
+import { latestRelease, RELEASE_FETCH } from "../../ops/core/releases.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 import { runCommand, type Runner } from "../../ops/core/hosting.ts";
 import { parsePort } from "../../ops/core/console-port.ts";
@@ -17,7 +18,7 @@ function setting(project: string, name: string): string {
   return readFileSync(path, "utf8").trim();
 }
 
-/** Fetch is explicit, bounded and never part of confirming an already previewed SHA. */
+/** Fetch is explicit, bounded and never part of confirming an already previewed SHA. The target is the latest release. */
 export function upgradeRoutes(project: string, run: Runner = runCommand): Record<string, Route> {
   let fetching = false;
   const settings = async () => {
@@ -44,16 +45,15 @@ export function upgradeRoutes(project: string, run: Runner = runCommand): Record
       try {
         fields(body as Record<string, unknown>, []);
         const before = await settings(); signal.throwIfAborted();
-        const result = await run(["git", "-C", project, "fetch", "origin", "refs/heads/main:refs/remotes/origin/main"],
-          { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" });
+        const result = await run(["git", "-C", project, ...RELEASE_FETCH], { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" });
         if (result.code !== 0) throw new Error("检查版本失败，请核对网络和本机 Git 配置后重试；未停止机器人");
         signal.throwIfAborted();
-        const target = await run(["git", "-C", project, "rev-parse", "--verify", "origin/main^{commit}"]);
-        if (target.code !== 0 || !/^[a-f0-9]{40}$/.test(target.stdout.trim())) throw new Error("无法确认 origin/main 的提交");
-        await assertLifecycleTarget(project, target.stdout.trim(), run);
+        const release = await latestRelease(args => run(["git", "-C", project, ...args]));
+        if (release.behind) throw new Error(`本地 main 已包含最新发布 ${release.tag}，没有可升级的版本`);
+        await assertLifecycleTarget(project, release.commit, run);
         const after = await settings();
         if (JSON.stringify(before) !== JSON.stringify(after)) throw new Error("检查版本期间部署状态已变化，请刷新后重试");
-        return { ...after, target: target.stdout.trim() };
+        return { ...after, target: release.commit, release: release.tag };
       } catch (error) { throw new ApiProblem(409, "input", (error as Error).message); }
       finally { fetching = false; }
     } },

@@ -23,7 +23,7 @@ async function execute(command: string[], cwd: string) {
 }
 
 for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform === "windows" ? process.platform !== "win32" : process.platform !== "linux")(
-  `${platform}: console dispatch retains confirmed SHA after origin/main changes; plain CLI still fetches latest`, async () => {
+  `${platform}: console dispatch retains confirmed SHA after a newer release; plain CLI fetches the release tags and takes the latest`, async () => {
     const fixture = await tempFixture("upgrade-target-");
     try {
       const repo = join(fixture.root, "repo"), marker = join(fixture.root, "target"), fetches = join(fixture.root, "fetches");
@@ -42,7 +42,14 @@ for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform 
         commits.push(await git("rev-parse", "HEAD"));
       }
       const [original, confirmed, later] = commits as [string, string, string];
-      await git("checkout", "--detach", original); await git("update-ref", "refs/remotes/origin/main", confirmed);
+      // Local main is the deployed release; origin's main has moved past the latest release, which never counts. Only
+      // stable vX.Y.Z tags are releases, compared by number (v1.0.10 is newer than v1.0.9).
+      await git("checkout", "--detach", original); await git("branch", "-f", "main", original);
+      await git("tag", "v1.0.0", original); await git("tag", "v1.0.9", original); await git("tag", "-a", "-m", "release", "v1.0.10", confirmed);
+      for (const tag of ["v1.1.0-rc.1", "v01.2.0", "v2.0", "vnext", "release-9.9.9"]) await git("tag", tag, original);
+      const origin = join(fixture.root, "origin.git");
+      await git("init", "--quiet", "--bare", origin); await git("remote", "add", "origin", origin);
+      await git("push", "--quiet", "origin", `${later}:refs/heads/main`, "refs/tags/*:refs/tags/*");
       const stateDir = join(repo, "data/state"); await mkdir(stateDir, { recursive: true });
       const sourcePath = platform === "windows" ? "scripts/ops.ps1" : "scripts/ops.sh";
       const source = (await readFile(join(project, sourcePath), "utf8")).replaceAll("\r\n", "\n");
@@ -56,31 +63,32 @@ set -euo pipefail
 PROJECT_DIR=${quote(repo)}; STATE_DIR=${quote(stateDir)}
 git_here() {
     if [ "\${1:-}" = fetch ]; then
-        printf fetch >> ${quote(fetches)}
-        git -C "$PROJECT_DIR" update-ref refs/remotes/origin/main ${quote(later)}
-    else git -C "$PROJECT_DIR" "$@"; fi
+        printf '%s' "$*" >> ${quote(fetches)}
+    fi
+    git -C "$PROJECT_DIR" "$@"
 }
 operation_start() { :; }; operation_finish() { :; }; operation_stage() { :; }; operation_event() { :; }
 operation_capture() { "$@"; }
 remove_upgrade_stage() { :; }; acquire_deploy_lock() { :; }; require_git_checkout() { :; }
-P() { :; }; ER() { printf '%s\\n' "$*" >&2; }; WA() { :; }; OK() { :; }; after_upgrade() { :; }
+P() { :; }; ER() { printf '%s\\n' "$*" >&2; }; WA() { :; }; OK() { printf '%s\\n' "$*"; }; after_upgrade() { :; }
 run_target_upgrader() { printf '%s' "$1" > ${quote(marker)}; }
 docker() { printf '%s\\n' 'real Docker forbidden' >&2; return 97; }
-${await opsShellFunctions("core_reported", "finish_update", "finish_lifecycle_result")}
+${await opsShellFunctions("core_reported", "finish_update", "finish_lifecycle_result", "latest_release")}
 ${source.slice(start, end + 3)}
 shift
 update "$@"
 `);
       } else {
         const definition = source.match(/^function Invoke-Update\([^\n]+[\s\S]*?^\}/m)?.[0];
-        expect(definition).toBeDefined();
+        const releases = source.match(/^function Get-LatestRelease \{[\s\S]*?^\}/m)?.[0];
+        expect(definition).toBeDefined(); expect(releases).toBeDefined();
         await writeFile(script, String.fromCharCode(0xfeff) + `param([string]$RequestBase64)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $Project = ${quotePS(repo)}
 function Start-OperationLog {}; function Stop-OperationLog {}; function Set-OperationStage {}; function Write-OperationEvent {}
 function Write-OperationFailure {}; function Test-Administrator { $true }; function Get-GitPath { 'git' }; function Get-BunPath { 'synthetic-bun' }
-function Err($text) { Write-Host $text }; function Done {}; function Warn {}; function Remove-UpgradeStage {}
+function Err($text) { Write-Host $text }; function Done($text) { Write-Host $text }; function Warn {}; function Step {}; function Remove-UpgradeStage {}
 function Invoke-GitCapture([string[]]$Arguments) {
     if ($Arguments[0] -eq 'archive') {
         [IO.File]::WriteAllText(${quotePS(marker)}, $Arguments[3])
@@ -88,9 +96,7 @@ function Invoke-GitCapture([string[]]$Arguments) {
         return [pscustomobject]@{ ExitCode = 91; Text = 'synthetic handoff' }
     }
     if ($Arguments[0] -eq 'fetch') {
-        [IO.File]::AppendAllText(${quotePS(fetches)}, 'fetch')
-        & git -C $Project update-ref refs/remotes/origin/main ${quotePS(later)}
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = '' }
+        [IO.File]::AppendAllText(${quotePS(fetches)}, ($Arguments -join ' '))
     }
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
@@ -98,6 +104,7 @@ function Invoke-GitCapture([string[]]$Arguments) {
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = "$text".Trim() }
     } finally { $ErrorActionPreference = $previous }
 }
+${releases}
 ${definition}
 $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
 Invoke-Update -ConfirmedTarget $request.Target | Out-Null
@@ -113,26 +120,48 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
       };
       let checkedFetches = 0;
       const routes = upgradeRoutes(repo, async argv => {
-        // The remote response is local synthetic Git data; every other check uses the actual repository.
-        if (argv[3] === "fetch") { checkedFetches++; return { code: 0, stdout: "", stderr: "" }; }
+        // The remote is a local bare repository; every command is the real one.
+        if (argv[3] === "fetch") checkedFetches++;
         const result = await execute(argv, repo);
         return { code: result.code, stdout: result.output, stderr: "" };
       });
       const context: RouteContext = { body: {}, signal: new AbortController().signal, session: {} as RouteContext["session"] };
-      const checked = await routes["POST /api/lifecycle/check-update"]!.run(context) as { target: string };
-      expect(checked.target).toBe(confirmed); expect(checkedFetches).toBe(1);
+      const checked = await routes["POST /api/lifecycle/check-update"]!.run(context) as { target: string; release: string };
+      expect(checked).toMatchObject({ target: confirmed, release: "v1.0.10" }); expect(checkedFetches).toBe(1);
       const params = await operationPreparer(repo, new Views())("update", {
         target: checked.target, switchMain: true, directory: "all",
       }, "fixture");
-      await git("update-ref", "refs/remotes/origin/main", later);
+      // A newer release after the preview; the console task keeps the confirmed commit.
+      await git("push", "--quiet", "origin", `${later}:refs/tags/v1.0.11`);
       const args = operationArgs("update", params);
       expect(args).toEqual(["update", confirmed]);
       const result = await dispatch(args); expect(result.code, result.output).toBe(0);
       expect(await readFile(marker, "utf8"), result.output).toBe(confirmed); expect(await readFile(fetches, "utf8")).toBe("");
       expect(checkedFetches).toBe(1);
+      // The terminal fetches origin's release tags as they are: a local tag that differs is replaced, one origin no
+      // longer has is removed, and other tags stay.
+      await git("tag", "-f", "v1.0.9", later); await git("tag", "v9.9.9", original); await git("tag", "keep", original);
       const ordinary = await dispatch(["update"]);
       expect(ordinary.code, ordinary.output).toBe(0); expect(await readFile(marker, "utf8")).toBe(later);
-      expect(await readFile(fetches, "utf8")).toBe("fetch");
+      expect(await readFile(fetches, "utf8")).toBe("fetch --prune --no-tags origin +refs/tags/v*:refs/tags/v*");
+      expect(await git("rev-parse", "v1.0.9^{commit}")).toBe(original); expect(await git("rev-parse", "keep")).toBe(original);
+      expect(await git("tag", "--list", "v9.9.9")).toBe("");
+      // Local main already holds the latest release and more: nothing to upgrade to.
+      await git("branch", "-f", "main", await git("commit-tree", "-m", "ahead", "-p", later, `${later}^{tree}`));
+      const behind = await dispatch(["update"]);
+      expect(behind.code, behind.output).toBe(0); expect(behind.output).toContain("本地 main 已包含最新发布 v1.0.11");
+      expect(await readFile(marker, "utf8")).toBe("");
+      // Main at the release itself still hands over (the upgrader checks the data and redeploys).
+      await git("branch", "-f", "main", later);
+      expect((await dispatch(["update"])).code).toBe(0); expect(await readFile(marker, "utf8")).toBe(later);
+      await git("branch", "-f", "main", original);
+      // An origin without releases: nothing is chosen.
+      const empty = join(fixture.root, "empty.git");
+      await git("init", "--quiet", "--bare", empty); await git("remote", "set-url", "origin", empty);
+      const none = await dispatch(["update"]);
+      expect(none.output).toContain("远端没有正式发布"); expect(await readFile(marker, "utf8")).toBe("");
+      expect(await git("tag", "--list", "v*")).toBe("");
+      await git("remote", "set-url", "origin", origin);
       for (const invalid of ["main", "0".repeat(40)]) {
         await dispatch(["update", invalid]); expect(await readFile(marker, "utf8")).toBe("");
         expect(await readFile(fetches, "utf8")).toBe("");

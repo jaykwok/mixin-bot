@@ -11,6 +11,7 @@ import { loadDeploymentState, type DeploymentState } from "./deployment-state.ts
 import { describePendingTransaction } from "./pending-transaction.ts";
 import { accountIdentity, LaunchdPlatform, SERVICE_ACCOUNT, trustCheckout, type Identity, type ServiceDefinition } from "./launchd-host.ts";
 import { checkoutOperator } from "./macos-lifecycle.ts";
+import { latestRelease, RELEASE_FETCH, type Release } from "./releases.ts";
 import { accountEnvironment, deployCheck, deployEntry, removeAsAccount, runCore, upgradeEntry } from "./macos-deploy.ts";
 import { AT_FDCWD, close, mkdirAt, O, openAt, renameAt, statAt } from "../../src/lib/darwin.ts";
 import { handOverLog } from "../../src/lib/operation-log.ts";
@@ -128,7 +129,7 @@ async function resumeUpgrade(context: Context, pending: DeploymentState, action:
     "--branch", pending.record.original_branch, "--rollback", ...(context.definition?.git ? ["--git-path", context.definition.git] : [])], { cwd: project, env: context.env });
 }
 
-/** update, resume and rollback: an unfinished transaction first, then (for a fresh upgrade) origin/main or the confirmed commit. */
+/** update, resume and rollback: an unfinished transaction first, then (for a fresh upgrade) the latest release or the confirmed commit. */
 async function update(context: Context, confirmedTarget: string, action: "" | "continue" | "rollback", confirmation: string): Promise<number> {
   const { project, env } = context;
   if (confirmedTarget && !/^[0-9a-f]{40}$/.test(confirmedTarget)) throw new EntryError("已确认的升级目标必须是完整提交 SHA；请重新检查版本");
@@ -159,7 +160,7 @@ async function update(context: Context, confirmedTarget: string, action: "" | "c
     return 0;
   }
   if (env.MIXIN_OPS_CONSOLE === "1" && !confirmedTarget) throw new EntryError("控制台升级缺少已确认目标，未拉取或停止服务");
-  step("同步到 origin/main，由目标版本的升级器完成升级");
+  step("升级到最新发布，由目标版本的升级器完成升级");
   if ((await git(context, ["rev-parse", "--is-inside-work-tree"])).code !== 0)
     throw new EntryError(`${project} 不是 git 仓库，无法自动更新；这份部署可能是解压得到的，请改用 git clone 重新部署后再使用 update`);
   // Tracked changes would be overwritten by the switch; untracked files are not touched, and data/ and logs/ are ignored.
@@ -175,15 +176,19 @@ async function update(context: Context, confirmedTarget: string, action: "" | "c
     const resolved = await git(context, ["rev-parse", "--verify", "--quiet", `${target}^{commit}`]);
     if (resolved.code !== 0 || resolved.stdout.trim() !== target) throw new EntryError("已确认的提交在本地不存在，请重新检查版本");
   } else {
-    step("拉取 origin/main...");
+    step("拉取发布标签...");
     setStage("fetch");
     // As the checkout's owner, with their Git credentials: .git stays theirs.
     const operator = await checkoutOperator(project);
-    const code = await attached([context.definition?.git ?? "/usr/bin/git", "-C", project, "fetch", "--prune", "origin", "refs/heads/main:refs/remotes/origin/main"],
+    const code = await attached([context.definition?.git ?? "/usr/bin/git", "-C", project, ...RELEASE_FETCH],
       { cwd: project, env: { ...context.env, ...operator.env, GIT_TERMINAL_PROMPT: "0" }, ...(operator.identity ? { identity: operator.identity } : {}) });
     if (code !== 0) throw new EntryError("git fetch 失败");
-    target = (await git(context, ["rev-parse", "--verify", "--quiet", "origin/main^{commit}"])).stdout.trim();
-    if (!/^[0-9a-f]{40}$/.test(target)) throw new EntryError("无法解析 origin/main；请确认远端存在 main 分支");
+    let release: Release;
+    try { release = await latestRelease(args => git(context, args)); }
+    catch (error) { throw new EntryError((error as Error).message); }
+    if (release.behind) { ok(`本地 main 已包含最新发布 ${release.tag}，没有可升级的版本`); return 0; }
+    step(`最新发布：${release.tag}（${release.commit.slice(0, 7)}）`);
+    target = release.commit;
   }
   const code = await runTargetUpgrader(context, target, "");
   // A console task's result is the core's; on a terminal a restarted service gets a full check.
@@ -323,7 +328,7 @@ function help(): void {
   doctor     健康检查：共享资料目录、LaunchDaemon、本机端口、版本、事件 Stream、通讯录同步、配置
              加 --json 输出单行 JSON，供控制台使用；加 --repair 在本机实例未就绪时重启
   deploy     配置并部署当前代码；已有部署可重建，失败自动回滚
-  update     同步 origin/main，停机前检查部署记录与配置，停机后切换并验证；提交前失败自动回滚
+  update     升级到最新发布（最高的 vX.Y.Z 标签），停机前检查部署记录与配置，停机后切换并验证；提交前失败自动回滚
              沿用现有端口、共享资料目录、应用凭据和 AI 配置；改配置请用 deploy
   resume     按事务记录继续中断的部署或升级（不重新提问）
   rollback   回滚中断的部署或升级；数据已提交时只能继续

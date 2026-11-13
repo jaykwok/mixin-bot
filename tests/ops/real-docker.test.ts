@@ -338,11 +338,13 @@ function holdDataApply(tree: string): void {
 // The tests read and publish in checkouts that another user may own; the scripts get no such exception.
 const git = (cwd: string, ...args: string[]) =>
   must("git", ["-c", "safe.directory=*", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], cwd);
+// Every published commit is a release: upgrades take the highest vX.Y.Z tag, not origin's main.
+let releases = 0;
 function publish(upstream: string, message: string, change: () => void): string {
   change();
   git(upstream, "add", "-A");
   git(upstream, "commit", "-qm", message);
-  git(upstream, "push", "-q", "origin", "main");
+  git(upstream, "push", "-q", "origin", "main", `HEAD:refs/tags/v0.0.${++releases}`);
   return git(upstream, "rev-parse", "HEAD");
 }
 function prepend(file: string, line: string): void {

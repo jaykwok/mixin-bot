@@ -100,7 +100,7 @@ async function dockerSession(context: DeploymentContext<DockerInput>): Promise<D
     try { facts = parseFacts(factsText); candidate = parseCandidateRecord(candidateText); }
     catch (error) { throw new MaintenanceRefused(`${error instanceof Error ? error.message : "升级准备记录无效"}；服务和数据未改动，请重新运行升级`); }
     if (candidate.source !== "commit" || candidate.target_sha !== upgrade.target) throw new MaintenanceRefused("候选镜像不是从本次目标提交构建的；服务和数据未改动，请重新运行升级");
-    if (!await checkGit.mainExists(signal)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止");
+    if (!await checkGit.mainExists(signal)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止。请在项目目录运行 git switch -c main（以当前提交建立 main）后重试");
     if (await effects.container(ROLLBACK_CONTAINER)) throw new MaintenanceRefused("发现旧回滚容器 mixin-bot-rollback，请先确认其状态");
     const original = await effects.container(SERVICE_CONTAINER);
     if (!original || original.name !== SERVICE_CONTAINER || original.id !== facts.container || original.user !== facts.user || original.image !== facts.image || original.data !== facts.data)
@@ -322,7 +322,7 @@ const docker: DeploymentPlatform<DockerInput> = {
 export function preflightDockerUpgrade(input: DockerUpgradeInput, options: Pick<DockerOptions, "project" | "source" | "native" | "gitPath">,
   signal?: AbortSignal): Promise<OpsResult> {
   return preflightHost(input, options, docker, async ({ project, native, git }, cancellation) => {
-    if (!await git.mainExists(cancellation)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止");
+    if (!await git.mainExists(cancellation)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止。请在项目目录运行 git switch -c main（以当前提交建立 main）后重试");
     const effects = new DockerDeployment(project, await DockerPlatform.connect(project, native), () => {});
     if (await effects.container(ROLLBACK_CONTAINER)) throw new MaintenanceRefused("发现旧回滚容器 mixin-bot-rollback，请先确认其状态；旧服务尚未停止");
     const original = await effects.container(SERVICE_CONTAINER);

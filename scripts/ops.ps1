@@ -564,8 +564,21 @@ function Invoke-TransactionCommand([string]$Action, [string]$Confirmation = '') 
     return $true
 }
 
-# 获取目标提交并交给目标版本升级器；停机、迁移、回滚由升级器负责。
-# 有未完成的事务时先继续或回滚，使用记录的目标提交，不追随最新 main。
+# 最高的正式发布标签 vX.Y.Z（不含预发布；每段至多九位，与控制台和其他平台的入口相同）；没有时返回空串。
+function Get-LatestRelease {
+    $listed = Invoke-GitCapture @('for-each-ref', '--format=%(refname:strip=2)', 'refs/tags/v*')
+    if ($listed.ExitCode -ne 0) { return '' }
+    $best = ''; $bestVersion = $null
+    foreach ($tag in ("$($listed.Text)" -split "`r?`n")) {
+        if ($tag.Trim() -cnotmatch '^v(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$') { continue }
+        $version = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+        if ($null -eq $bestVersion -or $version -gt $bestVersion) { $best = $tag.Trim(); $bestVersion = $version }
+    }
+    return $best
+}
+
+# 获取目标提交（最新发布或控制台确认的提交）并交给目标版本升级器；停机、迁移、回滚由升级器负责。
+# 有未完成的事务时先继续或回滚，使用记录的目标提交，不拉取新的发布。
 function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [string]$Confirmation = '') {
     $script:OpsCoreExitCode = 1
     $operation = Start-OperationLog $Project 'upgrade'
@@ -618,9 +631,22 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
         if ($resolved.ExitCode -ne 0 -or $resolved.Text -cne $ConfirmedTarget) { Err '已确认的提交在本地不存在，请重新检查版本'; return $false }
         $target = $ConfirmedTarget
     } else {
-        $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
+        Step '拉取发布标签...'
+        # 与远端的发布标签保持一致：远端改动或删除的标签在本地同样改动或删除，选择总以远端为准。
+        $fetch = Invoke-GitCapture @('fetch', '--prune', '--no-tags', 'origin', '+refs/tags/v*:refs/tags/v*')
         if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
-        $target = (Invoke-GitCapture @('rev-parse', 'origin/main')).Text
+        $release = Get-LatestRelease
+        if (-not $release) { Err '远端没有正式发布（vX.Y.Z 标签），无法升级'; return $false }
+        $resolved = Invoke-GitCapture @('rev-parse', '--verify', '--quiet', ('refs/tags/' + $release + '^{commit}'))
+        if ($resolved.ExitCode -ne 0) { Err "无法解析发布 $release 的提交"; return $false }
+        $target = $resolved.Text
+        $main = Invoke-GitCapture @('rev-parse', '--verify', '--quiet', 'refs/heads/main^{commit}')
+        if ($main.ExitCode -eq 0 -and $main.Text -cne $target -and (Invoke-GitCapture @('merge-base', '--is-ancestor', $target, $main.Text)).ExitCode -eq 0) {
+            Done "本地 main 已包含最新发布 ${release}，没有可升级的版本"
+            $operationExit = 0
+            return $true
+        }
+        Step "最新发布：${release}（$($target.Substring(0, [Math]::Min(7, $target.Length)))）"
     }
     Write-OperationEvent 'info' ("original=$original target=$target action=$Action")
     if ($original -notmatch '^[0-9a-f]{40}$' -or $target -notmatch '^[0-9a-f]{40}$') { Err '无法识别提交'; return $false }
@@ -959,7 +985,7 @@ switch ($Command) {
         Write-Host ""
         Write-Host "  doctor          只读诊断（含共享资料目录与运行版本）；-Json 输出 JSON；-Repair 自动修复"
         Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
-        Write-Host "  update          同步 origin/main，停机前检查部署记录与配置，停机后切换并验证；提交前失败回滚"
+        Write-Host "  update          升级到最新发布（最高的 vX.Y.Z 标签），停机前检查部署记录与配置，停机后切换并验证；提交前失败回滚"
         Write-Host "                  沿用现有端口、共享资料目录、应用凭据和 AI 配置；改配置请用 deploy"
         Write-Host "  resume          按事务记录继续中断的部署或升级（不重新提问）"
         Write-Host "  rollback        回滚中断的部署或升级；数据已提交时只能继续"

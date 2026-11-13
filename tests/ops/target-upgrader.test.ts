@@ -380,7 +380,7 @@ function unchangedCheck({ log, git, state, container }: Fixture) {
 scenario("ops update ignores terminal settings through the post-upgrade check", "target-upgrader-ops-", async fx => {
   const { f, git, ops, reset, old, target } = fx;
   const origin = join(f.root, "origin.git");
-  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
+  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/tags/v1.0.1`);
   // Upgrading uses only the saved settings, so the health check afterwards runs against the saved port as well
   // (its heading shows the port it probes). Invalid terminal values neither block the entry nor reach the check.
   for (const port of ["9999", "invalid"]) {
@@ -395,7 +395,7 @@ scenario("ops update ignores terminal settings through the post-upgrade check", 
 scenario("ops resume and rollback run the recorded target's core; without the target commit a rollback takes the pinned runtime", "target-upgrader-ops-recovery-", async fx => {
   const { f, work, state, git, ops, log, coreArgs, container, reset, old, target } = fx;
   const origin = join(f.root, "origin.git"), pointer = join(state, "deploy-transaction"), oldShort = old.slice(0, 7);
-  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
+  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/tags/v1.0.1`);
   // The core kept its transaction: only resume or rollback go on, and neither passes a new choice.
   await reset(old);
   let result = await ops(["update"], { FIXTURE_CORE: "pending" });
@@ -434,7 +434,7 @@ scenario("ops resume and rollback run the recorded target's core; without the ta
 scenario("ops update leaves the structured result to the core once it took over and writes it only for an earlier failure", "target-upgrader-ops-result-", async fx => {
   const { f, git, ops, reset, old, target } = fx;
   const origin = join(f.root, "origin.git"), file = join(f.root, "result.json"), core = { fixture: "result of the core" };
-  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
+  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/tags/v1.0.1`);
   await reset(old);
   let result = await ops(["update"], { MIXIN_OPS_RESULT_FILE: posix(file) });
   expect(result.code, result.text).toBe(0); expect(result.text).not.toContain("健康检查");
@@ -577,7 +577,7 @@ scenario("ops update interrupted by Ctrl+C, TERM or a hangup cleans up before th
   if (process.platform === "win32") return;
   const { f, work, mock, state, git, env, log, container, reset, candidateTags, processes, old, target } = fx;
   const origin = join(f.root, "origin.git");
-  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
+  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/tags/v1.0.1`);
   const interrupt = async (signal: "group" | "hangup" | "ops", started: string, extra: Record<string, string>) => {
     await reset(old); await rm(join(f.root, "events"), { force: true });
     const held = processes.spawn([bash!, "scripts/ops.sh", "update"], { cwd: work, env: { ...process.env, ...env(extra) } });

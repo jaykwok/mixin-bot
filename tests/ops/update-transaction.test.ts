@@ -65,7 +65,8 @@ test.skipIf(process.platform !== "linux")("Linux update holds its real flock thr
     const old = await git("rev-parse", "HEAD");
     await writeFile(join(work, "version.txt"), "new"); await git("add", "."); await git("commit", "-m", "new");
     expect((await run(["git", "init", "--bare", origin])).code).toBe(0);
-    await git("remote", "add", "origin", origin); await git("push", "origin", "main");
+    // The update takes origin's latest release.
+    await git("remote", "add", "origin", origin); await git("push", "origin", "main", "main:refs/tags/v1.0.0");
     for (const mode of ["fail", "signal-term", "signal-int", "success"]) {
       await git("reset", "--hard", old);
       const markers = join(fixture.root, mode); await mkdir(markers);

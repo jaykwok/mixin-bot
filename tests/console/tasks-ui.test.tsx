@@ -39,7 +39,7 @@ test("升级缺少范围时可直接选部门；取消不提交，预览只传�
   const requests: { url: string; body: unknown }[] = [];
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     const body = JSON.parse(String(options?.body ?? "{}")); requests.push({ url: String(url), body });
-    if (String(url) === "/api/lifecycle/check-update") return Response.json({ target: "e".repeat(40), branch: "main", hasDirectory: false });
+    if (String(url) === "/api/lifecycle/check-update") return Response.json({ target: "e".repeat(40), release: "v2.0.2", branch: "main", hasDirectory: false });
     if (String(url) === "/api/lifecycle/directory/open") return Response.json({ view: "tree-one", children: [{ key: "opaque-one", name: "研发部" }] });
     if (String(url) === "/api/lifecycle/directory/children") return Response.json({ children: [{ key: "opaque-two", name: "测试部" }] });
     if (String(url) === "/api/plans") return Response.json({ id: "plan-one", summary: ["测试部，包含子部门"], expiresAt: Date.now() + 60000 });
@@ -92,12 +92,13 @@ test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检�
   let offline = false; const requests: unknown[] = [], target = "c".repeat(40);
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     if (String(url) === "/api/lifecycle/check-update") return offline ? Response.json({ error: "网络失败", code: "input" }, { status: 409 })
-      : Response.json({ target, branch: "feature", hasDirectory: true });
+      : Response.json({ target, release: "v9.8.7", branch: "feature", hasDirectory: true });
     requests.push(JSON.parse(String(options?.body))); return Response.json({ id: "plan-upgrade", summary: [target], expiresAt: Date.now() + 60000 });
   }) as typeof fetch;
   try {
     render(<UpgradeForm />, root); expect(requests).toEqual([]); find(root, "检查更新").click();
     await until(() => !!find(root, "预览升级")); expect(find(root, "预览升级").disabled).toBe(true);
+    expect(root.textContent).toContain("检查最新发布"); expect(root.textContent).toContain("目标版本v9.8.7"); expect(root.textContent).toContain(target);
     // A saved directory scope is used as it is; switching to main still has to be allowed.
     expect(root.querySelector('[aria-label="升级通讯录范围"]')).toBeNull();
     await Bun.sleep(20); expect(find(root, "预览升级").disabled).toBe(true);
@@ -105,7 +106,7 @@ test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检�
     await until(() => !find(root, "预览升级").disabled); find(root, "预览升级").click(); await until(() => !!root.querySelector('[role="dialog"]'));
     expect(requests).toEqual([{ operation: "update", params: { target, switchMain: true, directory: "saved" } }]);
     find(root, "返回").click(); offline = true; find(root, "检查更新").click(); await until(() => root.textContent!.includes("网络失败"));
-    expect(find(root, "预览升级")).toBeUndefined(); expect(root.textContent).not.toContain(target);
+    expect(find(root, "预览升级")).toBeUndefined(); expect(root.textContent).not.toContain(target); expect(root.textContent).not.toContain("v9.8.7");
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
 

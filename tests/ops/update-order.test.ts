@@ -93,16 +93,20 @@ exit "\${FIXTURE_UPGRADER_EXIT:-0}"
     };
     const old = await commit("old"), target = await commit("new");
     const origin = join(f.root, "origin.git");
+    // origin's main is ahead of the latest release; the target is the release.
+    const ahead = await commit("unreleased");
     await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", "main");
+    await git("push", "origin", `${old}:refs/tags/v1.0.0`, `${target}:refs/tags/v1.0.1`);
     await git("reset", "--hard", old); await git("update-ref", "refs/remotes/origin/main", old);
+    expect(ahead).not.toBe(target);
 
-    // A new upgrade fetches origin/main, exports its upgrader to tmp/upgrade-*, passes stdin through for the
+    // A new upgrade fetches the release tags, exports the latest release's upgrader to tmp/upgrade-*, passes stdin through for the
     // interactive preview, runs a full check when the service runs, and removes the export.
     await writeFile(join(state, "running"), "true");
     let result = await update({}, "answer\n");
     expect(result.code, result.text).toBe(0);
-    expect(result.text).toContain("拉取 origin/main");
-    expect(await git("rev-parse", "refs/remotes/origin/main")).toBe(target);
+    expect(result.text).toContain("拉取发布标签"); expect(result.text).toContain(`最新发布：v1.0.1（${target.slice(0, 7)}）`);
+    expect(await git("rev-parse", "refs/tags/v1.0.1")).toBe(target); expect(await git("rev-parse", "refs/remotes/origin/main")).toBe(old);
     const [fresh] = await events_();
     expect(fresh).toMatch(new RegExp(`^upgrader version=new dir=tmp/upgrade-[A-Za-z0-9]{8} args=${target} stdin=answer$`));
     expect(result.text).toContain("SETTINGS-RELOADED\nDOCTOR"); expect(await exports()).toEqual([]);

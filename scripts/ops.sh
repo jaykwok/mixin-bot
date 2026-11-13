@@ -560,6 +560,19 @@ deploy_command() {
     MIXIN_OPS_PROJECT="$PROJECT_DIR" run_forwarding bash "$OPS_SOURCE_DIR/scripts/lib/deploy.sh" "$OPS_COMMAND" </dev/null
 }
 
+# 最高的正式发布标签 vX.Y.Z（不含预发布；每段至多九位，与控制台和其他平台的入口相同）；没有时输出为空。
+latest_release() {
+    local tag best='' major minor patch top=-1 mid=-1 low=-1
+    while IFS= read -r tag; do
+        [[ "$tag" =~ ^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] || continue
+        major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+        if (( major > top || (major == top && (minor > mid || (minor == mid && patch > low))) )); then
+            best="$tag" top=$major mid=$minor low=$patch
+        fi
+    done < <(git_here for-each-ref --format='%(refname:strip=2)' 'refs/tags/v*')
+    printf '%s' "$best"
+}
+
 update() {
     local confirmed="${1:-}"
     if [ -n "$confirmed" ] && ! [[ "$confirmed" =~ ^[0-9a-f]{40}$ ]]; then
@@ -596,12 +609,12 @@ update() {
         ER '控制台升级缺少已确认目标，未拉取或停止服务'; return 1
     fi
 
-    P "同步到 origin/main，由目标版本的升级器完成升级"
+    P "升级到最新发布，由目标版本的升级器完成升级"
     require_git_checkout || return 1
     # 已跟踪文件的改动会被升级器的 checkout 冲掉，必须先拦下来。只看已跟踪文件：
     # 未跟踪文件不会被这些操作动到，拿它们挡住升级只会让这条命令永远跑不起来。
     # data/ 和 logs/ 都在 .gitignore 里，配置与数据本来就不算改动。
-    local dirty target
+    local dirty target release main
     dirty="$(git_here status --porcelain --untracked-files=no 2>&1)"
     if [ -n "$dirty" ]; then
         ER "已跟踪文件有未提交的改动，已停止升级："
@@ -613,13 +626,22 @@ update() {
         target="$(git_here rev-parse --verify --quiet "${confirmed}^{commit}")" || { ER '已确认的提交在本地不存在，请重新检查版本'; return 1; }
         [ "$target" = "$confirmed" ] || { ER '已确认的目标不是提交，请重新检查版本'; return 1; }
     else
-        P "拉取 origin/main..."
+        P "拉取发布标签..."
         operation_stage fetch
-        if ! operation_capture git_here fetch --prune origin refs/heads/main:refs/remotes/origin/main; then
+        # 与远端的发布标签保持一致：远端改动或删除的标签在本地同样改动或删除，选择总以远端为准。
+        if ! operation_capture git_here fetch --prune --no-tags origin '+refs/tags/v*:refs/tags/v*'; then
             ER "git fetch 失败"
             return 1
         fi
-        target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
+        release="$(latest_release)"
+        [ -n "$release" ] || { ER "远端没有正式发布（vX.Y.Z 标签），无法升级"; return 1; }
+        target="$(git_here rev-parse --verify --quiet "refs/tags/${release}^{commit}")" || { ER "无法解析发布 $release 的提交"; return 1; }
+        main="$(git_here rev-parse --verify --quiet 'refs/heads/main^{commit}')" || main=''
+        if [ -n "$main" ] && [ "$main" != "$target" ] && git_here merge-base --is-ancestor "$target" "$main"; then
+            OK "本地 main 已包含最新发布 ${release}，没有可升级的版本"
+            return 0
+        fi
+        P "最新发布：${release}（${target:0:7}）"
     fi
     operation_event info "original=$(git_here rev-parse HEAD 2>/dev/null) target=$target"
     # 停机前的预检和预览由目标版本的升级器负责；停机、切换代码、迁移和回滚由它交给目标版本的运维核心。
@@ -784,10 +806,10 @@ case "${1:-}" in
         echo "  doctor     健康检查：共享资料目录、容器、本机 :$PORT、版本、事件 Stream、通讯录同步、配置"
         echo "             加 --json 输出单行 JSON，供控制台使用"
         echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
-        echo "  update     同步 origin/main，由目标版本的升级器在停机前检查部署记录与配置，"
+        echo "  update     升级到最新发布（最高的 vX.Y.Z 标签），由目标版本的升级器在停机前检查部署记录与配置，"
         echo "             再停机重建并切换容器；提交前失败自动回滚。沿用现有端口、共享资料目录、"
         echo "             应用凭据和 AI 配置；改配置请用 deploy"
-        echo "  resume     继续中断的部署或升级：使用事务记录中的目标提交和设置，不拉取新的 main"
+        echo "  resume     继续中断的部署或升级：使用事务记录中的目标提交和设置，不拉取新的发布"
         echo "  rollback   回滚中断的部署或升级：恢复数据、配置、代码和原运行状态；数据已提交时拒绝"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"

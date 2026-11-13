@@ -56,9 +56,12 @@ test("重部署设置来自状态文件，读取不联网；损坏和未完成�
     writeFileSync(join(f.root, "data/state/deploy-transaction"), "corrupt"); await expect(get()).rejects.toThrow("无法读取");
   } finally { await f.cleanup(); }
 });
-test("检查版本只在明确请求时获取固定 origin/main；网络失败、未知参数和并发检查拒绝", async () => {
+test("检查版本只在明确请求时拉取发布标签，目标是最新的正式发布；网络失败、未知参数和并发检查拒绝", async () => {
   const f = await tempFixture("upgrade-version-");
-  const commands: string[][] = [], target = "b".repeat(40); let network = true, unblock: (() => void) | undefined, wait = false;
+  const commands: string[][] = [], target = "b".repeat(40), main = "c".repeat(40);
+  let network = true, unblock: (() => void) | undefined, wait = false, behind = false;
+  // Only stable vX.Y.Z tags count, compared by number; pre-releases, leading zeros and other names are not releases.
+  let tags = "v1.0.0\nv2.0.9\nv2.0.10\nv2.1.0-rc.1\nv02.3.0\nv3.0\nvnext\n";
   try {
     const routes = upgradeRoutes(f.root, async (argv, env) => {
       commands.push(argv);
@@ -68,7 +71,11 @@ test("检查版本只在明确请求时获取固定 origin/main；网络失败�
         return { code: network ? 0 : 1, stdout: "", stderr: "synthetic-secret-in-remote" };
       }
       if (argv[3] === "show") return { code: 0, stdout: '{"protocol":"mixin-console-lifecycle","version":1}', stderr: "" };
-      return { code: 0, stdout: argv.includes("origin/main^{commit}") ? target : "feature", stderr: "" };
+      if (argv[3] === "for-each-ref") return { code: 0, stdout: tags, stderr: "" };
+      if (argv[3] === "merge-base") return { code: behind ? 0 : 1, stdout: "", stderr: "" };
+      if (argv.includes("refs/tags/v2.0.10^{commit}")) return { code: 0, stdout: target, stderr: "" };
+      if (argv.includes("refs/heads/main^{commit}")) return { code: 0, stdout: main, stderr: "" };
+      return { code: 0, stdout: argv.includes("--abbrev-ref") ? "feature" : "", stderr: "" };
     });
     expect(await routes["GET /api/lifecycle/upgrade"]!.run(context())).toEqual({ branch: "feature", hasDirectory: false });
     expect(commands.some(argv => argv[3] === "fetch")).toBe(false);
@@ -78,8 +85,15 @@ test("检查版本只在明确请求时获取固定 origin/main；网络失败�
     await expect(routes["POST /api/lifecycle/check-update"]!.run(context())).rejects.toThrow("检查版本失败");
     network = true;
     mkdirSync(join(f.root, "data/config"), { recursive: true }); writeFileSync(join(f.root, "data/config/directory.json"), '{"format":1,"all":true}');
-    expect(await routes["POST /api/lifecycle/check-update"]!.run(context())).toEqual({ branch: "feature", hasDirectory: true, target });
-    expect(commands.filter(argv => argv[3] === "fetch")).toEqual(Array(2).fill(["git", "-C", f.root, "fetch", "origin", "refs/heads/main:refs/remotes/origin/main"]));
+    expect(await routes["POST /api/lifecycle/check-update"]!.run(context())).toEqual({ branch: "feature", hasDirectory: true, target, release: "v2.0.10" });
+    expect(commands.filter(argv => argv[3] === "fetch")).toEqual(Array(2).fill(["git", "-C", f.root, "fetch", "--prune", "--no-tags", "origin", "+refs/tags/v*:refs/tags/v*"]));
+    expect(commands.find(argv => argv[3] === "merge-base")).toEqual(["git", "-C", f.root, "merge-base", "--is-ancestor", target, main]);
+    // Local main already holds the latest release and more; or origin has no release at all.
+    behind = true;
+    await expect(routes["POST /api/lifecycle/check-update"]!.run(context())).rejects.toThrow("本地 main 已包含最新发布 v2.0.10，没有可升级的版本");
+    behind = false; tags = "v2.1.0-rc.1\nvnext\n";
+    await expect(routes["POST /api/lifecycle/check-update"]!.run(context())).rejects.toThrow("远端没有正式发布");
+    tags = "v2.0.10\n";
     wait = true; const pending = routes["POST /api/lifecycle/check-update"]!.run(context());
     while (!unblock) await Bun.sleep(1);
     await expect(routes["POST /api/lifecycle/check-update"]!.run(context())).rejects.toThrow("正在检查版本");

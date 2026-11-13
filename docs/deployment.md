@@ -58,8 +58,9 @@ brew install --cask libreoffice    # 可选：Word/PPT 预览
 
 ```sh
 sudo mkdir -p /opt/mixin-bot && sudo chown "$USER" /opt/mixin-bot
-git clone https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
+git clone --branch v2.0.1 https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
 cd /opt/mixin-bot
+git switch -c main
 ```
 
 部署按服务账户实际检查每个工具的版本和路径，并把找到的路径写进服务定义；以后升级 Homebrew 后若工具位置变化，重新部署即可。服务的 `PATH` 只包含这些工具和系统目录，语言环境为 `C.UTF-8`，不读取任何登录 shell 的配置。
@@ -93,12 +94,15 @@ Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffic
 
 ## 执行部署
 
-先获取代码，再进入项目目录：
+先获取最新的正式发布，进入项目目录，再以它建立本地 main 分支：
 
 ```sh
-git clone https://github.com/jaykwok/mixin-bot.git
+git clone --branch v2.0.1 https://github.com/jaykwok/mixin-bot.git
 cd mixin-bot
+git switch -c main
 ```
+
+按上面的克隆命令安装的是正式发布。版本检查和升级只跟随正式发布：目标是远端最高的 `vX.Y.Z` 标签（不含预发布，按数字比较），main 上尚未发布的提交不会成为升级目标；`deploy` 和重新部署使用项目目录当前检出的代码。升级要求本地有 main 分支，并且 main 能快进到目标发布。本地 main 领先于最新发布（包含它，但不是它）时，没有可升级的版本；main 正好是最新发布时，升级照常检查部署记录并重新部署这个版本。
 
 项目目录必须是单独的 Git 检出，不要放在另一个 Git 仓库的工作区里：部署和升级按项目目录读取提交，不支持嵌套检出。
 

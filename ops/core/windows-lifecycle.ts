@@ -33,7 +33,7 @@ function deployRefusal(facts: WindowsService): string | null {
 }
 /** Start rules of a fresh upgrade: the upgrader runs them before asking anything, the host again under deploy.lock. */
 async function startChecks(git: DeploymentGit, service: WindowsPlatform, input: WindowsUpgradeInput, signal?: AbortSignal) {
-  if (!await git.mainExists(signal)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止");
+  if (!await git.mainExists(signal)) throw new MaintenanceRefused("本地 main 分支不存在；旧服务尚未停止。请在项目目录运行 git switch -c main（以当前提交建立 main）后重试");
   const facts = await service.inspect(), refusal = serviceRefusal(facts);
   if (refusal) throw new MaintenanceRefused(refusal + "；旧服务尚未停止");
   const checked = await git.switchConflicts(input.target, signal);
