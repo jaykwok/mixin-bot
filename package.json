@@ -35,7 +35,7 @@
     "@earendil-works/pi-mcp": "1.5.2",
     "@earendil-works/pi-schema": "1.5.2",
     "fs-extra": "11.4.0",
-    "hono": "4.13.13",
+    "hono": "4.13.18",
     "marked": "18.0.5",
     "pptx-automizer": "0.9.3",
     "preact": "11.0.2",
