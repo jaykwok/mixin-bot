@@ -1,6 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
 import { log } from "../../src/core/log.ts";
-import { NATIVE_FILE_MAX_BYTES } from "../../src/core/transfer-limits.ts";
 import { createHash, createHmac } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -93,7 +92,9 @@ test("configuration is S3 only with two-hour downloads and separate 30-minute cl
   const config = validateRelayConfig(base);
   expect(config.expireHours).toBe(2);
   expect(config.cleanupGraceMinutes).toBe(30);
-  expect(config.maxBytes).toBe(2 * 1024 ** 3);
+  expect(config.maxMB).toBe(2048);
+  expect(validateRelayConfig({ ...base, maxMB: 30.5 }).maxMB).toBe(30.5);
+  expect(validateRelayConfig({ ...base, maxMB: 5120 }).maxMB).toBe(5120);
   expect(config.forcePathStyle).toBe(false);
   expect(config.prefix).toBe("");
   for (const root of ["", "/", "//"]) expect(validateRelayConfig({ ...base, prefix: root }).prefix).toBe("");
@@ -115,7 +116,8 @@ test("configuration is S3 only with two-hour downloads and separate 30-minute cl
       { ...base, prefix: "a//b" }, { ...base, prefix: "a\\b" }, { ...base, prefix: "a?b" },
       { ...base, expireHours: 0 }, { ...base, expireHours: null }, { ...base, expireHours: 169 },
       { ...base, cleanupGraceMinutes: 0 }, { ...base, cleanupGraceMinutes: 1441 },
-      { ...base, maxBytes: NATIVE_FILE_MAX_BYTES }, { ...base, maxBytes: 6 * 1024 ** 3 },
+      { ...base, maxMB: 30 }, { ...base, maxMB: 6144 }, { ...base, maxMB: NaN }, { ...base, maxMB: Infinity },
+      { ...base, maxMB: "2048" }, { ...base, maxBytes: 2048 * 1024 ** 2 },
     ]) expect(() => validateRelayConfig(invalid)).toThrow();
     // A console's bucket domain would get the bucket prepended twice under virtual-hosted style.
     expect(() => validateRelayConfig({ ...base, endpoint: "https://test-bucket.s3.example.test" })).toThrow("请填写 https://s3.example.test");
@@ -347,7 +349,7 @@ test("snapshot limits, changed source size and cancellation reject before remote
   const f = await fixture();
   try {
     await expect(relayFile({ ...f.request(), size: 6 })).rejects.toThrow("大小发生变化");
-    await expect(relayFile({ ...f.request(), config: { ...f.config, maxBytes: 4 } })).rejects.toThrow("上限");
+    await expect(relayFile({ ...f.request(), config: { ...f.config, maxMB: 4 / 1024 ** 2 } })).rejects.toThrow("上限");
     await expect(relayFile({ ...f.request(), signal: AbortSignal.abort(new Error("pre-cancel")) })).rejects.toThrow("pre-cancel");
     await expect(relayFile({ ...f.request(), filename: "../file" })).rejects.toThrow("文件名");
     expect(f.calls).toHaveLength(0);

@@ -8,6 +8,7 @@ import { operationArgs } from "../../ops/core/operations.ts";
 import { operationPreparer } from "../../console/server/prepare-operation.ts";
 import { Views } from "../../console/server/views.ts";
 import type { RouteContext } from "../../console/server/routes.ts";
+import { DATA_VERSION } from "../../src/core/version.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
@@ -51,6 +52,8 @@ for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform 
       await git("init", "--quiet", "--bare", origin); await git("remote", "add", "origin", origin);
       await git("push", "--quiet", "origin", `${later}:refs/heads/main`, "refs/tags/*:refs/tags/*");
       const stateDir = join(repo, "data/state"); await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, "data-version.json"), JSON.stringify({ dataVersion: DATA_VERSION, appVersion: "1.0.9",
+        build: original.slice(0, 12), transaction: "deploy-fixture", application: "a".repeat(64) }));
       const sourcePath = platform === "windows" ? "scripts/ops.ps1" : "scripts/ops.sh";
       const source = (await readFile(join(project, sourcePath), "utf8")).replaceAll("\r\n", "\n");
       const script = join(fixture.root, platform === "windows" ? "dispatch.ps1" : "dispatch.sh");
@@ -127,7 +130,7 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
       });
       const context: RouteContext = { body: {}, signal: new AbortController().signal, session: {} as RouteContext["session"] };
       const checked = await routes["POST /api/lifecycle/check-update"]!.run(context) as { target: string; release: string };
-      expect(checked).toMatchObject({ target: confirmed, release: "v1.0.10" }); expect(checkedFetches).toBe(1);
+      expect(checked).toMatchObject({ current: "1.0.9", available: true, target: confirmed, release: "v1.0.10" }); expect(checkedFetches).toBe(1);
       const params = await operationPreparer(repo, new Views())("update", {
         target: checked.target, switchMain: true, directory: "all",
       }, "fixture");

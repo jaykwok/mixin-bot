@@ -105,13 +105,13 @@ export interface LogLine {
   level: "debug" | "info" | "warn" | "error" | "other";
 }
 
-/** 设置页展示的外链状态：只含可显示字段，凭据不离开配置文件。 */
+/** 外链页展示的状态：只含可显示字段，凭据不离开配置文件。 */
 export type RelaySummary = { enabled: false } | {
   enabled: true; endpoint: string; region: string; bucket: string; prefix: string; pathStyle: boolean;
-  maxBytes: number; expireHours: number; cleanupGraceMinutes: number; sessionToken: boolean;
+  maxMB: number; expireHours: number; cleanupGraceMinutes: number; sessionToken: boolean;
 };
 
-/** 设置页展示的应用机器人状态：只有平台环境，AppID 和 AppSecret 不离开配置文件。 */
+/** 应用机器人页展示的状态：只有平台环境，AppID 和 AppSecret 不离开配置文件。 */
 export type AppBotSummary = { configured: false } | { configured: true; environment: "production" | "staging" };
 
 export async function loadAppBotSummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<AppBotSummary> {
@@ -147,13 +147,13 @@ export async function loadRelaySummary(project = PROJECT_DIR, signal?: AbortSign
   const config = validateRelayConfig(doc, "relay.json");
   return {
     enabled: true, endpoint: config.endpoint, region: config.region, bucket: config.bucket, prefix: config.prefix,
-    pathStyle: config.forcePathStyle, maxBytes: config.maxBytes, expireHours: config.expireHours,
+    pathStyle: config.forcePathStyle, maxMB: config.maxMB, expireHours: config.expireHours,
     cleanupGraceMinutes: config.cleanupGraceMinutes, sessionToken: config.sessionToken !== undefined,
   };
 }
 
 /**
- * 设置页展示的当前模型：只读 Pi 设置里的选择，完整校验（目录、凭证）由体检和启动负责。
+ * 模型页展示的当前模型：只读 Pi 设置里的选择，完整校验（目录、凭证）由体检和启动负责。
  * 推理级别与服务相同：先取该模型的单独设置，再取全局默认；超出模型能力时由服务启动时下调。
  */
 export interface ModelSummary { provider: string; model: string; thinking: { level: string; source: "model" | "default" } | null }

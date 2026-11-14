@@ -503,6 +503,7 @@ input[type="file"]::file-selector-button:hover { background: var(--fill-hover); 
 .change-bar .row-text { font-size: 13px; color: var(--muted); }
 .change-bar.active { background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
 .change-bar.active .row-text { color: var(--accent-text); font-weight: 500; }
+.page-tabs { margin-bottom: 20px; }
 .tabs-row { min-height: 0; padding-bottom: 6px; }
 .tabs-row + .group-note { padding-top: 2px; }
 .tabs-row + .group-note::before { display: none; }

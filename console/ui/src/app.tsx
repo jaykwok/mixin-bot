@@ -15,13 +15,13 @@ import { resetExports } from "./exports.tsx";
 import { OverviewPage, StatusPill } from "./overview.tsx";
 import { CommandPalette, type Command } from "./palette.tsx";
 import { takeLoginToken } from "./login.ts";
-import { StatsPage } from "./stats.tsx";
+import { StatsWorkspace } from "./stats.tsx";
 import { PushPage } from "./push.tsx";
 import { ReadOnlyPage } from "./read-pages.tsx";
 import { TasksPage, resetTasks, taskEnded, useFollowed } from "./tasks.tsx";
 import { FirstDeployWizard } from "./first-deploy.tsx";
 import { TooltipLayer } from "./tooltip.tsx";
-import { DirectoryForm, RelayActions, StatsImportForm, StorageActions } from "./write-forms.tsx";
+import { DirectoryForm, StorageActions } from "./write-forms.tsx";
 import { SettingsPage } from "./configuration.tsx";
 import { applyTheme, nextTheme, storedTheme, themeLabel, type Theme } from "./theme.ts";
 import { Banner, EmptyState, Row, Section, Tile } from "./ui.tsx";
@@ -32,7 +32,7 @@ const SESSION_POLL_MS = 60_000;
 const TOUCH_INTERVAL_MS = 60_000;
 /** Pages of tables and conversations use the full width; settings-like pages read best narrower. */
 const WIDE = new Set(["conversations", "stats", "push", "logs"]);
-const NARROW = new Set(["maintain", "settings", "directory", "storage", "relay", "health"]);
+const NARROW = new Set(["maintain", "settings", "models", "bot", "materials", "directory", "storage", "relay", "health"]);
 
 /** Tasks after which the overview is read at once rather than at the next poll. */
 const LIFECYCLE = new Set(["install", "uninstall", "deploy", "repair", "update", "resume", "rollback"]);
@@ -312,7 +312,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
               {route === "overview" && <OverviewPage data={overview} error={overviewError} refreshing={refreshing}
                 onRefresh={() => void loadOverview(true)} sessionLeft={Math.min(idleLeft, absoluteLeft)} />}
               {route === "conversations" && <ConversationsPage />}
-              {route === "stats" && <><StatsPage /><StatsImportForm /></>}
+              {route === "stats" && <StatsWorkspace />}
               {route === "maintain" && <TasksPage platform={overview?.console.platform}
                 setup={!overview ? <Section title="首次部署"><Row icon={overviewError ? "alert" : "loader"} tint={overviewError ? "red" : "blue"}
                     title={overviewError ? "无法读取部署状态" : "正在读取部署状态…"} detail={overviewError ?? "读到之后显示首次部署向导或已有部署的操作。"} /></Section>
@@ -320,12 +320,15 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
               {route === "health" && <ReadOnlyPage page="health" />}
               {route === "logs" && <ReadOnlyPage page="logs" />}
               {route === "storage" && <ReadOnlyPage page="storage"><StorageActions /></ReadOnlyPage>}
-              {route === "relay" && <ReadOnlyPage page="relay"><RelayActions /></ReadOnlyPage>}
+              {route === "relay" && <SettingsPage page="relay" />}
               {route === "directory" && <ReadOnlyPage page="directory" refresh={directorySettled}>
                 <DirectoryForm onSettled={() => { setDirectorySettled(count => count + 1); void loadOverview(false); }} />
               </ReadOnlyPage>}
               {route === "push" && <PushPage />}
               {route === "settings" && <SettingsPage />}
+              {route === "models" && <SettingsPage page="models" />}
+              {route === "bot" && <SettingsPage page="bot" />}
+              {route === "materials" && <SettingsPage page="materials" />}
             </div>
           )}
         </main>

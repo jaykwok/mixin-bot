@@ -15,7 +15,7 @@ import { openRelayIndex, type RelayIndex } from "../../src/integrations/relay-in
 const RELAY: RelayConfig = {
   provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket",
   accessKeyId: "bot", secretAccessKey: "secret", prefix: "relay/", forcePathStyle: false,
-  maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30,
+  maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30,
 };
 
 /** 一个刚好越过 IM 单条附件上限的文件，用来触发外链分支。 */

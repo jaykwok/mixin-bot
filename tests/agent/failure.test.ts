@@ -127,7 +127,7 @@ describe("请求失败回执", () => {
       "无法读取 data/config/models.json。请先生成 AI 配置：运行 bun run configure",
       // Pi 存选型的文件读坏了，同样是配置问题，不该落到通用提示上。
       "data/runtime/pi/settings.json: JSON Parse error: Expected '}'",
-      "provider zai 未配置可用凭证，请重新配置模型（控制台「设置」或 model-configure；本地开发运行 bun run configure）",
+      "provider zai 未配置可用凭证，请重新配置模型（控制台「模型」或 model-configure；本地开发运行 bun run configure）",
     ]) {
       expect(describeRequestFailure(new Error(message))).toContain("模型配置有问题");
     }

@@ -1,5 +1,5 @@
 /** @jsxImportSource preact */
-// 设置页的「资料索引的排除目录」：共享资料里不进索引的文件夹。规则由运行中的服务读写（data/config/materials-ignore.txt），保存后
+// 资料与文档页的「资料索引的排除目录」：共享资料里不进索引的文件夹。规则由运行中的服务读写（data/config/materials-ignore.txt），保存后
 // 下一次索引就按新规则生成，不需要重启。可以逐层打开共享资料的文件夹来挑，也可以直接输入路径；以任意层级前缀开头的规则按名字
 // 排除每一层的同名文件夹。
 import { useEffect, useRef, useState } from "preact/hooks";

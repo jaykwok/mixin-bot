@@ -25,8 +25,8 @@ ops_command_hint() {
             doctor) path='体检 → 刷新' ;;
             status) path='总览 → 刷新' ;;
             logs) path='日志' ;;
-            configure-app-bot) path='设置 → 应用机器人凭据' ;;
-            relay-configure) path='设置 → 外链配置' ;;
+            configure-app-bot) path='应用机器人 → 编辑配置' ;;
+            relay-configure) path='外链 → 编辑配置' ;;
             directory) path='通讯录' ;;
         esac
         if [ -n "$path" ]; then printf '「%s」' "$path"; return; fi

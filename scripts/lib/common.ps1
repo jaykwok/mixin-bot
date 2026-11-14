@@ -22,8 +22,8 @@ function Get-OpsCommandHint([string]$Command) {
             'doctor' = '体检 → 刷新'
             'status' = '总览 → 刷新'
             'logs' = '日志'
-            'configure-app-bot' = '设置 → 应用机器人凭据'
-            'relay-configure' = '设置 → 外链配置'
+            'configure-app-bot' = '应用机器人 → 编辑配置'
+            'relay-configure' = '外链 → 编辑配置'
             'directory' = '通讯录'
         }
         if ($paths.ContainsKey($Command)) { return "「$($paths[$Command])」" }

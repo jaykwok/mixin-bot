@@ -4,11 +4,38 @@ import { GlobalRegistrator } from "../helpers/dom.tsx";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
+const { act } = await import("preact/test-utils");
 const { ConfigurationForm, ConfigurationRecovery } = await import("../../console/ui/src/configuration.tsx");
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const until = async (check: () => boolean) => { const end = Date.now() + 3000; while (!check() && Date.now() < end) await Bun.sleep(10); expect(check()).toBe(true); };
 const button = (root: Element, text: string) => [...root.querySelectorAll("button")].find(value => value.textContent === text)!;
 const options = (root: Element) => [...root.querySelectorAll('[role="option"]')] as HTMLElement[];
+
+test("外链上限以 MB 显示、编辑和提交，保存后不换算成字节", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  let saved: Record<string, unknown> | undefined;
+  const draft = { id: "config-mb", revision: 0, validated: false, summary: [], expiresAt: Date.now() + 60000,
+    form: { kind: "relay", enabled: true, maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30 } };
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    if (String(url).endsWith("/open")) return Response.json(draft);
+    if (String(url).endsWith("/edit")) {
+      saved = JSON.parse(String(init?.body)).patch;
+      return Response.json({ ...draft, revision: 1, form: { ...draft.form, maxMB: saved!.maxMB } });
+    }
+    if (String(url).endsWith("/check")) return Response.json({ ...draft, revision: 1, validated: true });
+    return Response.json({});
+  }) as typeof fetch;
+  try {
+    render(<ConfigurationForm kind="relay" />, root); button(root, "编辑配置").click();
+    await until(() => !!root.querySelector('[aria-label="文件上限（MB）"]'));
+    const input = root.querySelector<HTMLInputElement>('[aria-label="文件上限（MB）"]')!;
+    expect(input.value).toBe("2048"); input.value = "30.5"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    await Bun.sleep(10); button(root, "保存草稿并校验").click(); await until(() => !!button(root, "预览应用配置"));
+    expect(saved?.maxMB).toBe(30.5); expect(saved).not.toHaveProperty("maxBytes");
+    expect(root.querySelector<HTMLInputElement>('[aria-label="文件上限（MB）"]')!.value).toBe("30.5");
+    button(root, "取消草稿").click(); await until(() => !root.querySelector("fieldset"));
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
+});
 
 test("配置恢复先收尾宿主维护，发布前中断也可见；运行参数显示正确名称，状态读取失败隐藏动作", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
@@ -37,7 +64,7 @@ test("配置恢复先收尾宿主维护，发布前中断也可见；运行参�
     await until(() => !!root.querySelector('[role="alert"]'));
     expect(button(root, "预览恢复原配置")).toBeUndefined();
     expect(button(root, "预览恢复中断的维护")).toBeUndefined();
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
 test("配置表单只提交草稿编号供预览；凭据保持/替换明确，校验成功后清空新密码，取消不调用应用", async () => {
@@ -66,7 +93,7 @@ test("配置表单只提交草稿编号供预览；凭据保持/替换明确，�
     expect(calls.find(value => value.path === "/api/plans")?.body).toEqual({ operation: "configuration-apply", params: { draft: "config-test" } });
     button(root, "返回").click(); button(root, "取消草稿").click(); await until(() => !root.querySelector("fieldset"));
     expect(calls.some(value => value.path === "/api/tasks")).toBe(false); expect(calls.some(value => value.path.endsWith("/discard"))).toBe(true);
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
 test("没有已设置的密钥时只能填写新值；草稿收下密钥后才可以保留", async () => {
@@ -88,7 +115,7 @@ test("没有已设置的密钥时只能填写新值；草稿收下密钥后才�
     const input = root.querySelector('input[type="password"]') as HTMLInputElement; input.value = "first-secret"; input.dispatchEvent(new Event("input", { bubbles: true }));
     await Bun.sleep(10); button(root, "保存草稿并校验").click(); await until(() => !!button(root, "预览应用配置"));
     expect(modes()).toEqual(["keep", "set"]);
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
 test("取消后迟到的配置校验不会重新显示可应用草稿；恢复入口区分回滚和已提交收尾", async () => {
@@ -105,7 +132,7 @@ test("取消后迟到的配置校验不会重新显示可应用草稿；恢复�
     resolveCheck(Response.json({ ...draft, validated: true })); await Bun.sleep(30); expect(button(root, "预览应用配置")).toBeUndefined();
     render(<ConfigurationRecovery />, root); await until(() => !!button(root, "预览完成配置收尾"));
     expect(button(root, "预览恢复原配置")).toBeUndefined();
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
 test("模型目录同时显示内置和私有缓存的安全投影，选择缓存模型不触发联网；外链停用保留凭据不发送新秘密", async () => {
@@ -114,7 +141,7 @@ test("模型目录同时显示内置和私有缓存的安全投影，选择缓�
   const form = () => kind === "models" ? { kind, provider: "openrouter", model: "builtin", thinking: "off", providers: [{ id: "openrouter", hasKey: true, models: [] }],
     catalogModels: [{ provider: "openrouter", id: "cached", name: "缓存模型", contextWindow: 64000, maxTokens: 8000 }] }
     : { kind, enabled: true, endpoint: "https://example.test", region: "test", bucket: "fixture", prefix: "", hasSecret: true, hasAccessKey: true, hasToken: true,
-      maxBytes: 1000, expireHours: 1, cleanupGraceMinutes: 30 };
+      maxMB: 1000, expireHours: 1, cleanupGraceMinutes: 30 };
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     const path = String(url), body = options?.body ? JSON.parse(String(options.body)) : undefined; calls.push({ path, body });
     if (path.endsWith("/catalog")) return Response.json({ providers: [{ id: "openrouter", name: "OpenRouter" }], apis: ["openai-completions"], models: [{ provider: "openrouter", id: "builtin", contextWindow: 32000, maxTokens: 4000 }] });
@@ -138,7 +165,7 @@ test("模型目录同时显示内置和私有缓存的安全投影，选择缓�
     button(root, "保存草稿并校验").click(); await until(() => !!button(root, "预览应用配置"));
     expect(calls.find(value => value.path.endsWith("/edit"))?.body.patch).toMatchObject({ enabled: false, secret: { mode: "keep" }, accessKey: { mode: "keep" }, token: { mode: "keep" } });
     expect(calls.some(value => value.path === "/api/tasks")).toBe(false);
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
 test("自定义服务商：填写协议、端点和密钥后获取模型列表，关键词筛选、键盘或点击选择，选中的模型带上已知上限；换端点后列表作废", async () => {
@@ -198,5 +225,5 @@ test("自定义服务商：填写协议、端点和密钥后获取模型列表�
     listed = Response.json({ error: "模型端点拒绝了请求（HTTP 401）：请检查 API 密钥及其权限", code: "input" }, { status: 409 });
     fetchButton().click(); await until(() => !!root.querySelector('.form-error[role="alert"]'));
     expect(root.querySelector('.form-error[role="alert"]')!.textContent).toContain("HTTP 401");
-  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });

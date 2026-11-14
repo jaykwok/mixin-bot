@@ -25,7 +25,7 @@ const OPERATOR_NOTE_KIND = "mixin.operator-note";
 const TAKEOVER_TEXT_MAX = 4_000;
 /** A stop waits for the member's run and its tools to end (console/server/bot.ts allows 130 s). */
 const TAKEOVER_WAIT_MS = 150_000;
-import { Banner, Chip, Dialog, EmptyState, Segmented, Spinner, type Tone } from "./ui.tsx";
+import { Banner, Chip, Dialog, EmptyState, Row, Section, Segmented, Spinner, type Tone } from "./ui.tsx";
 
 const MEMBER_BATCH = 200;
 /** Search blocks one click may read in a row while it finds little (each block scans at most 500 entries). */
@@ -209,6 +209,11 @@ export function ConversationsPage() {
         )}
         {!spaces && !spacesError && <EmptyState icon="loader" title="正在读取会话空间…" />}
         {spaces && <SpaceGrid spaces={spaces} opening={opening} onOpen={space => void openSpace(space)} />}
+        <Section title="会话维护">
+          <Row icon="trash" tint="red" title="清空全部会话" detail="包含单聊和所有群组；统计保留。此操作不可撤销。">
+            <TaskAction operation="history-clear" params={{ space: "all" }} danger>预览清空全部会话</TaskAction>
+          </Row>
+        </Section>
       </>
     );
   }

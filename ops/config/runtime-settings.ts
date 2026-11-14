@@ -99,9 +99,9 @@ if (import.meta.main) {
       process.exitCode = 1;
     }
   } else try {
-    if (argv.length) throw new Error("不带参数时按当前环境变量保存；高级运行参数请在控制台的「设置」中修改");
+    if (argv.length) throw new Error("不带参数时按当前环境变量保存；高级运行参数请在控制台的「运行参数」或「资料与文档」中修改");
     // The native settings: a Docker host's own working directory and task runtime are not the container's.
-    if (process.platform === "linux") throw new Error("Docker 部署的运行参数由部署入口写入，没有保存；高级运行参数请在控制台的「设置」中修改");
+    if (process.platform === "linux") throw new Error("Docker 部署的运行参数由部署入口写入，没有保存；高级运行参数请在控制台的「运行参数」或「资料与文档」中修改");
     const { withMaintenance } = await import("../../src/core/maintenance.ts");
     const { assertLocalConfigurationWrite } = await import("../../src/core/maintenance-state.ts");
     await withMaintenance(() => { assertLocalConfigurationWrite("."); return saveRuntimeSettings(); });

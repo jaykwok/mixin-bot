@@ -13,8 +13,8 @@ const newer = (a: number[], b: number[]) => {
 type Git = (args: string[]) => Promise<{ code: number; stdout: string }>;
 export interface Release { tag: string; commit: string; /** Local main already contains it and more: nothing to upgrade to. */ behind: boolean }
 
-/** The latest release among the local tags, read after RELEASE_FETCH. Throws when there is none or it cannot be read. */
-export async function latestRelease(git: Git): Promise<Release> {
+/** The latest published version, read after RELEASE_FETCH, independently of the checkout's branch or ancestry. */
+export async function latestReleaseTag(git: Git): Promise<Pick<Release, "tag" | "commit">> {
   const listed = await git(["for-each-ref", "--format=%(refname:strip=2)", "refs/tags/v*"]);
   if (listed.code !== 0) throw new Error("无法读取发布标签");
   let tag = "", best: number[] = [];
@@ -25,6 +25,12 @@ export async function latestRelease(git: Git): Promise<Release> {
   if (!tag) throw new Error("远端没有正式发布（vX.Y.Z 标签），无法升级");
   const commit = (await git(["rev-parse", "--verify", "--quiet", `refs/tags/${tag}^{commit}`])).stdout.trim();
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error(`无法解析发布 ${tag} 的提交`);
+  return { tag, commit };
+}
+
+/** CLI upgrade selection also protects a local main that already contains the release. */
+export async function latestRelease(git: Git): Promise<Release> {
+  const { tag, commit } = await latestReleaseTag(git);
   const main = await git(["rev-parse", "--verify", "--quiet", "refs/heads/main^{commit}"]), local = main.stdout.trim();
   const behind = main.code === 0 && local !== commit && (await git(["merge-base", "--is-ancestor", commit, local])).code === 0;
   return { tag, commit, behind };

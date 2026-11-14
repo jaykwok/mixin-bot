@@ -269,7 +269,9 @@ test("高级设置支持 Path style、中文目录、有限期与删除余量，
     expect(prepared.output).toContain("再保留 60 分钟");
     expect(prepared.output).toContain("对象路径：临时/分发/日期-UUID/原文件名");
     expect(await publish(fixture.root)).toMatchObject({ code: 0 });
-    expect(loadRelayConfig(file(fixture.root))).toEqual({ ...base, forcePathStyle: true, prefix: "临时/分发/", maxBytes: 512 * 1024 ** 2, expireHours: 3, cleanupGraceMinutes: 60 });
+    expect(loadRelayConfig(file(fixture.root))).toEqual({ ...base, forcePathStyle: true, prefix: "临时/分发/", maxMB: 512, expireHours: 3, cleanupGraceMinutes: 60 });
+    const stored = JSON.parse(await readFile(file(fixture.root), "utf8"));
+    expect(stored.maxMB).toBe(512); expect(stored).not.toHaveProperty("maxBytes");
   } finally { await fixture.cleanup(); }
 }, FLOW_BUDGET_MS);
 
@@ -374,7 +376,7 @@ test("发布拒绝覆盖填写期间的其他修改", async () => {
   try {
     await seed(fixture.root, base);
     expect((await run(fixture.root)).code).toBe(0);
-    const changed = await seed(fixture.root, { ...base, maxBytes: 1024 ** 3 });
+    const changed = await seed(fixture.root, { ...base, maxMB: 1024 });
     expect(await publish(fixture.root)).toEqual({ code: 1, steps: ["check=1"] });
     expect(await readFile(file(fixture.root), "utf8")).toBe(changed);
     await settled(fixture.root);
@@ -384,7 +386,7 @@ test("发布拒绝覆盖填写期间的其他修改", async () => {
 test("停用删除配置并保留账本", async () => {
   const fixture = await tempFixture("relay-configure-disable-");
   try {
-    await seed(fixture.root, { ...base, maxBytes: 1024 ** 3 });
+    await seed(fixture.root, { ...base, maxMB: 1024 });
     await mkdir(join(fixture.root, "data/state"), { recursive: true });
     const ledger = join(fixture.root, "data/state/relay.sqlite");
     await writeFile(ledger, "ledger-sentinel");

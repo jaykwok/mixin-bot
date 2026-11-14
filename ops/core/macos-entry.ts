@@ -340,7 +340,7 @@ function help(): void {
   logs       持续查看 logs/mixin-bot.log
   relay-configure | model-configure | configure-app-bot
              配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置
-  runtime-configure <草稿名>  应用控制台「设置」中已确认的高级运行参数
+  runtime-configure <草稿名>  应用控制台「运行参数」或「资料与文档」中已确认的参数
   directory  查看事件 Stream 与通讯录同步状态
   directory-scope [all]  修改同步范围并应用：不带参数时在终端里逐层勾选部门，带 all 时同步整个通讯录
   relay-ls | relay-test | relay-purge <关键字>|--all   大文件外链的列出、验收与清理

@@ -10,12 +10,12 @@ import { RELAY_INDEX_PATH } from "../../src/core/storage.ts";
 import { publish } from "../../src/lib/atomic-file.ts";
 import { configurationSnapshot } from "./configuration-form.ts";
 import { serializeConfigurationStage, stageName } from "./configuration-stage.ts";
-import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay-s3.ts";
+import { DEFAULT_RELAY_MAX_MB, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay-s3.ts";
 import { readRelayIndex, RelayIndexFormatError } from "../../src/integrations/relay-index.ts";
 import { normalizeRelayUrlInput, suggestRelayRegion } from "./relay-url.ts";
 
 const MIB = 1024 ** 2;
-const CONFIG_FIELDS = ["provider", "endpoint", "region", "bucket", "accessKeyId", "secretAccessKey", "sessionToken", "prefix", "forcePathStyle", "maxBytes", "expireHours", "cleanupGraceMinutes"];
+const CONFIG_FIELDS = ["provider", "endpoint", "region", "bucket", "accessKeyId", "secretAccessKey", "sessionToken", "prefix", "forcePathStyle", "maxMB", "expireHours", "cleanupGraceMinutes"];
 
 function bail<T>(value: T | symbol): T {
   if (isCancel(value)) throw new DOMException("配置已取消", "AbortError");
@@ -110,7 +110,7 @@ async function stageRelay(project: string, stage: string): Promise<void> {
     ].join("\n"), "对象存储准备");
     const next: RelayConfig = { ...(previous ?? {
       provider: "s3", endpoint: "", region: "", bucket: "", accessKeyId: "", secretAccessKey: "",
-      prefix: "", forcePathStyle: false, maxBytes: DEFAULT_RELAY_MAX_BYTES,
+      prefix: "", forcePathStyle: false, maxMB: DEFAULT_RELAY_MAX_MB,
       expireHours: DEFAULT_RELAY_EXPIRE_HOURS, cleanupGraceMinutes: DEFAULT_RELAY_CLEANUP_GRACE_MINUTES,
     }) };
     next.endpoint = normalizeRelayUrlInput(await askText("S3 服务端点 Endpoint", next.endpoint, requireUrl));
@@ -157,8 +157,8 @@ async function stageRelay(project: string, stage: string): Promise<void> {
       // No defaultValue: clack would turn a cleared field back into the old directory, leaving no way to choose the root.
       next.prefix = bail<string>(await text({ message: "对象目录 Prefix（清空表示桶根目录）", initialValue: next.prefix,
         validate: value => validationError({ ...next, prefix: value ?? "" }) })).trim();
-      next.maxBytes = Number(await askText("单文件外链上限（MiB，须大于 " + NATIVE_FILE_MAX_BYTES / MIB + "，最大 5120）",
-        String(next.maxBytes / MIB), value => validationError({ ...next, maxBytes: Number(value) * MIB }))) * MIB;
+      next.maxMB = Number(await askText("单文件外链上限（MB，须大于 " + NATIVE_FILE_MAX_BYTES / MIB + "，最大 5120）",
+        String(next.maxMB), value => validationError({ ...next, maxMB: Number(value) })));
       next.expireHours = Number(await askText("链接有效期（小时，最多 168）", String(next.expireHours),
         value => validationError({ ...next, expireHours: Number(value) })));
       next.cleanupGraceMinutes = Number(await askText("删除余量（分钟，链接到期后额外保留）", String(next.cleanupGraceMinutes),
@@ -174,7 +174,7 @@ async function stageRelay(project: string, stage: string): Promise<void> {
       "对象路径：" + validated.prefix + "日期-UUID/原文件名" + (validated.prefix ? "" : "（桶根目录）"),
       "寻址：" + (validated.forcePathStyle ? "Path style" : "Virtual hosted"),
       "凭据：已设置（隐藏）" + (validated.sessionToken ? "，含临时 Token（需自行续期）" : ""),
-      "单文件上限：" + validated.maxBytes / MIB + " MiB",
+      "单文件上限：" + validated.maxMB + " MB",
       "下载有效期：" + validated.expireHours + " 小时（仅授权 GET 下载）",
       "计划删除：链接到期后再保留 " + validated.cleanupGraceMinutes + " 分钟；后台扫描删除，失败重试",
     ].join("\n"), "保存预览");
@@ -194,7 +194,7 @@ async function stageRelay(project: string, stage: string): Promise<void> {
 if (import.meta.main) {
   try {
     const [mode, path, extra] = process.argv.slice(2);
-    if (mode !== "--stage" || !path || extra) throw new Error("请用命令行 relay-configure 进入配置向导，或在控制台的「设置 → 外链配置」填写");
+    if (mode !== "--stage" || !path || extra) throw new Error("请用命令行 relay-configure 进入配置向导，或在控制台的「外链 → 编辑配置」填写");
     await stageRelay(".", resolve(path));
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") cancel("已取消，配置和服务保持原状。");

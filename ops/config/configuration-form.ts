@@ -5,7 +5,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { applicationBinding, readDataVersion, VERSION_FILE } from "../../src/core/data-version.ts";
 import { parseAppBotConfig } from "../../src/integrations/open-platform/config.ts";
-import { validateRelayConfig, DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES } from "../../src/integrations/relay-s3.ts";
+import { validateRelayConfig, DEFAULT_RELAY_MAX_MB, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES } from "../../src/integrations/relay-s3.ts";
 import { normalizeRelayUrlInput } from "./relay-url.ts";
 
 export const CONFIGURATION_KINDS = ["models", "app", "relay"] as const;
@@ -113,9 +113,9 @@ export function configurationForm(snapshot: ConfigurationSnapshot): ObjectValue 
   const source = parsed(snapshot.files.relay), config = snapshot.files.relay === null ? null : validateRelayConfig(source);
   return { kind: snapshot.kind, enabled: config !== null, ...(config ? {
     endpoint: config.endpoint, region: config.region, bucket: config.bucket, prefix: config.prefix, forcePathStyle: config.forcePathStyle,
-    maxBytes: config.maxBytes, expireHours: config.expireHours, cleanupGraceMinutes: config.cleanupGraceMinutes,
+    maxMB: config.maxMB, expireHours: config.expireHours, cleanupGraceMinutes: config.cleanupGraceMinutes,
     hasAccessKey: true, hasSecret: true, hasToken: !!config.sessionToken,
-  } : { prefix: "", forcePathStyle: false, maxBytes: DEFAULT_RELAY_MAX_BYTES, expireHours: DEFAULT_RELAY_EXPIRE_HOURS, cleanupGraceMinutes: DEFAULT_RELAY_CLEANUP_GRACE_MINUTES }) };
+  } : { prefix: "", forcePathStyle: false, maxMB: DEFAULT_RELAY_MAX_MB, expireHours: DEFAULT_RELAY_EXPIRE_HOURS, cleanupGraceMinutes: DEFAULT_RELAY_CLEANUP_GRACE_MINUTES }) };
 }
 
 function secret(input: unknown, previous: unknown, canKeep = true, optional = false): unknown {
@@ -169,7 +169,7 @@ export function editConfiguration(base: ConfigurationSnapshot, input: unknown): 
     next.files.app = json(config); return next;
   }
   if (base.kind === "relay") {
-    only(patch, ["enabled", "endpoint", "region", "bucket", "prefix", "forcePathStyle", "maxBytes", "expireHours", "cleanupGraceMinutes", "accessKey", "secret", "token"]);
+    only(patch, ["enabled", "endpoint", "region", "bucket", "prefix", "forcePathStyle", "maxMB", "expireHours", "cleanupGraceMinutes", "accessKey", "secret", "token"]);
     if (patch.enabled === false) { next.files.relay = null; return next; }
     if (patch.enabled !== true) throw new Error("请明确启用或停用外链");
     const previous = parsed(base.files.relay), endpoint = normalizeRelayUrlInput(patch.endpoint as string);
@@ -179,7 +179,7 @@ export function editConfiguration(base: ConfigurationSnapshot, input: unknown): 
     const value: ObjectValue = { ...previous, provider: "s3", endpoint, accessKeyId,
       secretAccessKey: secret(patch.secret, previous.secretAccessKey, sameAccount),
       sessionToken: secret(patch.token, previous.sessionToken, sameAccount, true) };
-    for (const key of ["region", "bucket", "prefix", "forcePathStyle", "maxBytes", "expireHours", "cleanupGraceMinutes"]) value[key] = patch[key];
+    for (const key of ["region", "bucket", "prefix", "forcePathStyle", "maxMB", "expireHours", "cleanupGraceMinutes"]) value[key] = patch[key];
     next.files.relay = json({ ...value, ...validateRelayConfig(value) }); return next;
   }
   only(patch, ["provider", "mode", "api", "baseUrl", "key", "model", "thinking"]);

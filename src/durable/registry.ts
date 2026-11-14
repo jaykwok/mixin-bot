@@ -24,7 +24,7 @@ import { auxiliaryMemberTools, type AuxiliaryBudget } from "./auxiliary.ts";
 import type { RequestDoor } from "./door.ts";
 import type { McpTools } from "../integrations/mcp.ts";
 import { mcpMemberTools } from "./mcp.ts";
-import type { RelayConfig } from "../integrations/relay.ts";
+import { relayMaxBytes, type RelayConfig } from "../integrations/relay.ts";
 import { codemodeExtension } from "./codemode/index.ts";
 import { moduleExtensionName, promptExtension } from "./prompt.ts";
 import { sendMemberTools } from "./send.ts";
@@ -63,7 +63,7 @@ export function spaceExtensions(options: SpaceRegistryOptions): Extension[] {
   const documents = documentMemberTools(members);
   const searchTools = materialsTools(resolve(options.layout.materialsIgnore)).map((spec) => memberTool(spec, members));
   const send = sendMemberTools({ ...members, relay: options.relay, outbound: options.outbound });
-  if (options.closeout) send.push(deliverableTool(members, options.relay?.maxBytes));
+  if (options.closeout) send.push(deliverableTool(members, options.relay ? relayMaxBytes(options.relay) : undefined));
   const auxiliary = options.auxiliary ? auxiliaryMemberTools(members, options.auxiliary.door, options.auxiliary.config, options.auxiliary.budget) : [];
   const mcp = options.mcp ? mcpMemberTools(members, options.mcp.manager, options.mcp.door) : [];
   const modules = options.modules.map((module) => ({ module, tools: module.tools.map((spec) => memberTool(spec, members)) }));

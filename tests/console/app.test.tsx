@@ -72,7 +72,7 @@ test("登录链接兑换成功后进入总览；兑换和轮询都不带续期�
   }
   // Every section is a link.
   expect([...container.querySelectorAll(".nav-item")].every(item => item.tagName === "A")).toBe(true);
-  for (const id of ["health", "conversations", "stats", "push", "settings"]) expect(has(`a[href="#/${id}"]`)).toBe(true);
+  for (const id of ["health", "conversations", "stats", "push", "settings", "models", "bot", "materials", "relay"]) expect(has(`a[href="#/${id}"]`)).toBe(true);
 });
 
 test("通讯录卡片显示保存的范围是否已生效，应用失败时写明之前的范围仍然生效；同步进行中显示同步中", async () => {

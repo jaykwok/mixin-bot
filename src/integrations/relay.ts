@@ -12,8 +12,8 @@ import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import { openRelayIndex, relayCacheKey, type RelayIndex, type RelayIndexEntry } from "./relay-index.ts";
 import { deleteObject, downloadUrl, objectBaseUrl, objectNameFromUrl, putObject, remoteStillExists,
-  readRelayConfigFile, relayBackendId, storedObjectUrl, S3RequestError, LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
-export { LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
+  readRelayConfigFile, relayBackendId, relayMaxBytes, storedObjectUrl, S3RequestError, LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
+export { LinkUnavailable, relayMaxBytes, type RelayConfig } from "./relay-s3.ts";
 
 export function loadRelayConfig(path = RELAY_CONFIG_PATH): RelayConfig | null {
   return readRelayConfigFile(path);
@@ -24,7 +24,7 @@ export async function initializeRelay(): Promise<void> {
   cachedConfig = loadRelayConfig();
   // Validate the ledger under the service lease, before the HTTP listener accepts work.
   if (cachedConfig) await getRelayIndex();
-  if (cachedConfig) log.info("大文件 S3 外链已启用（上限 " + formatSize(cachedConfig.maxBytes) + "，桶 " + cachedConfig.bucket +
+  if (cachedConfig) log.info("大文件 S3 外链已启用（上限 " + cachedConfig.maxMB + " MB，桶 " + cachedConfig.bucket +
     "，" + cachedConfig.expireHours + " 小时后失效，再保留 " + cachedConfig.cleanupGraceMinutes + " 分钟后清理）");
   else log.info("未配置 " + RELAY_CONFIG_PATH + "，超过附件上限的文件仍按报错处理");
 }
@@ -217,8 +217,8 @@ export async function checkRelayBackend(report: (status: RelayCheckStatus, text:
     }
     const seconds = Math.max(0.001, (performance.now() - started) / 1000);
     step("pass", `上传并核验大小：${formatSize(payload.length)}，用时 ${seconds.toFixed(1)} 秒`);
-    const minutes = config.maxBytes / (payload.length / seconds) / 60;
-    step(minutes <= RELAY_HTTP_TIMEOUT / 60_000 ? "pass" : "warn", `按本次速度粗估，上传 ${formatSize(config.maxBytes)} 约需 ${Math.ceil(minutes)} 分钟；` +
+    const minutes = relayMaxBytes(config) / (payload.length / seconds) / 60;
+    step(minutes <= RELAY_HTTP_TIMEOUT / 60_000 ? "pass" : "warn", `按本次速度粗估，上传 ${config.maxMB} MB 约需 ${Math.ceil(minutes)} 分钟；` +
       `单次上传限时 ${RELAY_HTTP_TIMEOUT / 60_000} 分钟` + (minutes <= RELAY_HTTP_TIMEOUT / 60_000 ? "" : "，接近上限的文件可能超时，可调低单文件上限"));
     const download = await probe(url, "GET");
     step(download.body?.equals(payload) ? "pass" : "fail", download.body?.equals(payload) ? "签名链接下载成功，内容一致"
@@ -264,7 +264,7 @@ export async function relayFile(request: RelayRequest): Promise<string> {
   const signal = AbortSignal.any([application.signal, AbortSignal.timeout(RELAY_HTTP_TIMEOUT), ...(request.signal ? [request.signal] : [])]);
   signal.throwIfAborted();
   if (!filename || filename === "." || filename === ".." || /[/\\\x00-\x1f\x7f]/.test(filename) || Buffer.byteLength(filename) > 512) throw new Error("外链文件名无效");
-  if (request.size > config.maxBytes) throw new Error(filename + " 超过外链分发上限 " + formatSize(config.maxBytes));
+  if (request.size > relayMaxBytes(config)) throw new Error(filename + " 超过外链分发上限 " + config.maxMB + " MB");
   const tempDir = resolve(request.tempDir ?? "data/runtime/tmp/relay");
   await mkdir(tempDir, { recursive: true });
   const snapshot = join(tempDir, ".relay-" + randomUUID());
@@ -273,7 +273,7 @@ export async function relayFile(request: RelayRequest): Promise<string> {
   try {
     await pipeline(createReadStream(localPath), new Transform({ transform(chunk: Buffer, _encoding, next) {
       size += chunk.length;
-      if (size > config.maxBytes) next(new Error("源文件增长超过外链上限"));
+      if (size > relayMaxBytes(config)) next(new Error("源文件增长超过外链上限"));
       else { hash.update(chunk); next(null, chunk); }
     } }), createWriteStream(snapshot, { flags: "wx" }), { signal });
     if (size !== request.size) throw new Error("源文件在同步时大小发生变化，请重新发送文件");

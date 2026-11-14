@@ -33,7 +33,7 @@ test("命令提示：控制台里指向页面，终端里是各平台自己的�
   for (const platform of ["linux", "windows", "macos"] as const) {
     expect(commandHint(platform, "logs", console)).toBe("「日志」");
     expect(commandHint(platform, "resume", console)).toBe("「维护 → 继续上次操作」");
-    expect(commandHint(platform, "relay-configure", console)).toBe("「设置 → 外链配置」");
+    expect(commandHint(platform, "relay-configure", console)).toBe("「外链 → 编辑配置」");
   }
   expect(commandHint("linux", "uninstall", console)).toBe("scripts/ops.sh uninstall");
   expect(commandHint("linux", "constructor", console)).toBe("scripts/ops.sh constructor");
@@ -183,7 +183,7 @@ test("S3 外链：没有配置时没有这一行；必填项缺一项即失败�
       for (const value of ["", "   ", 7, null]) {
         await writeFile(path, JSON.stringify({ ...complete, [state]: value }));
         const rows = await relay();
-        expect(rows, `${state}=${JSON.stringify(value)}`).toEqual([{ name: "data/config/relay.json", status: "fail", detail: "S3 必填项不全", fix: "使用 「设置 → 外链配置」 重新配置。" }]);
+        expect(rows, `${state}=${JSON.stringify(value)}`).toEqual([{ name: "data/config/relay.json", status: "fail", detail: "S3 必填项不全", fix: "使用 「外链 → 编辑配置」 重新配置。" }]);
       }
     }
     for (const text of ["{", "[]", "null", '"s3"', JSON.stringify({ ...complete, provider: "oss" })]) {

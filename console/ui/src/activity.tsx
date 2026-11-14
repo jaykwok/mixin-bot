@@ -1,6 +1,7 @@
 /** @jsxImportSource preact */
 // What runs in the background, whichever page is open: the sheet with the progress of a task confirmed on this page, and
 // the tray in the corner that follows those tasks and the exports until each ends.
+import { useEffect } from "preact/hooks";
 import { ExportItem, useExportJobs } from "./exports.tsx";
 import { Icon } from "./icons.tsx";
 import { forgetTask, showTask, TASK_LABELS, TASK_STATES, TaskProgress, taskEnded, taskTone, useFollowed, viewTaskInPage, type Followed } from "./tasks.tsx";
@@ -27,6 +28,15 @@ export function TaskSheet() {
 
 function TaskItem({ item }: { item: Followed }) {
   const look = taskTone(item.task), ended = taskEnded(item.task?.state);
+  const succeeded = !item.error && item.task?.state === "succeeded" && !item.task.needsRecovery
+    && item.task.result?.outcome === "success" && item.task.result.exitCode === 0;
+  // Only dismiss a confirmed success, after it has been visible in the tray for ten seconds. Opening its sheet or
+  // leaving this component cancels the timer; failed, uncertain and recovery-needed tasks remain until dismissed.
+  useEffect(() => {
+    if (!succeeded) return;
+    const timer = setTimeout(() => forgetTask(item.id), 10_000);
+    return () => clearTimeout(timer);
+  }, [item.id, succeeded]);
   const state = item.error ? `无法读取任务状态：${item.error}` : item.task ? `${TASK_STATES[item.task.state] ?? item.task.state}${item.task.needsRecovery ? " · 需要恢复处理" : ""}` : "正在读取…";
   return (
     <div class={`activity-item${look.tone ? ` tone-${look.tone}` : ""}`} role="status">
@@ -34,7 +44,7 @@ function TaskItem({ item }: { item: Followed }) {
         <span class="activity-icon"><Icon name={ended ? look.icon : "activity"} size={16} /></span>
         <span class="activity-text">
           <span class="activity-name">{TASK_LABELS[item.operation] ?? item.operation}</span>
-          <span class="activity-state">{!ended && <Icon name="loader" size={12} class="spin" />}{state}</span>
+          <span class="activity-state">{!ended && <Icon name="loader" size={12} class="spin" />}{state}{succeeded && " · 10 秒后自动收起"}</span>
           {!ended && <ProgressBar label="任务进度" />}
         </span>
       </button>

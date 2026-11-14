@@ -4,7 +4,8 @@ import { readFileSync, lstatSync } from "node:fs";
 import { loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { fields } from "../../ops/core/operations.ts";
 import { assertLifecycleTarget } from "../../ops/core/recovery-plan.ts";
-import { latestRelease, RELEASE_FETCH } from "../../ops/core/releases.ts";
+import { latestReleaseTag, RELEASE_FETCH } from "../../ops/core/releases.ts";
+import { deploymentRecord } from "../../src/core/data-version.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 import { runCommand, type Runner } from "../../ops/core/hosting.ts";
 import { parsePort } from "../../ops/core/console-port.ts";
@@ -27,6 +28,12 @@ export function upgradeRoutes(project: string, run: Runner = runCommand): Record
     if (branch.code !== 0 || !branch.stdout.trim()) throw new Error("无法读取当前分支");
     return { branch: branch.stdout.trim(), hasDirectory: !!readDirectoryScope(join(project, "data/config/directory.json")) };
   };
+  const installed = () => {
+    if (loadPendingTransaction(project)) throw new Error("请先继续或回滚未完成的部署或升级");
+    const record = deploymentRecord(project);
+    if (!record) throw new Error("请先完成首次部署，再检查更新");
+    return { record, hasDirectory: !!readDirectoryScope(join(project, "data/config/directory.json")) };
+  };
   return {
     "GET /api/lifecycle/deploy": { run: async () => {
       if (undeployed(project)) throw new ApiProblem(409, "input", "尚未部署：重新部署只用于已有实例，请先完成首次部署");
@@ -37,23 +44,25 @@ export function upgradeRoutes(project: string, run: Runner = runCommand): Record
       } catch { throw new ApiProblem(409, "input", "无法读取已有部署设置，请检查未完成的维护事务及 data/state 中的端口和共享目录记录"); }
     } },
     "GET /api/lifecycle/upgrade": { run: async () => {
-      try { return await settings(); } catch (error) { throw new ApiProblem(409, "input", (error as Error).message); }
+      try { const saved = installed(); return { current: saved.record.appVersion, hasDirectory: saved.hasDirectory }; }
+      catch (error) { throw new ApiProblem(409, "input", (error as Error).message); }
     } },
     "POST /api/lifecycle/check-update": { slow: true, run: async ({ body, signal }) => {
       if (fetching) throw new ApiProblem(409, "busy", "正在检查版本，请稍后重试");
       fetching = true;
       try {
         fields(body as Record<string, unknown>, []);
-        const before = await settings(); signal.throwIfAborted();
+        const before = installed(); signal.throwIfAborted();
         const result = await run(["git", "-C", project, ...RELEASE_FETCH], { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" });
         if (result.code !== 0) throw new Error("检查版本失败，请核对网络和本机 Git 配置后重试；未停止机器人");
         signal.throwIfAborted();
-        const release = await latestRelease(args => run(["git", "-C", project, ...args]));
-        if (release.behind) throw new Error(`本地 main 已包含最新发布 ${release.tag}，没有可升级的版本`);
-        await assertLifecycleTarget(project, release.commit, run);
-        const after = await settings();
+        const release = await latestReleaseTag(args => run(["git", "-C", project, ...args]));
+        const available = Bun.semver.order(release.tag.slice(1), before.record.appVersion) > 0;
+        if (available) await assertLifecycleTarget(project, release.commit, run);
+        const after = installed();
         if (JSON.stringify(before) !== JSON.stringify(after)) throw new Error("检查版本期间部署状态已变化，请刷新后重试");
-        return { ...after, target: release.commit, release: release.tag };
+        // The SHA is an execution token only: previews and the executor keep it pinned even if a newer release appears.
+        return { current: after.record.appVersion, hasDirectory: after.hasDirectory, available, ...(available ? { target: release.commit } : {}), release: release.tag };
       } catch (error) { throw new ApiProblem(409, "input", (error as Error).message); }
       finally { fetching = false; }
     } },

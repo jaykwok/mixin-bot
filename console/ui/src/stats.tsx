@@ -3,6 +3,7 @@
 // ledger is read on the host, so this page works with the bot stopped (names then say so). A stats view fixes the
 // identity mode; switching it opens a new view, and leaving the page closes it.
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import type { ComponentChildren } from "preact";
 import { api, ApiFailure } from "./api.ts";
 import type { IdentityMode, StatsGrain, StatsPeriodKey, StatsResponse, StatsTokens, ViewInfo } from "./contract.ts";
 import { BarList, ColumnChart, ColumnTable, type ColumnPoint } from "./charts.tsx";
@@ -10,7 +11,8 @@ import { StatsExportDialog } from "./exports.tsx";
 import { clock, compact, count, dateTime, percent } from "./format.ts";
 import { Icon } from "./icons.tsx";
 import { IdentityText, ModeBadge, ModeSwitch, NamesNotice, NamesObserved } from "./identity.tsx";
-import { Banner, Card, EmptyState, Segmented } from "./ui.tsx";
+import { Banner, Card, EmptyState, PageHeader, Segmented } from "./ui.tsx";
+import { StatsImportForm } from "./write-forms.tsx";
 
 const QUICK: [StatsPeriodKey, string][] = [["7d", "近 7 天"], ["30d", "近 30 天"], ["week", "本周"], ["month", "本月"], ["all", "全部"]];
 const MORE: [StatsPeriodKey, string][] = [["today", "今天"], ["yesterday", "昨天"], ["last-week", "上周"], ["last-month", "上月"], ["custom", "自定义区间"]];
@@ -55,7 +57,16 @@ function Tile({ label, value, sub }: { label: string; value: string; sub?: strin
 const tokenTip = (tokens: StatsTokens) =>
   `输入 ${count(tokens.input)} · 输出 ${count(tokens.output)} · 缓存读 ${count(tokens.cacheRead)} · 缓存写 ${count(tokens.cacheWrite)}`;
 
-export function StatsPage() {
+export function StatsWorkspace() {
+  const [tab, setTab] = useState("overview");
+  const navigation = <div class="page-tabs"><Segmented label="统计功能" value={tab} onChange={setTab}
+    options={[{ value: "overview", label: "统计概览", icon: "chart" }, { value: "import", label: "导入统计", icon: "upload" }]} /></div>;
+  return tab === "overview" ? <StatsPage navigation={navigation} /> : <>
+    <PageHeader title="统计" description="恢复以前保存的统计账本。" />{navigation}<StatsImportForm />
+  </>;
+}
+
+export function StatsPage({ navigation }: { navigation?: ComponentChildren }) {
   // The mode asked for (each request opens a view); the switch shows the mode of the view actually open.
   const [mode, setMode] = useState<{ mode: IdentityMode; confirm: boolean }>({ mode: "default", confirm: false });
   const [view, setView] = useState<ViewInfo | null>(null);
@@ -182,6 +193,7 @@ export function StatsPage() {
         </div>
       </div>
 
+      {navigation}
       <div class="filter-bar" role="toolbar" aria-label="统计筛选">
         <Segmented label="统计区间" value={filters.period} onChange={period => set({ period })}
           options={QUICK.map(([value, label]) => ({ value, label }))} />

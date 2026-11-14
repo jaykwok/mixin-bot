@@ -173,7 +173,7 @@ export async function operationScope(project: string, operation: string, params:
       "只导入统计汇总，不导入会话。源文件必须是停止写入的一致快照。");
   } else if (operation.startsWith("relay-")) {
     // The task's own preflight refuses both without relay.json: say so before anything is confirmed.
-    if (!existsSync(join(data, "config/relay.json"))) throw new Error("没有启用外链（data/config/relay.json 不存在）；请先在“设置”中启用外链");
+    if (!existsSync(join(data, "config/relay.json"))) throw new Error("没有启用外链（data/config/relay.json 不存在）；请先在“外链”页编辑配置并启用");
     const keyword = params.keyword as string | undefined;
     scope = relayScope(data, keyword);
     if (operation === "relay-test") summary.push("连接已配置的外链存储，上传并删除一个测试对象。");

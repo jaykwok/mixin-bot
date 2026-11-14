@@ -115,7 +115,7 @@ MCP stdio 程序在各平台上都具有服务用户权限。当前部署面向�
 
 ### 资料索引与文档解析
 
-索引用于定位文件，未命中时仍需定向查找资料。`data/config/materials-ignore.txt` 在首次建立索引时生成只含注释的用法模板，之后不再覆盖；每行一个共享资料相对路径前缀，`**/名称` 匹配任意层级，`#` 表示注释；规则也可以在控制台「设置」页修改，保存时保留注释行。规则在每次检查索引时读取，改动后不需要重启。它影响索引和资料搜索，不限制模型按路径直接读取文件。扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
+索引用于定位文件，未命中时仍需定向查找资料。`data/config/materials-ignore.txt` 在首次建立索引时生成只含注释的用法模板，之后不再覆盖；每行一个共享资料相对路径前缀，`**/名称` 匹配任意层级，`#` 表示注释；规则也可以在控制台「资料与文档」页修改，保存时保留注释行。规则在每次检查索引时读取，改动后不需要重启。它影响索引和资料搜索，不限制模型按路径直接读取文件。扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
 
 PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境，并按原件 SHA-256、解析器与依赖锁版本复用缓存：共享资料的结果位于 `data/index/parsed`，用户私有文件的结果只放本用户 tmp。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。不提供 OCR，文档工具只接受现代 Office 格式。
 
@@ -132,7 +132,7 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 | 工具 | 摘要校验、大纲、局改、组装、按模板生成、图片素材、渲染、来源记录 | [tools.ts](../src/agent/modules/document-work/tools.ts) |
 | 固定环境 | 共享环境按需 `uv sync`，统一 Python 与依赖锁 | [python-toolchain.ts](../src/agent/python-toolchain.ts) |
 
-**开关。** `BOT_DOCUMENT_WORK_ENABLED` 默认 `1`，设为 `0` 关闭：在控制台的「设置 → 高级运行参数 → 文档处理 → 文档加工模块」修改并应用，或在 `data/config/runtime.json` 中设置后重启；进程环境变量优先于文件。关闭会移除六个文档工具（codemode 脚本也调用不到）、skill、模块提示词及其额外 `read` 权限；资料索引、`document_extract`、`document_environment`、原文件发送和 `read/bash/edit/write` 保留，已有 venv 不卸载。
+**开关。** `BOT_DOCUMENT_WORK_ENABLED` 默认 `1`，设为 `0` 关闭：在控制台的「资料与文档 → 文档处理 → 文档加工模块」修改并应用，或在 `data/config/runtime.json` 中设置后重启；进程环境变量优先于文件。关闭会移除六个文档工具（codemode 脚本也调用不到）、skill、模块提示词及其额外 `read` 权限；资料索引、`document_extract`、`document_environment`、原文件发送和 `read/bash/edit/write` 保留，已有 venv 不卸载。
 
 实现集中在 [document-work 模块目录](../src/agent/modules/document-work)，[modules.ts](../src/agent/modules.ts) 是唯一注册点。要从代码中移除，先关闭并重启，再删除模块目录和对应的注册分支，清理相关测试和专用依赖（`pptx-automizer`、`docxcompose`、`pypdfium2`），重新生成锁文件并运行 `bun run check`。
 
@@ -284,7 +284,9 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 程序版本取自 `package.json`（2.1.1），数据格式 `DATA_VERSION` 为 5，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。格式 5 随 v2.1.0 引入：从这个版本起升级只跟随正式发布，更早的部署一律在新目录全新部署，而不是原地升级。
 
-升级只跟随正式发布，部署和重新部署使用当前检出。控制台的版本检查和三个平台的 `update` 入口用同一条规则（[releases.ts](../ops/core/releases.ts)、`ops.sh` 的 `latest_release`、`ops.ps1` 的 `Get-LatestRelease`）：先执行 `git fetch --prune --no-tags origin '+refs/tags/v*:refs/tags/v*'`，让本地的 `v*` 标签与远端一致，再取最高的 `vX.Y.Z`（每段至多九位数字，不含预发布）；本地 main 领先于它（包含它，但不是它）时没有可升级的版本，正好是它时照常交给升级器（检查部署记录并重新部署）。所以 main 可以领先于最新发布，推到 main 的提交在打标签之前不会成为升级目标。发布时在 CI 通过的提交上建附注标签 `vX.Y.Z` 并发布 Release，同时把 README 和[部署文档](deployment.md)克隆命令里的版本改成新版本（检查会核对它与 `package.json` 一致）。标签发布后不移动、不删除，修正以下一个修订号发布。升级只快进本地 main，所以每个发布都必须是上一个发布的后代；在其他分支上修复并发布的，要合回 main。
+升级只跟随正式发布，部署和重新部署使用当前检出。控制台和三个平台的 `update` 入口都先执行 `git fetch --prune --no-tags origin '+refs/tags/v*:refs/tags/v*'`，让本地的 `v*` 标签与远端一致，再取最高的 `vX.Y.Z`（每段至多九位数字，不含预发布；选择规则见 [releases.ts](../ops/core/releases.ts)、`ops.sh` 的 `latest_release`、`ops.ps1` 的 `Get-LatestRelease`）。控制台只比较部署记录中的程序版本与最新发布版本：有更高版本才提供升级，界面只显示版本号，执行时仍固定到检查所得的提交。命令行还会检查本地 main：领先于发布（包含它，但不是它）时没有可升级的版本，正好是它时照常交给升级器检查部署记录并重新部署。实际升级仍须通过快进、降级和工作区冲突检查。
+
+main 可以领先于最新发布，推到 main 的提交在打标签之前不会成为升级目标。发布时在 CI 通过的提交上建附注标签 `vX.Y.Z` 并发布 Release，同时把 README 和[部署文档](deployment.md)克隆命令里的版本改成新版本（检查会核对它与 `package.json` 一致）。标签发布后不移动、不删除，修正以下一个修订号发布。升级只快进本地 main，所以每个发布都必须是上一个发布的后代；在其他分支上修复并发布的，要合回 main。
 
 七个直接 Pi 依赖（含 `pi-schema`）精确锁为 1.5.2，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides，也不打补丁。请求门（[door.ts](../src/durable/door.ts)）按官方随每次生成与压缩请求传入的 `sessionId`（会话的 `pi.provider`）找到会话和成员：映射只取成员目录、会话身份与 `pi.provider` 三者一致的已提交数据，空间开启时在恢复调度前载入，新建成员会话提交后登记，遇到未知 `sessionId` 重读一次，仍未知或被两个会话占用则不发送；分叉不继承身份，没有发送资格。门在最后一次同步检查（取消、关闭、总时限、待执行控制命令）之后直接交给 provider，中间没有 await；凭证解析等异步步骤都在检查之前。门本身不写记录，用量由 Durable 记入 `pi.usage`。升级 Pi 时需要重新验证 `sessionId` 仍随生成与压缩请求传入，以及取消、恢复语义。
 

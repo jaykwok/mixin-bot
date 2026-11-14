@@ -8,7 +8,7 @@ import type { BrowsePurpose, Overview } from "./contract.ts";
 import { PathField } from "./files.tsx";
 import { Icon } from "./icons.tsx";
 import { TaskAction } from "./tasks.tsx";
-import { Disclosure, Field, Row, Section, Segmented, Skeleton, Toggle } from "./ui.tsx";
+import { Field, Row, Section, Segmented, Skeleton, Toggle } from "./ui.tsx";
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 export function StorageActions() {
@@ -63,21 +63,19 @@ export function RelayActions() {
 }
 
 export function StatsImportForm() {
-  const [open, setOpen] = useState(false), [path, setPath] = useState("");
-  return <Disclosure title="导入统计" icon="upload" tint="orange" open={open} onToggle={setOpen}
-    detail="把已保存的统计账本恢复到全新部署的空账本，可以选主机上的文件，也可以从这台电脑上传。">
-    <p class="muted">只接受当前版本（schema 3）的统计账本，恢复到全新部署的空账本；已导入过另一份或已有统计时拒绝；同一份文件重复导入不会增加统计。
-      使用停止写入的一致快照；WAL 尚未合并时须保留同目录的 -wal 文件。</p>
-    <div class="group">
+  const [path, setPath] = useState("");
+  return <>
+    <Section title="从主机文件导入" footer="使用停止写入的一致快照；WAL 尚未合并时须保留同目录的 -wal 文件。">
+      <div class="group-note">把已保存的统计账本恢复到全新部署的空账本。已有统计或已导入另一份时不能覆盖；同一份文件重复导入不会增加统计。</div>
       <Field group label="主机上的统计文件" note="运行控制台的主机上 stats.sqlite 的完整路径。">
         <PathField label="统计文件" purpose="stats" value={path} onChange={setPath} placeholder="stats.sqlite 的完整路径" />
       </Field>
       <div class="row"><span class="row-text" />
         <TaskAction operation="stat-import" params={{ path }} disabled={!path.trim()} primary>校验并预览导入</TaskAction>
       </div>
-    </div>
+    </Section>
     <StatsUpload />
-  </Disclosure>;
+  </>;
 }
 
 function StatsUpload() {
@@ -123,20 +121,24 @@ interface RuntimeOption { key: string; label: string; description: string; unit?
   browse?: { purpose: BrowsePurpose; unavailable?: string } }
 interface RuntimeForm { hash: string | null; values: Record<string, string>; groups: { label: string; description: string; options: RuntimeOption[] }[] }
 /** The advanced runtime settings, a group at a time. A change is kept until it is applied or dropped, whichever group is shown. */
-export function RuntimeForm() {
+export function RuntimeForm({ area = "runtime" }: { area?: "runtime" | "materials" }) {
   const [data, setData] = useState<RuntimeForm | null>(null), [changes, setChanges] = useState<Record<string, string | null>>({}), [error, setError] = useState(""), [version, setVersion] = useState(0);
   const [group, setGroup] = useState("");
   useEffect(() => {
     const controller = new AbortController(); setData(null); setChanges({});
     void api<RuntimeForm>("/api/forms/runtime", { signal: controller.signal }).then(value => {
-      if (!controller.signal.aborted) { setData(value); setError(""); setGroup(previous => value.groups.some(item => item.label === previous) ? previous : value.groups[0]?.label ?? ""); }
+      const groups = value.groups.map(group => ({ ...group, ...(group.label === "缓存与索引" ? {
+        label: area === "materials" ? "资料索引" : "模型缓存", description: area === "materials" ? "资料索引容量与刷新" : "模型服务商的缓存保留策略",
+      } : {}), options: group.options.filter(option =>
+        (option.key.startsWith("BOT_DOCUMENT_") || option.key.startsWith("BOT_INDEX_")) === (area === "materials")) })).filter(group => group.options.length);
+      if (!controller.signal.aborted) { setData({ ...value, groups }); setError(""); setGroup(previous => groups.some(item => item.label === previous) ? previous : groups[0]?.label ?? ""); }
     }, error => { if (!controller.signal.aborted) setError(message(error)); });
     return () => controller.abort();
-  }, [version]);
+  }, [version, area]);
   const change = (key: string, value: string) => setChanges(previous => ({ ...previous, [key]: value || null }));
   const shown = data?.groups.find(item => item.label === group) ?? data?.groups[0];
   const changed = data ? data.groups.flatMap(item => item.options).filter(option => Object.hasOwn(changes, option.key)) : [];
-  return <Section title="高级运行参数"
+  return <Section title={area === "materials" ? "文档与索引参数" : "运行参数"}
     aside={<button type="button" class="btn ghost small-btn" onClick={() => setVersion(value => value + 1)}><Icon name="refresh" size={13} />重新读取</button>}
     footer="保存前校验；执行时短暂停机，结束后恢复原来的运行状态。留空表示恢复默认值。">
     {error && <div class="group-note form-error" role="alert">{error}</div>}

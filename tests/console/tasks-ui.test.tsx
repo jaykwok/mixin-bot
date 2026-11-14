@@ -39,7 +39,7 @@ test("升级缺少范围时可直接选部门；取消不提交，预览只传�
   const requests: { url: string; body: unknown }[] = [];
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     const body = JSON.parse(String(options?.body ?? "{}")); requests.push({ url: String(url), body });
-    if (String(url) === "/api/lifecycle/check-update") return Response.json({ target: "e".repeat(40), release: "v2.0.2", branch: "main", hasDirectory: false });
+    if (String(url) === "/api/lifecycle/check-update") return Response.json({ target: "e".repeat(40), release: "v2.0.2", current: "2.0.1", available: true, hasDirectory: false });
     if (String(url) === "/api/lifecycle/directory/open") return Response.json({ view: "tree-one", children: [{ key: "opaque-one", name: "研发部" }] });
     if (String(url) === "/api/lifecycle/directory/children") return Response.json({ children: [{ key: "opaque-two", name: "测试部" }] });
     if (String(url) === "/api/plans") return Response.json({ id: "plan-one", summary: ["测试部，包含子部门"], expiresAt: Date.now() + 60000 });
@@ -56,7 +56,7 @@ test("升级缺少范围时可直接选部门；取消不提交，预览只传�
     find(root, "读取部署部门树").click(); await until(() => !!find(root, "下级部门")); find(root, "下级部门").click(); await until(() => root.textContent!.includes("测试部"));
     root.querySelectorAll<HTMLInputElement>('.department-tree input[type="checkbox"]')[1]!.click(); await until(() => !find(root, "预览升级").disabled);
     find(root, "预览升级").click(); await until(() => !!root.querySelector('[role="dialog"]'));
-    expect(requests.at(-1)).toEqual({ url: "/api/plans", body: { operation: "update", params: { target: "e".repeat(40), switchMain: false, directory: { view: "tree-one", selected: ["opaque-two"] } } } });
+    expect(requests.at(-1)).toEqual({ url: "/api/plans", body: { operation: "update", params: { target: "e".repeat(40), switchMain: true, directory: { view: "tree-one", selected: ["opaque-two"] } } } });
     expect(requests.some(item => item.url === "/api/directory/apply")).toBe(false);
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
@@ -87,25 +87,28 @@ test("重部署表单保留显式端口和目录选择，Linux 重建修复与 W
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
 
-test("升级表单没有隐式选择，确认绑定检查到的 SHA；版本检查失败清除旧目标", async () => {
+test("升级只显示版本号，执行仍绑定检查到的提交；已是最新时没有升级入口，检查失败清除旧目标", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
-  let offline = false; const requests: unknown[] = [], target = "c".repeat(40);
+  let offline = false, available = true; const requests: unknown[] = [], target = "c".repeat(40);
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     if (String(url) === "/api/lifecycle/check-update") return offline ? Response.json({ error: "网络失败", code: "input" }, { status: 409 })
-      : Response.json({ target, release: "v9.8.7", branch: "feature", hasDirectory: true });
-    requests.push(JSON.parse(String(options?.body))); return Response.json({ id: "plan-upgrade", summary: [target], expiresAt: Date.now() + 60000 });
+      : Response.json({ ...(available ? { target } : {}), release: "v9.8.7", current: available ? "9.8.6" : "9.8.7", available, hasDirectory: true });
+    requests.push(JSON.parse(String(options?.body))); return Response.json({ id: "plan-upgrade", summary: [`目标提交：${target}；当前分支 feature；允许切到 main：是`, "确认后短暂停机"], expiresAt: Date.now() + 60000 });
   }) as typeof fetch;
   try {
     render(<UpgradeForm />, root); expect(requests).toEqual([]); find(root, "检查更新").click();
-    await until(() => !!find(root, "预览升级")); expect(find(root, "预览升级").disabled).toBe(true);
-    expect(root.textContent).toContain("检查最新发布"); expect(root.textContent).toContain("目标版本v9.8.7"); expect(root.textContent).toContain(target);
-    // A saved directory scope is used as it is; switching to main still has to be allowed.
+    await until(() => !!find(root, "预览升级")); expect(find(root, "预览升级").disabled).toBe(false);
+    expect(root.textContent).toContain("当前版本v9.8.6"); expect(root.textContent).toContain("最新正式版本v9.8.7"); expect(root.textContent).not.toContain(target);
+    // Saved scope is retained; branches and execution identifiers are not version choices.
     expect(root.querySelector('[aria-label="升级通讯录范围"]')).toBeNull();
-    await Bun.sleep(20); expect(find(root, "预览升级").disabled).toBe(true);
-    root.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
+    expect(root.querySelector('input[type="checkbox"]')).toBeNull();
     await until(() => !find(root, "预览升级").disabled); find(root, "预览升级").click(); await until(() => !!root.querySelector('[role="dialog"]'));
     expect(requests).toEqual([{ operation: "update", params: { target, switchMain: true, directory: "saved" } }]);
-    find(root, "返回").click(); offline = true; find(root, "检查更新").click(); await until(() => root.textContent!.includes("网络失败"));
+    expect(root.querySelector('[role="dialog"]')!.textContent).toContain("升级到 v9.8.7");
+    expect(root.textContent).not.toContain(target); expect(root.textContent).not.toContain("main"); expect(root.textContent).not.toContain("feature");
+    find(root, "返回").click(); available = false; find(root, "检查更新").click(); await until(() => root.textContent!.includes("没有可升级的版本"));
+    expect(find(root, "预览升级")).toBeUndefined(); expect(requests).toHaveLength(1);
+    offline = true; find(root, "检查更新").click(); await until(() => root.textContent!.includes("网络失败"));
     expect(find(root, "预览升级")).toBeUndefined(); expect(root.textContent).not.toContain(target); expect(root.textContent).not.toContain("v9.8.7");
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
@@ -441,5 +444,28 @@ test("运行参数表单带原始摘要和明确修改项生成预览", async ()
     const input = root.querySelector("input")!; input.value = "16"; input.dispatchEvent(new Event("input", { bubbles: true }));
     await until(() => !find(root, "校验并预览").disabled); find(root, "校验并预览").click(); await until(() => !!root.querySelector('[role="dialog"]'));
     expect(sent).toEqual({ operation: "runtime-configure", params: { hash: "base", changes: { BOT_MAX_ACTIVE_REQUESTS: "16" } } });
+  } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
+});
+
+test("资料和文档参数归到自己的页面，保存时只提交该页修改并保留完整配置摘要", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  let sent: unknown;
+  globalThis.fetch = (async (url: string, options?: RequestInit) => {
+    if (String(url) === "/api/forms/runtime") return Response.json({ hash: "whole-config", values: {}, groups: [
+      { label: "缓存与索引", description: "索引与缓存", options: [
+        { key: "BOT_INDEX_MAX_FILES", label: "索引文件上限", default: "20000" }, { key: "PI_CACHE_RETENTION", label: "模型缓存保留", default: "short" },
+      ] },
+      { label: "文档处理", description: "文档环境", options: [{ key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", default: "" }] },
+    ] });
+    sent = JSON.parse(String(options?.body)); return Response.json({ id: "plan-runtime", summary: ["应用参数"], expiresAt: Date.now() + 60000 });
+  }) as typeof fetch;
+  try {
+    render(<RuntimeForm />, root); await until(() => root.textContent!.includes("模型缓存保留"));
+    expect(root.textContent).not.toContain("索引文件上限"); expect(root.textContent).not.toContain("文档处理");
+    render(<RuntimeForm area="materials" />, root); await until(() => root.textContent!.includes("索引文件上限"));
+    expect(root.textContent).not.toContain("模型缓存保留");
+    const input = root.querySelector<HTMLInputElement>("input")!; input.value = "25000"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    await until(() => !find(root, "校验并预览").disabled); find(root, "校验并预览").click(); await until(() => !!root.querySelector('[role="dialog"]'));
+    expect(sent).toEqual({ operation: "runtime-configure", params: { hash: "whole-config", changes: { BOT_INDEX_MAX_FILES: "25000" } } });
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });

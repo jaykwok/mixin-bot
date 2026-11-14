@@ -51,7 +51,7 @@ test("网页命令提示使用实际页面，显示上下文不启用写操作�
       expect(command.env.MIXIN_OPS_CONSOLE).toBeUndefined(); expect(command.env.MIXIN_OPS_GUARD).toBeUndefined();
     }
     for (const [command, expected] of [["resume", "「维护 → 继续上次操作」"], ["logs", "「日志」"],
-      ["doctor", "「体检 → 刷新」"], ["configure-app-bot", "「设置 → 应用机器人凭据」"], ["relay-configure", "「设置 → 外链配置」"],
+      ["doctor", "「体检 → 刷新」"], ["configure-app-bot", "「应用机器人 → 编辑配置」"], ["relay-configure", "「外链 → 编辑配置」"],
       ["uninstall", "scripts/ops.sh uninstall"]]) {
       const child = Bun.spawn([bash, script.replaceAll("\\", "/"), command!], { cwd: f.root, windowsHide: true,
         env: { ...process.env, MIXIN_OPS_UI: "console" }, stdout: "pipe", stderr: "pipe" });

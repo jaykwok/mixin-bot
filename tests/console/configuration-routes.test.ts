@@ -159,7 +159,7 @@ test("拒绝原因：项目自己的中文原因脱敏后给页面，库和系�
     const routes = configurationRoutes(drafts, async () => { throw thrown; });
     const open = await routes["POST /api/configuration/open"]!.run(context({ kind: "relay" })) as { id: string; revision: number };
     const relay = { enabled: true, endpoint: "http://127.0.0.1:9000", region: "us-east-1", bucket: "fixture-bucket", prefix: "", forcePathStyle: false,
-      maxBytes: 64 * 1024 * 1024, expireHours: 24, cleanupGraceMinutes: 10, accessKey: { mode: "set", value: "fixture-access" }, secret: { mode: "set", value: "fixture-do-not-display" }, token: { mode: "clear" } };
+      maxMB: 64, expireHours: 24, cleanupGraceMinutes: 10, accessKey: { mode: "set", value: "fixture-access" }, secret: { mode: "set", value: "fixture-do-not-display" }, token: { mode: "clear" } };
     const refused = await reason(routes["POST /api/configuration/edit"]!.run(context({ id: open.id, revision: open.revision, patch: relay })));
     expect(refused.message).toContain("IP / localhost 端点需要 forcePathStyle: true；正式配置未修改");
     const edited = await routes["POST /api/configuration/edit"]!.run(context({ id: open.id, revision: open.revision, patch: { ...relay, forcePathStyle: true } })) as { revision: number };

@@ -16,14 +16,17 @@ export interface RelayConfig {
   /** "" for the bucket root, otherwise a directory ending in "/". */
   prefix: string;
   forcePathStyle: boolean;
-  maxBytes: number;
+  /** File limit in MB (1 MB = 1024 × 1024 bytes), also stored in relay.json in this unit. */
+  maxMB: number;
   expireHours: number;
   cleanupGraceMinutes: number;
 }
 
-export const DEFAULT_RELAY_MAX_BYTES = 2 * 1024 ** 3;
+export const DEFAULT_RELAY_MAX_MB = 2048;
 export const DEFAULT_RELAY_EXPIRE_HOURS = 2;
 export const DEFAULT_RELAY_CLEANUP_GRACE_MINUTES = 30;
+/** Byte limit for file I/O; configuration and forms retain MB throughout. */
+export const relayMaxBytes = (config: RelayConfig): number => Math.floor(config.maxMB * 1024 ** 2);
 /** The storage a ledger key belongs to: the settings that decide where an object lives, never the credentials. */
 export function relayBackendId(config: RelayConfig): string {
   return createHash("sha256").update(JSON.stringify(["s3", config.endpoint, config.region, config.bucket, config.prefix, config.forcePathStyle])).digest("hex");
@@ -78,10 +81,11 @@ export function validateRelayConfig(doc: unknown, path = "data/config/relay.json
   if (!forcePathStyle && endpoint.hostname.startsWith(bucket + ".")) {
     throw new Error(`${path} 的 endpoint 已包含桶名；Virtual hosted 会自动在服务端点前加桶名，请填写 ${endpoint.protocol}//${endpoint.hostname.slice(bucket.length + 1)}`);
   }
-  const maxBytes = f.maxBytes === undefined ? DEFAULT_RELAY_MAX_BYTES : f.maxBytes;
+  if (Object.hasOwn(f, "maxBytes")) throw new Error(`${path} 的文件上限请使用 maxMB（MB）`);
+  const maxMB = f.maxMB === undefined ? DEFAULT_RELAY_MAX_MB : f.maxMB;
   // Single PUT is intentionally bounded: no multipart uploads to strand or abort on another API.
-  if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes <= NATIVE_FILE_MAX_BYTES || maxBytes > 5 * 1024 ** 3) {
-    throw new Error(`${path} 的 maxBytes 必须是大于 ${NATIVE_FILE_MAX_BYTES} 且不超过 5 GiB 的整数`);
+  if (typeof maxMB !== "number" || !Number.isFinite(maxMB) || maxMB <= NATIVE_FILE_MAX_BYTES / 1024 ** 2 || maxMB > 5120) {
+    throw new Error(`${path} 的 maxMB 必须大于 ${NATIVE_FILE_MAX_BYTES / 1024 ** 2} 且不超过 5120（MB）`);
   }
   const expireHours = f.expireHours === undefined ? DEFAULT_RELAY_EXPIRE_HOURS : f.expireHours;
   if (typeof expireHours !== "number" || !Number.isFinite(expireHours) || expireHours * 3600 < 1 || expireHours > 168) {
@@ -91,7 +95,7 @@ export function validateRelayConfig(doc: unknown, path = "data/config/relay.json
   if (typeof cleanupGraceMinutes !== "number" || !Number.isInteger(cleanupGraceMinutes) || cleanupGraceMinutes < 1 || cleanupGraceMinutes > 1440) {
     throw new Error(`${path} 的 cleanupGraceMinutes 必须是 1 到 1440 之间的整数（分钟）`);
   }
-  return { provider: "s3", endpoint: endpoint.origin, region, bucket, prefix, forcePathStyle, maxBytes, expireHours, cleanupGraceMinutes,
+  return { provider: "s3", endpoint: endpoint.origin, region, bucket, prefix, forcePathStyle, maxMB, expireHours, cleanupGraceMinutes,
     accessKeyId: required(f.accessKeyId, "accessKeyId", path), secretAccessKey: required(f.secretAccessKey, "secretAccessKey", path),
     ...(f.sessionToken === undefined ? {} : { sessionToken: required(f.sessionToken, "sessionToken", path) }) };
 }

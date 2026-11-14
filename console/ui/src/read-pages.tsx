@@ -16,7 +16,7 @@ const LEVELS = [{ value: "all", label: "全部" }, { value: "error", label: "错
 const OPTIONAL = new Set(["正在处理", "错误", "自动复核"]);
 
 /** `refresh`: read the page again whenever it changes (a write elsewhere on the page has ended). */
-export function ReadOnlyPage({ page, refresh = 0, children }: { page: string; refresh?: number; children?: ComponentChildren }) {
+export function ReadOnlyPage({ page, refresh = 0, children, embedded = false }: { page: string; refresh?: number; children?: ComponentChildren; embedded?: boolean }) {
   const [data, setData] = useState<ReadPage | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false);
   const [filters, setFilters] = useState<Filters>({ keyword: "", level: "all", task: "" });
   const current = useRef<AbortController | null>(null);
@@ -42,11 +42,13 @@ export function ReadOnlyPage({ page, refresh = 0, children }: { page: string; re
   useEffect(() => { setData(null); void load(); return () => current.current?.abort(); }, [page]);
   useEffect(() => { if (refresh) void load(false, false); }, [refresh]);
   const filter = (patch: Partial<Filters>) => setFilters(previous => ({ ...previous, ...patch }));
+  const actions = <>
+    {page === "logs" && <button class="btn" type="button" disabled={busy} onClick={() => void load(true)}><Icon name="download" size={14} />导出筛选结果</button>}
+    <button class="btn" type="button" disabled={busy} onClick={() => void load()}><Icon name="refresh" size={14} class={busy ? "spin" : undefined} />刷新</button>
+  </>;
   return <>
-    <PageHeader title={item.label} description={item.description} actions={<>
-      {page === "logs" && <button class="btn" type="button" disabled={busy} onClick={() => void load(true)}><Icon name="download" size={14} />导出筛选结果</button>}
-      <button class="btn" type="button" disabled={busy} onClick={() => void load()}><Icon name="refresh" size={14} class={busy ? "spin" : undefined} />刷新</button>
-    </>} />
+    {embedded ? <header class="section-header"><h2>外链文件</h2><div class="section-aside">{actions}</div></header>
+      : <PageHeader title={item.label} description={item.description} actions={actions} />}
     {page === "logs" && <form class="filter-bar read-filters" onSubmit={event => { event.preventDefault(); void load(); }}>
       <div class="input-icon"><Icon name="search" size={14} />
         <input type="search" aria-label="关键词" placeholder="关键词" value={filters.keyword} maxLength={128} onInput={event => filter({ keyword: event.currentTarget.value })} /></div>

@@ -235,7 +235,7 @@ windowsTest("控制台体检与修复输出使用控制台页面，直接调用�
       expect(result.code, result.stderr).toBe(1);
       const health = JSON.parse(result.stdout);
       const fixes = health.checks.map((check: { fix: string }) => check.fix).join("\n");
-      expect(fixes).toContain(web ? "设置 → 应用机器人凭据" : "scripts\\ops.ps1 configure-app-bot");
+      expect(fixes).toContain(web ? "应用机器人 → 编辑配置" : "scripts\\ops.ps1 configure-app-bot");
       expect(fixes).toContain(web ? "维护 → 重新部署" : "scripts\\ops.ps1 deploy");
       expect(fixes).toContain(web ? "「日志」" : "scripts\\ops.ps1 logs");
       if (web) expect(fixes).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);

@@ -1,5 +1,5 @@
 /** @jsxImportSource preact */
-// The settings page: what is configured now, and an editor per configuration. An edit is a private draft on the host:
+// Configuration pages: what is configured now, and an editor per configuration. An edit is a private draft on the host:
 // saved and checked first, then previewed and applied as a task; cancelling or leaving the page discards it.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "./api.ts";
@@ -8,10 +8,11 @@ import { clock } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
 import { MaterialExclusionsForm } from "./materials.tsx";
 import { ModelPicker } from "./model-picker.tsx";
-import type { Tint } from "./nav.ts";
+import { NAV, type Tint } from "./nav.ts";
 import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
 import { Banner, Field, PageHeader, Row, Section, Segmented, Skeleton, Spinner, Toggle } from "./ui.tsx";
-import { RuntimeForm } from "./write-forms.tsx";
+import { RelayActions, RuntimeForm } from "./write-forms.tsx";
+import { ReadOnlyPage } from "./read-pages.tsx";
 
 type Kind = "models" | "app" | "relay";
 type Secret = { mode: "keep" | "set" | "clear"; value?: string };
@@ -21,7 +22,7 @@ type Provider = { id: string; custom?: boolean; api?: string; baseUrl?: string; 
 interface Form { kind: Kind; provider?: string; model?: string; thinking?: string; providers?: Provider[]; appId?: string; environment?: string; bound?: boolean;
   catalogModels?: (Model & { provider: string })[];
   hasSecret?: boolean; hasAccessKey?: boolean; hasToken?: boolean; enabled?: boolean; endpoint?: string; region?: string; bucket?: string; prefix?: string;
-  forcePathStyle?: boolean; maxBytes?: number; expireHours?: number; cleanupGraceMinutes?: number }
+  forcePathStyle?: boolean; maxMB?: number; expireHours?: number; cleanupGraceMinutes?: number }
 interface Draft { id: string; revision: number; expiresAt: number; validated: boolean; summary: string[]; form: Form }
 /** `listable`: the protocols whose endpoints list their models. */
 interface Catalog { providers: { id: string; name: string }[]; apis: string[]; listable?: string[]; models: (Model & { provider: string })[] }
@@ -65,7 +66,7 @@ function initial(form: Form, catalog?: Catalog): Patch {
   if (form.kind === "models") return modelPatch(form, form.provider ?? form.providers?.[0]?.id ?? "", catalog);
   if (form.kind === "app") return { appId: form.appId ?? "", environment: form.environment ?? "production", secret: retained(form.hasSecret) };
   return { enabled: form.enabled ?? false, endpoint: form.endpoint ?? "", region: form.region ?? "", bucket: form.bucket ?? "", prefix: form.prefix ?? "",
-    forcePathStyle: form.forcePathStyle ?? false, maxBytes: form.maxBytes, expireHours: form.expireHours, cleanupGraceMinutes: form.cleanupGraceMinutes,
+    forcePathStyle: form.forcePathStyle ?? false, maxMB: form.maxMB, expireHours: form.expireHours, cleanupGraceMinutes: form.cleanupGraceMinutes,
     accessKey: retained(form.hasAccessKey), secret: retained(form.hasSecret), token: retained(form.hasToken, true) };
 }
 /** `stored`: a value exists (saved, or already in this draft) that "keep" can keep; without one there is only a new value to enter. */
@@ -195,7 +196,11 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
         {kind === "relay" && <><div class="row"><Toggle label="启用外链" detail="关闭后大文件仍按平台限制直接发送。" checked={!!patch.enabled} onChange={value => change("enabled", value)} /></div>
           {!!patch.enabled && <>{text("endpoint", "S3 端点")}{text("region", "区域")}{text("bucket", "存储桶")}{text("prefix", "路径前缀（可为空）")}
             <div class="row"><Toggle label="使用路径式寻址" checked={!!patch.forcePathStyle} onChange={value => change("forcePathStyle", value)} /></div>
-            {text("maxBytes", "文件上限（字节）", true)}{text("expireHours", "链接有效期（小时）", true)}{text("cleanupGraceMinutes", "清理宽限（分钟）", true)}
+            <Field label="文件上限（MB）" note="1 MB = 1024 × 1024 字节；大于 30 MB，最大 5120 MB。">
+              <input aria-label="文件上限（MB）" type="number" min="30" max="5120" step="any"
+                value={typeof patch.maxMB === "number" ? patch.maxMB : ""}
+                onInput={event => change("maxMB", event.currentTarget.value === "" ? undefined : Number(event.currentTarget.value))} />
+            </Field>{text("expireHours", "链接有效期（小时）", true)}{text("cleanupGraceMinutes", "清理宽限（分钟）", true)}
             {secret("accessKey", "访问密钥 ID")}{secret("secret", "访问密钥")}{secret("token", "临时会话令牌", true)}</>}</>}
         {kind === "models" && <><Field label="服务商 ID"><input list={`providers-${draft.id}`} value={String(patch.provider ?? "")} onInput={event => { setPatch(modelPatch(draft.form, event.currentTarget.value, catalog)); setValid(false); }} /></Field>
           <datalist id={`providers-${draft.id}`}>{[...new Set([...(draft.form.providers ?? []).map(value => value.id), ...(catalog?.providers ?? []).map(value => value.id)])].map(id => <option key={id} value={id} />)}</datalist>
@@ -283,7 +288,7 @@ const rowsOf = (rows: string[][], names: string[]) => rows.filter(([name]) => na
 /** Tasks after which this page reads the saved settings again. */
 const SETTINGS_TASKS = new Set(["configuration-apply", "configuration-restore", "runtime-configure", "maintenance-recover"]);
 
-export function SettingsPage() {
+export function SettingsPage({ page = "settings" }: { page?: "settings" | "models" | "bot" | "relay" | "materials" }) {
   const [data, setData] = useState<ReadPage | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [version, setVersion] = useState(0);
   // A settings task confirmed on this page has ended since it opened: what is saved has changed, or a recovery is now due.
   // The runtime form starts over only after a runtime task (its unapplied changes would go too).
@@ -307,21 +312,23 @@ export function SettingsPage() {
   }, [version, ended]);
   const rows = data?.rows ?? [];
   const mcp = rowsOf(rows, ["MCP"]);
+  const navigation = NAV.find(item => item.id === page)!;
   return <>
-    <PageHeader title="设置" description="模型、机器人凭据、外链与运行参数。修改先保存为草稿并校验，再预览应用。"
+    <PageHeader title={navigation.label} description={navigation.description}
       actions={<button class="btn" disabled={busy} onClick={() => setVersion(value => value + 1)}><Icon name="refresh" size={14} class={busy ? "spin" : undefined} />刷新</button>} />
     {error && <Banner tone="danger" icon="alert" title="当前配置读取失败" action={<button class="btn small-btn" onClick={() => setVersion(value => value + 1)}>重试</button>}>{error}</Banner>}
     <ConfigurationRecovery key={ended} quiet />
     {!data && busy ? <Section><Skeleton lines={4} /></Section> : <>
-      <ConfigurationForm kind="models" summary={rowsOf(rows, ["模型", "辅助模型"])} />
-      <ConfigurationForm kind="app" summary={rowsOf(rows, ["应用机器人"])} />
-      <ConfigurationForm kind="relay" summary={rowsOf(rows, ["外链", "外链配置"])} />
-      {mcp.length > 0 && <Section title="MCP" footer="MCP 服务器在配置文件中设置，这里只显示摘要。">
+      {page === "models" && <ConfigurationForm kind="models" summary={rowsOf(rows, ["模型", "辅助模型"])} />}
+      {page === "bot" && <ConfigurationForm kind="app" summary={rowsOf(rows, ["应用机器人"])} />}
+      {page === "relay" && <ConfigurationForm kind="relay" summary={rowsOf(rows, ["外链", "外链配置"])} />}
+      {page === "models" && mcp.length > 0 && <Section title="MCP" footer="MCP 服务器在配置文件中设置，这里只显示摘要。">
         {mcp.map(([name, value]) => <Row key={name} class="value" icon="layers" tint="gray" title={name === "MCP" ? "MCP" : name!.slice("MCP · ".length)}>{value}</Row>)}
       </Section>}
     </>}
-    <MaterialExclusionsForm />
-    <RuntimeForm key={runtimeEnded} />
+    {page === "materials" && <MaterialExclusionsForm />}
+    {(page === "settings" || page === "materials") && <RuntimeForm key={runtimeEnded} area={page === "materials" ? "materials" : "runtime"} />}
+    {page === "relay" && <><RelayActions /><ReadOnlyPage page="relay" refresh={ended} embedded /></>}
     {data && <p class="footnote">读取于 {clock(data.checkedAt)} · {data.note}</p>}
   </>;
 }

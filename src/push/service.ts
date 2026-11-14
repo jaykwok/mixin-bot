@@ -63,7 +63,7 @@ import type { DepartmentTree } from "../integrations/open-platform/department-tr
 import type { DirectoryIdentity } from "../integrations/open-platform/identity-directory.ts";
 import { cardMessage, type CardContent, type SendOutcome, splitText, type Target, textMessage } from "../integrations/open-platform/messages.ts";
 import type { StreamEvent } from "../integrations/open-platform/stream.ts";
-import type { RelayConfig } from "../integrations/relay.ts";
+import { relayMaxBytes, type RelayConfig } from "../integrations/relay.ts";
 import { PUSH_NOTE_KIND } from "./note.ts";
 import { checkpoints, quietHours } from "./reminders.ts";
 import { ROLE_LIMITS } from "./role-limits.ts";
@@ -2231,7 +2231,7 @@ export class PushService {
       await rm(dir, { recursive: true, force: true });
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const forwards = this.#store.forwards(pushId, "confirmed"), handed = new Set(forwards.map(forward => forward.from));
-      const partBytes = this.options.relay?.maxBytes ?? NATIVE_FILE_MAX_BYTES;
+      const partBytes = this.options.relay ? relayMaxBytes(this.options.relay) : NATIVE_FILE_MAX_BYTES;
       const pack = await buildSummary({ push, recipients, items, forwards, files, dir, partBytes, bare: true, split: true, now: this.#now(), signal: this.#signal });
       const tally = this.#tally(push, recipients);
       const missing = recipients.filter(recipient => delivered(recipient) && !this.#answered(push, recipient, handed))

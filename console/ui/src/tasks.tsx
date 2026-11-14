@@ -26,6 +26,11 @@ const RECOVERABLE = ["history-clear", "history-compact", "stat-import", "tmp-pur
   "runtime-configure", "backup-clean", "relay-test", "relay-purge", "maintenance-recover"];
 const STEPS = ["预览", "确认", "执行"];
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
+const VERSION_TASKS = new Set(["update", "deploy", "install", "resume", "rollback", "repair"]);
+/** Build identifiers remain in the overview and the downloadable diagnostic log, not the version workflow. */
+const taskText = (operation: string, text: string) => VERSION_TASKS.has(operation) ? text
+  .replace(/：目标提交\s+[0-9a-f]{7,40}/g, "")
+  .replace(/\b(?:[0-9a-f]{40}|(?=[0-9a-f]*[a-f])[0-9a-f]{7,12})(?:-dirty)?\b/g, "（构建信息见总览）") : text;
 export const taskEnded = (state: string | undefined) => !!state && state !== "queued" && state !== "running";
 
 /** How a task stands, for its glyph, stepper and progress bar. */
@@ -102,8 +107,8 @@ export function useFollowed(): { followed: Followed[]; shown: string | null; han
  * A button that previews `operation`; the sheet that follows shows what will be done and until when the preview holds, and
  * hands the task over on confirmation. `danger`: the confirmation is red (the button itself only says it in red).
  */
-export function TaskAction({ operation, params, children, disabled, danger = false, primary = false, onStarted }: {
-  operation: string; params: Record<string, unknown>; children: ComponentChildren; disabled?: boolean; danger?: boolean; primary?: boolean; onStarted?: (task: TaskView) => void;
+export function TaskAction({ operation, params, children, disabled, danger = false, primary = false, onStarted, release }: {
+  operation: string; params: Record<string, unknown>; children: ComponentChildren; disabled?: boolean; danger?: boolean; primary?: boolean; onStarted?: (task: TaskView) => void; release?: string;
 }) {
   // The preview's expiry is the server's: `now` and `received` are server time.
   const [plan, setPlan] = useState<Plan | null>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [now, setNow] = useState(serverTime);
@@ -148,20 +153,21 @@ export function TaskAction({ operation, params, children, disabled, danger = fal
   return <>
     <button type="button" class={`btn${danger ? " destructive" : primary ? " primary" : ""}`} disabled={disabled || busy} onClick={() => void preview()}>
       {busy && !plan ? <><Icon name="loader" size={14} class="spin" />正在预览…</> : children}</button>
-    {!plan && error && <p role="alert" class="form-error">{error}</p>}
+    {!plan && error && <p role="alert" class="form-error">{taskText(operation, error)}</p>}
     {plan && <Dialog title={`确认${TASK_LABELS[operation] ?? "操作"}`} icon={danger ? "alert" : "shield"} onClose={close}
       header={<Stepper steps={[...STEPS, "完成"]} current={submitting ? 2 : busy ? 0 : 1} label="任务流程" />} footer={<>
         <button class="btn" disabled={busy} onClick={close}>返回</button>
         {expired || refused ? <button class="btn primary" disabled={busy} onClick={() => void preview()}>{busy ? "正在预览…" : "重新预览"}</button>
           : <button class={`btn ${danger ? "danger" : "primary"}`} disabled={busy} onClick={() => void submit()}>{submitting ? "正在交接任务…" : "确认执行"}</button>}
       </>}>
-      <ul class="plan-summary">{plan.summary.map((line, index) => <li key={index}>{line}</li>)}</ul>
+      <ul class="plan-summary">{release && <li>升级到 {release}</li>}{plan.summary.filter(line => !release || !line.startsWith("目标提交："))
+        .map((line, index) => <li key={index}>{taskText(operation, line)}</li>)}</ul>
       <div class="plan-meta">
         <span>{expired ? "预览已过期，请重新核对。" : `预览有效至 ${dateTime(plan.expiresAt)}。`}</span>
         {!expired && <Countdown total={Math.max(1, plan.expiresAt - received)} left={plan.expiresAt - now} label="预览剩余有效时间" />}
       </div>
       <p class="plan-note">确认后任务独立运行，关掉网页或控制台不会取消。重新打开后可在维护页查看结果。</p>
-      {error && <p role="alert" class="form-error">{error}</p>}
+      {error && <p role="alert" class="form-error">{taskText(operation, error)}</p>}
     </Dialog>}
   </>;
 }
@@ -256,8 +262,9 @@ export function TaskProgress({ id, recoveryAllowed, inSheet = false }: { id: str
     } catch (error) { setError(message(error)); }
   };
   const ended = taskEnded(task?.state), look = taskTone(task);
-  const phase = [...events].reverse().find(event => event.kind === "phase")?.text;
-  const stage = [...events].reverse().find(event => event.text.startsWith("部署阶段："))?.text.slice(5);
+  const display = (text: string) => taskText(task?.operation ?? "", text);
+  const phase = display([...events].reverse().find(event => event.kind === "phase")?.text ?? "");
+  const stage = display([...events].reverse().find(event => event.text.startsWith("部署阶段："))?.text.slice(5) ?? "");
   const state = task ? TASK_STATES[task.state] ?? task.state : "正在读取…";
   return <section class="task-detail">
     <div class="task-head">
@@ -268,16 +275,16 @@ export function TaskProgress({ id, recoveryAllowed, inSheet = false }: { id: str
       </div>
     </div>
     <Stepper steps={[...STEPS, ended ? state : "完成"]} current={ended ? 3 : 2} tone={look.tone ?? undefined} label="任务流程" />
-    {!ended && <div class="task-phase"><Spinner label="" /><span class="phase-text" key={stage ?? phase}>{stage ? `部署阶段：${stage}` : phase ?? (task?.state === "queued" ? "等待执行器接单" : "正在执行")}</span></div>}
+    {!ended && <div class="task-phase"><Spinner label="" /><span class="phase-text" key={stage || phase}>{stage ? `部署阶段：${stage}` : phase || (task?.state === "queued" ? "等待执行器接单" : "正在执行")}</span></div>}
     <ProgressBar label="任务进度" value={ended ? 1 : undefined} tone={look.tone ?? undefined} />
-    {task?.result && <p role="status" class={`task-result${look.tone ? ` ${look.tone}` : ""}`}>{task.result.message || (task.result.outcome === "success" ? "执行完成" : "执行失败，请查看下方记录")}</p>}
+    {task?.result && <p role="status" class={`task-result${look.tone ? ` ${look.tone}` : ""}`}>{display(task.result.message) || (task.result.outcome === "success" ? "执行完成" : "执行失败，请查看下方记录")}</p>}
     {task?.needsRecovery && <><p role="alert">维护记录仍需处理。请查看体检和运维日志，按恢复指引继续或回滚。</p>
       {recoveryAllowed && RECOVERABLE.includes(task.operation) && <div class="action-row"><TaskAction operation="maintenance-recover" params={{}}>预览恢复中断的维护</TaskAction></div>}</>}
-    {task?.reason && <p role="alert">{task.reason}</p>}
+    {task?.reason && <p role="alert">{display(task.reason)}</p>}
     {[...new Set([loadError, streamError, error])].filter(Boolean).map(text => <p key={text} role="alert">{text}</p>)}
     <details class="task-output" open={task?.state === "failed"}>
       <summary><Icon name="chevronRight" size={13} />任务输出{events.length ? `（${events.length} 行）` : ""}</summary>
-      <pre class="task-events" aria-label="任务输出">{events.map(event => <div key={event.seq} class={event.kind === "error" ? "event-error" : ""}>{event.text}</div>)}</pre>
+      <pre class="task-events" aria-label="任务输出">{events.map(event => <div key={event.seq} class={event.kind === "error" ? "event-error" : ""}>{display(event.text)}</div>)}</pre>
     </details>
     <div class="task-foot">
       <span>最多显示最近 2000 行。{inSheet ? "关闭这里不会取消任务。" : "收起详情只断开订阅，不会取消任务。"}</span>
@@ -340,9 +347,6 @@ export function TasksPage({ resultsOnly = false, setup, platform }: { resultsOnl
     {!resultsOnly && !setup && <>
       <BackupCleanup />
       <Section title="危险操作">
-        <Row icon="trash" tint="red" title="清空全部会话" detail="包含单聊和所有群组；统计保留。此操作不可撤销。">
-          <TaskAction operation="history-clear" params={{ space: "all" }} danger>预览清空全部会话</TaskAction>
-        </Row>
         <UninstallForm platform={platform} />
       </Section>
     </>}
@@ -430,13 +434,13 @@ export function DeployForm() {
 
 export function UpgradeForm() {
   const [selected, setSelected] = useState<DeploymentSelection | null>(null);
-  const [version, setVersion] = useState<{ branch: string; hasDirectory: boolean; target: string; release: string } | null>(null);
-  const [directory, setDirectory] = useState(""), [switchMain, setSwitchMain] = useState(false);
+  const [version, setVersion] = useState<{ current: string; available: boolean; hasDirectory: boolean; target?: string; release: string } | null>(null);
+  const [directory, setDirectory] = useState("");
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const live = useRef(true), controller = useRef<AbortController | null>(null), lock = useRef(false);
   useEffect(() => { live.current = true; return () => { live.current = false; controller.current?.abort(); }; }, []);
   const check = async () => {
-    if (lock.current) return; lock.current = true; setBusy(true); setError(""); setVersion(null); setDirectory(""); setSelected(null); setSwitchMain(false);
+    if (lock.current) return; lock.current = true; setBusy(true); setError(""); setVersion(null); setDirectory(""); setSelected(null);
     controller.current?.abort(); controller.current = new AbortController();
     try { const value = await api<NonNullable<typeof version>>("/api/lifecycle/check-update", { method: "POST", body: {}, intent: true, signal: controller.current.signal, timeoutMs: 120_000 });
       if (live.current) setVersion(value); }
@@ -445,20 +449,21 @@ export function UpgradeForm() {
   };
   const scope = version?.hasDirectory ? "saved" : directory;
   return <Section title="软件更新" footer="升级沿用模型、机器人凭据和运行参数；完成后请重新运行 bun run console。">
-    <Row icon="cloud" tint="blue" title="检查最新发布" detail="取得最新的正式发布后选择升级方式，再预览确认。">
+    <Row icon="cloud" tint="blue" title="检查最新发布" detail="比较当前部署与最新正式发布的版本号，有新版本时预览升级。">
       <button type="button" class="btn" disabled={busy} onClick={() => void check()}>{busy ? <><Icon name="loader" size={14} class="spin" />正在检查版本…</> : "检查更新"}</button>
     </Row>
     {error && <div class="group-note form-error" role="alert">{error}</div>}
     {version && <>
-      <Row class="value" title="目标版本">{version.release}</Row>
-      <Row class="value" title="目标提交"><code>{version.target}</code></Row>
-      <Row class="value" title="当前分支">{version.branch}</Row>
+      <Row class="value" title="当前版本">v{version.current}</Row>
+      <Row class="value" title="最新正式版本">{version.release}</Row>
+      {!version.available && <Row icon="check" tint="green" title="没有可升级的版本" detail="当前版本已是最新正式版本或更新。" />}
+      {version.available && version.target && <>
       <ScopeChoice label="升级通讯录范围" hasDirectory={version.hasDirectory} value={directory} onChange={setDirectory} onSelection={setSelected} />
-      {version.branch !== "main" && <div class="row"><Toggle label="允许切换到 main 分支" detail={`当前在 ${version.branch} 分支；升级会切换到 main。`} checked={switchMain} onChange={setSwitchMain} /></div>}
-      <Row title="升级" detail="预览列出目标提交和步骤，确认后在后台运行。">
-        <TaskAction operation="update" params={{ target: version.target, switchMain, directory: scope === "departments" ? selected : scope }} primary
-          disabled={!scope || scope === "departments" && !selected || (version.branch !== "main" && !switchMain)} onStarted={() => setVersion(null)}>预览升级</TaskAction>
+      <Row title="发现新版本" detail="预览目标版本和执行步骤，确认后在后台升级。">
+        <TaskAction operation="update" release={version.release} params={{ target: version.target, switchMain: true, directory: scope === "departments" ? selected : scope }} primary
+          disabled={!scope || scope === "departments" && !selected} onStarted={() => setVersion(null)}>预览升级</TaskAction>
       </Row>
+      </>}
     </>}
   </Section>;
 }
@@ -478,8 +483,8 @@ export function RecoveryActions() {
     {error && <div class="group-note form-error" role="alert">{error}</div>}
     {!busy && !error && !pending && <Row icon="check" tint="green" title="没有未完成的部署或升级。" />}
     {pending && <>
-      <Row icon="alert" tint="orange" title={pending.subject} detail={pending.committed ? "数据已提交，只能继续完成启动和清理。" : !pending.canResume ? "上次操作已经开始回滚，只能完成回滚。" : "按原事务记录处理，不拉取新目标或改变已保存的选择。"} />
-      <div class="row-body flush-top"><ul class="plain-list">{pending.record.map(line => <li key={line}>{line}</li>)}</ul></div>
+      <Row icon="alert" tint="orange" title={taskText("resume", pending.subject)} detail={pending.committed ? "数据已提交，只能继续完成启动和清理。" : !pending.canResume ? "上次操作已经开始回滚，只能完成回滚。" : "按原事务记录处理，不拉取新目标或改变已保存的选择。"} />
+      <div class="row-body flush-top"><ul class="plain-list">{pending.record.map(line => <li key={line}>{taskText("resume", line)}</li>)}</ul></div>
       <div class="row"><div class="action-row">
         <TaskAction operation="resume" params={{}} disabled={!pending.canResume} primary onStarted={() => setPending(null)}>预览继续上次操作</TaskAction>
         <TaskAction operation="rollback" params={{}} disabled={!pending.canRollback} danger onStarted={() => setPending(null)}>预览回滚上次操作</TaskAction>

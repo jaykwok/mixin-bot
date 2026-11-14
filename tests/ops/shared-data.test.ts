@@ -173,7 +173,7 @@ test("外链摘要直接读取配置文件：未配置、有效、无效均不�
       bucket: "bot-1250000000", accessKeyId: "fixture-private-ak", secretAccessKey: "fixture-private-sk", sessionToken: "fixture-private-token" }));
     const summary = await settingsData.loadRelaySummary(fixture.root);
     expect(summary).toEqual({ enabled: true, endpoint: "https://cos.ap-chengdu.myqcloud.com", region: "ap-chengdu", bucket: "bot-1250000000",
-      prefix: "", pathStyle: false, maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30, sessionToken: true });
+      prefix: "", pathStyle: false, maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30, sessionToken: true });
     expect(JSON.stringify(summary)).not.toContain("fixture-private");
     await writeFile(path, '{"secretAccessKey": fixture-private-sk');
     const invalid = await settingsData.loadRelaySummary(fixture.root).then(() => "", (error: Error) => error.message);

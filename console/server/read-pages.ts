@@ -42,7 +42,7 @@ function settingRows(index: number, value: Summaries[number]): [string, string][
     case 3: {
       const relay = value as Summaries[3];
       return relay.enabled ? [["外链 · 端点", relay.endpoint], ["外链 · 区域", relay.region], ["外链 · 桶", relay.bucket], ["外链 · 对象目录", relay.prefix || "桶根目录"],
-        ["外链 · 寻址方式", relay.pathStyle ? "路径式" : "虚拟主机式"], ["外链 · 单个文件上限", size(relay.maxBytes)], ["外链 · 链接有效期", `${relay.expireHours} 小时`],
+        ["外链 · 寻址方式", relay.pathStyle ? "路径式" : "虚拟主机式"], ["外链 · 单个文件上限", `${relay.maxMB} MB`], ["外链 · 链接有效期", `${relay.expireHours} 小时`],
         ["外链 · 到期后保留", `${relay.cleanupGraceMinutes} 分钟`], ["外链 · 临时会话令牌", relay.sessionToken ? "已设置" : "未使用"]] : [["外链", "未启用"]];
     }
     case 4: {

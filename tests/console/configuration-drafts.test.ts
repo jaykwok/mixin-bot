@@ -87,12 +87,12 @@ test("外链保留未知字段，换端点和账户必须重新填写凭据，�
   const f = await tempFixture("console-config-relay-");
   try {
     const config = { provider: "s3", endpoint: "https://example.test", region: "test", bucket: "fixture-bucket", prefix: "", forcePathStyle: false,
-      maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30, accessKeyId: "access-private", secretAccessKey: "secret-private", sessionToken: "token-private", custom: { secret: "unknown-private" } };
+      maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30, accessKeyId: "access-private", secretAccessKey: "secret-private", sessionToken: "token-private", custom: { secret: "unknown-private" } };
     write(f.root, CONFIGURATION_FILES.relay, config);
     const base = configurationSnapshot(f.root, "relay"), form = configurationForm(base);
     expect(JSON.stringify(form)).not.toContain("private");
     const patch = { enabled: true, endpoint: config.endpoint, region: config.region, bucket: config.bucket, prefix: "new/", forcePathStyle: false,
-      maxBytes: config.maxBytes, expireHours: 3, cleanupGraceMinutes: 40, accessKey: { mode: "keep" }, secret: { mode: "keep" }, token: { mode: "keep" } };
+      maxMB: config.maxMB, expireHours: 3, cleanupGraceMinutes: 40, accessKey: { mode: "keep" }, secret: { mode: "keep" }, token: { mode: "keep" } };
     expect(JSON.parse(editConfiguration(base, patch).files.relay!)).toMatchObject({ custom: config.custom, secretAccessKey: config.secretAccessKey, prefix: "new/" });
     expect(() => editConfiguration(base, { ...patch, endpoint: "https://elsewhere.test" })).toThrow("不能沿用");
     expect(() => editConfiguration(base, { ...patch, accessKey: { mode: "set", value: "another" } })).toThrow("不能沿用");

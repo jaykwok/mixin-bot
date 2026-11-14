@@ -11,7 +11,7 @@ import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_SETTINGS_PATH } from "./storage
 import { validateEngineSettings } from "./engine-policy.ts";
 
 /** 部署的实例在控制台或用 model-configure 修改模型；没有部署的本地开发运行 bun run configure。 */
-export const MODEL_CONFIG_ENTRY = "控制台「设置」或 model-configure；本地开发运行 bun run configure";
+export const MODEL_CONFIG_ENTRY = "控制台「模型」或 model-configure；本地开发运行 bun run configure";
 
 // Pi 没有从包入口导出这两个类型，用它自己的方法签名取，避免抄一份结构定义出来。
 type PiSettingsStorage = Parameters<typeof SettingsManager.fromStorage>[0];

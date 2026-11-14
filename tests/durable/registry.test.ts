@@ -32,7 +32,7 @@ const BOB = "+8613800000002";
 const RELAY: RelayConfig = {
   provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket",
   accessKeyId: "bot", secretAccessKey: "secret", prefix: "relay/", forcePathStyle: false,
-  maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30,
+  maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30,
 };
 
 const [documentWork] = await loadModuleDefinitions({ documentWorkEnabled: true }) as [AgentModuleDefinition];

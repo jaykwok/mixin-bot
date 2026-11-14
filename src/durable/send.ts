@@ -6,7 +6,7 @@
 //
 // Every send goes to the reply context of the invocation's own request (its run record), never to a later message of
 // the member. Relay link notes and file send states are written to that run record in the invocation's commits.
-import type { RelayConfig } from "../integrations/relay.ts";
+import { relayMaxBytes, type RelayConfig } from "../integrations/relay.ts";
 import type { SendOutcome } from "../integrations/open-platform/messages.ts";
 import { sendTools, SendNotConfirmed, type SendChannel, type SendContext } from "../agent/send-tools.ts";
 import { type BaseToolsOptions, type Member, type MemberCall, memberTool, type MemberTool } from "./tools.ts";
@@ -50,7 +50,7 @@ async function sendContext(options: SendToolsOptions, member: Member, call: Memb
     channel: sendChannel(options.outbound, item.record.reply),
     workspaceDir: member.places.workspaceDir,
     tempDir: member.places.tempDir,
-    fileDelivery: fileDelivery(member, call, active, options.relay?.maxBytes),
+    fileDelivery: fileDelivery(member, call, active, options.relay ? relayMaxBytes(options.relay) : undefined),
     // From the record as it is now, not as it was when the context was built: a registration earlier in this turn counts.
     deliverable: async name => {
       const record = (await memberRecords(call.api, active.phone, call.context)).requests[active.requestId];

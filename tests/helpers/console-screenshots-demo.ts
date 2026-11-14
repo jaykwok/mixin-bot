@@ -272,7 +272,7 @@ try {
     versions: versionRows({ source: "running", program, dataVersion: DATA_VERSION, local: program }),
   });
   const server = startServer({ port, guard: guardConfig(port), bundle: await buildBundle(), auth, instanceId: crypto.randomUUID(), overview,
-    routes: { ...conversationRoutes({ bot: linked, audit, views }), ...statsRoutes({ bot: linked, audit, views, root }), ...exporter.routes(), ...demoTasks(), ...demoSheets() },
+    routes: { ...conversationRoutes({ bot: linked, audit, views }), ...statsRoutes({ bot: linked, audit, views, root }), ...exporter.routes(), ...demoTasks(), ...demoSheets(), ...demoConfiguration() },
     download: (ticket, context) => exporter.download(ticket, context) });
   cleanups.push(() => server.stop(true));
 
@@ -300,8 +300,9 @@ try {
   await page.shoot(join(outDir, "console-stats.png"), 1440);
 
   // A host path is pasted, or chosen in the picker that browses the host's file system.
-  await page.click(".disclosure-head", "导入统计");
+  await page.click('[role="radio"]', "导入统计");
   await page.until("document.querySelector('.path-field button') !== null", "导入统计表单");
+  await page.shoot(join(outDir, "console-stats-import.png"));
   await page.click(".path-field button", "选取");
   await page.until("document.querySelectorAll('.entry').length > 3", "选择框");
   await page.click(".entry", "stats-20261001.sqlite");
@@ -321,12 +322,32 @@ try {
   await page.click(".task-list button", "重启");
   await page.until("document.body.innerText.includes('机器人运行中（实例身份与就绪检查通过）')", "任务详情");
   await page.shoot(join(outDir, "console-maintain.png"), "full");
+  await page.click("button", "检查更新");
+  await page.until("document.body.innerText.includes('最新正式版本')", "发布版本");
+  await page.evaluate("scrollTo(0, 0)");
+  await page.shoot(join(outDir, "console-upgrade.png"));
+  await page.click("button", "预览升级");
+  await page.until("document.querySelector('.plan-summary') !== null", "升级预览");
+  if (await page.evaluate("document.querySelector('.plan-summary').innerText.includes('main') || document.querySelector('.plan-summary').innerText.includes('abc123')")) throw new Error("升级预览泄露了分支或构建标识");
+  await page.shoot(join(outDir, "console-upgrade-confirm.png"));
+  await page.click("button", "返回");
 
   // Every operation is previewed first: the confirm sheet with its steps and the plan's time limit.
   await page.evaluate("scrollTo(0, 0)");
   await page.click("button", "重启");
   await page.until("document.querySelector('.plan-summary') !== null", "确认重启");
   await page.shoot(join(outDir, "console-confirm.png"));
+  await page.click("button", "返回");
+
+  await page.go(`http://127.0.0.1:${port}/#/relay`);
+  await page.until("document.body.innerText.includes('外链配置') && document.querySelector('button') !== null", "外链配置入口");
+  await page.shoot(join(outDir, "console-relay.png"));
+  await page.click("button", "编辑配置");
+  await page.until("document.querySelector('[aria-label=\"文件上限（MB）\"]') !== null", "外链 MB 表单");
+  await page.shoot(join(outDir, "console-relay-edit.png"), "full");
+  await page.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await page.until("document.documentElement.scrollWidth <= innerWidth", "窄屏无横向溢出");
+  await page.shoot(join(outDir, "console-relay-mobile.png"));
 } finally {
   for (const cleanup of cleanups.reverse()) { try { await cleanup(); } catch (error) { console.error(`清理失败：${String(error)}`); } }
 }
@@ -350,7 +371,26 @@ function demoSheets(): Record<string, Route> {
   return {
     "POST /api/files/list": { run: async () => listing },
     "POST /api/plans": { run: async ({ body }) => ({ id: `plan-${crypto.randomUUID()}`, operation: (body as { operation: string }).operation, expiresAt: Date.now() + 5 * 60_000,
-      summary: ["停止机器人：等待进行中的回答结束（最多 60 秒）", `启动同一版本 v${VERSION}，核对实例身份与就绪检查`, "完成后恢复事件 Stream 连接"] }) },
+      summary: (body as { operation: string }).operation === "update"
+        ? [`目标提交：${"abc123".repeat(6)}abcd；当前分支 main；允许切换 main`, "下载发布版本，校验配置与数据", "停机升级，完成后恢复原运行状态"]
+        : ["停止机器人：等待进行中的回答结束（最多 60 秒）", `启动同一版本 v${VERSION}，核对实例身份与就绪检查`, "完成后恢复事件 Stream 连接"] }) },
+  };
+}
+
+/** Configuration and release fixtures: no credentials, remote fetch, or live deployment writes. */
+function demoConfiguration(): Record<string, Route> {
+  const draft = { id: "config-demo", revision: 0, expiresAt: now + DAY, validated: false, summary: [],
+    form: { kind: "relay", enabled: true, endpoint: "https://s3.example.test", region: "auto", bucket: "bot-files", prefix: "",
+      forcePathStyle: false, maxMB: 2048, expireHours: 2, cleanupGraceMinutes: 30, hasAccessKey: true, hasSecret: true, hasToken: false } };
+  return {
+    "GET /api/configuration/state": { run: async () => ({ transaction: null, maintenancePending: false }) },
+    "POST /api/read/settings": { run: async () => ({ checkedAt: now, note: "当前配置", columns: ["项目", "值"], rows: [
+      ["外链配置", "未启用"], ["模型", "示例模型"], ["应用机器人", "已配置"],
+    ] }) },
+    "POST /api/read/relay": { run: async () => ({ checkedAt: now, note: "尚无外链文件", columns: ["文件", "状态"], rows: [] }) },
+    "POST /api/configuration/open": { run: async () => draft },
+    "POST /api/configuration/discard": { run: async () => ({}) },
+    "POST /api/lifecycle/check-update": { run: async () => ({ current: VERSION, release: "v2.2.0", target: "abc123".repeat(6) + "abcd", available: true, hasDirectory: true }) },
   };
 }
 
