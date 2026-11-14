@@ -3,7 +3,7 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rea
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { configurationForm, configurationSnapshot, assertConfigurationBase,
-  editConfiguration, type ConfigurationKind, type ConfigurationSnapshot } from "../config/configuration-form.ts";
+  editConfiguration, modelListRequest, type ConfigurationKind, type ConfigurationSnapshot } from "../config/configuration-form.ts";
 import { writeAtomic } from "./console-state.ts";
 import { configurationDigest, parseConfigurationDraft, type ConfigurationDraft } from "../config/configuration-draft.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
@@ -77,6 +77,11 @@ export class ConfigurationDrafts {
     const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);
     draft.next = editConfiguration(draft.next, patch); draft.revision++; delete draft.validated;
     this.write(draft); return this.view(id, session);
+  }
+  /** A custom provider's model list for the provider fields being edited; the draft itself is not changed. */
+  modelListInput(id: string, session: string, patch: unknown): { provider: string; config: Record<string, unknown> } {
+    const draft = this.owned(id, session); assertConfigurationBase(this.project, draft.base);
+    return modelListRequest(draft.next, patch);
   }
   validationInput(id: string, session: string, revision: number): { digest: string; snapshot: ConfigurationSnapshot } {
     const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);

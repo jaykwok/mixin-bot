@@ -126,6 +126,37 @@ function secret(input: unknown, previous: unknown, canKeep = true, optional = fa
   throw new Error("凭据不能沿用；请明确填写新值，或保留同一端点和账户");
 }
 
+/**
+ * The provider entry a models patch writes: its ID, the entry before, and the entry with the patch's protocol, endpoint and
+ * credential applied (a custom provider's models are the caller's). A credential is kept only on the same endpoint.
+ */
+function providerEntry(source: ObjectValue, patch: ObjectValue) {
+  const id = text(patch.provider); if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) || ["__proto__", "constructor", "prototype"].includes(id)) throw new Error("服务商 ID 无效");
+  if (!["builtin", "custom"].includes(String(patch.mode))) throw new Error("请选择内置或自定义服务商");
+  const providers = configurationObject(source.providers ?? {});
+  const previous = Object.hasOwn(providers, id) ? configurationObject(providers[id]) : {};
+  const api = patch.mode === "custom" ? text(patch.api) : previous.api;
+  const baseUrl = patch.mode === "custom" ? text(patch.baseUrl) : undefined;
+  if (baseUrl !== undefined && publicUrl(baseUrl) !== baseUrl) throw new Error("模型端点必须是无账号、查询参数和片段的 HTTP(S) 地址");
+  // A native provider may contain arbitrary authentication headers or command references. Do not silently transfer it.
+  if (Object.keys(previous).length && (previous.api !== api || previous.baseUrl !== baseUrl)) throw new Error("修改服务协议或端点请使用新的服务商 ID，避免把原有凭据和原生字段带到另一端点");
+  const provider: ObjectValue = { ...previous, apiKey: secret(patch.key, previous.apiKey), ...patch.mode === "custom" ? { api, baseUrl } : {} };
+  return { id, previous, provider, providers };
+}
+
+/**
+ * What a custom provider's model list needs: the provider ID and its entry as this patch would write it, without its models.
+ * The credential stays on the host (a kept key comes from the draft), and only goes to the runtime that resolves it.
+ */
+export function modelListRequest(snapshot: ConfigurationSnapshot, input: unknown): { provider: string; config: ObjectValue } {
+  if (snapshot.kind !== "models") throw new Error("只有模型配置可以获取模型列表");
+  const patch = configurationObject(input); only(patch, ["provider", "mode", "api", "baseUrl", "key"]);
+  if (patch.mode !== "custom") throw new Error("内置服务商使用模型目录，不需要获取模型列表");
+  const { id, provider: config } = providerEntry(parsed(snapshot.files.models), patch);
+  delete config.models;
+  return { provider: id, config };
+}
+
 /** Known-field patch, never a replacement of the raw native file. */
 export function editConfiguration(base: ConfigurationSnapshot, input: unknown): ConfigurationSnapshot {
   const patch = configurationObject(input), next = structuredClone(base);
@@ -152,21 +183,11 @@ export function editConfiguration(base: ConfigurationSnapshot, input: unknown): 
     next.files.relay = json({ ...value, ...validateRelayConfig(value) }); return next;
   }
   only(patch, ["provider", "mode", "api", "baseUrl", "key", "model", "thinking"]);
-  const id = text(patch.provider); if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) || ["__proto__", "constructor", "prototype"].includes(id)) throw new Error("服务商 ID 无效");
-  if (!["builtin", "custom"].includes(String(patch.mode))) throw new Error("请选择内置或自定义服务商");
-  const source = parsed(base.files.models), providers = configurationObject(source.providers ?? {});
-  const previous = Object.hasOwn(providers, id) ? configurationObject(providers[id]) : {};
-  const api = patch.mode === "custom" ? text(patch.api) : previous.api;
-  const baseUrl = patch.mode === "custom" ? text(patch.baseUrl) : undefined;
-  if (baseUrl !== undefined && publicUrl(baseUrl) !== baseUrl) throw new Error("模型端点必须是无账号、查询参数和片段的 HTTP(S) 地址");
-  // A native provider may contain arbitrary authentication headers or command references. Do not silently transfer it.
-  if (Object.keys(previous).length && (previous.api !== api || previous.baseUrl !== baseUrl)) throw new Error("修改服务协议或端点请使用新的服务商 ID，避免把原有凭据和原生字段带到另一端点");
-  const provider: ObjectValue = { ...previous, apiKey: secret(patch.key, previous.apiKey) };
+  const source = parsed(base.files.models), { id, previous, provider, providers } = providerEntry(source, patch);
   const model = typeof patch.model === "string" ? { id: text(patch.model) } : configurationObject(patch.model);
   const modelId = text(model.id);
   if (patch.mode === "custom") {
     only(model, ["id", "name", "contextWindow", "maxTokens", "input", "reasoning", "cost"]);
-    provider.api = api; provider.baseUrl = baseUrl;
     const models = Array.isArray(previous.models) ? previous.models.map(configurationObject) : [];
     const before = models.find(value => value.id === modelId) ?? {};
     const edited: ObjectValue = { ...before, ...model, id: modelId, name: model.name ?? before.name ?? modelId };

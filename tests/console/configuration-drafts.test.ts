@@ -40,6 +40,34 @@ test("模型表单不回显凭据或未知原生字段，编辑保留其他服�
   } finally { await f.cleanup(); }
 });
 
+test("模型列表请求取正在编辑的服务商字段：保留的密钥只在同一端点取自草稿，新密钥照填；不带模型，不改草稿", async () => {
+  const f = await tempFixture("console-config-model-list-");
+  try {
+    const providers = { gateway: { api: modelPatch.api, baseUrl: modelPatch.baseUrl, apiKey: "!fixture-key-command", headers: { "X-Org": "fixture" },
+      models: [{ id: "fixture", contextWindow: 32000, maxTokens: 4000 }] } };
+    write(f.root, CONFIGURATION_FILES.models, { providers });
+    write(f.root, CONFIGURATION_FILES.settings, { defaultProvider: "gateway", defaultModel: "fixture" });
+    const drafts = new ConfigurationDrafts(f.root), opened = drafts.create("models", "one");
+    const fields = { provider: "gateway", mode: "custom", api: modelPatch.api, baseUrl: modelPatch.baseUrl, key: { mode: "keep" } };
+    expect(drafts.modelListInput(opened.id, "one", fields)).toEqual({ provider: "gateway",
+      config: { api: modelPatch.api, baseUrl: modelPatch.baseUrl, apiKey: "!fixture-key-command", headers: { "X-Org": "fixture" } } });
+    expect(drafts.modelListInput(opened.id, "one", { ...fields, key: { mode: "set", value: "sk-new" } }).config.apiKey).toBe("sk-new");
+    // A new provider ID has nothing to keep: its key is the typed one.
+    const fresh = { ...fields, provider: "another", baseUrl: "https://other.test/v1" };
+    expect(() => drafts.modelListInput(opened.id, "one", fresh)).toThrow("不能沿用");
+    expect(drafts.modelListInput(opened.id, "one", { ...fresh, key: { mode: "set", value: "sk-other" } })).toEqual({ provider: "another",
+      config: { apiKey: "sk-other", api: modelPatch.api, baseUrl: "https://other.test/v1" } });
+    expect(() => drafts.modelListInput(opened.id, "one", { ...fields, baseUrl: "https://other.test/v1" })).toThrow("新的服务商 ID");
+    expect(() => drafts.modelListInput(opened.id, "one", { ...fields, mode: "builtin" })).toThrow("模型目录");
+    expect(() => drafts.modelListInput(opened.id, "one", { ...fields, model: "fixture" })).toThrow("未允许");
+    expect(() => drafts.modelListInput(opened.id, "two", fields)).toThrow("过期");
+    expect(drafts.read(opened.id).revision).toBe(0);
+    expect(drafts.read(opened.id).next).toEqual(drafts.read(opened.id).base);
+    const app = drafts.create("app", "one");
+    expect(() => drafts.modelListInput(app.id, "one", fields)).toThrow("只有模型配置");
+  } finally { await f.cleanup(); }
+});
+
 test("应用表单可轮换同一应用密钥但不可跨应用沿用数据，未知参数被拒绝", async () => {
   const f = await tempFixture("console-config-app-");
   try {

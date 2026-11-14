@@ -172,3 +172,41 @@ test("拒绝原因：项目自己的中文原因脱敏后给页面，库和系�
     expect((await reason(routes["POST /api/configuration/edit"]!.run(context({ id: open.id, revision: 0, patch: relay })))).message).toBe("草稿已变化，请重新读取；正式配置未修改");
   } finally { await f.cleanup(); }
 });
+
+test("模型列表路由：会话内草稿的服务商字段经 stdin 交给运行环境；列表只留编号、名称和上限；失败原因不说“正式配置未修改”", async () => {
+  const f = await tempFixture("configuration-model-list-route-");
+  try {
+    mkdirSync(join(f.root, "data/config"), { recursive: true });
+    writeFileSync(join(f.root, "data/config/models.json"), JSON.stringify({ providers: { gateway: { api: "openai-completions", baseUrl: "https://example.test/v1", apiKey: "sk-saved-private" } } }));
+    const drafts = new ConfigurationDrafts(f.root), inputs: unknown[] = [];
+    const routes = configurationRoutes(drafts, async (action, input) => {
+      expect(action).toBe("models"); inputs.push(input);
+      return { models: [{ id: "listed" }] };
+    });
+    const context = (body: unknown, session = "one") => ({ body, session: { label: session }, signal: new AbortController().signal } as RouteContext);
+    const open = await routes["POST /api/configuration/open"]!.run(context({ kind: "models" })) as { id: string };
+    const patch = { provider: "gateway", mode: "custom", api: "openai-completions", baseUrl: "https://example.test/v1", key: { mode: "keep" } };
+    expect(await routes["POST /api/configuration/models"]!.run(context({ id: open.id, patch }))).toEqual({ models: [{ id: "listed" }] });
+    expect(inputs).toEqual([{ version: 1, provider: "gateway", config: { api: "openai-completions", baseUrl: "https://example.test/v1", apiKey: "sk-saved-private" } }]);
+    await expect(routes["POST /api/configuration/models"]!.run(context({ id: open.id, patch }, "two"))).rejects.toMatchObject({ status: 409 });
+    await expect(routes["POST /api/configuration/models"]!.run(context({ id: open.id, patch, extra: 1 }))).rejects.toMatchObject({ status: 409 });
+    expect(inputs).toHaveLength(1);
+
+    // The runtime helper's output, as the page receives it.
+    const container = { code: 0, stdout: JSON.stringify([{ Image: "sha256:" + "a".repeat(64), Config: { User: "1001:1001" }, Mounts: [dataMount(f.root)] }]), stderr: "", timedOut: false };
+    const answer = (stdout: string, stderr = "", code = 0) => configurationQuery(f.root, async (_command, args, options) => {
+      if (args[0] === "container") return container;
+      expect(args).toContain("models"); expect(options?.input).toContain("sk-input-private"); expect(JSON.stringify(args)).not.toContain("sk-input-private");
+      return { code, stdout, stderr, timedOut: false };
+    }, linux)("models", { version: 1, provider: "gateway", config: { apiKey: "sk-input-private" } });
+    const models = [{ id: "b", name: "B 模型", contextWindow: 64000, maxTokens: 8000, input: ["text", "image"], cost: { input: 9 }, headers: { leaked: "x" } },
+      { id: "b" }, { id: "" }, { id: "x\u0007" }, { id: "c", contextWindow: -1, maxTokens: 1.5, name: 7 }, "not-an-object"];
+    expect(await answer(JSON.stringify({ protocol: "mixin-configuration-models", version: 1, models }))).toEqual({ models: [
+      { id: "b", name: "B 模型", contextWindow: 64000, maxTokens: 8000, input: ["text", "image"] }, { id: "c" }] });
+    await expect(answer(JSON.stringify({ protocol: "mixin-configuration", version: 1, models: [] }))).rejects.toThrow("不完整");
+    const refused = await answer("", "模型端点拒绝了请求（HTTP 401）：请检查 API 密钥及其权限", 1).then(() => null, (error: Error) => error);
+    expect(refused?.message).toBe("模型端点拒绝了请求（HTTP 401）：请检查 API 密钥及其权限");
+    const generic = await answer("", "TypeError: fetch failed sk-input-private", 1).then(() => null, (error: Error) => error);
+    expect(generic?.message).toContain("获取模型列表未完成"); expect(generic?.message).not.toContain("sk-input-private");
+  } finally { await f.cleanup(); }
+});

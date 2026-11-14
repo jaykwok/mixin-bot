@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { checkConfiguration, configurationCatalog } from "../../ops/config/configuration-check.ts";
+import { checkConfiguration, configurationCatalog, listProviderModels } from "../../ops/config/configuration-check.ts";
+import { LISTABLE_APIS } from "../../ops/config/model-list.ts";
 import type { ConfigurationSnapshot } from "../../ops/config/configuration-form.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -64,9 +65,47 @@ test("内部校验 CLI 只接受命名动作和严格协议，中文通过 stdin
   } finally { await f.cleanup(); }
 });
 
+test("模型列表的密钥由 Pi 按服务启动的方式解析（字面值、!命令、请求头）；凭据只写进随后删除的私有目录", async () => {
+  const f = await tempFixture("configuration-model-list-"), seen: Record<string, string>[] = [];
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch(request) {
+    seen.push(Object.fromEntries(request.headers));
+    return new URL(request.url).pathname === "/v1/models" ? Response.json({ data: [{ id: "listed-b" }, { id: "listed-a", context_length: 64000 }] }) : new Response("", { status: 404 });
+  } });
+  try {
+    const temporaryRoot = join(f.root, "private-tmp"), baseUrl = `http://127.0.0.1:${server.port}/v1`;
+    const listed = await listProviderModels({ provider: "gateway", config: { api: "openai-completions", baseUrl, apiKey: "sk-fixture-literal", headers: { "X-Org": "fixture-org" } } }, { temporaryRoot });
+    expect(listed).toEqual({ protocol: "mixin-configuration-models", version: 1, models: [{ id: "listed-a", contextWindow: 64000 }, { id: "listed-b" }] });
+    expect(seen.at(-1)).toMatchObject({ authorization: "Bearer sk-fixture-literal", "x-org": "fixture-org" });
+    await listProviderModels({ provider: "gateway", config: { api: "openai-responses", baseUrl, apiKey: "!echo fixture-command-key" } }, { temporaryRoot });
+    expect(seen.at(-1)!.authorization).toBe("Bearer fixture-command-key");
+    expect(await readdir(temporaryRoot)).toEqual([]);
+
+    await expect(listProviderModels({ provider: "gateway", config: { api: "bedrock-converse-stream", baseUrl, apiKey: "k" } }, { temporaryRoot })).rejects.toThrow("没有模型列表接口");
+    await expect(listProviderModels({ provider: "gateway", config: { api: "openai-completions", apiKey: "k" } }, { temporaryRoot })).rejects.toThrow("API 端点");
+    await expect(listProviderModels({ provider: "__proto__", config: { api: "openai-completions", baseUrl } }, { temporaryRoot })).rejects.toThrow("请求无效");
+    const broken = await listProviderModels({ provider: "gateway", config: { api: "openai-completions", baseUrl, apiKey: "sk-fixture-private", models: "not-a-list" } }, { temporaryRoot })
+      .then(() => null, (error: Error) => error);
+    expect(broken?.message).toContain("未通过 Pi 校验"); expect(broken?.message).not.toContain("sk-fixture-private");
+    expect(await readdir(temporaryRoot)).toEqual([]);
+
+    // The internal CLI: the request on stdin, the list on stdout; a refusal names the status, not the key.
+    const run = async (input: unknown) => {
+      const child = Bun.spawn([process.execPath, source, "models"], { cwd: f.root, stdin: new Blob([JSON.stringify(input)]), stdout: "pipe", stderr: "pipe" });
+      const [code, out, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]); return { code, out, error };
+    };
+    const good = await run({ version: 1, provider: "gateway", config: { api: "openai-completions", baseUrl, apiKey: "sk-fixture-literal" } });
+    expect(good.code).toBe(0); expect(JSON.parse(good.out).models.map((value: { id: string }) => value.id)).toEqual(["listed-a", "listed-b"]);
+    const missing = await run({ version: 1, provider: "gateway", config: { api: "anthropic-messages", baseUrl, apiKey: "sk-fixture-private" } });
+    expect(missing.code).toBe(1); expect(missing.out).toBe(""); expect(missing.error).toContain("HTTP 404"); expect(missing.error).not.toContain("sk-fixture-private");
+    expect((await run({ version: 1, provider: "gateway", config: {}, extra: true })).code).toBe(1);
+  } finally { server.stop(true); await f.cleanup(); }
+});
+
 test("内置服务商、协议和模型目录来自 Pi，不读取部署配置", async () => {
   const result = await configurationCatalog();
   expect(result.providers.some(value => value.id === "openai")).toBe(true);
+  expect(result.listable).toEqual([...LISTABLE_APIS]);
+  for (const api of LISTABLE_APIS) expect(result.apis).toContain(api);
   expect(result.apis).toContain("openai-completions"); expect(result.models.length).toBeGreaterThan(0);
   expect(result.models.some(value => value.provider === "openai")).toBe(true);
 });

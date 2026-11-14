@@ -477,6 +477,17 @@ input[type="file"]::file-selector-button:hover { background: var(--fill-hover); 
 .cost-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 10px 12px; flex: 1 1 100%; max-width: 600px; }
 .cost-item { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .cost-item input { width: 100%; }
+/* A model ID with its candidates under it: the list floats over the rows that follow. */
+.model-picker { position: relative; display: flex; flex: 0 1 360px; min-width: 0; }
+.model-picker > input { flex: 1; min-width: 0; }
+.model-picker-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20; max-height: 300px; overflow-y: auto; margin: 0; padding: 6px; list-style: none;
+  background: var(--elevated); border-radius: 12px; box-shadow: var(--shadow-pop); animation: pop 0.18s var(--ease-sheet) backwards; }
+.model-picker-item { display: flex; flex-direction: column; gap: 1px; padding: 7px 10px; border-radius: 8px; cursor: pointer; }
+.model-picker-item[aria-selected="true"] { background: var(--accent); color: #fff; }
+.model-picker-id { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 12.5px; }
+.model-picker-detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.model-picker-item[aria-selected="true"] .model-picker-detail { color: rgba(255, 255, 255, 0.85); }
+.model-picker-empty { padding: 10px; font-size: 12.5px; color: var(--muted); }
 /* A draft's fields: one fieldset (disabled while the draft is saved and checked), its rows separated as the group's are. */
 .draft-fields { min-width: 0; margin: 0; padding: 0; border: 0; transition: opacity 0.2s; }
 .draft-fields:disabled { opacity: 0.6; }

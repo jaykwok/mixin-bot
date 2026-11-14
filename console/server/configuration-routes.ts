@@ -2,6 +2,7 @@ import { capture } from "./query.ts";
 import type { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
 import { configurationKind } from "../../ops/config/configuration-form.ts";
 import type { ConfigurationCheckResult } from "../../ops/config/configuration-check.ts";
+import type { ListedModel } from "../../ops/config/model-list.ts";
 import { fields, textParam } from "../../ops/core/operations.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
@@ -9,33 +10,53 @@ import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.t
 import { localHost, runtimeQuery } from "./runtime-query.ts";
 import { redactSecrets } from "../../src/lib/redact.ts";
 
-export type ConfigurationQuery = (action: "check" | "catalog", input: unknown, signal?: AbortSignal) => Promise<unknown>;
+export type ConfigurationQuery = (action: "check" | "catalog" | "models", input: unknown, signal?: AbortSignal) => Promise<unknown>;
+const PROTOCOLS = { check: "mixin-configuration", catalog: "mixin-configuration-catalog", models: "mixin-configuration-models" } as const;
 
 const UNCHANGED = "正式配置未修改";
 /**
  * The project's own refusals are short Chinese sentences that name fields, never their values (the models check already
  * replaces Pi's text). Library, runtime and system errors are English and may quote input: those stay generic.
  */
-function configurationReason(text: string): string | undefined {
+function configurationReason(text: string, unchanged = true): string | undefined {
   const line = text.trim().split(/\r?\n/).at(-1)?.trim() ?? "";
   if (!line || line.length > 400 || !/[㐀-鿿]/.test(line)) return undefined;
   const clean = redactSecrets(line).replace(/\b1[3-9]\d{9}\b/g, value => `${value.slice(0, 3)}****${value.slice(-4)}`);
-  return /未修改|尚未写入|没有覆盖/.test(clean) ? clean : `${clean}；${UNCHANGED}`;
+  return !unchanged || /未修改|尚未写入|没有覆盖/.test(clean) ? clean : `${clean}；${UNCHANGED}`;
 }
 const ownReason = (error: unknown) => error instanceof Error && error.constructor === Error && !("code" in error) ? configurationReason(error.message) : undefined;
 
 /** Same installed runtime and service identity on Docker hosts, without stopping the service or mounting the console. */
 export function configurationQuery(project: string, query = capture, host = localHost): ConfigurationQuery {
   return async (action, input, signal) => {
-    const result = await runtimeQuery(project, "configuration-check", action, action === "check" ? input : undefined, signal, query, host);
-    if (result.timedOut) throw new ApiProblem(504, "timeout", `配置校验超时，请检查网络和镜像依赖；${UNCHANGED}`);
-    if (result.code !== 0) throw new ApiProblem(409, "input", configurationReason(result.stderr) ?? `配置校验未完成，请检查字段、凭据引用、镜像依赖和网络；${UNCHANGED}`);
+    const result = await runtimeQuery(project, "configuration-check", action, action === "catalog" ? undefined : input, signal, query, host);
+    // A model list changes nothing: its refusals are not about the saved configuration.
+    const listing = action === "models";
+    if (result.timedOut) throw new ApiProblem(504, "timeout", listing ? "获取模型列表超时，请检查 API 地址和网络" : `配置校验超时，请检查网络和镜像依赖；${UNCHANGED}`);
+    if (result.code !== 0) throw new ApiProblem(409, "input", configurationReason(result.stderr, !listing)
+      ?? (listing ? "获取模型列表未完成，请检查 API 地址、协议、密钥和网络" : `配置校验未完成，请检查字段、凭据引用、镜像依赖和网络；${UNCHANGED}`));
     try {
       const value = JSON.parse(result.stdout);
-      if (value.version !== 1 || value.protocol !== (action === "check" ? "mixin-configuration" : "mixin-configuration-catalog") || (action === "check" && value.success !== true)) throw new Error();
-      return value;
+      if (value.version !== 1 || value.protocol !== PROTOCOLS[action] || (action === "check" && value.success !== true)) throw new Error();
+      return listing ? { models: listedModels(value.models) } : value;
     } catch { throw new Error("配置校验返回了不完整或不支持的结果"); }
   };
+}
+
+/** The list as the page gets it: ids, names and limits that look like what they are, nothing else the helper may have added. */
+export function listedModels(value: unknown): ListedModel[] {
+  if (!Array.isArray(value) || value.length > 5000) throw new Error("模型列表无效");
+  const text = (item: unknown) => typeof item === "string" && item.trim() && item.length <= 256 && !/[\x00-\x1f\x7f]/.test(item) ? item : undefined;
+  const count = (item: unknown) => typeof item === "number" && Number.isSafeInteger(item) && item > 0 ? item : undefined;
+  const seen = new Set<string>();
+  return value.flatMap(raw => {
+    const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {}, id = text(item.id);
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    const name = text(item.name), contextWindow = count(item.contextWindow), maxTokens = count(item.maxTokens);
+    const input: ListedModel["input"] = Array.isArray(item.input) && item.input.includes("image") ? ["text", "image"] : undefined;
+    return [{ id, ...name ? { name } : {}, ...contextWindow ? { contextWindow } : {}, ...maxTokens ? { maxTokens } : {}, ...input ? { input } : {} }];
+  });
 }
 
 export function configurationRoutes(drafts: ConfigurationDrafts, query = configurationQuery(drafts.project)): Record<string, Route> {
@@ -74,5 +95,10 @@ export function configurationRoutes(drafts: ConfigurationDrafts, query = configu
       const params = body as Record<string, unknown>; fields(params, ["id"]); drafts.discard(textParam(params.id), session.label); return { discarded: true };
     }),
     "GET /api/configuration/catalog": wrap(async ({ signal }) => query("catalog", undefined, signal)),
+    // The provider fields being edited, a newly typed key included; a kept key is read from the draft on the host.
+    "POST /api/configuration/models": wrap(async ({ body, session, signal }) => {
+      const params = body as Record<string, unknown>; fields(params, ["id", "patch"]);
+      return query("models", { version: 1, ...drafts.modelListInput(textParam(params.id), session.label, params.patch) }, signal);
+    }),
   };
 }

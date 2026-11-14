@@ -7,6 +7,7 @@ import type { ReadPage } from "./contract.ts";
 import { clock } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
 import { MaterialExclusionsForm } from "./materials.tsx";
+import { ModelPicker } from "./model-picker.tsx";
 import type { Tint } from "./nav.ts";
 import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
 import { Banner, Field, PageHeader, Row, Section, Segmented, Skeleton, Spinner, Toggle } from "./ui.tsx";
@@ -22,8 +23,28 @@ interface Form { kind: Kind; provider?: string; model?: string; thinking?: strin
   hasSecret?: boolean; hasAccessKey?: boolean; hasToken?: boolean; enabled?: boolean; endpoint?: string; region?: string; bucket?: string; prefix?: string;
   forcePathStyle?: boolean; maxBytes?: number; expireHours?: number; cleanupGraceMinutes?: number }
 interface Draft { id: string; revision: number; expiresAt: number; validated: boolean; summary: string[]; form: Form }
-interface Catalog { providers: { id: string; name: string }[]; apis: string[]; models: (Model & { provider: string })[] }
+/** `listable`: the protocols whose endpoints list their models. */
+interface Catalog { providers: { id: string; name: string }[]; apis: string[]; listable?: string[]; models: (Model & { provider: string })[] }
 type Patch = Record<string, unknown>;
+/** A custom endpoint's models, for the provider, protocol and endpoint they were fetched with. */
+interface Listed { key: string; models: Model[] }
+/** Pi's protocol IDs under the names providers document them by. */
+const API_LABELS: Record<string, string> = { "openai-completions": "OpenAI Chat Completions", "openai-responses": "OpenAI Responses",
+  "anthropic-messages": "Anthropic Messages", "google-generative-ai": "Google Gemini", "mistral-conversations": "Mistral",
+  "azure-openai-responses": "Azure OpenAI Responses", "openai-codex-responses": "OpenAI Codex Responses", "google-vertex": "Google Vertex AI",
+  "bedrock-converse-stream": "Amazon Bedrock Converse", "pi-messages": "Pi Messages" };
+/**
+ * Where each protocol's base URL ends: the clients add their own paths after it. Described, not shown as an address: the
+ * page names no address outside this console (tests/console/bundle.test.ts).
+ */
+const ENDPOINTS: Record<string, string> = {
+  "openai-completions": "通常到 /v1 为止，请求发到 <端点>/chat/completions；兼容服务按其文档填写。",
+  "openai-responses": "通常到 /v1 为止，请求发到 <端点>/responses。",
+  "anthropic-messages": "不含 /v1：请求发到 <端点>/v1/messages。",
+  "google-generative-ai": "含 API 版本（例如 /v1beta）。",
+  "mistral-conversations": "不含 /v1：请求发到 <端点>/v1/chat/completions。",
+};
+const listKey = (patch: Patch) => JSON.stringify([patch.provider, patch.api, patch.baseUrl]);
 const titles = { models: "模型配置", app: "应用机器人凭据", relay: "外链配置" };
 const SECTIONS: Record<Kind, { title: string; icon: IconName; tint: Tint; detail: string }> = {
   models: { title: "模型", icon: "sparkles", tint: "purple", detail: "机器人使用的服务商、模型和推理级别。" },
@@ -73,7 +94,8 @@ const withoutSecrets = (patch: Patch): Patch => Object.fromEntries(Object.entrie
 /** One configuration: its saved summary (`summary`, from the settings read) and its draft editor. */
 export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summary?: string[][]; deploy?: DeployDraft }) {
   const [draft, setDraft] = useState<Draft | null>(null), [patch, setPatch] = useState<Patch>({}), [catalog, setCatalog] = useState<Catalog>(),
-    [busy, setBusy] = useState(false), [error, setError] = useState(""), [valid, setValid] = useState(false), [network, setNetwork] = useState(!!deploy), [refresh, setRefresh] = useState(false);
+    [busy, setBusy] = useState(false), [error, setError] = useState(""), [valid, setValid] = useState(false), [network, setNetwork] = useState(!!deploy), [refresh, setRefresh] = useState(false),
+    [listed, setListed] = useState<Listed | null>(null), [listing, setListing] = useState(false), [listError, setListError] = useState("");
   const current = useRef<string | null>(null), generation = useRef(0), kept = useRef<Patch | null>(null), round = useRef(deploy?.round);
   const discard = (id: string) => api("/api/configuration/discard", { method: "POST", body: { id }, quiet: true }).catch(() => {});
   useEffect(() => () => { generation.current++; if (current.current) void discard(current.current); current.current = null; }, []);
@@ -84,7 +106,7 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
     if (!deploy || deploy.round === round.current) return;
     round.current = deploy.round; generation.current++;
     if (current.current) kept.current = withoutSecrets(patch);
-    current.current = null; setDraft(null); setPatch({}); setBusy(false); setValid(false);
+    current.current = null; setDraft(null); setPatch({}); setBusy(false); setValid(false); setListed(null); setListing(false); setListError("");
   }, [deploy?.round]);
   const change = (key: string, value: unknown) => { setPatch(previous => ({ ...previous, [key]: value })); setValid(false); };
   const open = async () => {
@@ -94,6 +116,7 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
       const next = await api<Draft>("/api/configuration/open", { method: "POST", body: { kind }, intent: true });
       if (request !== generation.current) { void discard(next.id); return; }
       current.current = next.id; setDraft(next); setPatch({ ...initial(next.form), ...kept.current }); kept.current = null; setNetwork(!!deploy); setRefresh(false);
+      setListed(null); setListing(false); setListError("");
       if (kind === "models") {
         const data = await api<Catalog>("/api/configuration/catalog", { intent: true, timeoutMs: 90_000 });
         if (request === generation.current) setCatalog(data);
@@ -112,7 +135,18 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
     } catch (error) { if (request === generation.current) setError(errorText(error)); }
     finally { if (request === generation.current) setBusy(false); }
   };
-  const close = () => { generation.current++; if (current.current) void discard(current.current); current.current = null; setDraft(null); setPatch({}); setBusy(false); setError(""); setValid(false); };
+  /** The custom endpoint's models, with the key as typed or the one the draft keeps; the draft itself is not changed. */
+  const fetchModels = async () => {
+    if (!draft || busy || listing) return; const request = generation.current, key = listKey(patch); setListing(true); setListError("");
+    try {
+      const result = await api<{ models: Model[] }>("/api/configuration/models", { method: "POST", intent: true, timeoutMs: 120_000,
+        body: { id: draft.id, patch: { provider: patch.provider, mode: "custom", api: patch.api, baseUrl: patch.baseUrl, key: patch.key } } });
+      if (request === generation.current) setListed({ key, models: result.models });
+    } catch (error) { if (request === generation.current) { setListed(null); setListError(errorText(error)); } }
+    finally { if (request === generation.current) setListing(false); }
+  };
+  const close = () => { generation.current++; if (current.current) void discard(current.current); current.current = null; setDraft(null); setPatch({}); setBusy(false); setError(""); setValid(false);
+    setListed(null); setListing(false); setListError(""); };
   const text = (key: string, label: string, number = false) => <Field label={label}>{number
     ? <input type="number" value={String(patch[key] ?? "")} onInput={event => change(key, Number(event.currentTarget.value))} />
     : <input type="text" value={String(patch[key] ?? "")} onInput={event => change(key, event.currentTarget.value)} />}</Field>;
@@ -125,6 +159,24 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
   const changeModel = (key: keyof Model, value: unknown) => change("model", { ...model, [key]: value });
   const models = [...new Map([...(catalog?.models ?? []), ...(draft?.form.catalogModels ?? [])].filter(value => value.provider === patch.provider).map(value => [value.id, value])).values()];
   const thinking = models.find(value => value.id === model.id)?.thinking ?? ["off", "minimal", "low", "medium", "high", "xhigh"];
+  // A custom provider's candidates: the models it already has, then what its endpoint listed.
+  const saved = draft?.form.providers?.find(value => value.id === patch.provider && value.custom)?.models ?? [];
+  const fetched = listed?.key === listKey(patch) ? listed.models : null;
+  const candidates = [...new Map([...saved, ...fetched ?? []].map(value => [value.id, value])).values()];
+  const apis = [...new Set([...(catalog?.listable ?? []), ...(catalog?.apis ?? ["openai-completions"])])];
+  const listable = (catalog?.listable ?? []).includes(String(patch.api)), endpoint = ENDPOINTS[String(patch.api)];
+  const keyReady = (patch.key as Secret | undefined)?.mode === "keep" || !!(patch.key as Secret | undefined)?.value?.trim();
+  /** A picked custom model takes its saved definition, else what the list and the bundled catalogue know of it. */
+  const pickCustom = (picked: Model) => {
+    const own = saved.find(value => value.id === picked.id);
+    if (own) { change("model", { ...own }); return; }
+    const known = catalog?.models.find(value => value.id === picked.id) ?? catalog?.models.find(value => value.id === picked.id.split("/").pop());
+    change("model", { ...model, id: picked.id, name: picked.name ?? known?.name ?? picked.id, contextWindow: picked.contextWindow ?? known?.contextWindow ?? model.contextWindow,
+      maxTokens: picked.maxTokens ?? known?.maxTokens ?? model.maxTokens, input: picked.input ?? known?.input ?? model.input, reasoning: known?.reasoning ?? model.reasoning });
+  };
+  const listNote = !listable ? "这个协议没有模型列表接口，请直接填写模型 ID。" : listing ? "正在向端点获取模型列表…"
+    : fetched ? fetched.length ? `端点提供 ${fetched.length} 个模型：在“模型 ID”里输入关键词筛选，或点击选择。` : "端点没有返回模型，请直接填写模型 ID。"
+      : "填写协议、API 端点和密钥后获取端点提供的模型（只请求模型列表，不发起推理）；也可以直接填写模型 ID。";
   const section = SECTIONS[kind];
   return <Section title={deploy?.title ?? section.title}
     aside={<button type="button" class={`btn small-btn${draft ? " ghost" : ""}`} disabled={busy && !draft || !draft && !!deploy?.blocked} onClick={() => void open()}>
@@ -151,10 +203,19 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
             <Segmented label="模型来源" size="small" value={patch.mode === "custom" ? "custom" : "builtin"}
               onChange={value => { change("mode", value); change("model", value === "custom" ? { id: model.id, contextWindow: 128000, maxTokens: 8192, input: ["text"], reasoning: false } : model.id); }}
               options={[{ value: "builtin", label: "内置服务商目录" }, { value: "custom", label: "自定义模型" }]} /></Field>
-          {custom && <><div class="group-note">更改已有服务商的端点或协议，请使用新的服务商 ID。</div>{text("baseUrl", "API 端点")}
-            <Field label="协议"><select value={String(patch.api)} onChange={event => change("api", event.currentTarget.value)}>{(catalog?.apis ?? ["openai-completions"]).map(api => <option key={api} value={api}>{api}</option>)}</select></Field></>}
+          {custom && <><div class="group-note">更改已有服务商的端点或协议，请使用新的服务商 ID。</div>
+            <Field label="协议"><select value={String(patch.api)} onChange={event => change("api", event.currentTarget.value)}>{apis.map(api =>
+              <option key={api} value={api}>{API_LABELS[api] ? `${API_LABELS[api]}（${api}）` : api}</option>)}</select></Field>
+            <Field label="API 端点" note={endpoint}><input type="text" inputMode="url" spellcheck={false} placeholder="服务商的 API 地址，以 https 或 http 开头" value={String(patch.baseUrl ?? "")}
+              onInput={event => change("baseUrl", event.currentTarget.value)} /></Field></>}
           {secret("key", "模型 API 密钥")}
-          {custom ? <><Field label="模型 ID"><input value={model.id} onInput={event => changeModel("id", event.currentTarget.value)} /></Field>
+          {custom ? <><Row title="模型列表" detail={listNote}>
+              {listError && <div class="form-error" role="alert">{listError}</div>}
+              <button type="button" class="btn small-btn" disabled={busy || listing || !listable || !String(patch.baseUrl ?? "").trim() || !keyReady} onClick={() => void fetchModels()}>
+                {listing ? <><Icon name="loader" size={13} class="spin" />正在获取…</> : fetched ? "重新获取" : "获取模型列表"}</button></Row>
+            <Field group label="模型 ID" note={candidates.length ? "可以输入关键词筛选，也可以填写列表里没有的模型 ID。" : undefined}>
+              <ModelPicker label="模型 ID" value={model.id} models={candidates} placeholder={candidates.length ? "输入关键词筛选或填写模型 ID" : "填写模型 ID"}
+                onInput={value => changeModel("id", value)} onPick={pickCustom} /></Field>
             <Field label="显示名称"><input value={model.name ?? ""} onInput={event => changeModel("name", event.currentTarget.value)} /></Field>
             <Field label="上下文上限"><input type="number" min="1" value={model.contextWindow} onInput={event => changeModel("contextWindow", Number(event.currentTarget.value))} /></Field>
             <Field label="输出上限"><input type="number" min="1" value={model.maxTokens} onInput={event => changeModel("maxTokens", Number(event.currentTarget.value))} /></Field>
@@ -163,7 +224,9 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
             <Field label="每百万 token 单价"><span class="cost-grid">{[["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]].map(([key, label]) =>
               <span class="cost-item" key={key}><span>{label}</span><input type="number" min="0" step="any" aria-label={`${label}单价`} value={model.cost?.[key!] ?? 0}
                 onInput={event => changeModel("cost", { ...model.cost, [key!]: Number(event.currentTarget.value) })} /></span>)}</span></Field></>
-            : <Field label="模型"><select value={model.id} onChange={event => change("model", event.currentTarget.value)}><option value="">请选择模型</option>{model.id && !models.some(value => value.id === model.id) && <option value={model.id}>{model.id}</option>}{models.map(value => <option key={value.id} value={value.id}>{value.name ?? value.id}（{value.contextWindow} / {value.maxTokens}）</option>)}</select></Field>}
+            : <Field group label="模型" note={models.length ? `目录中有 ${models.length} 个模型，可以输入关键词筛选。` : "目录中没有这个服务商的模型；可以填写模型 ID。"}>
+              <ModelPicker label="模型" value={model.id} models={models} placeholder="输入关键词筛选或选择模型"
+                onInput={value => change("model", value)} onPick={picked => change("model", picked.id)} /></Field>}
           <Field label="推理级别"><select value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>{[...new Set([String(patch.thinking), ...thinking])].map(value => <option key={value} value={value}>{value}</option>)}</select></Field></>}
         {kind !== "relay" && !deploy && <div class="row"><Toggle label={kind === "app" ? "联网验证应用凭据" : "允许刷新模型目录"} detail={kind === "app" ? "仅获取 token。" : "刷新所选服务商的模型目录，不发起推理。"}
           checked={network} onChange={value => { setNetwork(value); if (!value) setRefresh(false); setValid(false); }} /></div>}
