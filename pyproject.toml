@@ -1,6 +1,6 @@
 [project]
 name = "mixin-bot-documents"
-version = "2.1.0"
+version = "2.1.1"
 description = "Fixed document tooling for the group collaboration agent"
 requires-python = ">=3.14,<3.15"
 dependencies = [
