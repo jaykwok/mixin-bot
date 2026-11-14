@@ -74,6 +74,7 @@ function Invoke-ConsoleProcess([string]$FilePath, [string[]]$Arguments, [switch]
     }
     if ($Arguments[0] -cne '--no-env-file' -or $Arguments[1] -ne (Join-Path $env:FIXTURE_RELEASE 'ops\\core\\cli.ts')) { throw 'core not run from the release' }
     Add-FixtureEvent ('core ' + (@($Arguments | Select-Object -Skip 2) -join ' ') + ' ' + $own)
+    if ($Arguments -contains 'replace-service') { return [int]($env:FIXTURE_MODE -ceq 'replace-failed') }
     if ($Arguments -contains '--preflight') { return [int]($env:FIXTURE_MODE -ceq 'preflight') }
     # The stage as the core reads it; the entry removes it afterwards.
     Copy-Item -LiteralPath $Arguments[[Array]::IndexOf($Arguments, '--stage') + 1] -Destination $env:FIXTURE_STAGE -Recurse
@@ -87,16 +88,18 @@ const free = () => new Promise<number>((done, fail) => {
   server.listen(0, "127.0.0.1", () => { const { port } = server.address() as { port: number }; server.close(() => done(port)); });
 });
 type Mode = "first" | "install" | "redeploy" | "reconfigure" | "console" | "pending" | "preflight" | "preview" | "workspace-missing" | "port-in-use" | "wizard-cancel"
-  | "core-failed" | "not-admin";
+  | "core-failed" | "not-admin" | "replace" | "replace-failed";
 const MODES: Mode[] = ["first", "install", "redeploy", "reconfigure", "console", "pending", "preflight", "preview", "workspace-missing", "port-in-use", "wizard-cancel", "core-failed",
-  "not-admin"];
+  "not-admin", "replace", "replace-failed"];
 
 for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows deploy entry: ${mode}`, async () => {
   const f = await tempFixture("deploy-entry-");
   const listener = mode === "port-in-use" ? createServer() : null;
   try {
     const release = join(f.root, "release"), project = join(f.root, "中文 project"), events = join(f.root, "events.txt"), staged = join(f.root, "staged");
-    const shared = join(f.root, "shared"), first = ["first", "install", "wizard-cancel", "port-in-use"].includes(mode);
+    const shared = join(f.root, "shared"), first = ["first", "install", "wizard-cancel", "port-in-use", "replace", "replace-failed"].includes(mode);
+    // A console first deployment confirmed with the bot service already on the host to remove first.
+    const replacing = mode === "replace" || mode === "replace-failed", installing = mode === "install" || replacing;
     await mkdir(join(release, "scripts"), { recursive: true }); await mkdir(join(release, "scripts/lib"));
     await writeFile(join(release, "scripts/lib/deploy.ps1"), await readFile(join(source, "scripts/lib/deploy.ps1")));
     await writeFile(join(release, "scripts/lib/common.ps1"), library);
@@ -111,7 +114,7 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
       await writeFile(join(project, "data/state/bot-port"), "1011");
     }
     // The console installed the dependencies before its first deployment.
-    if (mode === "install") await mkdir(join(project, "node_modules"));
+    if (installing) await mkdir(join(project, "node_modules"));
     if (mode === "pending") await writeFile(join(project, "data/state/deploy-transaction"), "deploy-fixture\n");
     // An abandoned stage from a killed deployment two days ago goes; a recent one may belong to another deployment and stays.
     await mkdir(join(project, "tmp/deploy-stage-0badf00d"), { recursive: true }); await mkdir(join(project, "tmp/deploy-stage-12345678"));
@@ -121,7 +124,8 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     const child = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(release, "scripts/lib/deploy.ps1")], {
       cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
       env: { ...process.env, MIXIN_OPS_TASK_ID: undefined, MIXIN_OPS_RESULT_FILE: undefined, MIXIN_OPS_UI: undefined,
-        MIXIN_OPS_CONSOLE: mode === "console" || mode === "install" ? "1" : undefined, MIXIN_OPS_LIFECYCLE: mode === "install" ? "install" : undefined,
+        MIXIN_OPS_CONSOLE: mode === "console" || installing ? "1" : undefined, MIXIN_OPS_LIFECYCLE: installing ? "install" : undefined,
+        MIXIN_OPS_REPLACE_SERVICE: replacing ? "d".repeat(64) : undefined,
         MIXIN_OPS_PROJECT: project, BOT_HOST: undefined,
         BOT_PORT: first ? String(port) : undefined, WORKSPACE_ROOT: mode === "reconfigure" ? shared : mode === "workspace-missing" ? join(f.root, "missing") : undefined,
         FIXTURE_MODE: mode, FIXTURE_EVENTS: events, FIXTURE_RELEASE: release, FIXTURE_PROJECT: project, FIXTURE_STAGE: staged, FIXTURE_WORKSPACE: "",
@@ -135,7 +139,10 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     const runtime = `runtime --prepare-values ${stage}\\runtime-values.json --deployment native child=BOT_HOST=127.0.0.1,BOT_PORT=${port},WORKSPACE_ROOT=${workspace} ${own}`;
     const core = `core deployment deploy --project <project> --stage ${stage} --command deploy --git-path fixture-git ${own}`;
     const preview = `data preview --project <project> --plan ${stage}\\data-plan.json --workspace ${workspace}`;
-    const before = [mode === "install" ? "lifecycle install" : "lifecycle deploy", preflight];
+    const replace = `core deployment replace-service --project <project> ${own}`;
+    const before = [installing ? "lifecycle install" : "lifecycle deploy", ...replacing ? [replace] : [], preflight];
+    const installed = [`protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
+      `stage --project <project> --stage ${stage}`, `scope? app=${stage}\\configuration-app.json`, runtime, core];
     const expected: Record<Mode, { code: number; events: string[]; files?: string[] }> = {
       first: { code: 0, events: [...before, "install install --frozen-lockfile", `protect ${stage}`, "data check --project <project> --workspace <project>\\workspace",
         "wizard configure.ts", `scope? app=${stage}\\configuration-app.json`, runtime, core],
@@ -157,6 +164,10 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
         "wizard configure.ts"] },
       "core-failed": { code: 1, events: [...before, `protect ${stage}`, preview, "reconfigure?", runtime, core] },
       "not-admin": { code: 1, events: [] },
+      // Removed before the preflight, which would refuse another directory's task; a failed removal changes nothing here.
+      replace: { code: 0, events: [...before, ...installed],
+        files: ["configuration-app.json", "configuration-models.json", "deployment.json", "directory-scope-plan.json", "runtime-values.json", "windows-tools"] },
+      "replace-failed": { code: 1, events: ["lifecycle install", replace] },
     };
     expect(code, out + err).toBe(expected[mode].code);
     expect(lines).toEqual(expected[mode].events);
@@ -170,9 +181,10 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     // Outside the console the entry keeps the system code page: compare the ASCII parts.
     if (mode === "port-in-use") expect(out + err).toContain(`${port} `);
     if (mode === "core-failed") { expect(out + err).toContain("ops resume"); expect(out + err).toContain("ops rollback"); }
+    if (mode === "replace-failed") expect(out + err).toContain("本机已有的机器人服务没有移除完（原因见上方）；本目录未做任何改动");
     // This run's stage always goes; the abandoned one once the preflight passed.
     const left = readdirSync(join(project, "tmp")).filter(name => name.startsWith("deploy-stage-")).sort();
-    expect(left).toEqual(["pending", "not-admin", "preflight"].includes(mode) ? ["deploy-stage-0badf00d", "deploy-stage-12345678"] : ["deploy-stage-12345678"]);
+    expect(left).toEqual(["pending", "not-admin", "preflight", "replace-failed"].includes(mode) ? ["deploy-stage-0badf00d", "deploy-stage-12345678"] : ["deploy-stage-12345678"]);
   } finally {
     listener?.close();
     await f.cleanup();

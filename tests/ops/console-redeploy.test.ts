@@ -83,7 +83,7 @@ for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "
       rmSync(output); rmSync(marker); rmSync(join(project, "data/config/directory.json"));
       const draft = (letter: string) => ({ draft: `config-${letter.repeat(32)}`, digest: letter.repeat(64) });
       const install = Bun.spawn(argv, { cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env,
-        ...deploymentEnvironment("install", { app: draft("a"), models: draft("b"), directory: "all", port: 2022, workspace: "" }, project),
+        ...deploymentEnvironment("install", { app: draft("a"), models: draft("b"), directory: "all", port: 2022, workspace: "", replace: null }, project),
         MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "fixture", MIXIN_OPS_PROJECT: "", MIXIN_OPS_RESULT_FILE: platform === "linux" ? posix(output) : output,
         FIXTURE_PROJECT: projectArg, FIXTURE_SOURCE: sourceArg, FIXTURE_EXIT: "0", FIXTURE_SIGNAL: "" } });
       const [installExit, installOut, installErr] = await Promise.all([install.exited, new Response(install.stdout).text(), new Response(install.stderr).text()]);

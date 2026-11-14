@@ -20,14 +20,15 @@ export function operationPreparer(project: string, views: Views, query = capture
   return async (operation: string, params: Record<string, unknown>, session: string): Promise<Record<string, unknown>> => {
     if (operation === "install") {
       // The browser names its two drafts; the plan carries each with the digest it was checked online with.
-      fields(params, ["app", "models", "directory", "port", "workspace"]); if (!configurations) throw new Error("配置草稿不可用");
+      fields(params, ["app", "models", "directory", "port", "workspace", "replace"]); if (!configurations) throw new Error("配置草稿不可用");
       const app = configurations.deploymentReference(textParam(params.app), session, "app"), models = configurations.deploymentReference(textParam(params.models), session, "models");
       let chosen = params.directory;
       if (chosen && typeof chosen === "object") {
         if (!directory) throw new Error("部署部门选择器不可用");
         chosen = await directory.prepare(chosen, session);
       }
-      const normalized = { app, models, directory: chosen, port: params.port, workspace: params.workspace };
+      // replace: the digest of the service already on this host the operator agreed to remove first, or null (installScope checks it).
+      const normalized = { app, models, directory: chosen, port: params.port, workspace: params.workspace, replace: params.replace };
       operationArgs(operation, normalized); return normalized;
     }
     if (["update", "deploy", "repair"].includes(operation) && params.directory && typeof params.directory === "object") {

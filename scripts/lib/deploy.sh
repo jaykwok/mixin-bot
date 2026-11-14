@@ -320,8 +320,8 @@ deploy_check() {
     if [ -e "$PENDING_POINTER" ]; then check_line fail "未完成的操作" "有未完成的部署事务；请在“维护”页继续或回滚"; fi
     original_service_container 2>/dev/null || status=$?
     case "$status" in
-        2) user="$(default_service_user "$DOCKER_ROOTLESS")" ;;
-        0) check_line fail "服务容器" "本机已有容器 mixin-bot（${ORIGINAL_CONTAINER_DATA:-数据目录不明}）；同一个 Docker 只能运行一个部署，请先在原目录卸载"; user="$ORIGINAL_CONTAINER_USER" ;;
+        # 已有的容器 mixin-bot 由控制台单独列出，确认后在部署前移除：之后按真正的首次部署处理，服务用默认身份。
+        0|2) user="$(default_service_user "$DOCKER_ROOTLESS")" ;;
         *) check_line fail "服务容器" "无法读取 Docker 中的容器 mixin-bot" ;;
     esac
     if [ -n "$user" ]; then
@@ -383,6 +383,13 @@ LOOPBACK_HOST=127.0.0.1
 # 持锁时没有别的部署在运行：上次被强行终止时留下的暂存（含应用凭据）不再有用。
 rm -rf -- "$PROJECT_DIR"/tmp/deploy-stage-????????
 HOST_BUN="$(ops_bun)" || { print_error "宿主机没有可用的 Bun（原因见上方）；${UNCHANGED}"; exit 1; }
+# 控制台首次部署确认过先移除本机已有的机器人容器（例如另一个目录留下的）：核心核对任务和计划、确认还是预览时那些容器后移除，
+# 之后的预检才不会因它们拒绝。那个目录的文件和镜像不动。
+if [ "$(console_lifecycle)" = install ] && [ -n "${MIXIN_OPS_REPLACE_SERVICE:-}" ]; then
+    print_status "部署前移除本机已有的机器人容器（预览时已确认）..."
+    "$HOST_BUN" --no-env-file "$DEPLOY_SOURCE_DIR/ops/core/cli.ts" deployment replace-service --project "$PROJECT_DIR" </dev/null ||
+        { print_error "本机已有的机器人容器没有移除完（原因见上方）；本目录未做任何改动"; exit 1; }
+fi
 # 部署锁之外的运维任务和回滚容器先由核心只读检查一次，构建之前就能拒绝；交接后它在锁内再查。
 "$HOST_BUN" --no-env-file "$DEPLOY_SOURCE_DIR/ops/core/cli.ts" deployment deploy --project "$PROJECT_DIR" --preflight </dev/null ||
     { print_error "部署预检未通过（原因见上方）；${UNCHANGED}"; exit 1; }

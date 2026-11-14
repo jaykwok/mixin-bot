@@ -226,6 +226,16 @@ test.skipIf(!linux)("部署入口：控制台首次部署不运行向导，由�
     expect(staged).toBeLessThan(choose); expect(choose).toBeLessThan(handover(result.events));
     expect(Object.keys(readDeployStage(f.capture).configuration).sort()).toEqual(["app", "models"]);
     expect(f.stages()).toEqual([]);
+    // Confirmed with the containers already on this Docker to remove: removed first, before the preflight that would refuse them.
+    const replace = `bun --no-env-file ${f.root}/ops/core/cli.ts deployment replace-service --project ${f.root}`;
+    const replacing = await f.run({ ...task, MIXIN_OPS_REPLACE_SERVICE: "d".repeat(64) });
+    expect(replacing.code, replacing.output).toBe(0);
+    const removed = replacing.events.indexOf(replace), preflight = replacing.events.findIndex(line => line.includes(" --preflight"));
+    expect(removed).toBeGreaterThanOrEqual(0); expect(removed).toBeLessThan(preflight);
+    const failed = await f.run({ ...task, MIXIN_OPS_REPLACE_SERVICE: "d".repeat(64), FIXTURE_REPLACE: "1" });
+    expect(failed.code, failed.output).toBe(1); expect(failed.output).toContain("本机已有的机器人容器没有移除完（原因见上方）；本目录未做任何改动");
+    expect(failed.events.some(line => line.includes(" --preflight"))).toBe(false); expect(handover(failed.events)).toBe(-1);
+    expect(result.events.includes(replace)).toBe(false);
   } finally { await f.cleanup(); }
 });
 

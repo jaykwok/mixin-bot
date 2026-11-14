@@ -78,6 +78,14 @@ foreach ($pointer in @('deploy-transaction', 'upgrade-transaction')) {
 }
 Assert-ConsoleLifecycle (Get-ConsoleLifecycle) $Project
 $core = Join-Path $ReleaseRoot 'ops\core\cli.ts'
+# 控制台首次部署确认过先移除本机已有的机器人服务（例如另一个目录留下的计划任务）：核心核对任务和计划、确认还是预览时那个服务后移除，
+# 之后的预检才不会因它拒绝。那个目录的文件不动。
+if ((Get-ConsoleLifecycle) -ceq 'install' -and $env:MIXIN_OPS_REPLACE_SERVICE) {
+    Step '部署前移除本机已有的机器人服务（预览时已确认）...'
+    if ((Invoke-ConsoleProcess $bunPath @('--no-env-file', $core, 'deployment', 'replace-service', '--project', $Project)) -ne 0) {
+        throw '本机已有的机器人服务没有移除完（原因见上方）；本目录未做任何改动'
+    }
+}
 # 部署锁、运维任务和计划任务归属先由核心只读检查一次，提问之前就能拒绝；交接后它在锁内再查。
 Set-OperationStage 'deploy-preflight'
 if ((Invoke-ConsoleProcess $bunPath @('--no-env-file', $core, 'deployment', 'deploy', '--project', $Project, '--preflight', '--git-path', $gitPath)) -ne 0) {

@@ -57,7 +57,7 @@ test("首次部署的入口检查：只有控制台的 install 任务按首次�
     ].join("\r\n") : ["set -euo pipefail", 'PROJECT_DIR="$FIXTURE_PROJECT"', `source '${join(repo, "scripts/lib/console-plan.sh")}'`,
       'lifecycle="$(console_lifecycle)"', 'assert_console_lifecycle "$lifecycle" || exit 3', 'echo "通过：$lifecycle"'].join("\n"));
     const ref = (letter: string) => ({ draft: "config-" + letter.repeat(32), digest: letter.repeat(64) });
-    const install: Record<string, string> = { ...deploymentEnvironment("install", { directory: "all", port: 2022, workspace: "", app: ref("a"), models: ref("b") }, f.root),
+    const install: Record<string, string> = { ...deploymentEnvironment("install", { directory: "all", port: 2022, workspace: "", app: ref("a"), models: ref("b"), replace: null }, f.root),
       MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "synthetic", FIXTURE_PROJECT: f.root };
     const deploy = { ...deploymentEnvironment("deploy", { directory: "all", port: 2022, workspace: "" }, f.root), MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "synthetic", FIXTURE_PROJECT: f.root };
     const scenarios: [Record<string, string>, boolean, string][] = [
@@ -67,6 +67,9 @@ test("首次部署的入口检查：只有控制台的 install 任务按首次�
       [{ ...install, MIXIN_OPS_CONSOLE: "" }, true, "通过：deploy"],
       [deploy, false, "已有配置"],
       [{ ...deploy, MIXIN_OPS_APP_DRAFT: install.MIXIN_OPS_APP_DRAFT }, false, "只有首次部署"],
+      // Removing the service already on the host is a first deployment's step only.
+      [{ ...install, MIXIN_OPS_REPLACE_SERVICE: "d".repeat(64) }, true, "通过：install"],
+      [{ ...deploy, MIXIN_OPS_REPLACE_SERVICE: "d".repeat(64) }, false, "只有首次部署可以移除本机已有的机器人服务"],
     ];
     for (const [env, okay, message] of scenarios) {
       const child = Bun.spawn(windows ? ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] : ["bash", script], {

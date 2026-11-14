@@ -475,41 +475,71 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       writeFileSync(join(root, "logs", `web-${operation}-${task.id}.log`), log.content);
       return { summary: plan.summary, view, log: log.content };
     };
-    afterAll(async () => { await client?.close(); }, 30_000);
-
-    sequence("web first deployment: dependencies, online drafts, directory, port and workspace from the wizard", async () => {
-      removeOurContainers();
-      ({ work } = repository(join(root, "web-install"), exportWithFakePlatform));
+    /** A fresh checkout and its own console, as the operator starts it there. */
+    const fresh = async (name: string) => {
+      ({ work } = repository(join(root, name), exportWithFakePlatform));
       projects.push(projectId(work));
       port = await freePort();
-      client = new LifecycleConsole(work, await freePort(), join(root, "logs", "web-install-console.log"),
+      client = new LifecycleConsole(work, await freePort(), join(root, "logs", `${name}-console.log`),
         { ...passthrough, PATH: hostPath, LANG: "C.UTF-8", TERM: "dumb" });
       await client.login();
       expect(await overview()).toBe(true);
-      // The model check needs Pi from node_modules: the console installs it as the checkout's owner, in the background.
-      expect(await client.json("/api/setup")).toMatchObject({ undeployed: true, dependencies: { installed: false } });
-      await client.json("/api/setup/dependencies", {});
+    };
+    /** The model check needs Pi from node_modules: the console installs it as the checkout's owner, in the background. */
+    const dependencies = async () => {
+      expect(await client!.json("/api/setup")).toMatchObject({ undeployed: true, dependencies: { installed: false } });
+      await client!.json("/api/setup/dependencies", {});
       for (const end = Date.now() + 1_200_000; ;) {
-        const { dependencies } = await client.json<{ dependencies: { installed: boolean; job: { state: string; message?: string } | null } }>("/api/setup");
+        const { dependencies } = await client!.json<{ dependencies: { installed: boolean; job: { state: string; message?: string } | null } }>("/api/setup");
         if (dependencies.job?.state === "failed") throw new Error(`dependency install failed: ${dependencies.job.message}`);
         if (dependencies.installed && dependencies.job?.state === "succeeded") break;
         if (Date.now() > end) throw new Error("the dependency install did not finish");
         await Bun.sleep(2000);
       }
       expect(existsSync(join(work, ".console/host-dependencies.json"))).toBe(true);
-      const check = await client.json<{ items: { state: string; name: string; detail: string }[] }>("/api/setup/check", {});
-      expect(check.items.filter(item => item.state !== "ok")).toEqual([]);
+    };
+    /** Both drafts of a first deployment, checked online (the application against the fake platform, the model by Pi). */
+    const drafts = async () => {
       const draft = async (kind: "app" | "models", patch: unknown) => {
         const opened = await client!.json<{ id: string; revision: number }>("/api/configuration/open", { kind });
         const edited = await client!.json<{ revision: number }>("/api/configuration/edit", { id: opened.id, revision: opened.revision, patch });
         await client!.json("/api/configuration/check", { id: opened.id, revision: edited.revision, network: true, refresh: false });
         return opened.id;
       };
-      const app = await draft("app", { appId: FIXTURE_APP_ID, environment: "production", secret: { mode: "set", value: fixtureSecret } });
-      const models = await draft("models", { provider: "fixture", mode: "custom", api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1",
-        key: { mode: "set", value: "test-only" }, thinking: "low", model: { id: "fixture-model", contextWindow: 64000, maxTokens: 8000,
-          input: ["text"], reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
-      const { summary, view, log } = await confirmed("install", { app, models, directory: "all", port, workspace: "" });
+      return { app: await draft("app", { appId: FIXTURE_APP_ID, environment: "production", secret: { mode: "set", value: fixtureSecret } }),
+        models: await draft("models", { provider: "fixture", mode: "custom", api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1",
+          key: { mode: "set", value: "test-only" }, thinking: "low", model: { id: "fixture-model", contextWindow: 64000, maxTokens: 8000,
+            input: ["text"], reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } }) };
+    };
+    // An OpenAI-compatible model list that answers only the key it is given, at an address both the host and a container
+    // on Docker's default network reach (the host's default-route source address; rootless: the fake platform's host).
+    let lister: ReturnType<typeof Bun.serve> | undefined;
+    const listOrigin = () => {
+      const hostname = rootless ? platformHost : /\bsrc (\S+)/.exec(must("ip", ["-4", "route", "get", "1.1.1.1"]))?.[1] ?? "";
+      lister ??= Bun.serve({ hostname, port: 0, fetch: request => new URL(request.url).pathname === "/v1/models" && request.headers.get("authorization") === "Bearer list-only"
+        ? Response.json({ object: "list", data: [{ id: "fixture-listed", object: "model", context_length: 32000 }, { id: "fixture-other", object: "model" }] })
+        : new Response("unauthorised", { status: 401 }) });
+      return `http://${hostname}:${lister.port}`;
+    };
+    /** "获取模型列表" for a custom provider, where the console runs it: the checkout's owner before a deployment, the deployed image after. */
+    const listed = async () => {
+      const opened = await client!.json<{ id: string }>("/api/configuration/open", { kind: "models" });
+      try {
+        return (await client!.json<{ models: { id: string; contextWindow?: number }[] }>("/api/configuration/models", { id: opened.id, patch: { provider: "listing",
+          mode: "custom", api: "openai-completions", baseUrl: `${listOrigin()}/v1`, key: { mode: "set", value: "list-only" } } })).models;
+      } finally { await client!.json("/api/configuration/discard", { id: opened.id }); }
+    };
+    afterAll(async () => { await client?.close(); await lister?.stop(true); }, 30_000);
+
+    sequence("web first deployment: dependencies, online drafts, directory, port and workspace from the wizard", async () => {
+      removeOurContainers();
+      await fresh("web-install");
+      await dependencies();
+      const check = await client!.json<{ items: { state: string; name: string; detail: string }[]; leftover: unknown }>("/api/setup/check", {});
+      expect(check.items.filter(item => item.state !== "ok")).toEqual([]);
+      expect(check.leftover).toBeNull();
+      const { app, models } = await drafts();
+      const { summary, view, log } = await confirmed("install", { app, models, directory: "all", port, workspace: "", replace: null });
       expect(summary.join("\n")).toContain("构建镜像并创建服务容器 mixin-bot");
       expect({ state: view.state, result: view.result }, log.slice(-6000)).toMatchObject({ state: "succeeded", result: { outcome: "success", finalState: "running" } });
       expect(bot()).toEqual({ running: true, user: identity });
@@ -520,6 +550,46 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       expect([app, models].filter(id => existsSync(join(work, ".console/config-drafts", `${id}.json`)))).toEqual([]);
       expect(await until("the console's node_modules to go", () => !existsSync(join(work, "node_modules")) && !existsSync(join(work, ".console/host-dependencies.json")), 30_000)).toBe(true);
       expect(await overview()).toBe(false);
+    }, 2_400_000);
+
+    // A first deployment in another directory while the first one runs (its operator forgot to uninstall it): the console
+    // lists that service, refuses the deployment until the operator agrees to remove it, and the task then stops and removes
+    // exactly those containers before it deploys. The old directory's files stay. The later steps go on with the new checkout.
+    sequence("web first deployment of another checkout removes the running service of the first once the operator agrees", async () => {
+      const old = work, oldIds = services().map(item => item.id);
+      expect(oldIds.length).toBeGreaterThan(0);
+      // The deployed path of the model list: the deployed image, on Docker's default network.
+      expect((await listed()).map(model => model.id)).toEqual(["fixture-listed", "fixture-other"]);
+      await client!.close();
+      await fresh("web-replace");
+      await dependencies();
+      // Before a deployment: the checkout's owner on the host.
+      expect(await listed()).toEqual([{ id: "fixture-listed", contextWindow: 32000 }, { id: "fixture-other" }]);
+      const check = await client!.json<{ items: { state: string; name: string; detail: string }[]; leftover: { digest: string; description: string } | null }>("/api/setup/check", {});
+      expect(check.items.filter(item => item.state !== "ok")).toEqual([]);
+      const names = ["mixin-bot", "mixin-bot-rollback"].filter(name => services().some(item => item.name === name));
+      expect(check.leftover?.description).toBe(`容器 ${names.join("、")}（${realpathSync(old)}，运行中）`);
+      expect(check.items.find(item => item.name === "已有服务")?.detail).toContain(check.leftover!.description);
+      const { app, models } = await drafts();
+      const params = { app, models, directory: "all", port, workspace: "" };
+      // Without the operator's agreement the preview is refused; nothing was stopped.
+      const refused = await client!.json<unknown>("/api/plans", { operation: "install", params: { ...params, replace: null } }, 409);
+      expect(JSON.stringify(refused)).toContain("一台机器只运行一个部署");
+      expect(services().map(item => item.id)).toEqual(oldIds);
+      const { summary, view, log } = await confirmed("install", { ...params, replace: check.leftover!.digest });
+      expect(summary.join("\n")).toContain(`部署前先停止并移除本机已有的${check.leftover!.description}，包括它的开机启动；那个目录的文件和镜像不删除`);
+      expect({ state: view.state, result: view.result }, log.slice(-6000)).toMatchObject({ state: "succeeded", result: { outcome: "success", finalState: "running" } });
+      expect(log).toContain("部署前移除本机已有的机器人容器（预览时已确认）");
+      expect(log).toContain(`已移除${check.leftover!.description}。`);
+      expect(containers().filter(item => oldIds.includes(item.id))).toEqual([]);
+      const now = services();
+      expect(now.length).toBeGreaterThan(0);
+      expect(now.every(item => item.sources.some(source => source.startsWith(work + "/")))).toBe(true);
+      expect(bot()).toEqual({ running: true, user: identity });
+      expect(await until("the new checkout's service", () => healthy(), 60_000)).toBe(true);
+      // The old directory is only left without its service.
+      expect({ data: existsSync(join(old, "data/state/data-version.json")), config: existsSync(join(old, "data/config/models.json")) })
+        .toEqual({ data: true, config: true });
     }, 2_400_000);
 
     sequence("web uninstall keeping data/, then a web redeploy recreates the service as the data's owner", async () => {

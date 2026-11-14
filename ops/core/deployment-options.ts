@@ -15,6 +15,7 @@ import { ownsDataMount } from "./deployment-data.ts";
 import { nativeService } from "./platform.ts";
 import { LaunchdPlatform, SERVICE_ACCOUNT, type LaunchdHostFacts } from "./launchd-host.ts";
 import { ConfigurationDrafts } from "./configuration-drafts.ts";
+import { botContainers, hostService, scheduledTask } from "./host-service.ts";
 import { deploymentRecord } from "../../src/core/data-version.ts";
 import { directoryChoice, checkedDirectoryChoice, directoryChoiceText, type DirectoryChoice } from "../lib/directory-choice.ts";
 import { REQUIRED_SETTINGS } from "../lib/settings-files.ts";
@@ -25,8 +26,11 @@ export type UpgradeOptions = Common & { target: string; switchMain: boolean };
 export type DeployOptions = Common & { port: number; workspace: string };
 /** A configuration draft as the console confirmed it (configuration-drafts.ts). */
 export type DraftReference = { draft: string; digest: string };
-/** A first deployment: the configuration comes from checked console drafts and the directory scope is chosen now. */
-export type InstallOptions = DeployOptions & { directory: "all" | DirectoryChoice; app: DraftReference; models: DraftReference };
+/**
+ * A first deployment: the configuration comes from checked console drafts and the directory scope is chosen now. `replace`:
+ * the digest of the bot service already on this host (host-service.ts) the operator agreed to remove first, or null.
+ */
+export type InstallOptions = DeployOptions & { directory: "all" | DirectoryChoice; app: DraftReference; models: DraftReference; replace: string | null };
 export type DeploymentOperation = "update" | "deploy" | "install";
 const INPUTS = ["data/state/data-version.json", "data/state/release-data.json", "data/state/bot-port", "data/state/workspace-root",
   "data/config/app-bot.json", "data/config/models.json", "data/config/runtime.json", "data/config/directory.json",
@@ -41,7 +45,7 @@ function draftReference(value: unknown): DraftReference {
 }
 
 export function deploymentOptions(operation: DeploymentOperation, input: Record<string, unknown>): UpgradeOptions | DeployOptions | InstallOptions {
-  const keys = ["directory", ...(operation === "update" ? ["target", "switchMain"] : ["port", "workspace"]), ...(operation === "install" ? ["app", "models"] : [])];
+  const keys = ["directory", ...(operation === "update" ? ["target", "switchMain"] : ["port", "workspace"]), ...(operation === "install" ? ["app", "models", "replace"] : [])];
   if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length !== keys.length
     || Object.keys(input).some(key => !keys.includes(key))) throw new Error("请明确选择每项部署设置，不接受缺失或多余参数");
   if (operation === "install" && input.directory === "saved") throw new Error("首次部署需要选择通讯录同步范围");
@@ -55,7 +59,9 @@ export function deploymentOptions(operation: DeploymentOperation, input: Record<
     || (input.workspace !== "" && !isAbsolute(input.workspace))) throw new Error("部署需要有效端口和共享目录的绝对路径；空目录表示使用默认目录");
   const deploy = { ...common, port: Number(input.port), workspace: input.workspace };
   if (operation !== "install") return deploy;
-  return { ...deploy, directory: deploy.directory as InstallOptions["directory"], app: draftReference(input.app), models: draftReference(input.models) };
+  if (input.replace !== null && (typeof input.replace !== "string" || !/^[a-f0-9]{64}$/.test(input.replace))) throw new Error("请明确选择是否移除本机已有的机器人服务");
+  return { ...deploy, directory: deploy.directory as InstallOptions["directory"], app: draftReference(input.app), models: draftReference(input.models),
+    replace: input.replace };
 }
 
 /** These are named internal choices, not a shell fragment. Clear ambient overrides when preserving saved settings. */
@@ -70,6 +76,8 @@ export function deploymentEnvironment(operation: DeploymentOperation, input: Rec
     // A first deployment's drafts as "<draft>:<digest>"; console-stage.ts stages them for the core.
     MIXIN_OPS_APP_DRAFT: "app" in value ? `${value.app.draft}:${value.app.digest}` : "",
     MIXIN_OPS_MODELS_DRAFT: "models" in value ? `${value.models.draft}:${value.models.digest}` : "",
+    // The confirmed service to remove before a first deployment; the core checks it against the task (deployment-cli.ts).
+    MIXIN_OPS_REPLACE_SERVICE: "replace" in value ? value.replace ?? "" : "",
     BOT_PORT: "port" in value ? String(value.port) : "",
     WORKSPACE_ROOT: "workspace" in value ? value.workspace || (nativeService() ? join(project, "workspace") : "") : "" };
 }
@@ -246,11 +254,17 @@ export async function installScope(project: string, params: Record<string, unkno
     if (!stat.isDirectory()) throw new Error("共享资料目录不存在或不是目录");
     workspaceIdentity = [path, String(stat.dev), String(stat.ino)];
   }
-  await assertNoService(project, run, launchd);
+  const leftover = await hostService(project, run, launchd);
+  if (leftover && options.replace !== leftover.digest) throw new Error(options.replace
+    ? `本机的 mixin-bot 服务与确认移除的不同（现在是${leftover.description}）：请重新检查本机后再确认`
+    : `本机已有${leftover.description}：一台机器只运行一个部署，请确认部署前移除它，或先在原目录卸载`);
   if (planDigest(before) !== planDigest(INPUTS.map(path => [path, fileHash(join(project, path))]))) throw new Error("预览期间部署设置已变化，请重试");
   const platform = process.platform === "win32" ? "注册开机启动的计划任务 mixin-bot" : process.platform === "darwin" ? `创建服务账户 ${SERVICE_ACCOUNT}（尚未创建时）并安装 LaunchDaemon`
     : "构建镜像并创建服务容器 mixin-bot";
+  // The confirmation is a parameter, not a fact of the scope: once removed, the leftover is gone when the core verifies the plan.
   return { scope: planDigest([before, options, branch.stdout.trim(), workspaceIdentity]), summary: [
+    ...leftover ? [`部署前先停止并移除本机已有的${leftover.description}，包括它的开机启动；${process.platform === "linux"
+      ? "那个目录的文件和镜像不删除" : "那个目录的文件不删除"}。移除后不再恢复，即使本次部署失败。`] : [],
     `首次部署当前代码；端口 ${options.port}；共享资料：${options.workspace || "workspace（默认）"}。`,
     ...app.validated!.summary, ...models.validated!.summary,
     options.directory === "all" ? "通讯录同步范围：整个通讯录。" : `通讯录同步范围：${options.directory.names.join("、")}（含全部子部门）。`,
@@ -269,33 +283,6 @@ export function sameWindowsPath(a: string, b: string): boolean {
   if (!a.trim() || !b.trim()) return false;
   const normal = (path: string) => win32.resolve(path).replace(/\\+$/, "").toLowerCase();
   return normal(a) === normal(b);
-}
-
-/** The scheduled task mixin-bot as the plan binds it, or null when there is none. A listing that fails is not "none". */
-async function scheduledTask(run: Runner): Promise<{ Actions?: { WorkingDirectory?: string }[] } | null> {
-  const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-    "$ErrorActionPreference='Stop'; $found=@(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ceq 'mixin-bot' }); if ($found.Count -eq 0) { 'null' } elseif ($found.Count -gt 1) { throw 'mixin-bot 计划任务不唯一' } else { $t=$found[0]; [ordered]@{Principal=[ordered]@{UserId=$t.Principal.UserId; LogonType=[string]$t.Principal.LogonType; RunLevel=[string]$t.Principal.RunLevel}; Actions=@($t.Actions | ForEach-Object { [ordered]@{Execute=$_.Execute; Arguments=$_.Arguments; WorkingDirectory=$_.WorkingDirectory} })} | ConvertTo-Json -Depth 6 -Compress }"]);
-  if (result.code !== 0) throw new Error("无法核对机器人计划任务");
-  return JSON.parse(result.stdout);
-}
-/** The bot's containers on this Docker daemon: mixin-bot and an old mixin-bot-rollback. */
-async function botContainers(run: Runner): Promise<string[]> {
-  const result = await run(["docker", "ps", "-a", "--filter", "name=^/mixin-bot$", "--filter", "name=^/mixin-bot-rollback$", "--format", "{{.Names}}"]);
-  if (result.code !== 0) throw new Error("无法读取 Docker 中的机器人容器");
-  return result.stdout.split("\n").map(line => line.trim()).filter(Boolean);
-}
-
-/** Before a first deployment: no bot service of this name on this host (one deployment per host and Docker daemon). */
-async function assertNoService(project: string, run: Runner, launchd: Partial<LaunchdHostFacts>): Promise<void> {
-  if (process.platform === "win32") {
-    if (await scheduledTask(run) !== null) throw new Error("本机已有计划任务 mixin-bot：一台机器只运行一个部署，请先在原目录卸载");
-  } else if (process.platform === "darwin") {
-    const service = await new LaunchdPlatform(project, { ...launchd, run }).inspect();
-    if (service.state !== "absent") throw new Error("本机已有机器人 LaunchDaemon：一台机器只运行一个部署，请先在原目录卸载");
-  } else {
-    const names = await botContainers(run);
-    if (names.length) throw new Error(`Docker 中已有容器 ${names.join("、")}：同一个 Docker 只运行一个部署，请先在原目录卸载`);
-  }
 }
 
 /**

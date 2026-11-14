@@ -206,7 +206,12 @@ export function operationObserver(project: string, run: Runner = runCommand, lau
     const head = await run(["git", "-C", project, "rev-parse", "HEAD"]);
     if (head.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("无法核对代码版本");
     let identity: string, state: string, container: string | undefined, restarting = false;
-    if (process.platform === "win32") {
+    if (operation === "install") {
+      // Nothing is deployed here yet (installScope). A service of the bot's name left on the host is bound by the scope and
+      // the operator's confirmation to remove it, not by its state: the plan still holds once the first step removed it.
+      identity = process.platform === "win32" ? JSON.parse(readFileSync(join(project, ".console", "owner.json"), "utf8")).sid : String(process.geteuid?.());
+      state = "absent";
+    } else if (process.platform === "win32") {
       const owner = JSON.parse(readFileSync(join(project, ".console", "owner.json"), "utf8"));
       identity = owner.sid;
       const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",

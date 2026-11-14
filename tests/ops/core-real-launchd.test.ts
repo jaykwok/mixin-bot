@@ -16,6 +16,7 @@ import { ensureServiceAccount } from "../../ops/core/macos-account.ts";
 import { checkProjectAccess, findMacosTools, handOverTree } from "../../ops/core/macos-deploy.ts";
 import { assertToolsTrusted, createServiceDirectories, MacosDeployment, parseMacosTools, servicePlist } from "../../ops/core/macos-deployment.ts";
 import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { HostServiceChanged, hostService, removeHostService } from "../../ops/core/host-service.ts";
 import { runCommand } from "../../ops/core/hosting.ts";
 import { runNative } from "../../ops/core/native-process.ts";
 import { publish } from "../../src/lib/atomic-file.ts";
@@ -131,6 +132,53 @@ setInterval(() => {}, 1000);
   await service.halt();
   expect(accountProcesses(user.uid).size).toBe(0);
   expect(existsSync(LAUNCHD_PLIST)).toBe(true);
+}, 180_000);
+
+// A first deployment in another directory (host-service.ts): the loaded LaunchDaemon of the old one is listed with that
+// directory; what the operator confirms names the definition, not whether it runs. Removal stops it, clears what the
+// service account left running and deletes the definition; the old directory's files and the account stay.
+test.skipIf(!run)("另一目录的首次部署：列出已加载的 LaunchDaemon，确认后停用、卸载并删除定义；不同的确认不动它；那个目录的文件和服务账户保留", async () => {
+  const user = await account();
+  const old = mkdtempSync("/tmp/mixin-real-launchd-old-"), fresh = mkdtempSync("/tmp/mixin-real-launchd-new-");
+  fixtures.push(old, fresh); chmodSync(old, 0o755);
+  for (const dir of ["bin", "ops/core"]) mkdirSync(join(old, dir), { recursive: true, mode: 0o755 });
+  for (const dir of ["data", "data/runtime", "data/runtime/home", "logs"]) { mkdirSync(join(old, dir), { recursive: true }); chownSync(join(old, dir), user.uid, user.gid); }
+  copyFileSync(process.execPath, join(old, "bin/bun")); chmodSync(join(old, "bin/bun"), 0o755);
+  writeFileSync(join(old, "ops/core/launchd-supervisor.ts"), `import { writeFileSync } from "node:fs";
+const escapee = Bun.spawn(["/usr/bin/perl", "-MPOSIX", "-e", "POSIX::setsid(); sleep 600"], { stdio: ["ignore", "ignore", "ignore"] });
+writeFileSync("data/runtime/report.json", JSON.stringify({ pid: process.pid, escapee: escapee.pid }));
+setInterval(() => {}, 1000);
+`, { mode: 0o644 });
+  const reported = () => { try { return JSON.parse(readFileSync(join(old, "data/runtime/report.json"), "utf8")) as { pid: number; escapee: number }; } catch { return null; } };
+  const tools = parseMacosTools(`format=1\nbun=${old}/bin/bun\ngit=/usr/bin/git\nuv=/usr/bin/true\nbash=/bin/bash\ncoreutils=/usr/bin\n`);
+  defined = true;
+  writeFileSync(LAUNCHD_PLIST, servicePlist(old, tools), { mode: 0o644 });
+  const service = new LaunchdPlatform(old);
+  await service.boot();
+  await until(reported);
+  const loaded = await hostService(fresh);
+  expect(loaded).toMatchObject({ directory: old, running: true, description: `LaunchDaemon ${LAUNCHD_PLIST}（${old}，已加载）` });
+  await service.halt();
+  const stopped = await hostService(fresh);
+  expect(stopped).toMatchObject({ directory: old, running: false, description: `LaunchDaemon ${LAUNCHD_PLIST}（${old}，未加载）` });
+  expect(stopped!.digest).toBe(loaded!.digest);
+  rmSync(join(old, "data/runtime/report.json"));
+  await service.boot();
+  const seen = await until(reported);
+
+  const said: string[] = [], output = (text: string) => { said.push(text); };
+  await expect(removeHostService(fresh, "0".repeat(64), output)).rejects.toBeInstanceOf(HostServiceChanged);
+  expect({ said, pid: alive(seen.pid), plist: existsSync(LAUNCHD_PLIST) }).toEqual({ said: [], pid: true, plist: true });
+
+  expect(await removeHostService(fresh, loaded!.digest, output)).toBe(`已移除${loaded!.description}`);
+  expect(said.join("")).toContain("那个目录的文件不删除");
+  expect({ pid: alive(seen.pid), escapee: alive(seen.escapee), plist: existsSync(LAUNCHD_PLIST), left: accountProcesses(user.uid).size })
+    .toEqual({ pid: false, escapee: false, plist: false, left: 0 });
+  // 113: launchd has no such job.
+  expect(Bun.spawnSync(["/bin/launchctl", "print", `system/${LAUNCHD_LABEL}`], { stdout: "ignore", stderr: "ignore" }).exitCode).toBe(113);
+  expect(await hostService(fresh)).toBeNull();
+  expect(existsSync(join(old, "ops/core/launchd-supervisor.ts"))).toBe(true);
+  expect(await accountIdentity(SERVICE_ACCOUNT)).toMatchObject({ uid: user.uid, gid: user.gid });
 }, 180_000);
 
 test.skipIf(!run)("macOS 入口的真实环境：交互命令以服务账户运行；服务账户进不去的检出被拒绝；工具都按服务账户实测", async () => {

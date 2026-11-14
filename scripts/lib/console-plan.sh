@@ -27,6 +27,7 @@ assert_console_lifecycle() {
         return 0
     fi
     [ -z "${MIXIN_OPS_APP_DRAFT:-}" ] && [ -z "${MIXIN_OPS_MODELS_DRAFT:-}" ] || { echo '只有首次部署使用网页配置草稿；服务尚未停止' >&2; return 1; }
+    [ -z "${MIXIN_OPS_REPLACE_SERVICE:-}" ] || { echo '只有首次部署可以移除本机已有的机器人服务；服务尚未停止' >&2; return 1; }
     local required
     for required in data/config/models.json data/config/app-bot.json data/runtime/pi/settings.json; do
         [ -f "$PROJECT_DIR/$required" ] || { echo '缺少已有配置，请先完成首次部署；服务尚未停止' >&2; return 1; }

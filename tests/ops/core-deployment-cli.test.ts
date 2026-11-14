@@ -17,6 +17,7 @@ import { consoleDir } from "../../ops/core/console-state.ts";
 import { serializeConfigurationStage, type ConfigurationStage } from "../../ops/config/configuration-stage.ts";
 import { configurationDigest } from "../../ops/config/configuration-draft.ts";
 import { readDeployStage } from "../../ops/core/deploy-stage.ts";
+import { HostServiceChanged } from "../../ops/core/host-service.ts";
 
 const original = "a".repeat(40), target = "b".repeat(40);
 const args = (project: string) => ["upgrade", "--project", project, "--original", original, "--target", target, "--branch", "main"];
@@ -219,6 +220,45 @@ test("首次部署任务走 deploy 入口：暂存的配置必须正是确认过
       return { ...done, command: input.command! };
     };
     await expect(runDeploymentCli(argv, { ...accepted(install), host: swapping }), "swapped after verify").rejects.toThrow("暂存的选择或配置与已接单任务不一致");
+  } finally { await f.cleanup(); }
+});
+
+test("移除已有服务：只给确认过移除的控制台首次部署任务，先复核任务和计划，只移除任务参数里的那个服务", async () => {
+  const f = await tempFixture("core-replace-service-");
+  try {
+    const project = join(f.root, "project"), digest = "d".repeat(64); await mkdir(project);
+    const store = new TaskStore(consoleDir(project)), task = (operation: string, replace: unknown, key: string) => store.create({ planId: "plan-" + key, operation,
+      params: { directory: "all", port: 1011, workspace: "", app: {}, models: {}, replace }, project, mechanism: "systemd-user" }, key).id;
+    const removals: [string, string][] = [], checks: string[] = [];
+    const env = (id: string, extra: Record<string, string> = {}) => ({ MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_LIFECYCLE: "install", MIXIN_OPS_TASK_ID: id,
+      MIXIN_OPS_EXPECT_CODE: "code", MIXIN_OPS_REPLACE_SERVICE: digest, ...extra });
+    const run = (id: string, extra: Record<string, string> = {}, replaceService = async (path: string, expected: string) => { removals.push([path, expected]); return "已移除合成服务"; },
+      argv = ["replace-service", "--project", project]) =>
+      runDeploymentCli(argv, { env: env(id, extra), checkPlan: async (_project, request) => { checks.push(request); }, replaceService });
+    const confirmed = task("install", digest, "confirmed");
+    expect(await run(confirmed)).toEqual({ json: false, result: { protocol: "mixin-ops", version: 1, command: "deploy", outcome: "success",
+      wasRunning: false, finalState: "stopped", exitCode: 0, message: "已移除合成服务" } });
+    expect(removals).toEqual([[resolve(project), digest]]); expect(checks).toEqual([confirmed]);
+
+    for (const [label, id, extra] of [["not confirmed", task("install", null, "none"), {}], ["another service", task("install", "e".repeat(64), "other"), {}],
+      ["redeploy", task("deploy", digest, "deploy"), {}], ["terminal", confirmed, { MIXIN_OPS_CONSOLE: "" }], ["lifecycle", confirmed, { MIXIN_OPS_LIFECYCLE: "deploy" }],
+      ["no code", confirmed, { MIXIN_OPS_EXPECT_CODE: "" }], ["no digest", confirmed, { MIXIN_OPS_REPLACE_SERVICE: "" }]] as const) {
+      const refused = await run(id, extra).catch((error: unknown) => error);
+      expect(refused, label).toBeInstanceOf(MaintenanceRefused);
+    }
+    // A plan that no longer holds stops it before anything is removed, with the check's own reason.
+    const stale = await runDeploymentCli(["replace-service", "--project", project], { env: env(confirmed),
+      checkPlan: async () => { throw new Error("fixture: plan changed"); }, replaceService: async () => { removals.push(["stale", ""]); return ""; } }).catch((error: unknown) => error);
+    expect(stale).toBeInstanceOf(MaintenanceRefused); expect((stale as Error).message).toBe("fixture: plan changed");
+    expect(removals).toHaveLength(1);
+    // A service changed since the preview is a refusal; a failed removal stays a failure.
+    const changed = await run(confirmed, {}, async () => { throw new HostServiceChanged("本机的 mixin-bot 服务与预览时不同"); }).catch((error: unknown) => error);
+    expect(changed).toBeInstanceOf(MaintenanceRefused);
+    const failed = await run(confirmed, {}, async () => { throw new Error("无法停止容器"); }).catch((error: unknown) => error);
+    expect(failed).not.toBeInstanceOf(MaintenanceRefused); expect((failed as Error).message).toBe("无法停止容器");
+    for (const argv of [["replace-service"], ["replace-service", "--project"], ["replace-service", "--project", project, "--json"], ["replace-service", "--stage", project]])
+      await expect(run(confirmed, {}, undefined, argv), argv.join(" ")).rejects.toThrow("用法");
+    expect(removals).toHaveLength(1);
   } finally { await f.cleanup(); }
 });
 

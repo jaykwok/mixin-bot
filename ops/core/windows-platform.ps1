@@ -10,7 +10,7 @@ $OutputEncoding = [Console]::OutputEncoding
 try {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     if (@($request.PSObject.Properties.Name | Where-Object { $_ -cnotin @('action','project','task','expected') }).Count -gt 0 -or
-        $request.action -cnotin @('inspect','stop','start','last-result') -or $request.project -isnot [string] -or
+        $request.action -cnotin @('inspect','stop','start','last-result','remove') -or $request.project -isnot [string] -or
         $request.task -isnot [string] -or $request.task -cne 'mixin-bot') { throw 'Invalid platform request' }
     $project = [IO.Path]::GetFullPath($request.project)
     $task = Get-NativeTask $request.task
@@ -28,14 +28,21 @@ try {
         $value = $null
         if ($task -and $owned) { $result = (Get-ScheduledTaskInfo -TaskName $request.task -ErrorAction Stop).LastTaskResult; $value = "$(Get-ResultCodeHex $result) / $result" }
     } else {
-        if (-not $owned -or ($state -ceq 'unsupported' -and $request.action -cne 'stop') -or $request.expected -isnot [string] -or $request.expected -cne $identity) { throw 'Deployment identity changed or unsupported; no action performed' }
-        if ($request.action -ceq 'stop') {
-            $stopResults = @(Stop-ProjectBot $project $request.task 3>&1 | ForEach-Object {
+        if (-not $owned -or ($state -ceq 'unsupported' -and $request.action -cnotin @('stop','remove')) -or $request.expected -isnot [string] -or $request.expected -cne $identity) { throw 'Deployment identity changed or unsupported; no action performed' }
+        if ($request.action -cin @('stop','remove')) {
+            if ($request.action -ceq 'remove' -and -not $task) { throw 'Service task is absent' }
+            # Removing keeps the task disabled once stopped: its supervisor trigger must not start it before it is unregistered.
+            $stopResults = @(Stop-ProjectBot $project $request.task -KeepDisabled:($request.action -ceq 'remove') 3>&1 | ForEach-Object {
                 if ($_ -is [System.Management.Automation.WarningRecord]) { [Console]::Error.WriteLine($_.Message) }
                 elseif ($_ -is [bool]) { $_ }
                 else { throw 'Unexpected output from stop effect' }
             })
             if ($stopResults.Count -ne 1 -or $stopResults[0] -ne $true) { throw 'Service did not stop' }
+            if ($request.action -ceq 'remove') {
+                Unregister-ScheduledTask -TaskName $request.task -Confirm:$false -ErrorAction Stop
+                if (Get-NativeTask $request.task) { throw 'Service task is still registered' }
+                if (@(Get-NativeBotPids $project).Count -gt 0) { throw 'Service processes remain' }
+            }
         } else {
             if (-not $task) { throw 'Service task is absent; deploy first' }
             if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $request.task -ErrorAction Stop | Out-Null }

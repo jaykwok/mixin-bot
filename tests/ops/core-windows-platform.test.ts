@@ -37,6 +37,12 @@ function Stop-ScheduledTask {
     $global:fixture.task.State='Disabled'
 }
 function Start-ScheduledTask { param($TaskName,$ErrorAction); $global:effects.Add('start'); $global:fixture.task.State='Running' }
+function Unregister-ScheduledTask {
+    param($TaskName,$Confirm,$ErrorAction)
+    $global:effects.Add('unregister')
+    if ($global:fixture.unregisterError) { throw '合成注销失败' }
+    if (-not $global:fixture.keepTask) { $global:fixture.task=$null }
+}
 $global:LASTEXITCODE=0
 & $env:FIXTURE_PLATFORM -RequestBase64 $env:FIXTURE_REQUEST
 $code=$LASTEXITCODE
@@ -87,6 +93,25 @@ test.skipIf(!windows)("真实 Windows 平台脚本保留单一 JSON；启停只�
     expect(failed.stderr).toContain("合成停止失败中文"); expect(failed.effects).toEqual(["disable", "stop", "enable"]);
   } finally { await f.cleanup(); }
 }, 30_000);
+
+test.skipIf(!windows)("真实 Windows 平台脚本移除任务：停止后保持禁用再注销，确认任务和进程都不在；身份不符时不动，停止失败时恢复启用且不注销", async () => {
+  const f = await fixture();
+  try {
+    const identity = service(await f.call("inspect")).identity, running = { ...f.task, State: "Running" };
+    const removed = await f.call("remove", { task: running }, identity);
+    expect(nativePayload(removed, "remove")).toBeNull(); expect(removed.stderr).toBe("");
+    expect(removed.effects).toEqual(["disable", "stop", "unregister"]);
+    const changed = await f.call("remove", { task: { ...running, Principal: { ...f.task.Principal, UserId: "another" } } }, identity);
+    expect(changed.code).toBe(1); expect(changed.effects).toEqual([]);
+    // (No foreground case: the real Stop-ProjectBot would taskkill the fixture's process ID on this machine.)
+    const failed = await f.call("remove", { task: running, stopError: true }, identity);
+    expect(failed.code).toBe(1); expect(failed.effects).toEqual(["disable", "stop", "enable"]); expect(failed.stderr).toContain("合成停止失败中文");
+    const kept = await f.call("remove", { task: running, keepTask: true }, identity);
+    expect(kept.code).toBe(1); expect(kept.stderr).toContain("still registered"); expect(kept.effects).toEqual(["disable", "stop", "unregister"]);
+    const absent = await f.call("remove", { task: null }, service(await f.call("inspect", { task: null })).identity);
+    expect(absent.code).toBe(1); expect(absent.effects).toEqual([]);
+  } finally { await f.cleanup(); }
+}, 60_000);
 
 test.skipIf(!windows)("真实 Windows 状态读取拒绝清单错误、前台进程、陌生任务和未识别任务状态", async () => {
   const f = await fixture();

@@ -19,6 +19,7 @@ function Assert-ConsoleLifecycle([string]$Operation, [string]$ProjectRoot, [stri
         return
     }
     if ($env:MIXIN_OPS_APP_DRAFT -or $env:MIXIN_OPS_MODELS_DRAFT) { throw '只有首次部署使用网页配置草稿；服务尚未停止' }
+    if ($env:MIXIN_OPS_REPLACE_SERVICE) { throw '只有首次部署可以移除本机已有的机器人服务；服务尚未停止' }
     foreach ($required in @('data/config/models.json','data/config/app-bot.json','data/runtime/pi/settings.json')) {
         if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot $required) -PathType Leaf)) { throw '缺少已有配置，请先完成首次部署；服务尚未停止' }
     }

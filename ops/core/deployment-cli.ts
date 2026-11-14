@@ -17,6 +17,7 @@ import { TaskStore, type TaskRequest } from "./tasks.ts";
 import { consoleDir } from "./console-state.ts";
 import type { OpsResult } from "./result.ts";
 import { parseConfirmedTransaction } from "../lib/confirmed-transaction.ts";
+import { HostServiceChanged, removeHostService } from "./host-service.ts";
 
 export interface UpgradeArgs {
   project: string;
@@ -102,6 +103,7 @@ interface Dependencies {
   preflightDeploy?: typeof preflightDockerDeploy;
   platform?: NodeJS.Platform;
   checkPlan?: typeof checkTaskPlan;
+  replaceService?: (project: string, expected: string, output: (text: string) => void) => Promise<string>;
 }
 interface Invocation {
   noun: string;
@@ -208,7 +210,32 @@ async function runDeployCli(args: DeployArgs, dependencies: Dependencies, signal
     } }, dependencies, source), signal);
 }
 
+const replaceUsage = () => new Error("用法：deployment replace-service --project <目录>（仅限控制台首次部署任务）");
+/**
+ * The first step of a console first deployment the operator confirmed with a service to remove (installScope): before the
+ * entry's own checks, which would refuse a service of another directory. Only that task, run by the code that planned it,
+ * whose plan still holds, and only the service it named (MIXIN_OPS_REPLACE_SERVICE, bound to the task's parameters).
+ */
+async function runReplaceService(argv: readonly string[], dependencies: Dependencies): Promise<OpsResult> {
+  if (argv.length !== 3 || argv[1] !== "--project" || !argv[2] || argv[2].startsWith("--")) throw replaceUsage();
+  const project = resolve(argv[2]), env = dependencies.env ?? process.env, expected = env.MIXIN_OPS_REPLACE_SERVICE ?? "";
+  await refusing(async () => {
+    if (env.MIXIN_OPS_CONSOLE !== "1" || env.MIXIN_OPS_LIFECYCLE !== "install" || !env.MIXIN_OPS_TASK_ID || !/^[a-f0-9]{64}$/.test(expected))
+      throw new MaintenanceRefused("只有确认过移除已有服务的控制台首次部署任务可以移除它；未执行操作");
+    if (!env.MIXIN_OPS_EXPECT_CODE) throw new MaintenanceRefused("控制台首次部署缺少确认版本；未执行操作");
+    const request = new TaskStore(consoleDir(project)).request(env.MIXIN_OPS_TASK_ID);
+    if (request.operation !== "install" || request.params.replace !== expected) throw new MaintenanceRefused("要移除的服务与已接单任务不一致；未执行操作");
+    await (dependencies.checkPlan ?? checkTaskPlan)(project, request.id, env.MIXIN_OPS_EXPECT_CODE);
+  });
+  const output = (text: string) => { process.stderr.write(text); };
+  let message: string;
+  try { message = await (dependencies.replaceService ?? removeHostService)(project, expected, output); }
+  catch (error) { throw error instanceof HostServiceChanged ? new MaintenanceRefused(error.message) : error; }
+  return { protocol: "mixin-ops", version: 1, command: "deploy", outcome: "success", wasRunning: false, finalState: "stopped", exitCode: 0, message };
+}
+
 export async function runDeploymentCli(argv: string[], dependencies: Dependencies = {}, signal?: AbortSignal): Promise<{ result: OpsResult; json: boolean }> {
+  if (argv[0] === "replace-service") return { result: await runReplaceService(argv, dependencies), json: false };
   if (argv[0] === "deploy") {
     const args = parseDeployArgs(argv);
     return { result: await runDeployCli(args, dependencies, signal), json: args.json };

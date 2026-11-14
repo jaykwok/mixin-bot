@@ -189,8 +189,7 @@ export async function deployCheck(project: string): Promise<number> {
   line("ok", "运行身份", "以 root 运行");
   const pending = pendingPointer(project);
   if (pending) line("fail", "未完成的操作", `有未完成的${pending}；请在“维护”页继续或回滚`);
-  const facts = await new LaunchdPlatform(project).inspect();
-  if (facts.state !== "absent" && !facts.owned) line("fail", "服务", "已有 LaunchDaemon 属于其他目录或其他账户；请先在那个目录卸载它");
+  // A LaunchDaemon already there is the console's own row (host-service.ts): removed before the deployment once confirmed.
   let account = await accountIdentity(SERVICE_ACCOUNT);
   const foreign = foreignServiceDirectories(project, account ? account.uid : null);
   if (foreign.length) line("fail", "数据目录", `${foreign.join("、")} 已存在且不属于服务账户 ${SERVICE_ACCOUNT}，控制台部署不交接已有目录：确认内容后移走它们，或在终端用 ${hint("deploy")} 部署`);
@@ -233,6 +232,7 @@ export function assertConsoleLifecycle(operation: "deploy" | "install" | "update
     return;
   }
   if (env.MIXIN_OPS_APP_DRAFT || env.MIXIN_OPS_MODELS_DRAFT) throw new EntryError("只有首次部署使用网页配置草稿；服务尚未停止");
+  if (env.MIXIN_OPS_REPLACE_SERVICE) throw new EntryError("只有首次部署可以移除本机已有的机器人服务；服务尚未停止");
   for (const required of REQUIRED_SETTINGS)
     if (!existsSync(join(project, required))) throw new EntryError("缺少已有配置，请先完成首次部署；服务尚未停止");
 }
@@ -326,6 +326,14 @@ export async function deployEntry(project: string, command: "deploy" | "repair",
   if (pending) throw new EntryError(`发现未完成的${pending}。续做和回滚只使用事务记录，不重新部署；请使用 ${hint("resume")} 继续，或 ${hint("rollback")} 回滚。`);
   const lifecycle = consoleLifecycle(env);
   assertConsoleLifecycle(lifecycle, project, "main", env);
+  // A first deployment confirmed with the bot service already on this host to remove (one left from another directory, say):
+  // the core checks the task, its plan and that the service is still the one previewed, removes it, and only then the checks
+  // below look at the host. Nothing here is written before (data/ must not become root's before the account exists).
+  if (lifecycle === "install" && env.MIXIN_OPS_REPLACE_SERVICE) {
+    step("部署前移除本机已有的机器人服务（预览时已确认）...");
+    if (await runCore(project, ["deployment", "replace-service", "--project", project], env) !== 0)
+      throw new EntryError("本机已有的机器人服务没有移除完（原因见上方）；本目录未做任何改动");
+  }
   const service = new LaunchdPlatform(project), deployed = (await service.inspect()).state !== "absent";
   let account = await accountIdentity(SERVICE_ACCOUNT);
   if (!account) {

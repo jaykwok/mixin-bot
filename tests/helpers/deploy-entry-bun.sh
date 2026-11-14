@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The host Bun of a deploy-entry fixture (tests/ops/deploy-entry.test.ts): it runs the core, the console's plan check (which
-# passes) and the console's stage tool (which stages a synthetic configuration). The preflight answers FIXTURE_PREFLIGHT; the
+# passes) and the console's stage tool (which stages a synthetic configuration). The removal of a service already on the host
+# answers FIXTURE_REPLACE, the preflight FIXTURE_PREFLIGHT; the
 # hand-over keeps a copy of the stage, its standard input, the lock and BOT_HOST it inherited, optionally publishes a
 # transaction pointer (FIXTURE_POINTER) and exits with FIXTURE_CORE.
 set -euo pipefail
@@ -12,6 +13,7 @@ for arg in "$@"; do
     previous="$arg"
 done
 case " $* " in
+    *" replace-service "*) exit "${FIXTURE_REPLACE:-0}" ;;
     *" --preflight "*) exit "${FIXTURE_PREFLIGHT:-0}" ;;
     *"/check-plan.ts "*) exit 0 ;;
     *" ops/core/console-stage.ts "*|*"/ops/core/console-stage.ts "*)

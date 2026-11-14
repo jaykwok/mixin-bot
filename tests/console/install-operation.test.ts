@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { assertDeploymentEnvironment, deploymentEnvironment, installScope } from "../../ops/core/deployment-options.ts";
-import { operationArgs, operationCommand, opsCommandOf } from "../../ops/core/operations.ts";
+import { operationArgs, operationCommand, operationObserver, opsCommandOf } from "../../ops/core/operations.ts";
+import { hostService } from "../../ops/core/host-service.ts";
 import { ConfigurationDrafts, taskDrafts } from "../../ops/core/configuration-drafts.ts";
 import { stageConsoleConfiguration } from "../../ops/core/console-stage.ts";
 import { parseConfigurationStage } from "../../ops/config/configuration-stage.ts";
@@ -35,11 +36,16 @@ async function fixture() {
   mkdirSync(join(f.root, ".console")); writeFileSync(join(f.root, ".console/port"), "10001");
   const drafts = new ConfigurationDrafts(f.root), app = checked(drafts, "app"), models = checked(drafts, "models");
   const reference = (id: string) => ({ draft: id, digest: configurationDigest(drafts.read(id)) });
-  const state = { service: false };
+  // service: a bot service of another directory on this host; running: its state (not part of what is confirmed).
+  const state = { service: false, running: true };
   const run: Runner = async argv => {
-    if (argv[0] === "git") return { code: 0, stdout: "main\n", stderr: "" };
-    if (argv[0] === "powershell") return { code: 0, stdout: state.service ? '{"Actions":[{"WorkingDirectory":"C:\\\\other"}]}\n' : "null\n", stderr: "" };
-    if (argv[0] === "docker") return { code: 0, stdout: state.service ? "mixin-bot\n" : "", stderr: "" };
+    if (argv[0] === "git") return { code: 0, stdout: argv.includes("--abbrev-ref") ? "main\n" : "a".repeat(40) + "\n", stderr: "" };
+    if (argv[0] === "powershell") return { code: 0, stdout: !state.service ? "null\n" : JSON.stringify({ State: state.running ? "Running" : "Ready", Path: "\\",
+      Principal: { UserId: "SYSTEM", GroupId: null, LogonType: "ServiceAccount", RunLevel: "Highest" },
+      Actions: [{ Execute: "powershell.exe", Arguments: "-File launcher.ps1", WorkingDirectory: "C:\\other" }] }) + "\n", stderr: "" };
+    if (argv[0] === "docker" && argv[1] === "ps") return { code: 0, stdout: state.service ? "mixin-bot\n" : "", stderr: "" };
+    if (argv[0] === "docker" && argv[1] === "container" && argv[2] === "inspect") return { code: 0, stdout: JSON.stringify([{ Id: "c".repeat(64), Image: "sha256:" + "e".repeat(64),
+      State: { Running: state.running }, Mounts: [{ Type: "bind", Source: "/srv/other/data", Destination: "/app/data" }] }]), stderr: "" };
     // macOS: no definition; a loaded job without one is someone else's LaunchDaemon.
     if (argv[0] === "/bin/launchctl") return state.service ? { code: 0, stdout: "state = running\n", stderr: "" } : { code: 113, stdout: "", stderr: "" };
     if (argv[0] === "/usr/bin/id") return { code: 1, stdout: "", stderr: "no such user" };
@@ -51,25 +57,32 @@ async function fixture() {
 
 test("首次部署只接受两份草稿引用和明确的通讯录范围，以 deploy 入口运行；草稿引用只出现在首次部署的环境里", () => {
   const ref = (letter: string) => ({ draft: "config-" + letter.repeat(32), digest: letter.repeat(64) });
-  const params = { directory: "all", port: 2022, workspace: "", app: ref("a"), models: ref("b") };
+  const params = { directory: "all", port: 2022, workspace: "", app: ref("a"), models: ref("b"), replace: null };
   expect(operationArgs("install", params)).toEqual(["deploy"]);
   expect([opsCommandOf("install"), opsCommandOf("repair")]).toEqual(["deploy", "repair"]);
   for (const bad of [{ ...params, directory: "saved" }, { ...params, app: undefined }, { ...params, app: ref("a").draft }, { ...params, models: { ...ref("b"), extra: 1 } },
-    { ...params, models: { draft: "config-x", digest: "b".repeat(64) } }, { ...params, argv: [] }, { directory: "all", port: 2022, workspace: "" }])
+    { ...params, models: { draft: "config-x", digest: "b".repeat(64) } }, { ...params, argv: [] }, { directory: "all", port: 2022, workspace: "" },
+    { ...params, replace: undefined }, { ...params, replace: "d".repeat(63) }, { ...params, replace: true }])
     expect(() => operationArgs("install", JSON.parse(JSON.stringify(bad)))).toThrow();
   const env = operationCommand("fixture", "install", params).env;
   expect(env).toMatchObject({ MIXIN_OPS_LIFECYCLE: "install", MIXIN_OPS_APP_DRAFT: `${"config-" + "a".repeat(32)}:${"a".repeat(64)}`,
-    MIXIN_OPS_MODELS_DRAFT: `${"config-" + "b".repeat(32)}:${"b".repeat(64)}`, BOT_DIRECTORY_SCOPE: "all", BOT_PORT: "2022" });
+    MIXIN_OPS_MODELS_DRAFT: `${"config-" + "b".repeat(32)}:${"b".repeat(64)}`, BOT_DIRECTORY_SCOPE: "all", BOT_PORT: "2022", MIXIN_OPS_REPLACE_SERVICE: "" });
   expect(() => assertDeploymentEnvironment("install", params, "fixture", { ...env, MIXIN_OPS_MODELS_DRAFT: "" })).toThrow("MIXIN_OPS_MODELS_DRAFT");
+  // The service to remove first travels with the task's own parameters: an entry cannot be handed another one.
+  const replacing = { ...params, replace: "d".repeat(64) }, replaceEnv = operationCommand("fixture", "install", replacing).env;
+  expect(replaceEnv.MIXIN_OPS_REPLACE_SERVICE).toBe("d".repeat(64));
+  expect(() => assertDeploymentEnvironment("install", replacing, "fixture", { ...replaceEnv, MIXIN_OPS_REPLACE_SERVICE: "e".repeat(64) })).toThrow("MIXIN_OPS_REPLACE_SERVICE");
+  expect(() => assertDeploymentEnvironment("install", params, "fixture", replaceEnv)).toThrow("MIXIN_OPS_REPLACE_SERVICE");
   const deploy = { directory: "saved", port: 2022, workspace: "" }, deployEnv = deploymentEnvironment("deploy", deploy, "fixture");
-  expect([deployEnv.MIXIN_OPS_APP_DRAFT, deployEnv.MIXIN_OPS_MODELS_DRAFT]).toEqual(["", ""]);
+  expect([deployEnv.MIXIN_OPS_APP_DRAFT, deployEnv.MIXIN_OPS_MODELS_DRAFT, deployEnv.MIXIN_OPS_REPLACE_SERVICE]).toEqual(["", "", ""]);
   expect(() => assertDeploymentEnvironment("deploy", deploy, "fixture", { ...deployEnv, MIXIN_OPS_APP_DRAFT: env.MIXIN_OPS_APP_DRAFT })).toThrow("MIXIN_OPS_APP_DRAFT");
+  expect(() => assertDeploymentEnvironment("deploy", deploy, "fixture", { ...deployEnv, MIXIN_OPS_REPLACE_SERVICE: "d".repeat(64) })).toThrow("MIXIN_OPS_REPLACE_SERVICE");
 });
 
 test("首次部署预览绑定在线校验过的草稿、范围、端口和资料目录；已部署、已有服务、草稿变化或未在线校验时拒绝", async () => {
   const f = await fixture();
   try {
-    const params = { directory: "all", port: 2022, workspace: "", app: f.appRef, models: f.modelsRef };
+    const params = { directory: "all", port: 2022, workspace: "", app: f.appRef, models: f.modelsRef, replace: null };
     const first = await installScope(f.root, params, f.run, f.launchd);
     expect(first.summary.join("\n")).toContain("应用机器人：fixture"); expect(first.summary.join("\n")).toContain("整个通讯录");
     expect(JSON.stringify(first)).not.toContain("synthetic");
@@ -78,7 +91,22 @@ test("首次部署预览绑定在线校验过的草稿、范围、端口和资�
     expect((await installScope(f.root, { ...params, directory: { ...departments, appHash: sha(appText) } }, f.run, f.launchd)).summary.join("")).toContain("合成研发");
     await expect(installScope(f.root, { ...params, directory: { ...departments, appHash: "0".repeat(64) } }, f.run, f.launchd)).rejects.toThrow("另一份应用凭据");
     await expect(installScope(f.root, { ...params, port: 10001 }, f.run, f.launchd)).rejects.toThrow("控制台端口");
-    f.state.service = true; await expect(installScope(f.root, params, f.run, f.launchd)).rejects.toThrow("卸载"); f.state.service = false;
+    // A service of the bot's name already on this host: refused until the operator confirms that very one to be removed first.
+    f.state.service = true;
+    await expect(installScope(f.root, params, f.run, f.launchd)).rejects.toThrow("请确认部署前移除它，或先在原目录卸载");
+    const leftover = (await hostService(f.root, f.run, f.launchd))!;
+    expect(leftover.digest).toMatch(/^[a-f0-9]{64}$/);
+    const replacing = await installScope(f.root, { ...params, replace: leftover.digest }, f.run, f.launchd);
+    expect(replacing.summary[0]).toContain(`部署前先停止并移除本机已有的${leftover.description}`);
+    expect(replacing.summary[0]).toContain("移除后不再恢复，即使本次部署失败");
+    expect(replacing.scope).not.toBe(first.scope);
+    await expect(installScope(f.root, { ...params, replace: "d".repeat(64) }, f.run, f.launchd)).rejects.toThrow("与确认移除的不同");
+    // Whether it runs is not what was confirmed; once it is gone (the deployment's first step), the confirmed plan still holds.
+    f.state.running = false;
+    expect((await installScope(f.root, { ...params, replace: leftover.digest }, f.run, f.launchd)).scope).toBe(replacing.scope);
+    f.state.service = false;
+    const removed = await installScope(f.root, { ...params, replace: leftover.digest }, f.run, f.launchd);
+    expect(removed.scope).toBe(replacing.scope); expect(removed.summary.join("\n")).not.toContain("移除");
     await expect(installScope(f.root, { ...params, app: { ...f.appRef, digest: "0".repeat(64) } }, f.run, f.launchd)).rejects.toThrow("请先在线校验应用机器人凭据");
     await expect(installScope(f.root, { ...params, app: f.modelsRef }, f.run, f.launchd)).rejects.toThrow("请先填写应用机器人凭据");
     const offline = checked(f.drafts, "models", false);
@@ -93,6 +121,21 @@ test("首次部署预览绑定在线校验过的草稿、范围、端口和资�
     // Another operation wrote the configuration the drafts were read against.
     writeFileSync(join(f.root, "data/config/app-bot.json"), "{}");
     await expect(installScope(f.root, params, f.run, f.launchd)).rejects.toThrow("已被其他操作修改");
+  } finally { await f.cleanup(); }
+});
+
+test("首次部署的计划不看已有服务的运行状态：移除它之后，确认过的计划照样成立", async () => {
+  const f = await fixture();
+  try {
+    writeFileSync(join(f.root, ".console/owner.json"), JSON.stringify({ sid: "S-1-5-21-fixture" }));
+    f.state.service = true;
+    const leftover = (await hostService(f.root, f.run, f.launchd))!, observe = operationObserver(f.root, f.run, f.launchd);
+    const params = { directory: "all", port: 2022, workspace: "", app: f.appRef, models: f.modelsRef, replace: leftover.digest };
+    const before = await observe("install", params);
+    expect(before.facts).toMatchObject({ runState: "absent" }); expect(before.facts).not.toHaveProperty("container");
+    expect(before.summary.join("\n")).toContain("当前状态：未部署");
+    f.state.service = false;
+    expect((await observe("install", params)).facts).toEqual(before.facts);
   } finally { await f.cleanup(); }
 });
 
@@ -112,8 +155,12 @@ test("首次部署的预览准备：浏览器只给草稿编号，计划带上�
   try {
     const picker = { prepare: async () => ({ departments: ["d1"], names: ["合成研发"], appHash: "e".repeat(64) }) } as unknown as DeploymentDirectory;
     const prepare = operationPreparer(f.root, {} as Views, undefined, undefined, undefined, undefined, f.drafts, picker);
-    const input = { app: f.app, models: f.models, directory: "all", port: 2022, workspace: "" };
+    const input = { app: f.app, models: f.models, directory: "all", port: 2022, workspace: "", replace: null };
     expect(await prepare("install", input, "one")).toEqual({ ...input, app: f.appRef, models: f.modelsRef });
+    expect(await prepare("install", { ...input, replace: "d".repeat(64) }, "one")).toMatchObject({ replace: "d".repeat(64) });
+    await expect(prepare("install", { ...input, replace: "--all" }, "one")).rejects.toThrow("是否移除本机已有的机器人服务");
+    const { replace: _omitted, ...unchosen } = input;
+    await expect(prepare("install", unchosen, "one")).rejects.toThrow();
     expect((await prepare("install", { ...input, directory: { view: "v", selected: ["k"] } }, "one")).directory).toMatchObject({ names: ["合成研发"] });
     await expect(prepare("install", input, "two")).rejects.toThrow("过期");
     await expect(prepare("install", { ...input, app: f.appRef }, "one")).rejects.toThrow("参数无效");

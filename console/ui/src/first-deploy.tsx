@@ -11,7 +11,7 @@ import { DeploymentDirectoryPicker, type DeploymentSelection } from "./deploymen
 import { PathField } from "./files.tsx";
 import { Icon } from "./icons.tsx";
 import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
-import { Row, Section, Segmented, Spinner } from "./ui.tsx";
+import { Row, Section, Segmented, Spinner, Toggle } from "./ui.tsx";
 
 interface DependencyJob { state: "running" | "succeeded" | "failed"; message?: string }
 interface Setup { undeployed: boolean; dependencies: { installed: boolean; job: DependencyJob | null } }
@@ -30,9 +30,15 @@ const DEPLOYS: Record<ConsoleInfo["platform"], string> = {
   macos: "创建服务账户（尚未创建时）并安装 LaunchDaemon",
 };
 
+/** A bot service already on this host, as the check found it: the deployment removes it first once the operator agrees. */
+interface Leftover { digest: string; description: string }
+/** What step 1 hands the wizard: `leftover` there is one; `replace` its digest once the operator agreed to remove it. */
+interface HostState { checked: boolean; installed: boolean; leftover: boolean; replace: string | null }
+
 /** Step 1: the dependencies the model check needs, and the deployment's own read-only check of this host. */
-function HostCheck({ platform, onChange }: { platform: ConsoleInfo["platform"]; onChange(value: { checked: boolean; installed: boolean }): void }) {
+function HostCheck({ platform, onChange }: { platform: ConsoleInfo["platform"]; onChange(value: HostState): void }) {
   const [setup, setSetup] = useState<Setup | null>(null), [items, setItems] = useState<CheckItem[] | null>(null);
+  const [leftover, setLeftover] = useState<Leftover | null>(null), [agreed, setAgreed] = useState<string | null>(null);
   const [checking, setChecking] = useState(false), [error, setError] = useState("");
   const live = useRef(true), timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined), following = useRef(false);
   const read = async () => {
@@ -53,17 +59,19 @@ function HostCheck({ platform, onChange }: { platform: ConsoleInfo["platform"]; 
   useEffect(() => { live.current = true; void read(); return () => { live.current = false; clearTimeout(timer.current); }; }, []);
   const installed = !!setup?.dependencies.installed, job = setup?.dependencies.job, installing = job?.state === "running";
   const checked = !!items && items.every(item => item.state === "ok");
-  useEffect(() => { onChange({ checked, installed }); }, [checked, installed]);
+  // Agreement holds for the service it was given for: another check that finds a different one asks again.
+  const replace = leftover && agreed === leftover.digest ? leftover.digest : null;
+  useEffect(() => { onChange({ checked, installed, leftover: !!leftover, replace }); }, [checked, installed, !!leftover, replace]);
   const install = async () => {
-    setError(""); setItems(null);
+    setError(""); setItems(null); setLeftover(null);
     try { const dependencies = await api<Setup["dependencies"]>("/api/setup/dependencies", { method: "POST", body: {}, intent: true });
       if (live.current) { following.current = dependencies.job?.state === "running"; setSetup(previous => ({ undeployed: previous?.undeployed ?? true, dependencies })); clearTimeout(timer.current); timer.current = setTimeout(() => void read(), 2000); } }
     catch (error) { if (live.current) setError(message(error)); }
   };
   const check = async () => {
-    setChecking(true); setError(""); setItems(null);
-    try { const value = await api<{ ok: boolean; items: CheckItem[] }>("/api/setup/check", { method: "POST", body: {}, intent: true, timeoutMs: 150_000 });
-      if (live.current) setItems(value.items); }
+    setChecking(true); setError(""); setItems(null); setLeftover(null);
+    try { const value = await api<{ ok: boolean; items: CheckItem[]; leftover: Leftover | null }>("/api/setup/check", { method: "POST", body: {}, intent: true, timeoutMs: 150_000 });
+      if (live.current) { setItems(value.items); setLeftover(value.leftover ?? null); } }
     catch (error) { if (live.current) setError(message(error)); }
     finally { if (live.current) setChecking(false); }
   };
@@ -80,13 +88,15 @@ function HostCheck({ platform, onChange }: { platform: ConsoleInfo["platform"]; 
         {checking ? <><Icon name="loader" size={14} class="spin" />正在检查…</> : items ? "重新检查" : "开始检查"}</button>
     </Row>
     {items && items.map(item => <Row key={item.name + item.detail} icon={item.state === "ok" ? "check" : "x"} tint={item.state === "ok" ? "green" : "red"} title={item.name} detail={item.detail} />)}
+    {leftover && <div class="row"><Toggle label="部署前移除已有服务" checked={replace !== null} onChange={value => setAgreed(value ? leftover.digest : null)}
+      detail={`停止并移除${leftover.description}，包括开机启动；${platform === "linux" ? "那个目录的文件和镜像" : "那个目录的文件"}不删除。移除后不再恢复，即使本次部署失败。`} /></div>}
     {error && <div class="group-note form-error" role="alert">{error}</div>}
   </Section>;
 }
 
 /** The first deployment wizard, shown on the maintenance page while this checkout is not deployed (and while its deployment runs). */
 export function FirstDeployWizard({ platform, consolePort }: { platform: ConsoleInfo["platform"]; consolePort: number }) {
-  const [host, setHost] = useState({ checked: false, installed: false });
+  const [host, setHost] = useState<HostState>({ checked: false, installed: false, leftover: false, replace: null });
   const [app, setApp] = useState<string | null>(null), [models, setModels] = useState<string | null>(null);
   const [scope, setScope] = useState<"" | "all" | "departments">(""), [selection, setSelection] = useState<DeploymentSelection | null>(null);
   const [port, setPort] = useState("10000"), [workspace, setWorkspace] = useState("");
@@ -100,7 +110,8 @@ export function FirstDeployWizard({ platform, consolePort }: { platform: Console
   useEffect(() => { setSelection(null); }, [app]);
   const portValid = /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
   const directory = scope === "departments" ? selection : scope || null;
-  const missing = [!host.checked && "环境检查未全部通过", !app && "应用机器人凭据未在线校验", !models && "模型配置未校验",
+  const missing = [!host.checked && "环境检查未全部通过", host.leftover && !host.replace && "未确认移除本机已有的机器人服务",
+    !app && "应用机器人凭据未在线校验", !models && "模型配置未校验",
     !directory && "未选择通讯录范围", !portValid ? "端口无效" : Number(port) === consolePort && `端口 ${port} 是控制台正在用的端口`].filter((value): value is string => !!value);
   const started = (accepted: { id: string }) => { setTask(accepted.id); setRound(value => value + 1); };
   return <>
@@ -131,8 +142,8 @@ export function FirstDeployWizard({ platform, consolePort }: { platform: Console
     </Section>
     <Section title="6. 预览并部署">
       <Row icon="play" tint="green" title="首次部署" detail={busy ? "首次部署正在后台运行，进度见任务详情。"
-        : missing.length ? `还差：${missing.join("、")}。` : `${DEPLOYS[platform]}，部署完成后启动机器人。预览列出全部步骤，确认后在后台运行。`}>
-        <TaskAction operation="install" params={{ app, models, directory, port: Number(port), workspace }} primary disabled={busy || missing.length > 0}
+        : missing.length ? `还差：${missing.join("、")}。` : `${host.replace ? "先移除本机已有的机器人服务，再" : ""}${DEPLOYS[platform]}，部署完成后启动机器人。预览列出全部步骤，确认后在后台运行。`}>
+        <TaskAction operation="install" params={{ app, models, directory, port: Number(port), workspace, replace: host.replace }} primary disabled={busy || missing.length > 0}
           onStarted={started}>预览首次部署</TaskAction>
       </Row>
       {running && taskEnded(running.task?.state) && running.task?.state !== "succeeded" && <div class="group-note form-error" role="alert">

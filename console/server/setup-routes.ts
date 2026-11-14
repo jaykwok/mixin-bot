@@ -10,6 +10,7 @@ import { dependenciesInstalled } from "../../ops/core/deployment-git.ts";
 import { consoleDir, writeAtomic } from "../../ops/core/console-state.ts";
 import { hostingCheck, type HostingCheck } from "../../ops/core/hosting.ts";
 import { SOURCE_DIR } from "../../ops/core/platform.ts";
+import { hostService, type HostService } from "../../ops/core/host-service.ts";
 import { redactSecrets } from "../../src/lib/redact.ts";
 import { asOperator, checkoutOwner, type Operator } from "./host-operator.ts";
 import { CREATED_DEPENDENCIES } from "./host-dependencies.ts";
@@ -23,15 +24,18 @@ const CHECK_MS = 90_000;
 export interface DependencyJob { state: "running" | "succeeded" | "failed"; startedAt: number; finishedAt?: number; message?: string }
 /** One line of the environment check. */
 export interface SetupCheck { state: "ok" | "fail"; name: string; detail: string }
+/** A bot service already on this host (host-service.ts): the first deployment removes it first once the operator agrees. */
+export interface Leftover { digest: string; description: string }
 export interface SetupHost {
   platform: NodeJS.Platform;
   undeployed(project: string): boolean;
   installed(project: string): boolean;
   operator(project: string): Promise<Operator | null>;
   hosting(): Promise<HostingCheck>;
+  service(project: string): Promise<HostService | null>;
 }
 const localSetup: SetupHost = { platform: process.platform, undeployed, installed: dependenciesInstalled, operator: project => checkoutOwner(project),
-  hosting: () => hostingCheck() };
+  hosting: () => hostingCheck(), service: project => hostService(project) };
 
 function failure(stderr: string, stdout: string): string {
   const line = (stderr.trim() || stdout.trim()).split(/\r?\n/).map(value => value.trim()).filter(Boolean).at(-1) ?? "";
@@ -79,7 +83,7 @@ export class HostSetup {
   dependencies() { return { installed: this.host.installed(this.project), job: this.job }; }
 
   /** Everything a first deployment needs from this host, read-only; the deployment checks it all again before it starts. */
-  async check(signal?: AbortSignal): Promise<{ ok: boolean; items: SetupCheck[] }> {
+  async check(signal?: AbortSignal): Promise<{ ok: boolean; items: SetupCheck[]; leftover: Leftover | null }> {
     const items: SetupCheck[] = [];
     const hosting = await this.host.hosting();
     items.push(hosting.ok ? { state: "ok", name: "后台任务", detail: hosting.facts.join("；") || "可以在后台运行部署任务" }
@@ -98,10 +102,25 @@ export class HostSetup {
       items.push(result.code === 0 && !result.timedOut ? { state: "ok", name: "检出属主", detail: `校验和安装依赖以 ${operator.env.USER ?? `UID ${operator.uid}`} 的身份运行` }
         : { state: "fail", name: "检出属主", detail: `项目目录的属主（UID ${operator.uid}）无法运行 ${process.execPath}：请把 Bun 安装在属主可以执行的位置（例如 /usr/local/bin），或由属主自己启动控制台${this.host.platform === "linux" ? "；还需要 util-linux 的 setpriv" : ""}` });
     }
+    // Read beside the entry's check (each is a process of its own, slow to start on Windows); settled, so neither waits on the other's failure.
+    const service = this.host.service(this.project).then(found => ({ found }), (error: unknown) => ({ error }));
     const entry = entryCheck(this.host.platform, this.project);
     const result = await this.query(entry.command, entry.args, { env: entry.env, signal, timeout: CHECK_MS });
     items.push(...result.timedOut ? [{ state: "fail" as const, name: "部署入口", detail: "环境检查超时，请稍后重试" }] : parseCheckLines(result.stdout, result.stderr, result.code));
-    return { ok: items.every(item => item.state === "ok"), items };
+    // Not a failure: the deployment removes it first once the operator agrees (the plan then binds exactly this one).
+    let leftover: Leftover | null = null;
+    try {
+      const read = await service;
+      if ("error" in read) throw read.error;
+      const found = read.found;
+      if (found) {
+        leftover = { digest: found.digest, description: found.description };
+        items.push({ state: "ok", name: "已有服务", detail: `本机已有${found.description}。一台机器只运行一个部署：可以选择在部署前移除它（包括开机启动），那个目录的文件不删除` });
+      }
+    } catch (error) {
+      items.push({ state: "fail", name: "已有服务", detail: `无法核对本机已有的机器人服务：${error instanceof Error ? redactSecrets(error.message).slice(0, 300) : "原因未知"}` });
+    }
+    return { ok: items.every(item => item.state === "ok"), items, leftover };
   }
 
   /** Starts `bun install --frozen-lockfile`; the page polls dependencies() for the outcome. */

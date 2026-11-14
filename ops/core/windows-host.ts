@@ -11,11 +11,13 @@ export interface WindowsService {
 /** No shell command strings: only a base64 JSON request crosses PowerShell's parameter binder. */
 export class WindowsPlatform {
   constructor(readonly project: string, readonly source: string, private readonly run: NativeRunner = runNative) {}
-  private async call(action: "inspect" | "start" | "stop" | "last-result", expected?: string): Promise<unknown> {
+  private async call(action: "inspect" | "start" | "stop" | "last-result" | "remove", expected?: string): Promise<unknown> {
     const request = { action, project: resolve(this.project), task: "mixin-bot", ...(expected ? { expected } : {}) };
     const result = await this.run({ command: "powershell.exe", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
       join(this.source, "ops/core/windows-platform.ps1"), "-RequestBase64", Buffer.from(JSON.stringify(request), "utf8").toString("base64")],
-      cwd: this.project, protocol: true, timeoutMs: action === "stop" ? 90_000 : 30_000 });
+      // The script takes every path from the request. Not the project's directory: a task left by another deployment may
+      // outlive its directory, and it is still read and removed.
+      cwd: this.source, protocol: true, timeoutMs: action === "stop" || action === "remove" ? 90_000 : 30_000 });
     return nativePayload(result, action);
   }
   async inspect(): Promise<WindowsService> {
@@ -32,4 +34,6 @@ export class WindowsPlatform {
   }
   async start(identity: string): Promise<void> { await this.call("start", identity); }
   async stop(identity: string): Promise<void> { await this.call("stop", identity); }
+  /** Stops the task's bot, keeps the task disabled and unregisters it; returns once neither is left. */
+  async remove(identity: string): Promise<void> { await this.call("remove", identity); }
 }
