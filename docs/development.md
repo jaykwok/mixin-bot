@@ -282,7 +282,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 ## 数据版本与升级
 
-程序版本取自 `package.json`（2.1.1），数据格式 `DATA_VERSION` 为 5，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。格式 5 随 v2.1.0 引入：从这个版本起升级只跟随正式发布，更早的部署一律在新目录全新部署，而不是原地升级。
+程序版本取自 `package.json`（2.1.2），数据格式 `DATA_VERSION` 为 5，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。格式 5 随 v2.1.0 引入：从这个版本起升级只跟随正式发布，更早的部署一律在新目录全新部署，而不是原地升级。
 
 升级只跟随正式发布，部署和重新部署使用当前检出。控制台和三个平台的 `update` 入口都先执行 `git fetch --prune --no-tags origin '+refs/tags/v*:refs/tags/v*'`，让本地的 `v*` 标签与远端一致，再取最高的 `vX.Y.Z`（每段至多九位数字，不含预发布；选择规则见 [releases.ts](../ops/core/releases.ts)、`ops.sh` 的 `latest_release`、`ops.ps1` 的 `Get-LatestRelease`）。控制台只比较部署记录中的程序版本与最新发布版本：有更高版本才提供升级，界面只显示版本号，执行时仍固定到检查所得的提交。命令行还会检查本地 main：领先于发布（包含它，但不是它）时没有可升级的版本，正好是它时照常交给升级器检查部署记录并重新部署。实际升级仍须通过快进、降级和工作区冲突检查。
 

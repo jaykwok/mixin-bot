@@ -58,7 +58,7 @@ brew install --cask libreoffice    # 可选：Word/PPT 预览
 
 ```sh
 sudo mkdir -p /opt/mixin-bot && sudo chown "$USER" /opt/mixin-bot
-git clone --branch v2.1.1 https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
+git clone --branch v2.1.2 https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
 cd /opt/mixin-bot
 git switch -c main
 ```
@@ -97,7 +97,7 @@ Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffic
 先获取最新的正式发布，进入项目目录，再以它建立本地 main 分支：
 
 ```sh
-git clone --branch v2.1.1 https://github.com/jaykwok/mixin-bot.git
+git clone --branch v2.1.2 https://github.com/jaykwok/mixin-bot.git
 cd mixin-bot
 git switch -c main
 ```
@@ -335,7 +335,7 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 
 ## 数据版本与升级
 
-当前程序版本 2.1.1、数据格式 5，Pi 精确锁为 1.5.2（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。更早的版本（使用数据格式 4 的 v2.0.1、数据格式 3 的 v2.0.0、v1.x 和 webhook 发布）不能原地升级，需在新目录全新部署；v2.0.1、v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](data-migrations.md#恢复统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
+当前程序版本 2.1.2、数据格式 5，Pi 精确锁为 1.5.2（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。更早的版本（使用数据格式 4 的 v2.0.1、数据格式 3 的 v2.0.0、v1.x 和 webhook 发布）不能原地升级，需在新目录全新部署；v2.0.1、v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](data-migrations.md#恢复统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
 
 还没有通讯录同步范围的部署（没有 `data/config/directory.json`）升级时必须在停机前选择，选定之前升级不会继续；要继续同步整个通讯录也得明确选它。控制台升级在预览前选择；命令行升级的规则见[命令行部署的选项](operations.md#命令行部署的选项)。
 

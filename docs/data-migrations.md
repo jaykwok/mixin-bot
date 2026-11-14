@@ -8,7 +8,7 @@
 
 | 名称 | 来源 | 用途 |
 | --- | --- | --- |
-| 程序版本 | `package.json` 的 `version`（当前 2.1.1） | 发布与升级判断、控制台显示 |
+| 程序版本 | `package.json` 的 `version`（当前 2.1.2） | 发布与升级判断、控制台显示 |
 | 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 5） | 程序能否打开现有数据 |
 | 构建 | Git 提交（12 位，有已跟踪改动时带 `-dirty`） | 区分同一版本号的不同构建 |
 | 会话存储 schema | Pi Durable 的 SQLite schema（当前 2） | 依赖库内部格式，由数据格式一并约束 |
@@ -21,12 +21,12 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
 部署提交时把**实际部署**的版本和数据所属的应用写入部署记录 `data/state/data-version.json`：
 
 ```json
-{ "dataVersion": 5, "appVersion": "2.1.1", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
+{ "dataVersion": 5, "appVersion": "2.1.2", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
 ```
 
 `application` 是平台环境与 AppID 的 SHA-256 摘要（不含 AppSecret，不保存 AppID 原文）。整个数据目录属于这一个应用：会话、成员身份、通讯录和待交付消息都不能跨应用或跨环境沿用。部署预检、验证实例、提交和服务启动都核对它，在打开通讯录、会话库或恢复任务之前拒绝不一致的配置；配置向导也不接受另一个 AppID 或环境。更换同一应用的 AppSecret 不受影响。要改用另一个应用，在新目录全新部署。
 
-运行中的服务在 `/health` 中报告自己的 `appVersion` 和 `build`（`version` 字段是健康协议版本，与程序版本无关）。控制台总览和 `ops doctor` 显示的是**正在运行的服务**报告的版本；服务没有运行时取自部署记录并注明“未运行”。检出的代码比运行中的服务新时另起一行，例如“本地工具 v2.1.1 · 运行服务 v2.1.0”。检出代码的 `package.json` 不代表已经部署的版本。
+运行中的服务在 `/health` 中报告自己的 `appVersion` 和 `build`（`version` 字段是健康协议版本，与程序版本无关）。控制台总览和 `ops doctor` 显示的是**正在运行的服务**报告的版本；服务没有运行时取自部署记录并注明“未运行”。检出的代码比运行中的服务新时另起一行，例如“本地工具 v2.1.2 · 运行服务 v2.1.0”。检出代码的 `package.json` 不代表已经部署的版本。
 
 ## 新装与升级
 
