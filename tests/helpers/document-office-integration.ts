@@ -33,6 +33,13 @@ await mkdir(root, { recursive: true });
 process.chdir(root);
 assert.equal(await documentToolchainReady(venvDir), true, "test venv must match uv.lock and Python 3.14");
 
+// The console's dependency task must also exercise its own sample conversion and close real PDFium objects correctly.
+const environmentCheck = await runProcess({ command: venvPythonPath(venvDir),
+  args: [join(project, "ops/config/document-check.py"), root, process.env.BOT_DOCUMENT_OFFICE_PATH || ""], cwd: root,
+  env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" }, timeoutMs: 3 * 60_000 });
+assert.equal(environmentCheck.exitCode, 0, environmentCheck.output);
+assert.ok(environmentCheck.output.includes("LibreOffice 转换与 PDF 页面渲染"), environmentCheck.output);
+
 // Every member's tmp is exactly this long. The previous layout put LibreOffice's profile 42 characters below it
 // (<tmp>/document-work-XXXXXX/.work/office-profile), 217 here; on the Windows machine where the failure was measured,
 // LibreOffice 26.2 already wrote no PDF from 149. The deepest job file stays under 260 characters, which Python needs on

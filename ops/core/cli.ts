@@ -27,6 +27,7 @@ import { relayLiteralArgs } from "../lib/relay-options.ts";
 import { runDeploymentCli } from "./deployment-cli.ts";
 import { configureLog } from "../../src/core/log.ts";
 import { checkUninstall } from "./uninstall.ts";
+import { DOCUMENT_ACTIONS, documentRequest, runDocuments } from "./documents.ts";
 
 interface Dependencies {
   env?: NodeJS.ProcessEnv;
@@ -40,6 +41,7 @@ interface Dependencies {
   runtime?: typeof runRuntime;
   backups?: typeof runBackups;
   relay?: typeof runRelay;
+  documents?: typeof runDocuments;
   deployment?: typeof runDeploymentCli;
 }
 
@@ -59,13 +61,14 @@ export async function runCore(args: string[], dependencies: Dependencies = {}, s
   const runtime = positionals[0] === "maintenance" && positionals[1] === "runtime-configure";
   const backups = positionals[0] === "maintenance" && ["backup-scan", "backup-clean"].includes(positionals[1]!);
   const relay = positionals[0] === "maintenance" && ["relay-ls", "relay-test", "relay-purge"].includes(positionals[1]!);
+  const documents = positionals[0] === "maintenance" && (DOCUMENT_ACTIONS as readonly string[]).includes(positionals[1]!);
   const recovery = positionals.length === 1 && positionals[0] === "maintenance-recover";
   const uninstall = positionals.length === 1 && positionals[0] === "uninstall-check";
   const allowed = ["project", "json", ...(history ? ["all", "direct", "storage-segment", "group-id", "expect"] : stats ? ["expect"] : tmp ? Object.keys(TMP_OPTIONS)
     : configuration ? positionals[1] === "configuration-apply" ? ["digest", "stage"] : ["expect"] : backups ? ["confirm"] : relay ? ["all", "keyword", "expect"] : [])];
-  if (!service && !history && !recovery && !stats && !tmp && !configuration && !runtime && !backups && !relay && !uninstall || service && positionals.length !== 2
+  if (!service && !history && !recovery && !stats && !tmp && !configuration && !runtime && !backups && !relay && !documents && !uninstall || service && positionals.length !== 2
     || tokens.some(token => token.kind === "option" && !allowed.includes(token.name)))
-    throw new Error("用法：ops core service <start|stop|restart|repair>、maintenance <history-clear|history-compact|stat-import|tmp-ls|tmp-preview|tmp-purge|tmp-reclaim|tmp-discard|configuration-apply|configuration-restore|runtime-configure|backup-scan|backup-clean|relay-ls|relay-test|relay-purge>、maintenance-recover 或 uninstall-check；--project <目录> [--json]");
+    throw new Error("用法：ops core service <start|stop|restart|repair>、maintenance <history-clear|history-compact|stat-import|tmp-ls|tmp-preview|tmp-purge|tmp-reclaim|tmp-discard|configuration-apply|configuration-restore|runtime-configure|backup-scan|backup-clean|relay-ls|relay-test|relay-purge|document-check|document-install|document-repair>、maintenance-recover 或 uninstall-check；--project <目录> [--json]");
   if (!values.project) throw new Error("缺少 --project，未执行操作");
   const project = resolve(values.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), action = recovery ? "maintenance-recover" : positionals[1]!;
   // Read-only, under the lock the uninstalling entry holds; a console uninstall's task and plan are checked there too.
@@ -82,6 +85,7 @@ export async function runCore(args: string[], dependencies: Dependencies = {}, s
   const configurationInput = configuration ? configurationRequest(action, [...(values.stage !== undefined ? ["--stage", values.stage] : []),
     ...positionals.slice(2), ...(values.digest ? ["--digest", values.digest] : []), ...(values.expect ? ["--expect", values.expect] : [])]) : undefined;
   const runtimeInput = runtime ? runtimeRequest(positionals.slice(2)) : undefined;
+  const documentsInput = documents ? documentRequest(action, positionals.slice(2)) : undefined;
   const backupInput = backups ? backupRequest(action, [...positionals.slice(2), ...(values.confirm ? ["--confirm", values.confirm] : [])]) : undefined;
   const relayInput = relay ? relayRequest(action, [...positionals.slice(2), ...(values.keyword !== undefined ? ["--keyword", values.keyword] : []),
     ...(values.all ? ["--all"] : []), ...(values.expect ? ["--expect", values.expect] : [])]) : undefined;
@@ -98,12 +102,12 @@ export async function runCore(args: string[], dependencies: Dependencies = {}, s
       const request = new TaskStore(consoleDir(project)).request(env.MIXIN_OPS_TASK_ID);
       if (request.operation !== action || (service || recovery) && Object.keys(request.params).length) throw new MaintenanceRefused("命令与确认的控制台任务不符");
       await (dependencies.checkPlan ?? checkTaskPlan)(project, request.id, expected);
-      if (historyInput || statsInput || tmpInput || configurationInput || runtimeInput || backupInput || relayInput) {
+      if (historyInput || statsInput || tmpInput || configurationInput || runtimeInput || backupInput || relayInput || documentsInput) {
         const plan = new PlanStore(consoleDir(project), operationObserver(project)).read(request.planId);
         const args = operationArgs(action, request.params, plan.facts.scope).slice(1);
         const selected = historyInput ? historyRequest(action, args) : tmpInput ? tmpRequest(action, args) : configurationInput ? configurationRequest(action, args)
-          : runtimeInput ? runtimeRequest(args) : backupInput ? backupRequest(action, args) : relayInput ? relayRequest(action, args) : statsImportRequest(args);
-        if (JSON.stringify(selected) !== JSON.stringify(historyInput ?? statsInput ?? tmpInput ?? configurationInput ?? runtimeInput ?? backupInput ?? relayInput)) throw new MaintenanceRefused("数据范围与确认过的控制台任务不符");
+          : runtimeInput ? runtimeRequest(args) : backupInput ? backupRequest(action, args) : relayInput ? relayRequest(action, args) : documentsInput ? documentRequest(action, args) : statsImportRequest(args);
+        if (JSON.stringify(selected) !== JSON.stringify(historyInput ?? statsInput ?? tmpInput ?? configurationInput ?? runtimeInput ?? backupInput ?? relayInput ?? documentsInput)) throw new MaintenanceRefused("数据范围与确认过的控制台任务不符");
       }
     }),
     async finish(result) { if (env.MIXIN_OPS_RESULT_FILE) await publishJson(env.MIXIN_OPS_RESULT_FILE, result); },
@@ -116,6 +120,7 @@ export async function runCore(args: string[], dependencies: Dependencies = {}, s
     : runtimeInput ? await (dependencies.runtime ?? runRuntime)(runtimeInput, options, signal)
     : backupInput ? await (dependencies.backups ?? runBackups)(backupInput, options, signal)
     : relayInput ? await (dependencies.relay ?? runRelay)(relayInput, options, signal)
+    : documentsInput ? await (dependencies.documents ?? runDocuments)(documentsInput, options, signal)
     : historyInput ? await (dependencies.history ?? runHistory)(historyInput, options, signal)
     : await runServiceCommand(action as ServiceAction, (dependencies.host ?? createServiceHost)(options), signal);
   return { result, json: !!values.json };

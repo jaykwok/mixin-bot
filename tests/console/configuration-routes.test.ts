@@ -10,6 +10,36 @@ import type { QueryHost } from "../../console/server/runtime-query.ts";
 /** The container path, whatever the runner: deployed Linux hosts query through the deployed image. */
 const linux: QueryHost = { platform: "linux", undeployed: () => false, operator: async () => null, service: async () => null };
 
+test("模型自动刷新只保存目录到当前草稿，不把缓存正文发给浏览器；变更、取消或已结束草稿拒绝迟到结果", async () => {
+  const f = await tempFixture("configuration-auto-catalog-");
+  try {
+    const drafts = new ConfigurationDrafts(f.root), catalog = JSON.stringify({ deepseek: { models: [{ id: "fresh", contextWindow: 32000, maxTokens: 4000 }], checkedAt: Date.now() } });
+    let during = () => {};
+    const routes = configurationRoutes(drafts, async (action, input) => {
+      expect(action).toBe("models"); expect(input).toMatchObject({ provider: "deepseek", config: { apiKey: "fixture-private" }, catalog: "{}" });
+      during(); return { models: [{ id: "fresh" }], catalog };
+    });
+    const patch = { provider: "deepseek", mode: "builtin", key: { mode: "set", value: "fixture-private" } };
+    for (const situation of ["ok", "changed", "cancelled", "closed"]) {
+      const draft = drafts.create("models", "one"), controller = new AbortController();
+      during = () => {
+        if (situation === "changed") drafts.edit(draft.id, "one", 0, { ...patch, model: "deepseek-chat", thinking: "off" });
+        if (situation === "cancelled") controller.abort();
+        if (situation === "closed") drafts.end("one");
+      };
+      const response = routes["POST /api/configuration/models"]!.run({ body: { id: draft.id, patch }, session: { label: "one" }, signal: controller.signal } as RouteContext);
+      if (situation === "ok") {
+        const result = await response as any;
+        expect(result.models).toEqual([{ id: "fresh" }]); expect(result).not.toHaveProperty("catalog");
+        expect(result.draft.revision).toBe(1); expect(result.draft.validated).toBe(false);
+        expect(drafts.read(draft.id).next.files.catalog).toBe(catalog);
+        expect(drafts.read(draft.id).next.files.models).toBeNull();
+      } else await expect(response).rejects.toThrow();
+      drafts.end("one");
+    }
+  } finally { await f.cleanup(); }
+});
+
 /** The bot container reports its data bind by the real path it was created with. */
 const dataMount = (root: string) => { mkdirSync(join(root, "data"), { recursive: true }); return { Type: "bind", RW: true, Destination: "/app/data", Source: realpathSync(join(root, "data")) }; };
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";

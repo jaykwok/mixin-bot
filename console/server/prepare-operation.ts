@@ -25,7 +25,7 @@ export function operationPreparer(project: string, views: Views, query = capture
       let chosen = params.directory;
       if (chosen && typeof chosen === "object") {
         if (!directory) throw new Error("部署部门选择器不可用");
-        chosen = await directory.prepare(chosen, session);
+        chosen = "saved" in chosen ? await directory.prepareSaved(chosen, session, textParam(params.app)) : await directory.prepare(chosen, session);
       }
       // replace: the digest of the service already on this host the operator agreed to remove first, or null (installScope checks it).
       const normalized = { app, models, directory: chosen, port: params.port, workspace: params.workspace, replace: params.replace };

@@ -25,7 +25,7 @@ import { askTransactionAction, askYesNo, attached, captured, EntryError, fail, h
 const SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 /** Data actions of the core, with the names ops.sh gives them. */
 const MAINTENANCE = new Set(["runtime-configure", "configuration-apply", "configuration-restore", "relay-ls", "relay-test", "relay-purge", "tmp-ls", "tmp-purge",
-  "tmp-preview", "tmp-reclaim", "tmp-discard", "history-clear", "history-compact", "stat-import", "backup-scan", "backup-clean"]);
+  "tmp-preview", "tmp-reclaim", "tmp-discard", "history-clear", "history-compact", "stat-import", "backup-scan", "backup-clean", "document-check", "document-install", "document-repair"]);
 const WIZARDS: Record<string, [label: string, wizard: string, kind: string]> = { "relay-configure": ["外链配置", "configure-relay.ts", "relay"],
   "model-configure": ["模型配置", "configure.ts", "models"], "configure-app-bot": ["应用机器人配置", "configure-app-bot.ts", "app"] };
 
@@ -341,6 +341,7 @@ function help(): void {
   relay-configure | model-configure | configure-app-bot
              配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置
   runtime-configure <草稿名>  应用控制台「运行参数」或「资料与文档」中已确认的参数
+  document-check | document-install | document-repair  检查、安装或修复文档依赖
   directory  查看事件 Stream 与通讯录同步状态
   directory-scope [all]  修改同步范围并应用：不带参数时在终端里逐层勾选部门，带 all 时同步整个通讯录
   relay-ls | relay-test | relay-purge <关键字>|--all   大文件外链的列出、验收与清理

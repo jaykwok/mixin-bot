@@ -14,6 +14,27 @@ const snapshot = (): ConfigurationSnapshot => ({ kind: "models", binding: null, 
   settings: JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture", defaultThinkingLevel: "low" }), catalog: null,
 } });
 
+test("内置目录在未选择模型时刷新并保留可校验的缓存，只访问所选目录且不把密钥交给目录站点", async () => {
+  const f = await tempFixture("configuration-builtin-list-"), previous = globalThis.fetch, seen: string[] = [];
+  const model = { id: "fresh-fixture", name: "Fresh fixture", api: "openai-completions", provider: "deepseek", baseUrl: "https://api.deepseek.com",
+    contextWindow: 32000, maxTokens: 4000, input: ["text"], reasoning: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    seen.push(String(url)); expect(String(url)).toContain("/api/models/providers/deepseek");
+    expect(new Headers(init?.headers).has("authorization")).toBe(false);
+    return Response.json([model], { headers: { "last-modified": "Thu, 01 Jan 2099 00:00:00 GMT" } });
+  }) as typeof fetch;
+  try {
+    const result = await listProviderModels({ provider: "deepseek", config: { apiKey: "fixture-private-key" }, catalog: "{}" }, { temporaryRoot: f.root });
+    expect(seen).toHaveLength(1); expect(result.models.some(value => value.id === model.id)).toBe(true);
+    expect(result.catalog).toBeDefined(); expect(JSON.stringify(result)).not.toContain("fixture-private-key");
+    const ready = await checkConfiguration({ kind: "models", binding: null, files: { catalog: result.catalog!,
+      models: JSON.stringify({ providers: { deepseek: { apiKey: "fixture-private-key" } } }),
+      settings: JSON.stringify({ defaultProvider: "deepseek", defaultModel: model.id }) } }, { root: f.root, temporaryRoot: f.root });
+    expect(ready.success).toBe(true); expect(seen).toHaveLength(1);
+    expect(await readdir(f.root)).toEqual([]);
+  } finally { globalThis.fetch = previous; await f.cleanup(); }
+});
+
 test("配置校验使用真实 Pi 启动路径，私有草稿目录无论成败均移除，不执行模型请求", async () => {
   const f = await tempFixture("configuration-check-");
   try {

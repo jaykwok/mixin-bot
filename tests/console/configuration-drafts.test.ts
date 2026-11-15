@@ -58,7 +58,9 @@ test("模型列表请求取正在编辑的服务商字段：保留的密钥只�
     expect(drafts.modelListInput(opened.id, "one", { ...fresh, key: { mode: "set", value: "sk-other" } })).toEqual({ provider: "another",
       config: { apiKey: "sk-other", api: modelPatch.api, baseUrl: "https://other.test/v1" } });
     expect(() => drafts.modelListInput(opened.id, "one", { ...fields, baseUrl: "https://other.test/v1" })).toThrow("新的服务商 ID");
-    expect(() => drafts.modelListInput(opened.id, "one", { ...fields, mode: "builtin" })).toThrow("模型目录");
+    expect(() => drafts.modelListInput(opened.id, "one", { ...fields, mode: "builtin" })).toThrow("新的服务商 ID");
+    expect(drafts.modelListInput(opened.id, "one", { provider: "openai", mode: "builtin", key: { mode: "set", value: "builtin-fixture" } }))
+      .toEqual({ provider: "openai", config: { apiKey: "builtin-fixture" }, catalog: "{}" });
     expect(() => drafts.modelListInput(opened.id, "one", { ...fields, model: "fixture" })).toThrow("未允许");
     expect(() => drafts.modelListInput(opened.id, "two", fields)).toThrow("过期");
     expect(drafts.read(opened.id).revision).toBe(0);

@@ -20,10 +20,11 @@ export interface TaskEvent { seq: number; at: number; kind: string; text: string
 export const TASK_STATES: Record<string, string> = { queued: "等待接单", "not-accepted": "未接单", running: "执行中", interrupted: "执行中断", succeeded: "已完成", failed: "失败", unknown: "结果未知" };
 export const TASK_LABELS: Record<string, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", install: "首次部署", repair: "修复部署", uninstall: "卸载", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "会话压缩",
   "tmp-purge": "归档临时文件", "tmp-reclaim": "物理回收", "tmp-discard": "删除归档", "stat-import": "导入统计", "runtime-configure": "运行参数",
-  "relay-test": "测试外链", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复配置" };
+  "relay-test": "测试外链", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复配置",
+  "document-check": "检查文档环境", "document-install": "安装文档依赖", "document-repair": "修复文档依赖" };
 /** Operations whose interruption leaves maintenance to recover. */
 const RECOVERABLE = ["history-clear", "history-compact", "stat-import", "tmp-purge", "tmp-reclaim", "tmp-discard", "configuration-apply", "configuration-restore",
-  "runtime-configure", "backup-clean", "relay-test", "relay-purge", "maintenance-recover"];
+  "runtime-configure", "backup-clean", "relay-test", "relay-purge", "maintenance-recover", "document-check", "document-install", "document-repair"];
 const STEPS = ["预览", "确认", "执行"];
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const VERSION_TASKS = new Set(["update", "deploy", "install", "resume", "rollback", "repair"]);

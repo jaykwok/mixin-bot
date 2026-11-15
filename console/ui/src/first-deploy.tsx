@@ -7,11 +7,11 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "./api.ts";
 import { ConfigurationForm } from "./configuration.tsx";
 import type { ConsoleInfo } from "./contract.ts";
-import { DeploymentDirectoryPicker, type DeploymentSelection } from "./deployment-directory.tsx";
+import { SetupDirectory, type SavedDirectorySelection } from "./setup-directory.tsx";
 import { PathField } from "./files.tsx";
 import { Icon } from "./icons.tsx";
 import { TaskAction, taskEnded, useFollowed } from "./tasks.tsx";
-import { Row, Section, Segmented, Spinner, Toggle } from "./ui.tsx";
+import { Row, Section, Spinner, Toggle } from "./ui.tsx";
 
 interface DependencyJob { state: "running" | "succeeded" | "failed"; message?: string }
 interface Setup { undeployed: boolean; dependencies: { installed: boolean; job: DependencyJob | null } }
@@ -98,7 +98,7 @@ function HostCheck({ platform, onChange }: { platform: ConsoleInfo["platform"]; 
 export function FirstDeployWizard({ platform, consolePort }: { platform: ConsoleInfo["platform"]; consolePort: number }) {
   const [host, setHost] = useState<HostState>({ checked: false, installed: false, leftover: false, replace: null });
   const [app, setApp] = useState<string | null>(null), [models, setModels] = useState<string | null>(null);
-  const [scope, setScope] = useState<"" | "all" | "departments">(""), [selection, setSelection] = useState<DeploymentSelection | null>(null);
+  const [directory, setDirectory] = useState<SavedDirectorySelection | null>(null);
   const [port, setPort] = useState("10000"), [workspace, setWorkspace] = useState("");
   // A deployment took the drafts: each form lets its draft go. `task` is that deployment, followed until it ends.
   const [round, setRound] = useState(0), [task, setTask] = useState<string | null>(null);
@@ -106,32 +106,21 @@ export function FirstDeployWizard({ platform, consolePort }: { platform: Console
   const running = followed.find(item => item.id === task);
   // Only a followed task runs: one closed in the activity tray had ended.
   const busy = !!running && !taskEnded(running.task?.state);
-  // Departments are read with the application draft: another draft needs another choice.
-  useEffect(() => { setSelection(null); }, [app]);
   const portValid = /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
-  const directory = scope === "departments" ? selection : scope || null;
   const missing = [!host.checked && "环境检查未全部通过", host.leftover && !host.replace && "未确认移除本机已有的机器人服务",
     !app && "应用机器人凭据未在线校验", !models && "模型配置未校验",
-    !directory && "未选择通讯录范围", !portValid ? "端口无效" : Number(port) === consolePort && `端口 ${port} 是控制台正在用的端口`].filter((value): value is string => !!value);
+    !directory && "未保存通讯录范围", !portValid ? "端口无效" : Number(port) === consolePort && `端口 ${port} 是控制台正在用的端口`].filter((value): value is string => !!value);
   const started = (accepted: { id: string }) => { setTask(accepted.id); setRound(value => value + 1); };
   return <>
-    <Section title="首次部署" footer="确认前不会改动本机；草稿只保存在本机，确认部署后才写入正式配置。">
+    <Section title="首次部署" footer="配置草稿和单独保存的通讯录范围保存在本机，确认部署后才写入正式配置并创建服务。">
       <Row icon="server" tint="blue" title="在浏览器中完成首次部署"
-        detail="按顺序完成下面几步，最后预览并确认。部署在后台运行，关掉网页不会取消；完成后控制台自动切换到已部署的状态。" />
+        detail="完成下面各项，通讯录范围可以先保存，最后预览并确认。部署在后台运行，关掉网页不会取消；完成后控制台自动切换到已部署的状态。" />
     </Section>
     <HostCheck platform={platform} onChange={setHost} />
     <ConfigurationForm kind="app" deploy={{ title: "2. 应用机器人凭据", onReady: setApp, round, blocked: busy ? "首次部署正在进行。" : undefined }} />
     <ConfigurationForm kind="models" deploy={{ title: "3. 模型", onReady: setModels, round,
       blocked: busy ? "首次部署正在进行。" : host.installed ? undefined : "先在第 1 步安装依赖：模型校验和模型目录要用它。" }} />
-    <Section title="4. 通讯录同步范围">
-      <Row title="同步范围" detail="机器人从平台同步哪些部门的成员。之后可在“通讯录”页修改。">
-        <Segmented label="通讯录同步范围" size="small" value={scope || "none"} onChange={value => { setScope(value === "none" ? "" : value); setSelection(null); }}
-          options={[{ value: "none", label: "未选择" }, { value: "all", label: "整个通讯录" }, { value: "departments", label: "部分部门" }]} />
-      </Row>
-      {scope === "departments" && <div class="row-body flush-top">{app
-        ? <DeploymentDirectoryPicker key={app} draft={app} onChange={setSelection} />
-        : <p class="muted small">先完成第 2 步：部门树用在线校验过的应用机器人凭据读取。</p>}</div>}
-    </Section>
+    <SetupDirectory draft={app} disabled={busy} onChange={setDirectory} />
     <Section title="5. 端口与共享资料">
       <Row title="机器人端口" detail="机器人在本机监听的端口，不能与控制台相同。">
         <input aria-label="机器人端口" type="number" min="1" max="65535" value={port} onInput={event => setPort(event.currentTarget.value)} />

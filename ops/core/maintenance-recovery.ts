@@ -54,7 +54,7 @@ export async function recoverMaintenance(options: MaintenanceHostOptions): Promi
           result.wasRunning = original.state === "running";
           if (!facts.owned || facts.identity !== original.identity || facts.state === "unsupported" || facts.pending) throw new MaintenanceRefused("部署身份、运行方式或事务已变化；保留运维恢复记录");
           if (checkpoint.request.runtime !== codeDigest(options.source)) throw new MaintenanceRefused("恢复必须使用原固定版本运行包；请从 .console/runtime/source-" + checkpoint.request.runtime + "/ops/core/cli.ts 执行 maintenance-recover");
-          if (!["history-clear", "history-compact", "stat-import", "tmp-ls", "tmp-preview", "tmp-purge", "tmp-reclaim", "tmp-discard", "configuration-apply", "configuration-restore", "runtime-configure", "backup-scan", "backup-clean", "relay-ls", "relay-test", "relay-purge"].includes(checkpoint.request.command)) throw new MaintenanceRefused("此版本尚不支持该维护动作的恢复；记录已保留");
+          if (!["history-clear", "history-compact", "stat-import", "tmp-ls", "tmp-preview", "tmp-purge", "tmp-reclaim", "tmp-discard", "configuration-apply", "configuration-restore", "runtime-configure", "backup-scan", "backup-clean", "relay-ls", "relay-test", "relay-purge", "document-check", "document-install", "document-repair"].includes(checkpoint.request.command)) throw new MaintenanceRefused("此版本尚不支持该维护动作的恢复；记录已保留");
           if (current.writer && current.writer.phase !== "reaped" && facts.state === "running" && !checkpoint.request.online) await host.stop();
           if (current.writer?.kind === "docker") {
             if (!(platform instanceof DockerPlatform)) throw new Error("Docker 维护必须由原宿主恢复");

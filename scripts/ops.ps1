@@ -879,6 +879,10 @@ switch ($Command) {
     "relay-configure" { if (-not (Invoke-ConfigureWizard 'configure-relay.ts' '外链配置' 'relay')) { exit $script:OpsCoreExitCode } }
     "configuration-apply" { if (-not (Invoke-ConfigurationChange apply $Target $Digest)) { exit $script:OpsCoreExitCode } }
     "configuration-restore" { if (-not (Invoke-ConfigurationChange restore $Target '' $Expect)) { exit $script:OpsCoreExitCode } }
+    { $_ -in @('document-check','document-install','document-repair') } {
+        if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json') }).Count) { throw '文档环境操作不接受额外参数' }
+        if (-not (Invoke-CoreMaintenance @('maintenance',$Command))) { exit $script:OpsCoreExitCode }
+    }
     "runtime-configure" { if (-not (Invoke-RuntimeConfiguration $Target)) { exit $script:OpsCoreExitCode } }
     "model-configure" { if (-not (Invoke-ConfigureWizard 'configure.ts' '模型配置' 'models')) { exit $script:OpsCoreExitCode } }
     "configure-app-bot" { if (-not (Invoke-ConfigureWizard 'configure-app-bot.ts' '应用机器人配置' 'app')) { exit $script:OpsCoreExitCode } }
@@ -997,6 +1001,7 @@ switch ($Command) {
         Write-Host "  relay-configure 交互配置可选的大文件外链；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态"
         Write-Host "  model-configure 运行模型配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置"
         Write-Host "  runtime-configure <草稿名> 应用控制台「运行参数」或「资料与文档」中已确认的参数"
+        Write-Host "  document-check | document-install | document-repair  检查、安装或修复文档依赖"
         Write-Host "  configure-app-bot 填写应用机器人 AppID/AppSecret 并验证；之后与 model-configure 相同地应用"
         Write-Host "  directory       查看事件 Stream 与通讯录同步状态（同步范围及是否生效、映射数、最近同步、待复核的缺席）"
         Write-Host "  directory-scope all"

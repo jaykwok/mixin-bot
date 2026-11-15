@@ -111,7 +111,7 @@ async function main(argv: string[]): Promise<number | undefined> {
   const forms = new FormRoutes(PROJECT_DIR, audit);
   const pushes = new PushRoutes(PROJECT_DIR, audit); auth.onEnd(label => pushes.end(label));
   const pushPage = new PushPage(PROJECT_DIR, audit); auth.onEnd(label => pushPage.end(label));
-  const deploymentDirectory = new DeploymentDirectory(PROJECT_DIR, departmentQuery(PROJECT_DIR), Date.now, configurations); auth.onEnd(label => deploymentDirectory.end(label));
+  const deploymentDirectory = new DeploymentDirectory(PROJECT_DIR, departmentQuery(PROJECT_DIR), Date.now, configurations, audit); auth.onEnd(label => deploymentDirectory.end(label));
   const setup = new HostSetup(PROJECT_DIR, audit);
   // A first deployment that succeeded while its task's cleanup could not settle the console's node_modules.
   try { if (inspectDataVersion(PROJECT_DIR).current && !loadPendingTransaction(PROJECT_DIR)) settleCreatedDependencies(PROJECT_DIR); }

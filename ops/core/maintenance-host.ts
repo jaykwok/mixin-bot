@@ -145,7 +145,8 @@ export function createMaintenanceHost(options: MaintenanceHostOptions, request: 
         || step.readOnly && step.script === "ops/tools/relay-admin.ts" && step.args[0] === "check" && ["list", "test", "purge"].includes(relayOptions(step.args.slice(1)).command)
         || step.online && step.script === "ops/config/configuration-apply.ts" && step.args[0] === "finish"
         || step.online && step.script === "ops/tools/backup-cleanup.ts" && ["scan", "apply"].includes(backupOptions(step.args).command)
-        || step.online && step.script === "ops/tools/relay-admin.ts" && ["list", "test"].includes(relayOptions(step.args).command);
+        || step.online && step.script === "ops/tools/relay-admin.ts" && ["list", "test"].includes(relayOptions(step.args).command)
+        || step.online && step.script === "ops/tools/document-environment.ts" && ["preflight", "check"].includes(step.args[0]!);
       if ((step.readOnly || step.online) && !preview) throw new Error("此脚本不是允许的在线步骤");
       if (!facts.owned || facts.identity !== deployment.identity || (!preview && !["stopped", "absent"].includes(facts.state))
         || preview && facts.state === "unsupported") throw new MaintenanceRefused("数据步骤之前部署身份或停机状态已变化");

@@ -301,7 +301,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
         <main class={`content${width}`} id="content">
           {resultsOnly ? <div class="view">
             <Banner tone="warn" icon="alert" title="代码已变化">
-              当前控制台只能查看任务结果。请退出当前控制台并重新运行 <code>bun run console</code>，再使用终端里的新链接登录。
+              当前控制台只能查看任务结果。若升级或回滚任务仍在进行，请先等待任务结束；然后在终端按 <kbd>Ctrl+C</kbd> 退出当前控制台，重新运行 <code>bun run console</code>，再使用终端里的新链接登录。关闭控制台不会中断已接单的后台任务。
             </Banner>
             <TasksPage resultsOnly />
           </div> : !runtimeChecked ? (overviewError
@@ -328,7 +328,7 @@ function Shell({ initial, onEnd, onLogout }: { initial: SessionView; onEnd: (gat
               {route === "settings" && <SettingsPage />}
               {route === "models" && <SettingsPage page="models" />}
               {route === "bot" && <SettingsPage page="bot" />}
-              {route === "materials" && <SettingsPage page="materials" />}
+              {route === "materials" && <SettingsPage page="materials" platform={overview?.console.platform} />}
             </div>
           )}
         </main>

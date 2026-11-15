@@ -83,7 +83,7 @@ const READ_ROUTES: ReadonlySet<string> = new Set([
   "POST /api/conversation/activity", "POST /api/conversation/boundaries", "POST /api/conversation/entries", "POST /api/conversation/entry", "POST /api/conversation/requests",
   "POST /api/conversation/search", "POST /api/views/close", "POST /api/views/search", "POST /api/views/space", "POST /api/views/stats", "POST /api/search", "POST /api/stats",
   "POST /api/exports/status", "POST /api/push/list", "POST /api/push/detail", "POST /api/push/groups", "POST /api/directory/children",
-  "POST /api/lifecycle/directory/open", "POST /api/lifecycle/directory/children", "POST /api/files/list", "POST /api/materials/folders",
+  "POST /api/lifecycle/directory/open", "POST /api/lifecycle/directory/children", "POST /api/setup/directory/read", "POST /api/files/list", "POST /api/materials/folders",
 ]);
 
 export function createHandler(options: ConsoleServerOptions): (request: Request, server?: RequestTimeouts) => Promise<Response> {
@@ -129,7 +129,7 @@ export function createHandler(options: ConsoleServerOptions): (request: Request,
       || /^GET \/api\/tasks(?:\/task-[a-f0-9]{32}(?:\/events)?)?$/.test(route) || /^POST \/api\/tasks\/task-[a-f0-9]{32}\/log$/.test(route);
     const read = kind === "download" || READ_ROUTES.has(route);
     const current = () => options.current?.(read) ?? true;
-    const replaced = () => failure(409, "代码已变化。当前控制台只能查看任务结果；请退出并重新运行 bun run console。", "version-changed");
+    const replaced = () => failure(409, "代码已变化。当前控制台只能查看任务结果；若升级或回滚仍在进行，请先等待任务结束，再在终端按 Ctrl+C 退出并重新运行 bun run console。关闭控制台不会中断已接单的后台任务。", "version-changed");
     if (route === "GET /api/runtime") return json({ current: current() });
     if (!stable && !current()) return replaced();
 

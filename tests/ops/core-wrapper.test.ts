@@ -22,6 +22,8 @@ test.skipIf(process.platform !== "linux")("真实 Shell 服务入口只转交核
       [["relay-purge", "--keyword", "--all"], ["maintenance", "relay-purge", "--keyword", "--all"]],
       [["relay-ls", "--unknown"], ["maintenance", "relay-ls", "--unknown"]],
       [["relay-test"], ["maintenance", "relay-test"]],
+      [["document-check"], ["maintenance", "document-check"]],
+      [["document-repair", "--unknown"], ["maintenance", "document-repair", "--unknown"]],
       [["backup-clean", "20261031T000000Z-abcdef", "--confirm", "0123456789abcdef"], ["maintenance", "backup-clean", "20261031T000000Z-abcdef", "--confirm", "0123456789abcdef"]],
       [["maintenance-recover"], ["maintenance-recover"]]]) {
     const child = Bun.spawn(["bash", join(repo, "scripts/ops.sh"), ...input!], { cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe",
@@ -85,6 +87,7 @@ test.skipIf(process.platform !== "win32")("真实 PowerShell 服务函数和分�
       ["runtime-configure", ["maintenance", "runtime-configure", ".runtime-draft-11111111-1111-1111-1111-111111111111.json"]],
       ["backup-scan", ["maintenance", "backup-scan"]],
       ["relay-ls", ["maintenance", "relay-ls"]], ["relay-test", ["maintenance", "relay-test"]],
+      ["document-check", ["maintenance", "document-check"]], ["document-install", ["maintenance", "document-install"]], ["document-repair", ["maintenance", "document-repair"]],
       ["relay-purge", ["maintenance", "relay-purge", "--keyword", "--all"]],
       ["backup-clean", ["maintenance", "backup-clean", "20261031T000000Z-abcdef", "--confirm", "0123456789abcdef"]]] as const) {
       const value = await run([action], 17); expect(value.exit, value.err).toBe(17);

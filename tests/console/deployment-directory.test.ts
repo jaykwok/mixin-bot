@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DeploymentDirectory, type DepartmentQuery } from "../../console/server/deployment-directory.ts";
 import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
@@ -106,5 +106,93 @@ test("首次部署：部门树用在线校验过的应用草稿读取；草稿�
     // An existing deployment keeps its installed configuration.
     mkdirSync(join(f.root, "data/state"), { recursive: true }); writeFileSync(join(f.root, "data/state/data-version.json"), "{}");
     await expect(open(draft.id)).rejects.toThrow("只用于首次部署");
+  } finally { await f.cleanup(); }
+});
+
+async function savedFixture() {
+  const f = await tempFixture("setup-directory-saved-");
+  const state = { time: 1_000_000, fail: false, incomplete: false, during: async () => {} }, calls: string[] = [];
+  const drafts = new ConfigurationDrafts(f.root, () => state.time);
+  const checked = (session = "one", appId = "fixture", secret = "synthetic-private", environment = "production") => {
+    const created = drafts.create("app", session), edited = drafts.edit(created.id, session, created.revision,
+      { appId, environment, secret: { mode: "set", value: secret } });
+    const input = drafts.validationInput(created.id, session, edited.revision);
+    drafts.validated(created.id, session, edited.revision, input.digest, ["通过"], undefined, true);
+    return created.id;
+  };
+  const query: DepartmentQuery = async (action, ids, _signal, app) => {
+    calls.push(action); await state.during();
+    if (state.fail) throw new Error("平台暂不可用");
+    return { appHash: createHash("sha256").update(app ?? "").digest("hex"), departments: state.incomplete ? [] :
+      action === "children" ? [{ id: "dept-root", name: "研发部" }] : ids.map(id => ({ id, name: "研发部最新名称" })) };
+  };
+  const picker = new DeploymentDirectory(f.root, query, () => state.time, drafts), routes = picker.routes();
+  const call = (action: string, body: unknown, session = "one") => routes[`POST /api/setup/directory/${action}`]!.run(context(body, session)) as Promise<{ scope: { saved: string; mode: string; count: number } | null }>;
+  const choose = async (draft: string) => {
+    const opened = await routes["POST /api/lifecycle/directory/open"]!.run(context({ draft })) as Opened;
+    return { view: opened.view, selected: [opened.children[0]!.key] };
+  };
+  return { ...f, state, drafts, checked, picker, query, call, choose, calls };
+}
+
+test("首次部署范围独立保存：草稿超时、退出登录和重启后按同一应用恢复，部署前重新核对且保存不写正式配置", async () => {
+  const f = await savedFixture();
+  try {
+    const draft = f.checked(), chosen = await f.choose(draft), saved = (await f.call("save", { draft, directory: chosen })).scope!;
+    expect(saved).toMatchObject({ mode: "departments", count: 1 });
+    expect(existsSync(join(f.root, "data"))).toBe(false);
+    const persisted = readFileSync(join(f.root, ".console/setup-directory.json"), "utf8");
+    expect(persisted).not.toContain("synthetic-private"); expect(persisted).not.toContain(draft);
+    f.state.time += 31 * 60_000;
+    await expect(f.call("read", { draft })).rejects.toThrow("过期");
+    f.picker.end("one"); f.drafts.end("one");
+    const next = f.checked("two", "fixture", "rotated-secret"), restarted = new DeploymentDirectory(f.root, f.query, () => f.state.time, f.drafts);
+    const restored = await restarted.routes()["POST /api/setup/directory/read"]!.run(context({ draft: next }, "two"));
+    expect(restored).toEqual({ scope: saved });
+    const opened = await restarted.routes()["POST /api/lifecycle/directory/open"]!.run(context({ draft: next }, "two")) as Opened & { selected: { key: string; name: string }[] };
+    expect(opened.selected).toHaveLength(1); expect(opened.selected[0]!.key).toBe(opened.children[0]!.key);
+    expect(opened.selected[0]!.key).not.toBe(chosen.selected[0]);
+    const choice = await restarted.prepareSaved({ saved: saved.saved }, "two", next);
+    expect(choice).toMatchObject({ departments: ["dept-root"], names: ["研发部最新名称"],
+      appHash: createHash("sha256").update(f.drafts.appText(next, "two")).digest("hex") });
+    expect(f.calls.at(-1)).toBe("verify");
+    expect(existsSync(join(f.root, "data"))).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test("首次部署范围按应用和环境隔离；整个通讯录可独立保存，其他登录不能借用草稿或部门键", async () => {
+  const f = await savedFixture();
+  try {
+    const draft = f.checked(), choice = await f.choose(draft);
+    await expect(f.call("save", { draft, directory: choice }, "two")).rejects.toThrow();
+    await expect(f.call("save", { draft, directory: { ...choice, selected: ["dept-root"] } })).rejects.toThrow("手填");
+    const saved = (await f.call("save", { draft, directory: "all" })).scope!;
+    expect(await f.picker.prepareSaved({ saved: saved.saved }, "one", draft)).toBe("all");
+    const other = f.checked("other", "another-app"), testing = f.checked("testing", "fixture", "synthetic-private", "staging");
+    expect(await f.call("read", { draft: other }, "other")).toEqual({ scope: null });
+    expect(await f.call("read", { draft: testing }, "testing")).toEqual({ scope: null });
+    await expect(f.picker.prepareSaved({ saved: saved.saved }, "other", other)).rejects.toThrow("已变化");
+    await expect(f.call("save", { draft: other, directory: choice }, "other")).rejects.toThrow();
+    expect(await f.call("read", { draft })).toEqual({ scope: saved });
+    mkdirSync(join(f.root, "data/state"), { recursive: true }); writeFileSync(join(f.root, "data/state/data-version.json"), "{}");
+    await expect(f.call("save", { draft, directory: "all" })).rejects.toThrow("只用于首次部署");
+  } finally { await f.cleanup(); }
+});
+
+test("已保存范围的在线核对失败或不完整时保留草稿，预览期间另存范围时拒绝旧引用", async () => {
+  const f = await savedFixture();
+  try {
+    const draft = f.checked(), chosen = await f.choose(draft), saved = (await f.call("save", { draft, directory: chosen })).scope!;
+    const before = readFileSync(join(f.root, ".console/setup-directory.json"), "utf8");
+    f.state.fail = true;
+    await expect(f.picker.prepareSaved({ saved: saved.saved }, "one", draft)).rejects.toThrow("不可用");
+    await expect(f.call("save", { draft, directory: chosen })).rejects.toThrow("不可用");
+    f.state.fail = false; f.state.incomplete = true;
+    await expect(f.picker.prepareSaved({ saved: saved.saved }, "one", draft)).rejects.toThrow("不完整");
+    expect(readFileSync(join(f.root, ".console/setup-directory.json"), "utf8")).toBe(before);
+    f.state.incomplete = false;
+    f.state.during = async () => { await f.call("save", { draft, directory: "all" }); };
+    await expect(f.picker.prepareSaved({ saved: saved.saved }, "one", draft)).rejects.toThrow("已变化");
+    expect((await f.call("read", { draft })).scope!.mode).toBe("all");
   } finally { await f.cleanup(); }
 });

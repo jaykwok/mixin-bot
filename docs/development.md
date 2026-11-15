@@ -56,9 +56,9 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 
 点击卡片、截止和汇总不经过模型：
 
-- 卡片按钮的数据是 `{k:"push", p, a, v, o?, f?}`（值都是文字），同样的内容也写进按钮的回调地址 `https://mixin-bot.invalid/push/<p>/<a>/<v>?o=…`：有的客户端点击时不带回按钮数据，只带回地址（实测鸿蒙 4 上的安卓版）。`.invalid` 域名不会被解析。点击经 Stream 的 `callback:card_interaction` 进入，先读按钮数据，读不到再读地址，按卡片版本去重。
+- 卡片按钮的数据是 `{k:"push", p, a, v, o?, f?}`（值都是文字），同样的内容也写进按钮的回调地址 `https://mixin-bot.invalid/push/<p>/<a>/<v>?o=…`：有的客户端点击时不带回按钮数据，只带回地址。`.invalid` 域名不会被解析。点击经 Stream 的 `callback:card_interaction` 进入，先读按钮数据，读不到再读地址，按卡片版本去重。
 - 入站的文字先让推送服务过目：`/登记群` 由它处理，不进收件箱；接收人和群里的其他文字只被记下原话，照常进收件箱交给模型。
-- 回复附件走现有的附件接收；记进回复后由推送在会话库的提交里占用，直到打包。记入按会话库已发布的快照找附件，占用按提交时的记录判定：提交时记录已经不在（没有推送占用时，随过期的请求一起清理）的附件打不进包，推送还在收回复时就从回复里去掉，连同记入它的请求记进 `push_lost_files`，单独给成员发一条重发提醒（发送失败按退避重试，重启后继续）。记入它的请求没有答上来时，失败提示里也说明；失败答复可能晚发，或者在发出前被 `/stop`、`/clear` 撤回，所以单独提醒不因它取消，成员可能收到两次。推送已经截止的，汇总里列为缺件。
+- 回复附件在会话库提交时按有效回复确定持有者：记入后由对应推送保留，撤回或改记时更新归属，打包后释放。每个回复项记录发起登记的请求。进行中的推送会移除已失效的附件，并在 `push_lost_files` 中保存文件名、成员、推送和请求关联，单独提醒成员重发；提醒发送失败时退避重试，重启后继续。该请求的失败答复也会列出失效附件，两种通知独立发送，成员可能收到两次。已截止推送中的失效附件在汇总里列为缺件。
 
 会话备注先写进状态库的发件箱，再用 Durable 被动写入（`mixin.push-note`，按请求号去重）记进相关成员的会话。这样模型知道前因，又不触发运行、不计入统计。
 
@@ -86,6 +86,8 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 | `read` | 读取共享资料、资料索引、本用户 tmp 及项目文档 skill |
 | `edit` / `write` | 仅写本用户 tmp，检查规范路径 |
 | `bash` | 执行命令，统一管理超时、取消、输出上限及后代回收 |
+| `materials_find` | 按文件名、路径和分类定位共享资料 |
+| `materials_grep` | 检索纯文本及已有的解析文本，返回命中片段和来源 |
 | `document_environment` | 按需准备解析环境，验证实际解释器、版本和库导入 |
 | `document_extract` | 提取 PDF/DOCX/PPTX/XLSX，按内容与解析器版本复用缓存，返回可检索的文本路径 |
 | `document_inspect` | 检查 DOCX/PPTX 包及内部引用，返回段落位置、正文块、实际页序和内容摘要；可附带页面或章节大纲 |
@@ -101,7 +103,7 @@ Stream 回调里同步完成字段校验、会话识别、身份查询（`agent.
 
 每个对话都接入 codemode：沿用 Pi 官方 codemode 的脚本运行时和说明文字（[durable/codemode](../src/durable/codemode)，宿主职责集中在 `index.ts`，非公开文档/结果形状依赖集中在 `protocol.ts`），不向脚本开放模型目录。六个 `document_*` 加工工具只能在脚本里调用：不直接声明给模型，列在 codemode 的说明里，用法说明由脚本里的 `describeNamespace("document_work")` 取得。`send_file` / `send_image` 只给模型直接调用，脚本拿不到；其余工具两种方式都能调用。原生 `read` 没有结构化输出 schema，官方 Codemode 只返回其文本，图片块在脚本值中省略；需要模型查看图片时直接调用 `read`。脚本里的调用走同一套工具包装、路径边界和文档并发上限（解析与加工各同时 2 个）。脚本输出过长时，完整输出和超长的子调用结果直接写在本用户 tmp 的 `codemode/<任务>-<调用>/` 下，只有本人的 `read` 能打开，不经过共享的系统临时目录。
 
-Codemode 的进程级预算为 2，单聊和所有群（全服务）共享同步 `acquireWorker()`。满额明确拒绝；构造失败或真实 worker exit 才释放。result、取消或 `close()` 完成不能当成线程退出。关机先停止准入，等待实际退出仍受整个应用的统一关机期限约束。
+Codemode 的全服务并发上限为 2，由同步的 `acquireWorker()` 管理。名额从 worker 创建起占用，创建失败或 worker 实际退出时释放；等待退出的已取消 worker 仍占名额。关机时停止准入，在应用的统一关机期限内等待退出。
 
 Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代，macOS 没有 subreaper，监督进程自成会话，按会话和父子关系结束后代（自建会话且父进程已退出的后代够不到）；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
 
@@ -117,9 +119,9 @@ MCP stdio 程序在各平台上都具有服务用户权限。当前部署面向�
 
 索引用于定位文件，未命中时仍需定向查找资料。`data/config/materials-ignore.txt` 在首次建立索引时生成只含注释的用法模板，之后不再覆盖；每行一个共享资料相对路径前缀，`**/名称` 匹配任意层级，`#` 表示注释；规则也可以在控制台「资料与文档」页修改，保存时保留注释行。规则在每次检查索引时读取，改动后不需要重启。它影响索引和资料搜索，不限制模型按路径直接读取文件。扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
 
-PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境，并按原件 SHA-256、解析器与依赖锁版本复用缓存：共享资料的结果位于 `data/index/parsed`，用户私有文件的结果只放本用户 tmp。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。不提供 OCR，文档工具只接受现代 Office 格式。
+PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，按原件 SHA-256、解析器与依赖锁版本复用结果。原生部署中，共享资料的解析缓存位于 `data/index/parsed`，私有文件的结果位于本成员 tmp；Linux 隔离模式的结果位于成员任务目录，按任务引用和保留期管理。特殊解析或文件生成先调用 `document_environment`。模型不能安装包或改写共享环境；文档工具不提供 OCR，只接受现代 Office 格式。
 
-Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列，默认使用应用共享的 `data/runtime/document-env`。Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../src/agent/document-manifest.ts)。修改依赖后运行 `uv lock`，再做[文档回归](#文档回归)。
+Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列。原生部署默认按需准备 `data/runtime/document-env`；Linux 隔离任务使用镜像内的 `/app/.venv`。Docker 构建、原生环境准备和就绪检测共用 [document-manifest.ts](../src/agent/document-manifest.ts)。修改依赖后运行 `uv lock`，再做[文档回归](#文档回归)。
 
 ## 文档加工
 
@@ -130,7 +132,7 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 | Skill | 复用原则、工具选择和交付标准 | [SKILL.md](../src/agent/modules/document-work/skills/document-work/SKILL.md) |
 | 按需指南 | Word/PPT 编辑要点、Markdown 生成约定、流程图脚本和各类文档的内容要点 | [references](../src/agent/modules/document-work/skills/document-work/references) |
 | 工具 | 摘要校验、大纲、局改、组装、按模板生成、图片素材、渲染、来源记录 | [tools.ts](../src/agent/modules/document-work/tools.ts) |
-| 固定环境 | 共享环境按需 `uv sync`，统一 Python 与依赖锁 | [python-toolchain.ts](../src/agent/python-toolchain.ts) |
+| 固定环境 | 原生部署按需 `uv sync`，隔离任务使用镜像内环境，统一 Python 与依赖锁 | [python-toolchain.ts](../src/agent/python-toolchain.ts) |
 
 **开关。** `BOT_DOCUMENT_WORK_ENABLED` 默认 `1`，设为 `0` 关闭：在控制台的「资料与文档 → 文档处理 → 文档加工模块」修改并应用，或在 `data/config/runtime.json` 中设置后重启；进程环境变量优先于文件。关闭会移除六个文档工具（codemode 脚本也调用不到）、skill、模块提示词及其额外 `read` 权限；资料索引、`document_extract`、`document_environment`、原文件发送和 `read/bash/edit/write` 保留，已有 venv 不卸载。
 
@@ -168,9 +170,9 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 
 ## 缓存与用量统计
 
-模型缓存使用 Pi 原生 `PI_CACHE_RETENTION` 与 provider 的 cacheRetention 策略。Durable 引擎不做缓存保温，也没有保温配置；保温是额外模型请求，与是否允许服务端缓存是两个选项。原生 retry、stream、按模型压缩预算、上下文缓存以及可选辅助模型和 MCP，见[运行设置与可选工具](runtime-tools.md)。模型 `inputLimits.images.resize` 控制图片尺寸。
+模型缓存使用 Pi 原生 `PI_CACHE_RETENTION` 与 provider 的 cacheRetention 策略，不发起后台保温请求。重试、流式请求、按模型压缩预算、上下文缓存及可选辅助模型和 MCP，见[运行设置与可选工具](runtime-tools.md)。模型 `inputLimits.images.resize` 控制图片尺寸。
 
-用量只取 Durable 官方的 `pi.usage`：每个会话按 `provider/model`（对话与压缩，在提交回复或摘要的同一事务里）和工具名（工具结果的 `usage`，包括 codemode 子调用在自身结算时记的那份）累计 input、output、cacheRead、cacheWrite、totalTokens。辅助分类和生图工具把提供方返回的用量放在工具结果上（分类的重试逐次相加），由 Durable 记到工具名下；codemode 结果自身不带用量，子调用不会重复计。本项目不另写请求开始、费用回执或条目游标，也不统计费用：SDK 的费用估算不代表 Coding Plan 实际账单或套餐配额。
+用量只取 Durable 官方的 `pi.usage`：每个会话按 `provider/model`（对话与压缩，在提交回复或摘要的同一事务里）和工具名（工具结果的 `usage`，包括 codemode 子调用在自身结算时记的那份）累计 input、output、cacheRead、cacheWrite、totalTokens。辅助分类和生图工具把提供方返回的用量放在工具结果上（分类的重试逐次相加），由 Durable 记到工具名下；codemode 结果自身不带用量，子调用不会重复计。统计记录提问与已返回的 token 用量，费用及套餐配额以服务商账单为准。
 
 [projection.ts](../src/durable/projection.ts) 在每轮结束、`/compact`、`/clear`、维护和打开空间时同步一位成员：先按请求记录补计提问，再读该会话的 `pi.usage` 快照，与账本里这个来源（会话库代际 + 会话 ID）上次的累计值相减，把增长量记到当天。同一成员的同步串行执行，快照在轮次内读取，较旧的快照不会覆盖新的累计值；累计值回退（较早的副本）时以当前值为新基准、不入账并写告警。补计提问用的请求 ID 保留 30 天（`ASK_ID_RETENTION_MS`），维护时裁剪并把只进不退的 `ask_horizon` 推到裁剪点，更早的提问不再补计。口径与导入见[统计账本](data-migrations.md#统计账本)。
 
@@ -186,7 +188,7 @@ bun audit
 
 本地开发直接运行 `bun run configure` 或 `bun run configure-app-bot` 时，向导在维护租约下直接写入配置，要先停止本地运行的服务。已部署的实例走另一条路：控制台的配置和运维命令 `model-configure`、`configure-app-bot` 填写期间服务照常运行，先确认，再短暂停机写入并按原运行状态恢复，见[日常控制](operations.md#日常控制)。已有应用机器人凭据（`data/config/app-bot.json`）与模型配置时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。一个应用同时只能有一条服务 Stream：本地开发要使用单独的测试应用，不能和生产服务共用凭据，否则两边会互相抢占连接。自动测试使用本地假平台（`tests/helpers`），不连接真实开放平台。
 
-`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 是工作根目录下的 `tests-*`，工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 用系统临时目录，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`，其余平台用项目 `tmp/`。Windows 在创建工作目录前用 `realpath` 展开 TEMP 或指定根目录的短路径、目录联接等别名，cwd、夹具环境变量和回执统一使用完整物理路径。默认夹具放在工作区之外，减少编辑器目录扫描对重命名的干扰。全部通过后删除，失败时保留现场并打印路径，诊断日志仍在项目 `tmp/`。
+`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 是工作根目录下的 `tests-*`，工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 用系统临时目录，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`，其余平台用项目 `tmp/`。Windows 在创建工作目录前用 `realpath` 展开 TEMP 或指定根目录的短路径、目录联接等别名，cwd、夹具环境变量和回执统一使用完整物理路径。Windows 和 WSL 默认把夹具放在项目目录之外。全部通过后删除，失败时保留现场并打印路径，诊断日志仍在项目 `tmp/`。
 
 `bun run test` 默认把测试文件按耗时分组并行。组数为 CPU 核数减一，Windows 最多 4 组，其他平台最多 6 组，可用 `--jobs=<组数>` 或环境变量 `MIXIN_TEST_JOBS` 指定，`--jobs=1` 即串行。
 
@@ -236,17 +238,17 @@ CI 在 GitHub 托管运行器的 Windows、Linux 和 macOS latest 版本上检�
 
 ### Linux 任务隔离与物理回收
 
-Linux Docker 部署的新部署和升级强制使用每任务 rootless Docker 隔离，缺少条件时部署在停机前拒绝，不回退到共享身份执行（配置要求见 [deployment.md](deployment.md)）。rootful 服务首次部署默认 UID 1001，需要属于 UID 1001 的 rootless daemon 与 socket；这一组合已在 WSL 的真实 Docker 环境中验证部署和任务读写边界，使用合成数据与独立测试 daemon。Linux 原生运行可选启用同一隔离。配置：`BOT_TASK_IMAGE` 必须是本机已存在的完整 `sha256:` 镜像 ID；`BOT_TASK_CONTROL_ROOT` 指向用户 tmp 之外、管理端拥有的普通 0700 目录。daemon 必须通过当前身份拥有的本机 Unix socket 连接，并报告 rootless。管理端本身需要访问 Docker；工作进程不获得 socket、宿主 PID namespace 或管理回执。启用前停止旧实例并确认旧工作进程退出，管理端、原生 MCP 和其他宿主服务仍属于可信控制面。0700 本身不能隔离同一宿主身份的恶意进程。
+Linux Docker 部署的新部署和升级强制使用每任务 rootless Docker 隔离，缺少条件时部署在停机前拒绝，不回退到共享身份执行（配置要求见 [deployment.md](deployment.md)）。rootful 服务首次部署默认 UID 1001，需要属于 UID 1001 的 rootless daemon 与 socket；Linux 原生运行可选启用同一隔离。配置：`BOT_TASK_IMAGE` 必须是本机已存在的完整 `sha256:` 镜像 ID；`BOT_TASK_CONTROL_ROOT` 指向用户 tmp 之外、管理端拥有的普通 0700 目录。daemon 必须通过当前身份拥有的本机 Unix socket 连接，并报告 rootless。管理端本身需要访问 Docker；工作进程不获得 socket、宿主 PID namespace 或管理回执。启用前停止旧实例并确认旧工作进程退出，管理端、原生 MCP 和其他宿主服务仍属于可信控制面。0700 本身不能隔离同一宿主身份的恶意进程。
 
-服务身份直接写入的 tmp 条目（不在隔离任务中产生），以及隔离任务的产物，同时使用服务内自动回收和停机离线回收。自动回收只处理签名登记、已退出写者和已核对实体；离线 `tmp reclaim` 保存固定计划、摘要和可恢复进度，物理操作与空间库账本结算保持同一维护租约。Windows 由持删除句柄的回收后端续做；macOS 在停机维护中证明服务账户没有其他进程、部署锁仍被持有后按删除日志删除和续做；Linux 服务身份条目的物理删除只能由宿主 UID 0、独立停机维护身份显式运行，不能通过普通服务包装器自动恢复。自动回收失败会保留结果登记和下一次重试时间，离线计划失败会保留原目录与清单。
+服务身份直接写入的 tmp 条目（不在隔离任务中产生），以及隔离任务的产物，同时使用服务内自动回收和停机离线回收。自动回收只处理签名登记、已退出写者和已核对实体；离线 `tmp reclaim` 保存固定计划、摘要和可恢复进度，物理操作与空间库账本结算保持同一维护租约。Windows 由持删除句柄的回收后端续做；macOS 在停机维护中确认服务账户没有其他进程、部署锁仍被持有后按删除日志删除和续做；Linux 服务身份条目的物理删除只能由宿主 UID 0、独立停机维护身份显式运行，不能通过普通服务包装器自动恢复。自动回收失败会保留结果登记和下一次重试时间，离线计划失败会保留原目录与清单。
 
 bash、文档操作与解析在任务容器中运行。镜像需要预先具备 bash、Python 所需系统库、字体、LibreOffice 等实际使用的能力；环境准备是管理操作。容器禁止网络、使用只读根文件系统、移除 capabilities，限制为 128 个 PID、1 GiB 内存和 2 CPU；来源、资料索引和解释器环境只读，只有本任务 `work` 可写。`PI_USER_TMP` 指向本任务工作目录，其他已封存任务的产物通过只读快照读取。管理端签名登记的 results 任务也可在 codemode 仍执行时提供只读快照，供后续子调用读取；results 任务不允许启动容器。其他活动工作任务不进入快照。管理根即使被列入额外只读目录，也不向 read/write/edit 工具开放。导出的产物拒绝链接、FIFO 和其他特殊文件。超过输入限制或隔离依赖失败时调用报错。
 
 管理端持久保存任务 ID、随机身份、daemon/镜像身份、挂载清单和阶段，确认容器及全部写者退出后才允许按登记 ID 回收。管理根的统一路径校验同时用于文件工具、文档加工与解析，在复制、哈希和命中解析缓存之前执行；workspace 内的管理目录及其符号链接别名也拒绝读取。未确认创建、状态损坏、命名实体替换、设备变化等情况保留目录与回执。仍被历史或待交付内容引用的产物不回收；完成回收的回执保留用于重复调用和重启恢复。旧共享目录无法证明父目录受保护、写者已退出时，在递归删除之前保留整个目录，并将逻辑过期和待物理回收分开记录。
 
-删除 scratch 或任务目录前，管理端还会永久撤销已登记容器 ID，并向同一 daemon 确认该 ID 已不存在。客户端取消与一次“不运行”快照不能撤销 daemon 已受理的迟到启动。确认失败时保留整个工作目录和 stopping 回执；已登记的固定 ID 与未确认创建名称分别处理，未确认名称暂时不存在仍不能证明创建不会稍后完成。
+删除 scratch 或任务目录前，管理端先撤销已登记的容器 ID，并向同一 daemon 确认该 ID 已不存在。无法确认时保留工作目录和 stopping 回执。未确认创建的任务按名称跟踪，只有创建结果明确后才能进入回收。
 
-初始化的并发调用复用同一次检查；失败只使当前尝试失效，后续调用可重新检查根目录、管理身份、daemon 和固定镜像，成功检查仍复用。任务分配在 allocating 阶段登记，成功后才交付 active 任务。失败状态及最后完成步骤进入签名回执，回收不会把未交付的失败任务当作 PID 存活的活跃任务；实体或归属标记证据不足仍保留并报告具体原因。失败回执暂时无法保存时汇总错误，同一后端在存储恢复后先补写失败检查点；真正 active 或尚在分配的任务继续受保护。
+并发初始化复用同一次检查，失败后可重新检查根目录、管理身份、daemon 和固定镜像。任务分配先登记 allocating 状态，完成后进入 active；失败回执保存最后完成步骤，存储恢复后补写尚未保存的检查点。回收根据任务状态、实体和归属记录判断，无法核对的条目保留并报告原因。
 
 可选验收使用 `MIXIN_REAL_TASKS=1 MIXIN_TASK_TEST_IMAGE=sha256:<完整镜像 ID> bun run test tests/ops/real-rootless-tasks.test.ts`，仅在无真实服务的 Linux 测试环境运行，使用已有镜像和合成数据；不自动安装 Docker、拉取镜像或更改现有服务。
 
@@ -278,11 +280,11 @@ bun tests/helpers/document-office-integration.ts $env:UV_PROJECT_ENVIRONMENT
 Remove-Item Env:UV_PROJECT_ENVIRONMENT
 ```
 
-`--office` 要求可运行的 LibreOffice 并检查 Word/PPT 转 PDF；省略时仍验证 PDF 预览。产物和报告保留在 `tmp/document-validation/run-*` 供人工看图，自动检查不会声称已经看过图片。`document-durable-integration.ts` 用合成模型经 Durable 引擎和群注册表走同样的场景（并行比对资料、按新内容挑选 PPT 页、修改 Word 直到预览并读图），产物在 `tmp/document-validation/durable-*`。`document-office-integration.ts` 同样需要 LibreOffice，在长数据目录和哈希命名的空间目录下渲染，并检查两名成员同时转换各用各的 profile、取消后 LibreOffice 进程退出且临时目录删除、之前的产物仍可经受控 read 读取；产物在 `tmp/document-validation/office-*`。
+`--office` 要求可运行的 LibreOffice 并检查 Word/PPT 转 PDF；省略时仍验证 PDF 预览。产物和报告保留在 `tmp/document-validation/run-*` 供人工检查版式；自动检查验证文件结构和执行结果。`document-durable-integration.ts` 用合成模型经 Durable 引擎和群注册表走同样的场景（并行比对资料、按新内容挑选 PPT 页、修改 Word 直到预览并读图），产物在 `tmp/document-validation/durable-*`。`document-office-integration.ts` 同样需要 LibreOffice，在长数据目录和哈希命名的空间目录下渲染，并检查两名成员同时转换各用各的 profile、取消后 LibreOffice 进程退出且临时目录删除、之前的产物仍可经受控 read 读取；产物在 `tmp/document-validation/office-*`。
 
 ## 数据版本与升级
 
-程序版本取自 `package.json`（2.1.2），数据格式 `DATA_VERSION` 为 5，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。格式 5 随 v2.1.0 引入：从这个版本起升级只跟随正式发布，更早的部署一律在新目录全新部署，而不是原地升级。
+程序版本取自 `package.json`（2.1.3），数据格式 `DATA_VERSION` 为 5，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。格式 5 随 v2.1.0 引入：从这个版本起升级只跟随正式发布，更早的部署一律在新目录全新部署，而不是原地升级。
 
 升级只跟随正式发布，部署和重新部署使用当前检出。控制台和三个平台的 `update` 入口都先执行 `git fetch --prune --no-tags origin '+refs/tags/v*:refs/tags/v*'`，让本地的 `v*` 标签与远端一致，再取最高的 `vX.Y.Z`（每段至多九位数字，不含预发布；选择规则见 [releases.ts](../ops/core/releases.ts)、`ops.sh` 的 `latest_release`、`ops.ps1` 的 `Get-LatestRelease`）。控制台只比较部署记录中的程序版本与最新发布版本：有更高版本才提供升级，界面只显示版本号，执行时仍固定到检查所得的提交。命令行还会检查本地 main：领先于发布（包含它，但不是它）时没有可升级的版本，正好是它时照常交给升级器检查部署记录并重新部署。实际升级仍须通过快进、降级和工作区冲突检查。
 
@@ -294,4 +296,4 @@ main 可以领先于最新发布，推到 main 的提交在打标签之前不会
 
 修订链有上限：Durable 给每次变更的文档追加一条增量，`checkpointWhen` 决定何时改写基准（同一提交删除这份文档的旧修订，本项目的文档都只保留当前值）。[checkpoint.ts](../src/durable/checkpoint.ts) 让所有机器人文档每 64 条修订写一次基准，读入一份文档最多折叠 64 条。服务和各维护动作能否进行由 [maintenance-state.ts](../src/core/maintenance-state.ts) 只读未完成的配置提交和运维核心记录的顶层状态判断，运维核心和控制台在进程内调用。维护命令的机器结果见 [maintenance-protocol.ts](../ops/lib/maintenance-protocol.ts)：`--json` 一行，只有退出码 0、结果完整且 `outcome` 为 `success` 才算成功；运维核心是否重新启动服务只看之后重读的维护状态。
 
-Codemode 仍需宿主负责成员结果目录、合并 store 总量校验和可靠交付；子调用用量由 Durable 在子调用结算时记入 `pi.usage`，不复制 VM、journal、参数解析或 provider 转换。
+Codemode 的宿主层负责成员结果目录、合并 store 的总量校验和文件交付；VM、journal、参数解析及 provider 转换使用 Pi 实现。子调用用量由 Durable 在子调用结算时记入 `pi.usage`。

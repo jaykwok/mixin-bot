@@ -37,13 +37,13 @@ Linux 工具进程监督需要访问 `/proc`；不支持 Alpine/musl。应用和
 
 rootful Docker（以 root 运行的默认安装）下，部署、升级、继续和回滚都要由 root 执行，控制台用 `sudo bun run console` 启动：只有 root 能完整查看镜像存储所在磁盘的剩余空间，并按服务的身份给新建的文件设置属主。docker 组中的普通用户在环境检查中即被拒绝，不会构建或停机，入口也不会自动 sudo。rootless Docker 由它所属的普通用户运行，不要用 sudo。
 
-容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-bot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时（例如卸载时保留了数据），重新部署按 `data/state` 的属主提出身份，经确认后才使用（控制台在预览中列出，命令行在终端里询问）；升级要求原容器存在。以前由 docker 组普通用户部署的实例改由 root 升级后，服务仍以原来的 UID/GID 运行。检出属于那个用户，git 拒绝以 root 操作它（仓库中的钩子和配置会以 root 运行）：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
+容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-bot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时（例如卸载时保留了数据），重新部署按 `data/state` 的属主提出身份，经确认后才使用（控制台在预览中列出，命令行在终端里询问）；升级要求原容器存在。运维由 root 执行，服务沿用已保存的 UID/GID。检出属于普通用户时，Git 需要 root 明确信任该目录：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
 
-机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：部署时选择的或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
+机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，部署将端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：部署时选择的或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
 
 ### macOS 原生部署（实验性支持）
 
-只支持 Apple 芯片（arm64），已验证 macOS 15 和 26；Intel Mac 和 Rosetta 下的终端会被拒绝。这一平台仍在验证中：开机后未登录即启动、重启恢复、睡眠唤醒等还需在真实机器上确认，生产使用前请先在自己的机器上完成[验证](../README.md#4-接入开发者后台并验证)。
+支持 Apple 芯片（arm64）的 macOS 15 和 26，Intel Mac 和 Rosetta 下的终端会被拒绝。macOS 为实验性支持，部署后请在目标机器检查开机启动、停止后重启和睡眠唤醒，并完成[消息与文件交付验证](../README.md#4-接入开发者后台并验证)。
 
 先用 Homebrew 安装工具（Git 也可以用 `xcode-select --install` 安装的版本）：
 
@@ -58,7 +58,7 @@ brew install --cask libreoffice    # 可选：Word/PPT 预览
 
 ```sh
 sudo mkdir -p /opt/mixin-bot && sudo chown "$USER" /opt/mixin-bot
-git clone --branch v2.1.2 https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
+git clone --branch v2.1.3 https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
 cd /opt/mixin-bot
 git switch -c main
 ```
@@ -71,11 +71,13 @@ git switch -c main
 
 ### Python 与文档预览
 
-Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。Windows、macOS 和 Docker 默认都使用应用共享的 `data/runtime/document-env/`，首次使用时按需 `uv sync`；不会自动使用项目根目录 `.venv`。依赖从下载缓存复制安装，避免硬链接导致原地修改相互影响。
+Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择，依赖由 `uv.lock` 锁定。Windows 和 macOS 原生部署默认使用 `data/runtime/document-env/`，首次使用时按需 `uv sync`；依赖从下载缓存复制安装。Linux Docker 的文档任务使用任务镜像内预装的 `/app/.venv`，无需在服务容器里另建共享环境。
 
-管理员显式配置 `BOT_DOCUMENT_ENV` 时改用指定的现成环境（控制台「资料与文档 → 文档处理」中的「共享文档环境覆盖」，留空或恢复默认即用 `data/runtime/document-env`）。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择。共享环境缺失或与当前配置不一致时由 uv 按需准备，因此首次使用文档功能可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，环境只存工具依赖。
+原生部署可用 `BOT_DOCUMENT_ENV` 指定现成环境（控制台「资料与文档 → 文档处理」中的「共享文档环境覆盖」）；留空使用 `data/runtime/document-env`。默认环境缺失或与依赖锁不符时由 uv 准备，首次使用可能需要联网下载 Python 和依赖。隔离任务固定使用镜像内环境，不使用此覆盖。生成文件保留在成员 tmp，环境目录只存工具依赖。
 
-通常无需手工同步。需要预热时，停止服务，在项目根目录执行：
+原生部署可在「资料与文档 → 文档环境」安装缺失依赖或修复依赖，任务自动暂停机器人并恢复原运行状态，最后验证文档读写与页面预览；检查环境本身不需要停机。详见[文档环境管理](console.md#文档环境)。
+
+也可以手动预热默认环境：先停止服务，再在项目根目录执行。Windows PowerShell 示例：
 
 ```powershell
 $env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'data/runtime/document-env')
@@ -86,23 +88,23 @@ if ($LASTEXITCODE -eq 0) {
 Remove-Item Env:UV_PROJECT_ENVIRONMENT
 ```
 
-Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT="$PWD/data/runtime/document-env" uv sync --locked --no-dev --no-install-project`，成功后运行 `bun src/agent/document-manifest.ts . "$PWD/data/runtime/document-env"`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
+macOS 或未启用隔离的 Linux 原生运行环境中，同等操作为 `UV_PROJECT_ENVIRONMENT="$PWD/data/runtime/document-env" uv sync --locked --no-dev --no-install-project`，成功后运行 `bun src/agent/document-manifest.ts . "$PWD/data/runtime/document-env"`。环境标记记录预期配置，运行时还会核对实际解释器、依赖版本和导入结果。
 
 Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在控制台「资料与文档 → 文档处理」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录，macOS 再查 `/Applications/LibreOffice.app`。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK；macOS 使用系统自带的冬青黑体、黑体-简和宋体-简，文档中的微软雅黑、等线、黑体、宋体等按此替换。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
-只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。每次转换的 LibreOffice 用户配置（profile）放在系统临时目录下单独创建的目录（容器内即该 `/tmp`），任务结束、失败或取消后删除，文档工具同时最多两次转换；缓存和输出放在本次任务临时目录。Windows 上 profile 目录较深时曾出现 LibreOffice 退出码为 0 却不生成 PDF，因此不放在数据目录下，服务账户的 TEMP 也应保持较短路径。转换错误会保留 LibreOffice 的诊断输出。
+只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。每次转换的 LibreOffice 用户配置（profile）放在系统临时目录下单独创建的目录（容器内即该 `/tmp`），任务结束、失败或取消后删除，文档工具同时最多两次转换；缓存和输出放在本次任务临时目录。Windows 服务账户的 TEMP 应使用较短路径，以符合 LibreOffice 对 profile 路径的要求。转换错误会保留 LibreOffice 的诊断输出。
 
 ## 执行部署
 
 先获取最新的正式发布，进入项目目录，再以它建立本地 main 分支：
 
 ```sh
-git clone --branch v2.1.2 https://github.com/jaykwok/mixin-bot.git
+git clone --branch v2.1.3 https://github.com/jaykwok/mixin-bot.git
 cd mixin-bot
 git switch -c main
 ```
 
-按上面的克隆命令安装的是正式发布。版本检查和升级只跟随正式发布：目标是远端最高的 `vX.Y.Z` 标签（不含预发布，按数字比较），main 上尚未发布的提交不会成为升级目标；`deploy` 和重新部署使用项目目录当前检出的代码。升级要求本地有 main 分支，并且 main 能快进到目标发布。本地 main 领先于最新发布（包含它，但不是它）时，没有可升级的版本；main 正好是最新发布时，升级照常检查部署记录并重新部署这个版本。
+上面的命令检出正式发布并建立本地 main。升级目标是远端最高的 `vX.Y.Z` 标签（不含预发布，按数字比较）；部署和重新部署使用当前检出的代码。控制台比较已部署版本与最新发布版本，有更高版本才提供升级。命令行 `update` 还会检查本地 main：领先于发布时结束，正好等于发布时检查部署记录并重新部署。实际升级要求 main 能快进到目标发布，且工作区没有冲突。
 
 项目目录必须是单独的 Git 检出，不要放在另一个 Git 仓库的工作区里：部署和升级按项目目录读取提交，不支持嵌套检出。
 
@@ -119,11 +121,11 @@ git switch -c main
 
 首次部署直接创建当前存储结构。部署任务先在目标运行环境（Linux 的候选镜像、macOS 的服务账户）里离线复核配置，再写入正式位置、创建服务并检查新实例；提交前失败撤销本次部署，不留下服务（macOS 新建的服务账户保留，重试时沿用）。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，任务输出中显示实际方式。
 
-之后的重新部署在控制台维护页进行：沿用已保存的模型和机器人凭据，核对机器人端口和共享资料目录，见[管理任务与恢复](console.md#管理任务与恢复)。修改模型或机器人凭据分别在「模型」或「应用机器人」页进行，不需要重新部署；命令行 `deploy` 在重新部署时还会询问是否重新运行 AI 配置向导（见[日常控制](operations.md#日常控制)）。重新部署先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态；共享资料目录、[通讯录同步范围](#通讯录同步范围)（还没有时）和新的配置都在停止前确定，只写进本次部署的暂存目录，停止后才写入正式位置；取消不会改动部署。部署失败会尝试回滚，恢复失败则保留现场并报错。更早版本（v1.x 和 webhook 发布）的目录不能重新部署或升级，见[从更早的版本切换](data-migrations.md#从更早的版本切换)。部署被强制中断或回滚未完成时，控制台维护页的「部署恢复」显示上次操作的记录，可以继续或回滚；继续只使用停机前确认的设置，数据已提交时只能继续，详见[中断恢复](operations.md#中断恢复)。
+之后的重新部署在控制台维护页进行：沿用已保存的模型和机器人凭据，核对机器人端口和共享资料目录，见[管理任务与恢复](console.md#管理任务与恢复)。修改模型或机器人凭据分别在「模型」或「应用机器人」页进行，不需要重新部署；命令行 `deploy` 在重新部署时还会询问是否重新运行 AI 配置向导（见[日常控制](operations.md#日常控制)）。重新部署先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态；共享资料目录、[通讯录同步范围](#通讯录同步范围)（还没有时）和新的配置都在停止前确定，只写进本次部署的暂存目录，停止后才写入正式位置；取消不会改动部署。部署失败会尝试回滚，恢复失败则保留现场并报错。更早版本（v2.0.1、v2.0.0、v1.x 和 webhook 发布）的目录不能重新部署或升级，见[从更早的版本切换](data-migrations.md#从更早的版本切换)。部署被强制中断或回滚未完成时，控制台维护页的「部署恢复」显示上次操作的记录，可以继续或回滚；继续只使用停机前确认的设置，数据已提交时只能继续，详见[中断恢复](operations.md#中断恢复)。
 
 ### 通讯录同步范围
 
-机器人只认识同步范围内的成员，部署时必须明确选择，没有默认值：整个通讯录，或选定的部门及其全部子部门（最多 200 个）。首次部署在向导里选择，部门树用向导中在线校验过的应用机器人凭据读取；已有凭据却还没有范围的部署（例如手工删除了这个文件）重新部署或升级时在停止服务之前选择，取消或失败都不停机、不改动部署。部门从一级部门开始逐层勾选，不接受手填的部门 ID。命令行部署和升级的选择方式见[命令行运维](operations.md#命令行部署的选项)。选定的范围随部署事务保存，停机后写入 `data/config/directory.json`；中断后继续时沿用停机前的选择。已经有范围的部署和升级不再询问，部署后修改范围见[同步范围](operations.md#事件-stream-与通讯录)。
+机器人只认识同步范围内的成员，部署时必须明确选择，没有默认值：整个通讯录，或选定的部门及其全部子部门（最多 200 个）。首次部署在向导里选择，部门树用在线校验过的应用机器人凭据读取。选好后点「保存选择范围」，范围单独保存在本机，模型配置超时、重新登录或重开控制台后仍可恢复，不必重新勾选；部署前再核对部门。已有凭据却还没有范围的部署（例如手工删除了这个文件）重新部署或升级时在停止服务之前选择，取消或失败都不停机、不改动部署。部门从一级部门开始逐层勾选，不接受手填的部门 ID。命令行部署和升级的选择方式见[命令行运维](operations.md#命令行部署的选项)。正式范围随部署事务写入 `data/config/directory.json`；中断后继续时沿用停机前的选择。已经有范围的部署和升级不再询问，部署后修改范围见[同步范围](operations.md#事件-stream-与通讯录)。
 
 没有范围的服务（例如手工删除了该文件）不同步通讯录：已同步的成员照常使用，不认识的成员收到“机器人还没有设置通讯录同步范围”的提示，体检判为失败。
 
@@ -201,13 +203,16 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 | `BOT_RUN_TIMEOUT_SECONDS` | 1200 秒 | 10–7200 秒，覆盖准备、模型、工具与最终交付 |
 | `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效进展的上限 |
 | `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS` | 600 秒 | 10–7200 秒；单次模型响应的上限，持续输出也不续期 |
+| `BOT_CLOSEOUT_SECONDS` | 300 秒 | 1–3600 秒；剩余这段时间时开始收尾，须小于总时限的一半 |
+| `BOT_DELIVERY_RESERVE_SECONDS` | 120 秒 | 1–1800 秒；最后这段时间只允许读取、登记和发送，须小于收尾时间 |
+| `BOT_FALLBACK_SEND_SECONDS` | 120 秒 | 1–600 秒；任务失败时带文件兜底交付的独立发送预算 |
 | `PI_CACHE_RETENTION` | short | Pi 原生 short/long，服务商决定实际期限；不提供全局 none，`settings.json` 显式设置的 `durable.stream.cacheRetention` 优先。Durable 引擎不做缓存保温 |
 | `BOT_ATTACHMENT_CONCURRENCY` | 2 | 1–8；在小附件读取前预约，覆盖读取与上传，限制内存峰值 |
 | `BOT_SHUTDOWN_TIMEOUT_SECONDS` | 20 秒 | 5–25 秒，覆盖 HTTP、任务、进程与租约收尾 |
 | `BOT_INDEX_TTL_MINUTES` | 5 分钟 | 1–1440 分钟，活跃会话每轮检查 |
 | `BOT_INDEX_MAX_FILES` | 50000 | 100–1000000 |
 | `BOT_INDEX_MAX_DEPTH` | 12 | 1–64 |
-| `BOT_DOCUMENT_ENV` | data/runtime/document-env | 留空使用应用共享的按需环境；填写则改用指定的现成环境 |
+| `BOT_DOCUMENT_ENV` | data/runtime/document-env | 原生部署的文档环境；隔离任务固定使用镜像内 `/app/.venv` |
 | `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、六个文档编辑、生成与预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 | `BOT_DOCUMENT_PPTX_TEMPLATE` | 未设置（内置版式） | `.pptx`/`.potx`；生成 PPT 未指定模板时套用，见下文 |
 | `BOT_DOCUMENT_DOCX_TEMPLATE` | 未设置（内置版式） | `.docx`/`.dotx`；生成 Word 未指定模板时套用，见下文 |
@@ -237,7 +242,7 @@ data/
 │   ├── directory.json         通讯录同步范围（整个通讯录或选定的部门，部署时选择）
 │   ├── task-deployment.json   Linux 任务隔离部署清单（私有，由部署维护）
 │   └── materials-ignore.txt   资料索引排除规则（自动生成模板；在控制台设置或手工编辑）
-├── index/                     资料索引 materials.md、扫描 manifest 与 parsed/ 解析缓存，可重建
+├── index/                     资料索引 materials.md、扫描 manifest 与原生部署的 parsed/ 解析缓存，可重建
 ├── conversations/
 │   ├── direct/durable.sqlite  单聊空间库（Pi Durable）：全部单聊成员的会话、排队消息、控制命令、待交付内容与附件登记
 │   └── groups/<群>/durable.sqlite  群空间库（另有 -wal 等，需一起备份）
@@ -259,7 +264,7 @@ data/
     ├── pi/settings.json       Pi 选型与 Durable 原生运行策略（需备份）
     ├── mcp/                   可选 MCP OAuth 凭证（按秘密配置备份）
     ├── models-store.json      模型目录缓存，动态目录服务商离线启动时需要
-    ├── document-env/          共享文档解析环境，按需准备，可重建
+    ├── document-env/          原生部署的共享文档环境，按需准备，可重建
     └── ...                    其余 Pi 资源与启动脚本，可重建
 workspace/                     默认共享资料目录（随代码提供；WORKSPACE_ROOT 可指向外置目录），模型只读
 backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
@@ -310,7 +315,7 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 
 `endpoint` 填**不含桶名、路径或查询参数的服务端点**，须能被机器人和接收者访问；例如腾讯 COS 填 `cos.ap-chengdu.myqcloud.com`，不要填控制台显示的桶域名。Virtual hosted 下端点以桶名开头时配置会被拒绝，向导会提示改正，并按腾讯 COS、AWS、R2 的端点预填区域。向导省略协议时补 HTTPS；生产环境使用 HTTPS，本地 MinIO 可显式填 `http://127.0.0.1:9000` 并设 `forcePathStyle: true`。可选 `sessionToken` 用于临时凭据。`prefix` 省略或为空时对象放在桶根目录；填 `relay/` 等目录时放在该目录下。不要把凭据写入地址或群消息。
 
-适配使用通用 S3 Signature V4 的 PUT、HEAD、GET 和 DELETE。具体云厂商、区域、资源池须支持这四项操作和预签名查询参数，不能把“支持部分 S3 API”视为所有能力均已验收：
+外链后端需要支持 S3 Signature V4 的 PUT、HEAD、GET、DELETE 和预签名查询参数。根据服务商文档填写端点、区域及寻址方式，配置后运行[外链测试](operations.md#测试外链)核对上传、私有访问、签名下载和删除：
 
 | 服务 | 配置依据 |
 | --- | --- |
@@ -331,11 +336,11 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 
 云端应再设覆盖分发对象的生命周期作为停机/账本丢失兜底：根目录布局覆盖整个专用桶，配置了 `prefix` 时只覆盖该目录。默认设置可使用一天或更长的保留期；实际规则必须长于上传预算、下载期限和删除余量之和。生命周期通常按天或异步处理，不能代替两小时下载签名。专用临时桶应关闭版本控制、对象锁及复制；已有历史版本需单独处理，否则普通 DELETE 可能只创建删除标记，旧版本仍占空间。参见 [S3 预签名有效期](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)、[S3 版本化删除](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html)和 [R2 生命周期](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)。
 
-停用会删除 `relay.json`，保留账本和远端文件，同时停止机器人的清理。切换端点、区域、桶或目录前应先在原配置下清空在册对象；向导保存前会提示不属于新设置的在册数量。新后端不会删除旧后端对象，后台每次运行对同一旧后端仅告警一次；可切回原配置清理，或在云端处理。doctor 的 S3 项只检查必填项，显示通过不代表云端权限、私有访问及签名已验收；修改配置或云端设置后，请在控制台「外链」页点 **测试外链存储**（或运行 `bun run relay test`）上传测试文件确认，见[测试外链](operations.md#测试外链)。
+停用会删除 `relay.json`，保留账本和远端文件，同时停止机器人的清理。切换端点、区域、桶或目录前应先在原配置下清空在册对象；向导保存前会提示不属于新设置的在册数量。新后端不会删除旧后端对象，后台每次运行对同一旧后端仅告警一次；可切回原配置清理，或在云端处理。doctor 的 S3 项检查本地配置格式与必填项，不访问存储桶；修改配置或云端设置后，请在控制台「外链」页点 **测试外链存储**（或运行 `bun run relay test`）上传测试文件确认，见[测试外链](operations.md#测试外链)。
 
 ## 数据版本与升级
 
-当前程序版本 2.1.2、数据格式 5，Pi 精确锁为 1.5.2（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。更早的版本（使用数据格式 4 的 v2.0.1、数据格式 3 的 v2.0.0、v1.x 和 webhook 发布）不能原地升级，需在新目录全新部署；v2.0.1、v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](data-migrations.md#恢复统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
+当前程序版本 2.1.3、数据格式 5，Pi 精确锁为 1.5.2（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。更早的版本（使用数据格式 4 的 v2.0.1、数据格式 3 的 v2.0.0、v1.x 和 webhook 发布）不能原地升级，需在新目录全新部署；v2.0.1、v2.0.0 和 v1.x 的统计可恢复到新部署的空账本（见[恢复统计](data-migrations.md#恢复统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
 
 还没有通讯录同步范围的部署（没有 `data/config/directory.json`）升级时必须在停机前选择，选定之前升级不会继续；要继续同步整个通讯录也得明确选它。控制台升级在预览前选择；命令行升级的规则见[命令行部署的选项](operations.md#命令行部署的选项)。
 

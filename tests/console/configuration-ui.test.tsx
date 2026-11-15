@@ -11,6 +11,45 @@ const until = async (check: () => boolean) => { const end = Date.now() + 3000; w
 const button = (root: Element, text: string) => [...root.querySelectorAll("button")].find(value => value.textContent === text)!;
 const options = (root: Element) => [...root.querySelectorAll('[role="option"]')] as HTMLElement[];
 
+test("自定义服务商只手填且不会切回内置；换密钥后重新读取，旧请求迟到不覆盖新列表", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  const pending = Promise.withResolvers<Response>(), calls: any[] = [];
+  const form = { kind: "models", provider: "openai", model: "", providers: [], catalogModels: [] };
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    const body = init?.body ? JSON.parse(String(init.body)) : null;
+    if (url.endsWith("/catalog")) return Response.json({ providers: [{ id: "openai", name: "OpenAI" }, { id: "deepseek", name: "DeepSeek" }],
+      apis: ["openai-completions"], listable: ["openai-completions"], models: [] });
+    if (url.endsWith("/models")) { calls.push(body); return calls.length === 1 ? pending.promise : Response.json({ models: [{ id: "new-key-model" }] }); }
+    return Response.json({ id: "config-auto", revision: 0, validated: false, summary: [], form });
+  }) as typeof fetch;
+  const field = (name: string) => root.querySelector<HTMLInputElement>(`[aria-label="${name}"]`)!;
+  const type = async (input: HTMLInputElement, value: string) => act(() => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); });
+  try {
+    await act(() => render(<ConfigurationForm kind="models" />, root)); button(root, "编辑配置").click();
+    await until(() => !!field("服务商 ID") && !root.querySelector("fieldset")!.disabled);
+    expect(field("服务商 ID").getAttribute("role")).toBe("combobox");
+    field("服务商 ID").dispatchEvent(new FocusEvent("focus")); await until(() => options(root).length === 2);
+    await type(field("服务商 ID"), "deep"); await until(() => options(root).length === 1);
+    options(root)[0]!.click(); await until(() => field("服务商 ID").value === "deepseek");
+    await act(() => root.querySelector<HTMLButtonElement>('[data-value="custom"]')!.click());
+    expect(field("服务商 ID").getAttribute("role")).toBeNull(); expect(field("服务商 ID").hasAttribute("list")).toBe(false);
+    await type(field("服务商 ID"), "my-gateway");
+    expect(root.querySelector('[data-value="custom"]')!.getAttribute("aria-checked")).toBe("true");
+    const endpoint = root.querySelector<HTMLInputElement>('[placeholder="服务商的 API 地址，以 https 或 http 开头"]')!;
+    await type(endpoint, "https://gateway.test/v1");
+    field("模型 ID").dispatchEvent(new FocusEvent("focus")); expect(calls).toHaveLength(0);
+    await type(field("模型 API 密钥"), "first-private-key");
+    field("模型 ID").dispatchEvent(new FocusEvent("focus")); await until(() => calls.length === 1);
+    expect(button(root, "保存草稿并校验").disabled).toBe(true);
+    await type(field("模型 API 密钥"), "second-private-key");
+    field("模型 ID").dispatchEvent(new FocusEvent("focus")); await until(() => calls.length === 2 && root.textContent!.includes("new-key-model"));
+    pending.resolve(Response.json({ models: [{ id: "stale-model" }] })); await act(async () => { await pending.promise; });
+    expect(root.textContent).not.toContain("stale-model"); expect(root.textContent).toContain("new-key-model");
+    expect(calls.map(value => value.patch.key.value)).toEqual(["first-private-key", "second-private-key"]);
+    expect(calls.every(value => value.patch.mode === "custom" && value.patch.provider === "my-gateway")).toBe(true);
+  } finally { pending.resolve(Response.json({ models: [] })); await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
+});
+
 test("外链上限以 MB 显示、编辑和提交，保存后不换算成字节", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
   let saved: Record<string, unknown> | undefined;
@@ -135,7 +174,7 @@ test("取消后迟到的配置校验不会重新显示可应用草稿；恢复�
   } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });
 
-test("模型目录同时显示内置和私有缓存的安全投影，选择缓存模型不触发联网；外链停用保留凭据不发送新秘密", async () => {
+test("内置模型打开时自动刷新，已有目录可先选择；外链停用保留凭据不发送新秘密", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
   const calls: { path: string; body: any }[] = []; let kind = "models";
   const form = () => kind === "models" ? { kind, provider: "openrouter", model: "builtin", thinking: "off", providers: [{ id: "openrouter", hasKey: true, models: [] }],
@@ -145,6 +184,7 @@ test("模型目录同时显示内置和私有缓存的安全投影，选择缓�
   globalThis.fetch = (async (url: string, options?: RequestInit) => {
     const path = String(url), body = options?.body ? JSON.parse(String(options.body)) : undefined; calls.push({ path, body });
     if (path.endsWith("/catalog")) return Response.json({ providers: [{ id: "openrouter", name: "OpenRouter" }], apis: ["openai-completions"], models: [{ provider: "openrouter", id: "builtin", contextWindow: 32000, maxTokens: 4000 }] });
+    if (path.endsWith("/models")) return Response.json({ models: [{ id: "cached", name: "缓存模型", contextWindow: 64000, maxTokens: 8000 }] });
     return Response.json({ id: "config-test", revision: 1, validated: path.endsWith("/check"), summary: [], form: form() });
   }) as typeof fetch;
   try {
@@ -157,7 +197,8 @@ test("模型目录同时显示内置和私有缓存的安全投影，选择缓�
     expect(options(root)).toEqual([]);
     button(root, "保存草稿并校验").click(); await until(() => !!button(root, "预览应用配置"));
     expect(calls.find(value => value.path.endsWith("/edit"))?.body.patch).toMatchObject({ mode: "builtin", model: "cached", key: { mode: "keep" } });
-    expect(calls.find(value => value.path.endsWith("/check"))?.body).toMatchObject({ network: false, refresh: false });
+    expect(calls.find(value => value.path.endsWith("/models"))?.body).toEqual({ id: "config-test", patch: { provider: "openrouter", mode: "builtin", key: { mode: "keep" } } });
+    expect(calls.find(value => value.path.endsWith("/check"))?.body).toMatchObject({ network: true, refresh: false });
     render(null, root); kind = "relay"; calls.length = 0;
     render(<ConfigurationForm kind="relay" />, root); button(root, "编辑配置").click(); await until(() => !!root.querySelector('input[type="checkbox"]'));
     expect(root.querySelector('input[type="password"]')).toBeNull();
@@ -180,27 +221,25 @@ test("自定义服务商：填写协议、端点和密钥后获取模型列表�
     if (path.endsWith("/models")) return typeof listed === "function" ? listed() : listed;
     return Response.json({ id: "config-test", revision: 1, validated: path.endsWith("/check"), summary: [], form });
   }) as typeof fetch;
-  const fetchButton = () => [...root.querySelectorAll("button")].find(value => /获取模型列表|重新获取/.test(value.textContent!))!;
   const picker = () => root.querySelector('[role="combobox"][aria-label="模型 ID"]') as HTMLInputElement;
   const type = (input: HTMLInputElement, value: string) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
   const key = (input: HTMLInputElement, name: string) => input.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true }));
   try {
     render(<ConfigurationForm kind="models" />, root); button(root, "编辑配置").click();
-    await until(() => !!picker() && !!fetchButton() && !fetchButton().disabled);
+    await until(() => !!picker() && !root.querySelector("fieldset")!.disabled);
     // Protocols carry their documented names; the endpoint field says where the base URL ends.
     const protocol = [...root.querySelectorAll("select")].find(value => [...value.options].some(option => option.value === "anthropic-messages"))!;
     expect([...protocol.options].map(option => option.textContent)).toEqual(["OpenAI Chat Completions（openai-completions）", "Anthropic Messages（anthropic-messages）",
       "Amazon Bedrock Converse（bedrock-converse-stream）"]);
     expect(root.textContent).toContain("请求发到 <端点>/chat/completions");
-    // Before any list: the saved models only.
-    picker().dispatchEvent(new FocusEvent("focus")); await until(() => options(root).length === 1);
-    key(picker(), "Escape"); await until(() => options(root).length === 0);
-
-    fetchButton().click(); await until(() => root.textContent!.includes("端点提供 2 个模型"));
+    expect(calls.some(value => value.path.endsWith("/models"))).toBe(false);
+    expect(root.textContent).not.toContain("允许刷新模型目录"); expect(root.textContent).not.toContain("本次刷新模型目录");
+    // Focusing the picker refreshes once; the open list receives the new models immediately.
+    picker().dispatchEvent(new FocusEvent("focus")); await until(() => root.textContent!.includes("已获取 2 个模型"));
     expect(calls.find(value => value.path === "/api/configuration/models")?.body).toEqual({ id: "config-test",
       patch: { provider: "gw", mode: "custom", api: "openai-completions", baseUrl: "https://gw.test/v1", key: { mode: "keep" } } });
-    expect(fetchButton().textContent).toBe("重新获取");
     picker().dispatchEvent(new FocusEvent("focus")); await until(() => options(root).length === 3);
+    expect(calls.filter(value => value.path.endsWith("/models"))).toHaveLength(1);
     expect(options(root).map(value => value.querySelector(".model-picker-id")!.textContent)).toEqual(["saved", "gpt-x", "other-model"]);
     // Every word must match: an ID typed so far is also the value, so one that is not listed can be kept.
     type(picker(), "other mod"); await until(() => options(root).length === 1);
@@ -216,14 +255,17 @@ test("自定义服务商：填写协议、端点和密钥后获取模型列表�
 
     // Another endpoint invalidates the list; a protocol without a list endpoint cannot fetch; a refusal is shown.
     const endpoint = [...root.querySelectorAll('input[type="text"]')].find(value => (value as HTMLInputElement).value === "https://gw.test/v1") as HTMLInputElement;
-    type(endpoint, "https://gw.test/v2"); await until(() => !root.textContent!.includes("端点提供 2 个模型"));
-    expect(fetchButton().textContent).toBe("获取模型列表");
+    type(endpoint, "https://gw.test/v2"); await until(() => !root.textContent!.includes("已获取 2 个模型"));
     protocol.value = "bedrock-converse-stream"; protocol.dispatchEvent(new Event("change", { bubbles: true }));
-    await until(() => fetchButton().disabled && root.textContent!.includes("这个协议没有模型列表接口"));
+    await until(() => root.textContent!.includes("这个协议没有模型列表接口"));
+    picker().dispatchEvent(new FocusEvent("focus")); expect(calls.filter(value => value.path.endsWith("/models"))).toHaveLength(1);
     protocol.value = "anthropic-messages"; protocol.dispatchEvent(new Event("change", { bubbles: true }));
-    await until(() => !fetchButton().disabled && root.textContent!.includes("不含 /v1"));
+    await until(() => root.textContent!.includes("不含 /v1"));
     listed = Response.json({ error: "模型端点拒绝了请求（HTTP 401）：请检查 API 密钥及其权限", code: "input" }, { status: 409 });
-    fetchButton().click(); await until(() => !!root.querySelector('.form-error[role="alert"]'));
+    picker().dispatchEvent(new FocusEvent("focus")); await until(() => !!root.querySelector('.form-error[role="alert"]'));
     expect(root.querySelector('.form-error[role="alert"]')!.textContent).toContain("HTTP 401");
+    listed = () => Response.json({ models: [{ id: "retry-ok" }] });
+    button(root, "重试刷新").click(); await until(() => root.textContent!.includes("已获取 1 个模型"));
+    expect(root.querySelector('.form-error[role="alert"]')).toBeNull();
   } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
 });

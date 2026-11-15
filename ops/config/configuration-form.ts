@@ -145,16 +145,15 @@ function providerEntry(source: ObjectValue, patch: ObjectValue) {
 }
 
 /**
- * What a custom provider's model list needs: the provider ID and its entry as this patch would write it, without its models.
+ * What a provider's model list needs: the provider ID and its entry as this patch would write it, without its models.
  * The credential stays on the host (a kept key comes from the draft), and only goes to the runtime that resolves it.
  */
-export function modelListRequest(snapshot: ConfigurationSnapshot, input: unknown): { provider: string; config: ObjectValue } {
+export function modelListRequest(snapshot: ConfigurationSnapshot, input: unknown): { provider: string; config: ObjectValue; catalog?: string } {
   if (snapshot.kind !== "models") throw new Error("只有模型配置可以获取模型列表");
   const patch = configurationObject(input); only(patch, ["provider", "mode", "api", "baseUrl", "key"]);
-  if (patch.mode !== "custom") throw new Error("内置服务商使用模型目录，不需要获取模型列表");
   const { id, provider: config } = providerEntry(parsed(snapshot.files.models), patch);
   delete config.models;
-  return { provider: id, config };
+  return { provider: id, config, ...(patch.mode === "builtin" ? { catalog: snapshot.files.catalog ?? "{}" } : {}) };
 }
 
 /** Known-field patch, never a replacement of the raw native file. */

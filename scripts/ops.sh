@@ -770,6 +770,7 @@ case "${1:-}" in
     configure-app-bot) configure_with_wizard 应用机器人配置 configure-app-bot.ts app ;;
     directory) service_bun ops/tools/directory-admin.ts status ;;
     directory-scope) shift; directory_scope "$@" ;;
+    document-check|document-install|document-repair) action="$1"; shift; ops_core maintenance "$action" "$@" ;;
     runtime-configure) shift; runtime_configure "$@" ;;
     configuration-apply) shift; configuration_admin apply "$@" ;;
     configuration-restore) shift; configuration_admin restore "$@" ;;
@@ -818,6 +819,7 @@ case "${1:-}" in
         echo "  relay-configure 交互配置可选的大文件外链；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态"
         echo "  model-configure 运行模型配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置"
         echo "  runtime-configure <草稿名> 应用控制台「运行参数」或「资料与文档」中已确认的参数"
+        echo "  document-check 检查镜像中的文档依赖与页面预览；修复请重新部署"
         echo "  configure-app-bot 填写应用机器人 AppID/AppSecret 并验证；之后与 model-configure 相同地应用"
         echo "  directory  查看事件 Stream 与通讯录同步状态（同步范围及是否生效、映射数、最近同步、待复核的缺席）"
         echo "  directory-scope [all]"

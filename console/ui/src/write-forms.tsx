@@ -62,6 +62,23 @@ export function RelayActions() {
   </Section>;
 }
 
+export function DocumentActions({ platform }: { platform?: "windows" | "linux" | "macos" }) {
+  return <Section title="文档环境" footer="任务在后台运行，可查看各步骤的日志。只有依赖、文档读写和页面预览都验证通过才显示成功；失败提示会保留。">
+    <Row icon="heartPulse" tint="pink" title="检查环境" detail="检查 Python、固定依赖及 DOCX、PPTX、XLSX、PDF 读写，并验证 LibreOffice 页面预览；不停止机器人。">
+      <TaskAction operation="document-check" params={{}} disabled={!platform}>检查环境</TaskAction>
+    </Row>
+    {platform === "linux" ? <div class="group-note">Docker 的文档依赖随镜像提供。检查未通过时，请到<a href="#/maintain">维护 → 重新部署</a>重建镜像。</div> : <>
+      <Row icon="download" tint="blue" title="安装缺失依赖" detail="按当前版本准备共享 Python 环境和文档依赖，最长等待 30 分钟。期间停止机器人，结束后恢复原运行状态。">
+        <TaskAction operation="document-install" params={{}} disabled={!platform}>安装缺失依赖</TaskAction>
+      </Row>
+      <Row icon="wrench" tint="orange" title="修复依赖" detail="重新下载并安装锁定版本，适合依赖损坏或普通安装仍失败的情况；同样需要暂停机器人。">
+        <TaskAction operation="document-repair" params={{}} disabled={!platform}>修复依赖</TaskAction>
+      </Row>
+      <div class="group-note">uv 和 LibreOffice 需要在部署机安装，并对机器人服务账户可用。下面可配置文档环境和 LibreOffice 程序路径；先应用设置，再运行检查。</div>
+    </>}
+  </Section>;
+}
+
 export function StatsImportForm() {
   const [path, setPath] = useState("");
   return <>
@@ -257,7 +274,6 @@ export function DirectoryForm({ onSettled }: { onSettled?: () => void }) {
       </Row>
       {data.unavailable > 0 && <div class="group-note form-error" role="alert">有 {data.unavailable} 个原选部门已不可查询，保存时将移除。</div>}
       {mode === "departments" && <div class="row-body">
-        <p class="selected-line">已选择：{selected.map(item => item.name).join("、") || "无"}</p>
         {hidden.length > 0 && <p class="selected-line">其中 {hidden.length} 个在尚未展开的下级部门里（{hidden.slice(0, 5).map(item => item.name).join("、")}{hidden.length > 5 ? " 等" : ""}），展开到它们可以取消勾选。
           <button class="btn ghost small-btn" disabled={busy} onClick={() => setSelected(previous => previous.filter(value => shown.has(value.key)))}>取消这 {hidden.length} 个</button></p>}
         <label class="check-label select-all"><input type="checkbox" checked={allTop} indeterminate={!allTop && selected.length > 0} disabled={busy || !top.length || top.length > MAX_DEPARTMENTS}

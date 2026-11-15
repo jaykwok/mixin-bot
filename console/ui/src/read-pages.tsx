@@ -60,6 +60,12 @@ export function ReadOnlyPage({ page, refresh = 0, children, embedded = false }: 
     {error && <Banner tone="danger" icon="alert" title="读取失败" action={<button class="btn small-btn" onClick={() => void load()}>重试</button>}>{error}</Banner>}
     {!data && busy && <Section><Skeleton lines={4} /></Section>}
     {data && <Result page={page} data={data} />}
+    {page === "health" && <Section title="依赖维护入口" footer="“维护 → 修复”恢复机器人服务状态。系统工具需在部署机安装到服务账户可访问的位置，具体要求见部署文档。">
+      <Row icon="folder" tint="mint" title="文档依赖与页面预览" detail="检查 Python、文档库和 LibreOffice；安装或修复文档依赖，配置程序路径。"><a class="btn" href="#/materials">资料与文档</a></Row>
+      <Row icon="layers" tint="blue" title="项目依赖与 Docker 镜像" detail="首次部署可安装项目依赖；已有部署通过重新部署安装锁定版本或重建镜像。"><a class="btn" href="#/maintain">维护</a></Row>
+      <Row icon="sparkles" tint="purple" title="模型服务与 MCP" detail="检查模型服务商、端点和凭据，查看 MCP 配置摘要；外部 MCP 服务按其部署方式修复。"><a class="btn" href="#/models">模型</a></Row>
+      <Row icon="link" tint="indigo" title="外链对象存储" detail="编辑外链配置，测试上传、签名下载和删除权限。"><a class="btn" href="#/relay">外链</a></Row>
+    </Section>}
     {children}
   </>;
 }

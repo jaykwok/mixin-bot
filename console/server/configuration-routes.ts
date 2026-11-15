@@ -38,7 +38,8 @@ export function configurationQuery(project: string, query = capture, host = loca
     try {
       const value = JSON.parse(result.stdout);
       if (value.version !== 1 || value.protocol !== PROTOCOLS[action] || (action === "check" && value.success !== true)) throw new Error();
-      return listing ? { models: listedModels(value.models) } : value;
+      if (listing && value.catalog !== undefined && (typeof value.catalog !== "string" || Buffer.byteLength(value.catalog) > 8 * 1024 * 1024)) throw new Error();
+      return listing ? { models: listedModels(value.models), ...value.catalog === undefined ? {} : { catalog: value.catalog } } : value;
     } catch { throw new Error("配置校验返回了不完整或不支持的结果"); }
   };
 }
@@ -98,7 +99,10 @@ export function configurationRoutes(drafts: ConfigurationDrafts, query = configu
     // The provider fields being edited, a newly typed key included; a kept key is read from the draft on the host.
     "POST /api/configuration/models": wrap(async ({ body, session, signal }) => {
       const params = body as Record<string, unknown>; fields(params, ["id", "patch"]);
-      return query("models", { version: 1, ...drafts.modelListInput(textParam(params.id), session.label, params.patch) }, signal);
+      const id = textParam(params.id), before = drafts.view(id, session.label), input = drafts.validationInput(id, session.label, before.revision);
+      const result = await query("models", { version: 1, ...drafts.modelListInput(id, session.label, params.patch) }, signal) as { models: ListedModel[]; catalog?: string };
+      signal.throwIfAborted();
+      return { models: result.models, ...result.catalog === undefined ? {} : { draft: drafts.modelCatalog(id, session.label, before.revision, input.digest, result.catalog) } };
     }),
   };
 }

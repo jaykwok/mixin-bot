@@ -300,13 +300,13 @@ test("通讯录表单重新读取部门树时保留未保存的勾选；保存�
   let settled = 0;
   try {
     render(<DirectoryForm onSettled={() => settled++} />, root); find(root, "选择同步范围").click();
-    await until(() => root.textContent!.includes("已选择：技术部"));
+    await until(() => root.textContent!.includes("已选 1 个部门。"));
     // Nothing changed here: reading again takes what the service has saved now.
     saved = [departments.sales];
-    await reread(); expect(root.textContent).toContain("已选择：销售部全选（2 个一级部门）");
+    await reread(); expect(root.textContent).toContain("已选 1 个部门。");
     // Ticked but not saved: reading again keeps the ticks.
-    box("技术部").click(); await until(() => root.textContent!.includes("已选择：销售部、技术部"));
-    await reread(); expect(root.textContent).toContain("已选择：销售部、技术部");
+    box("技术部").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
+    await reread(); expect(root.textContent).toContain("已选 2 个部门。");
     find(root, "保存并立即应用").click();
     await slowly(() => root.textContent!.includes("已保存，正在应用新范围（应用新范围：遍历部门）"));
     expect(settled).toBe(0);
@@ -347,10 +347,10 @@ test("通讯录表单跨分支混选；已选部门之下标出已包含，选�
     await expand(0, "研发组"); await expand(1, "前端");
     // Across branches: a subdepartment of one and another top-level department.
     box("前端").click(); box("销售部").click();
-    await until(() => root.textContent!.includes("已选择：前端、销售部"));
+    await until(() => root.textContent!.includes("已选 2 个部门。"));
     // Selecting 研发组 takes in 前端 chosen on its own; below it the box is shown as included and cannot be changed.
     box("研发组").click();
-    await until(() => root.textContent!.includes("已选择：销售部、研发组"));
+    await until(() => root.textContent!.includes("（已包含在「研发组」中）"));
     expect(box("前端").checked).toBe(true); expect(box("前端").disabled).toBe(true);
     expect(root.textContent).toContain("（已包含在「研发组」中）");
     expect(box("运维组").disabled).toBe(false);
@@ -378,7 +378,7 @@ test("通讯录表单全选勾上全部一级部门，再点清空；部门只�
   const box = (name: string) => [...root.querySelectorAll("label")].find(label => label.textContent!.startsWith(name))!.querySelector("input") as HTMLInputElement;
   const all = () => [box("全选").checked, box("全选").indeterminate];
   try {
-    render(<DirectoryForm />, root); find(root, "选择同步范围").click(); await until(() => root.textContent!.includes("已选择：前端、销售部"));
+    render(<DirectoryForm />, root); find(root, "选择同步范围").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
     expect([...root.querySelectorAll("button")].filter(button => button.textContent!.startsWith("移除"))).toEqual([]);
     expect(root.textContent).toContain("全选（2 个一级部门）");
     expect(all()).toEqual([false, true]);
@@ -386,24 +386,24 @@ test("通讯录表单全选勾上全部一级部门，再点清空；部门只�
     expect(root.textContent).toContain("其中 1 个在尚未展开的下级部门里（前端），展开到它们可以取消勾选。");
     find(root, "下级部门").click(); await until(() => [...root.querySelectorAll("label")].some(label => label.textContent!.startsWith("前端")));
     expect(root.textContent).not.toContain("尚未展开的下级部门里");
-    box("前端").click(); await until(() => root.textContent!.includes("已选择：销售部全选"));
+    box("前端").click(); await until(() => root.textContent!.includes("已选 1 个部门。"));
     // All: every top-level department, and nothing below them on its own.
-    box("前端").click(); await until(() => root.textContent!.includes("已选择：销售部、前端"));
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：技术部、销售部全选"));
+    box("前端").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
     expect(all()).toEqual([true, false]);
     expect([box("技术部").checked, box("销售部").checked, box("前端").checked, box("前端").disabled]).toEqual([true, true, true, true]);
-    box("销售部").click(); await until(() => root.textContent!.includes("已选择：技术部全选"));
+    box("销售部").click(); await until(() => root.textContent!.includes("已选 1 个部门。"));
     expect(all()).toEqual([false, true]);
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：技术部、销售部全选"));
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：无"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 0 个部门。"));
     expect(all()).toEqual([false, false]); expect(find(root, "保存并立即应用").disabled).toBe(true);
     box("全选").click(); await until(() => !find(root, "保存并立即应用").disabled);
     find(root, "保存并立即应用").click(); await until(() => saves.length === 1);
     expect(saves[0]).toEqual({ view: "v", mode: "departments", selected: ["tech", "sales"] });
     // Read again with 前端 saved and 技术部 closed: the one without a box is dropped by its button.
     render(null, root);
-    render(<DirectoryForm />, root); find(root, "选择同步范围").click(); await until(() => root.textContent!.includes("已选择：前端、销售部"));
-    find(root, "取消这 1 个").click(); await until(() => root.textContent!.includes("已选择：销售部全选"));
+    render(<DirectoryForm />, root); find(root, "选择同步范围").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
+    find(root, "取消这 1 个").click(); await until(() => root.textContent!.includes("已选 1 个部门。"));
     expect(root.textContent).not.toContain("尚未展开的下级部门里");
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });
@@ -420,14 +420,14 @@ test("部署部门选择的全选勾上全部一级部门，再点清空", async
   try {
     render(<DeploymentDirectoryPicker onChange={value => changes.push(value)} />, root); find(root, "读取部署部门树").click();
     await until(() => root.textContent!.includes("全选（2 个一级部门）"));
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：技术部、销售部"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
     expect(changes.at(-1)).toEqual({ view: "tree", selected: ["a", "b"] });
     expect([box("技术部").checked, box("销售部").checked, box("全选").checked]).toEqual([true, true, true]);
-    box("技术部").click(); await until(() => root.textContent!.includes("已选择：销售部全选"));
+    box("技术部").click(); await until(() => root.textContent!.includes("已选 1 个部门。"));
     expect([box("全选").checked, box("全选").indeterminate]).toEqual([false, true]);
     expect(changes.at(-1)).toEqual({ view: "tree", selected: ["b"] });
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：技术部、销售部"));
-    box("全选").click(); await until(() => root.textContent!.includes("已选择：无"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 2 个部门。"));
+    box("全选").click(); await until(() => root.textContent!.includes("已选 0 个部门。"));
     expect(changes.at(-1)).toBeNull();
   } finally { render(null, root); root.remove(); globalThis.fetch = previous; }
 });

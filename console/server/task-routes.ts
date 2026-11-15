@@ -65,7 +65,7 @@ export function taskRoutes(api: TaskApi): Record<string, Route> {
   const { tasks, plans, observers, audit } = api;
   // A first deployment being submitted (between reading the task list and creating its task).
   let installing = false;
-  const writable = () => { if (api.current && !api.current()) throw new Error("代码已变化，请退出并重新运行 bun run console"); };
+  const writable = () => { if (api.current && !api.current()) throw new Error("代码已变化；若升级或回滚仍在进行，请先等待任务结束，再退出并重新运行 bun run console"); };
   const get = async (id: string | undefined) => {
     if (!id || !/^task-[a-f0-9]{32}$/.test(id)) throw new ApiProblem(400, "input", "任务编号无效");
     const view = await tasks.view(id, observers);

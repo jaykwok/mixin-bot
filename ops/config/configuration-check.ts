@@ -25,9 +25,9 @@ interface CheckOptions {
   root?: string;
   temporaryRoot?: string;
 }
-export interface ModelListResult { protocol: "mixin-configuration-models"; version: 1; models: ListedModel[] }
-/** A custom provider's model list: its ID and its native entry as the draft would write it, credential included. */
-export interface ModelListRequest { provider: string; config: Record<string, unknown> }
+export interface ModelListResult { protocol: "mixin-configuration-models"; version: 1; models: ListedModel[]; catalog?: string }
+/** The native provider entry, credential included. Built-in refreshes also carry the host-only catalogue. */
+export interface ModelListRequest { provider: string; config: Record<string, unknown>; catalog?: string }
 const doc = (value: string | null | undefined) => configurationObject(JSON.parse(value ?? "{}"));
 
 /**
@@ -107,13 +107,14 @@ export async function checkConfiguration(snapshot: ConfigurationSnapshot, option
 }
 
 /**
- * The models a custom provider's endpoint lists. Pi resolves the credential from the provider entry exactly as the bot
- * does (a literal key, a !command, configured headers); the entry is written only to a private temporary file.
+ * Refresh a built-in provider's Pi catalogue, or list a custom endpoint's models. Pi resolves credentials exactly as
+ * the bot does (a literal key, a !command, configured headers); the entry is written only to a private temporary file.
  */
 export async function listProviderModels(request: ModelListRequest, options: { temporaryRoot?: string; fetcher?: typeof fetch } = {}): Promise<ModelListResult> {
   const value = configurationObject(request), config = configurationObject(value.config);
-  if (Object.keys(value).some(key => !["provider", "config"].includes(key)) || typeof value.provider !== "string"
+  if (Object.keys(value).some(key => !["provider", "config", "catalog"].includes(key)) || typeof value.provider !== "string"
     || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.provider) || ["__proto__", "constructor", "prototype"].includes(value.provider)) throw new Error("模型列表请求无效");
+  if (value.catalog !== undefined) return refreshProviderModels(request, options);
   if (!isListableApi(config.api)) throw new Error("这个协议没有模型列表接口，请直接填写模型 ID");
   if (typeof config.baseUrl !== "string") throw new Error("请先填写 API 端点");
   const { openModelRuntime } = await loadModelConfig();
@@ -131,6 +132,26 @@ export async function listProviderModels(request: ModelListRequest, options: { t
   } finally { await rm(dir, { recursive: true, force: true }); }
   const models = await listModels(config.api, auth?.baseUrl ?? config.baseUrl, { apiKey: auth?.apiKey, headers: auth?.headers }, { fetcher: options.fetcher });
   return { protocol: "mixin-configuration-models", version: 1, models };
+}
+
+/** Refresh only the chosen built-in provider, before the user has chosen a model. The cache stays host-side. */
+async function refreshProviderModels(request: ModelListRequest, options: { temporaryRoot?: string }): Promise<ModelListResult> {
+  if (typeof request.catalog !== "string" || Buffer.byteLength(request.catalog) > 8 * 1024 * 1024 || request.config.baseUrl !== undefined) throw new Error("内置模型目录请求无效");
+  const { openModelRuntime } = await loadModelConfig(), dir = await privateDirectory(options.temporaryRoot);
+  try {
+    const modelsPath = join(dir, "models.json"), modelsStorePath = join(dir, "models-store.json"), signal = AbortSignal.timeout(30_000);
+    await writeFile(modelsPath, JSON.stringify({ providers: { [request.provider]: request.config } }), { mode: 0o600, flag: "wx" });
+    await writeFile(modelsStorePath, request.catalog, { mode: 0o600, flag: "wx" });
+    const runtime = await openModelRuntime({ modelsPath, modelsStorePath, writableCatalog: true, signal });
+    if (!runtime.getProvider(request.provider)) throw new Error("unknown provider");
+    const refreshed = await runtime.refresh({ providers: [request.provider], allowNetwork: true, force: true, signal });
+    signal.throwIfAborted();
+    if (refreshed.errors.has(request.provider)) throw new Error("refresh failed");
+    return { protocol: "mixin-configuration-models", version: 1, models: runtime.getModels(request.provider).map(model => ({ id: model.id,
+      name: model.name, contextWindow: model.contextWindow, maxTokens: model.maxTokens, input: model.input })), catalog: await readFile(modelsStorePath, "utf8") };
+  } catch {
+    throw new Error("模型目录刷新失败，请检查服务商 ID、API 密钥及其权限和网络；可以重试或使用已有目录");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
 /** Bundled provider catalogue only; no network, user keys or existing configuration are read. */
@@ -159,8 +180,8 @@ if (import.meta.main) {
       body += decoder.decode();
       const request = JSON.parse(body);
       if (action === "models") {
-        if (request.version !== 1 || Object.keys(request).some(key => !["version", "provider", "config"].includes(key))) throw new Error("模型列表请求无效");
-        console.log(JSON.stringify(await listProviderModels({ provider: request.provider, config: request.config })));
+        if (request.version !== 1 || Object.keys(request).some(key => !["version", "provider", "config", "catalog"].includes(key))) throw new Error("模型列表请求无效");
+        console.log(JSON.stringify(await listProviderModels({ provider: request.provider, config: request.config, ...request.catalog === undefined ? {} : { catalog: request.catalog } })));
       } else if (request.version !== 1 || !request.snapshot || Object.keys(request).some(key => !["version", "snapshot", "network", "refresh"].includes(key))
         || (request.network !== undefined && typeof request.network !== "boolean") || (request.refresh !== undefined && typeof request.refresh !== "boolean")) throw new Error("配置校验请求无效");
       else console.log(JSON.stringify(await checkConfiguration(request.snapshot, { network: request.network, refresh: request.refresh })));

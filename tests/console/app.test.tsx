@@ -118,6 +118,8 @@ test("旧运行包在代码变化后仅显示任务结果和手动重开提示�
   };
   location.hash = "#/settings"; mount(null);
   await shows("代码已变化"); await shows("bun run console");
+  expect(text()).toContain("请先等待任务结束");
+  expect(text()).toContain("关闭控制台不会中断已接单的后台任务");
   expect(has('a[href="#/settings"]')).toBe(false);
   expect(has('a[href="#/conversations"]')).toBe(false);
   expect(has('a[href="#/maintain"]')).toBe(true);
@@ -207,6 +209,11 @@ test("尚未部署的检出：总览引导到首次部署向导；向导按步�
     "GET /api/tasks": () => ({ status: 200, body: { tasks: [] } }),
     "GET /api/setup": () => ({ status: 200, body: { undeployed: true, dependencies: { installed, job: null } } }),
     "POST /api/setup/dependencies": () => { installed = true; return { status: 200, body: { installed, job: { state: "succeeded" } } }; },
+    "POST /api/setup/directory/read": () => ({ status: 200, body: { scope: null } }),
+    "POST /api/setup/directory/save": call => {
+      expect(JSON.parse(call.body!)).toEqual({ draft: id("app"), directory: "all" });
+      return { status: 200, body: { scope: { saved: "saved-scope", mode: "all", count: 0 } } };
+    },
     // A task left by another directory: listed, and removed first only once the operator agrees.
     "POST /api/setup/check": () => ({ status: 200, body: { ok: true, items: [{ state: "ok", name: "管理员", detail: "当前是管理员 PowerShell" },
       { state: "ok", name: "已有服务", detail: "本机已有计划任务 mixin-bot（D:\\old，运行中）。" }],
@@ -252,9 +259,13 @@ test("尚未部署的检出：总览引导到首次部署向导；向导按步�
   buttons("保存草稿并校验")[1]!.click();
   // The application is checked online (its token); the model is checked by Pi without an inference request.
   await until(() => text().includes("已校验，首次部署使用这份草稿") && text().split("校验，首次部署使用这份草稿").length === 3, "两份草稿都校验过");
-  expect(text()).toContain("还差：未确认移除本机已有的机器人服务、未选择通讯录范围。");
+  expect(text()).toContain("还差：未确认移除本机已有的机器人服务、未保存通讯录范围。");
   expect(preview().disabled).toBe(true);
   container.querySelector<HTMLButtonElement>('[role="radiogroup"][aria-label="通讯录同步范围"] [data-value="all"]')!.click();
+  await until(() => buttons("保存选择范围")[0]?.disabled === false, "可单独保存范围");
+  expect(preview().disabled).toBe(true);
+  buttons("保存选择范围")[0]!.click();
+  await shows("已保存：整个通讯录");
   await shows("还差：未确认移除本机已有的机器人服务");
   expect(preview().disabled).toBe(true);
   const agree = [...container.querySelectorAll<HTMLLabelElement>("label.toggle")].find(label => label.textContent?.includes("部署前移除已有服务"))!;
@@ -265,7 +276,7 @@ test("尚未部署的检出：总览引导到首次部署向导；向导按步�
   preview().click();
   await shows("确认首次部署");
   // The browser names its drafts; the console turns them into checked references when it prepares the plan.
-  expect(plan).toEqual({ operation: "install", params: { app: id("app"), models: id("models"), directory: "all", port: 10000, workspace: "", replace: "d".repeat(64) } });
+  expect(plan).toEqual({ operation: "install", params: { app: id("app"), models: id("models"), directory: { saved: "saved-scope" }, port: 10000, workspace: "", replace: "d".repeat(64) } });
 });
 
 test("首次部署进行中：事务发布后不再算尚未部署，本页跟踪的首次部署结束前维护页仍是向导；总览提示未完成的部署并指向维护页", async () => {

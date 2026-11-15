@@ -29,12 +29,14 @@ import { readRelayIndex } from "../../src/integrations/relay-index.ts";
 import { spaceLabel } from "../lib/format.ts";
 import { runtimeOption } from "./runtime-options.ts";
 import { RUNTIME_DEFAULTS } from "../../src/core/runtime-schema.ts";
+import { DOCUMENT_ACTIONS, documentRequest } from "./documents.ts";
 
-export const OPERATIONS = ["start", "stop", "restart", "maintenance-recover", "history-clear", "history-compact", "tmp-purge", "tmp-reclaim", "tmp-discard", "runtime-configure", "stat-import", "relay-test", "relay-purge", "backup-clean", "configuration-apply", "configuration-restore", "resume", "rollback", "update", "deploy", "install", "repair", "uninstall"] as const;
+export const OPERATIONS = ["start", "stop", "restart", "maintenance-recover", "history-clear", "history-compact", "tmp-purge", "tmp-reclaim", "tmp-discard", "runtime-configure", "stat-import", "relay-test", "relay-purge", "backup-clean", "configuration-apply", "configuration-restore", "resume", "rollback", "update", "deploy", "install", "repair", "uninstall", ...DOCUMENT_ACTIONS] as const;
 export type Operation = typeof OPERATIONS[number];
 export const OPERATION_LABELS: Record<Operation, string> = { start: "启动", stop: "停止", restart: "重启", "maintenance-recover": "恢复中断的维护", update: "升级", deploy: "重新部署", install: "首次部署", repair: "修复部署", uninstall: "卸载", resume: "继续上次操作", rollback: "回滚上次操作", "history-clear": "清空会话", "history-compact": "登记会话压缩",
   "tmp-purge": "归档临时文件", "tmp-reclaim": "物理回收临时文件", "tmp-discard": "永久删除归档", "runtime-configure": "应用运行参数",
-  "stat-import": "导入统计", "relay-test": "测试外链存储", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复上次配置" };
+  "stat-import": "导入统计", "relay-test": "测试外链存储", "relay-purge": "清理外链", "backup-clean": "清理备份", "configuration-apply": "应用配置", "configuration-restore": "恢复上次配置",
+  "document-check": "检查文档环境", "document-install": "安装文档依赖", "document-repair": "修复文档依赖" };
 const DIGEST = /^[a-f0-9]{64}$/;
 const redactPhones = (value: string) => redactSecrets(value).replace(/\+?\d{5,20}/g, number => `${number.slice(0, 3)}****${number.slice(-2)}`);
 export function fields(params: Record<string, unknown>, allowed: string[]): void {
@@ -53,6 +55,7 @@ export function operationArgs(operation: string, params: Record<string, unknown>
   if (!OPERATIONS.includes(operation as Operation)) throw new Error("不支持这个管理操作");
   const argv = [opsCommandOf(operation)];
   switch (operation) {
+    case "document-check": case "document-install": case "document-repair": fields(params, []); documentRequest(operation, []); break;
     case "repair":
       if (nativeService()) fields(params, []); else deploymentOptions("deploy", params); break;
     case "update": case "deploy": case "install": {
@@ -112,6 +115,16 @@ export async function operationScope(project: string, operation: string, params:
   if (operation === "repair") return repairScope(project, params, run, launchd);
   if (operation === "uninstall") return uninstallScope(project, params, run, launchd);
   const data = join(project, "data"), summary: string[] = []; let scope = planDigest([operation, params]);
+  if ((DOCUMENT_ACTIONS as readonly string[]).includes(operation)) {
+    const runtime = await readRuntimeSettings(join(data, "config/runtime.json"));
+    scope = planDigest([operation, runtime.hash, process.env.BOT_DOCUMENT_ENV ?? "", process.env.BOT_DOCUMENT_OFFICE_PATH ?? ""]);
+    summary.push(operation === "document-check" ? "检查 Python、锁定依赖和文档读写，并转换一页临时文档验证 LibreOffice；不停止机器人。"
+      : `${operation === "document-repair" ? "重新下载并安装" : "安装缺失的"}锁定文档依赖，安装最多等待 30 分钟；随后验证文档读写和页面预览。`,
+      nativeService() ? `目标环境：${process.env.BOT_DOCUMENT_ENV?.trim() || runtime.values.BOT_DOCUMENT_ENV || "data/runtime/document-env"}`
+        : "检查当前部署镜像中的 /app/.venv；镜像依赖损坏时请重新部署。",
+      "uv 和 LibreOffice 须安装在部署机并对服务账户可用；此操作不安装系统软件。日志保存在后台任务详情。",
+      ...(operation === "document-check" ? [] : ["安装期间停止机器人；结束后恢复原运行状态。未通过验证时任务显示失败，可查看日志后重试。"]));
+  }
   if (operation === "start" || operation === "restart") {
     // The core refuses these under its lock; say so before the confirmation, not after it. Stopping is always allowed.
     const record = readOpsMaintenanceRecord(project), deployment = readOpsDeploymentRecord(project);

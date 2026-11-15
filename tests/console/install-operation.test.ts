@@ -153,7 +153,11 @@ test("配置草稿在最后一次使用 30 分钟后才过期：读部门树和�
 test("首次部署的预览准备：浏览器只给草稿编号，计划带上校验时的摘要；部门选择交给选择器核对", async () => {
   const f = await fixture();
   try {
-    const picker = { prepare: async () => ({ departments: ["d1"], names: ["合成研发"], appHash: "e".repeat(64) }) } as unknown as DeploymentDirectory;
+    const picker = { prepare: async () => ({ departments: ["d1"], names: ["合成研发"], appHash: "e".repeat(64) }),
+      prepareSaved: async (input: unknown, session: string, app: string) => {
+        expect(input).toEqual({ saved: "f".repeat(64) }); expect(session).toBe("one"); expect(app).toBe(f.app);
+        return { departments: ["saved-department"], names: ["已保存的部门"], appHash: "e".repeat(64) };
+      } } as unknown as DeploymentDirectory;
     const prepare = operationPreparer(f.root, {} as Views, undefined, undefined, undefined, undefined, f.drafts, picker);
     const input = { app: f.app, models: f.models, directory: "all", port: 2022, workspace: "", replace: null };
     expect(await prepare("install", input, "one")).toEqual({ ...input, app: f.appRef, models: f.modelsRef });
@@ -162,6 +166,7 @@ test("首次部署的预览准备：浏览器只给草稿编号，计划带上�
     const { replace: _omitted, ...unchosen } = input;
     await expect(prepare("install", unchosen, "one")).rejects.toThrow();
     expect((await prepare("install", { ...input, directory: { view: "v", selected: ["k"] } }, "one")).directory).toMatchObject({ names: ["合成研发"] });
+    expect((await prepare("install", { ...input, directory: { saved: "f".repeat(64) } }, "one")).directory).toMatchObject({ departments: ["saved-department"] });
     await expect(prepare("install", input, "two")).rejects.toThrow("过期");
     await expect(prepare("install", { ...input, app: f.appRef }, "one")).rejects.toThrow("参数无效");
     await expect(prepare("install", { ...input, app: f.models, models: f.app }, "one")).rejects.toThrow("请先填写");

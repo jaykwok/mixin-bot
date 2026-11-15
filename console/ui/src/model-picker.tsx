@@ -13,8 +13,8 @@ export function matchModels<T extends PickerModel>(models: T[], filter: string):
   return words.length ? models.filter(model => { const text = `${model.id} ${model.name ?? ""}`.toLowerCase(); return words.every(word => text.includes(word)); }) : models;
 }
 
-export function ModelPicker<T extends PickerModel>({ label, value, models, onInput, onPick, placeholder }: {
-  label: string; value: string; models: T[]; onInput(id: string): void; onPick(model: T): void; placeholder?: string;
+export function ModelPicker<T extends PickerModel>({ label, value, models, onInput, onPick, placeholder, onOpen, emptyText }: {
+  label: string; value: string; models: T[]; onInput(id: string): void; onPick(model: T): void; placeholder?: string; onOpen?(): void; emptyText?: string;
 }) {
   const [open, setOpen] = useState(false), [filter, setFilter] = useState(""), [index, setIndex] = useState(0);
   const list = useRef<HTMLUListElement>(null), listId = useId();
@@ -22,7 +22,7 @@ export function ModelPicker<T extends PickerModel>({ label, value, models, onInp
   useEffect(() => { list.current?.querySelector<HTMLElement>(`[data-index="${index}"]`)?.scrollIntoView?.({ block: "nearest" }); }, [index, open]);
   const pick = (model: T | undefined) => { if (!model) return; onPick(model); setFilter(""); setOpen(false); };
   // Opening shows every model, the current one first in view; typing narrows from there.
-  const show = () => { setFilter(""); setIndex(Math.max(0, models.findIndex(model => model.id === value))); setOpen(models.length > 0); };
+  const show = () => { setFilter(""); setIndex(Math.max(0, models.findIndex(model => model.id === value))); setOpen(true); onOpen?.(); };
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "ArrowDown") { event.preventDefault(); if (!open) show(); else setIndex(position => Math.min(position + 1, shown.length - 1)); }
     else if (event.key === "ArrowUp") { event.preventDefault(); setIndex(position => Math.max(position - 1, 0)); }
@@ -34,9 +34,9 @@ export function ModelPicker<T extends PickerModel>({ label, value, models, onInp
     <input type="text" role="combobox" aria-label={label} aria-autocomplete="list" aria-expanded={expanded} aria-controls={listId}
       aria-activedescendant={expanded && shown[index] ? `${listId}-${index}` : undefined} autoComplete="off" spellcheck={false}
       value={value} placeholder={placeholder} onFocus={show} onClick={() => { if (!open) show(); }} onKeyDown={onKeyDown}
-      onInput={event => { const text = event.currentTarget.value; onInput(text); setFilter(text); setIndex(0); setOpen(models.length > 0); }} />
+      onInput={event => { const text = event.currentTarget.value; onInput(text); setFilter(text); setIndex(0); setOpen(true); }} />
     {expanded && <ul class="model-picker-list" role="listbox" id={listId} ref={list} aria-label={`${label}候选`}>
-      {shown.length === 0 && <li class="model-picker-empty" role="presentation">没有匹配的模型；可以直接使用输入的模型 ID</li>}
+      {shown.length === 0 && <li class="model-picker-empty" role="presentation">{emptyText ?? "没有匹配的模型；可以直接使用输入的模型 ID"}</li>}
       {shown.map((model, position) => <li key={model.id} id={`${listId}-${position}`} data-index={position} role="option" aria-selected={position === index}
         class="model-picker-item" onMouseDown={event => event.preventDefault()} onMouseMove={() => setIndex(position)} onClick={() => pick(model)}>
         <span class="model-picker-id">{model.id}</span>

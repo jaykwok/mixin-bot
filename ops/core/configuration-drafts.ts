@@ -78,10 +78,19 @@ export class ConfigurationDrafts {
     draft.next = editConfiguration(draft.next, patch); draft.revision++; delete draft.validated;
     this.write(draft); return this.view(id, session);
   }
-  /** A custom provider's model list for the provider fields being edited; the draft itself is not changed. */
-  modelListInput(id: string, session: string, patch: unknown): { provider: string; config: Record<string, unknown> } {
+  /** Resolve the edited provider's credential on the host; no model selection is required. */
+  modelListInput(id: string, session: string, patch: unknown) {
     const draft = this.owned(id, session); assertConfigurationBase(this.project, draft.base);
     return modelListRequest(draft.next, patch);
+  }
+  /** A refreshed built-in catalogue belongs to the same unchanged draft; the edited selection is not validated by it. */
+  modelCatalog(id: string, session: string, revision: number, digest: string, catalog: string) {
+    const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);
+    if (draft.next.kind !== "models" || configurationDigest(draft) !== digest) throw new Error("读取模型目录期间草稿已变化，请重新获取");
+    if (typeof catalog !== "string" || Buffer.byteLength(catalog) > 8 * 1024 * 1024) throw new Error("模型目录缓存无效");
+    JSON.parse(catalog);
+    if (draft.next.files.catalog !== catalog) { draft.next.files.catalog = catalog; draft.revision++; delete draft.validated; }
+    this.write(draft); return this.view(id, session);
   }
   validationInput(id: string, session: string, revision: number): { digest: string; snapshot: ConfigurationSnapshot } {
     const draft = this.owned(id, session, revision); assertConfigurationBase(this.project, draft.base);
