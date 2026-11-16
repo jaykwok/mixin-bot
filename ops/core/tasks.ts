@@ -302,6 +302,7 @@ export class TaskStore {
     check?(): void;
     /** Finish cleanup that still needs the request before removing its record. */
     cleanup?(request: TaskRequest): Promise<void>;
+    onFailure?(request: TaskRequest, stage: "cleanup" | "record", error: unknown): void;
   } = {}): Promise<{ removed: string[]; retained: number; failed: number }> {
     const removed: string[] = [];
     let retained = 0, failed = 0;
@@ -318,13 +319,13 @@ export class TaskStore {
       } catch { retained++; continue; }
       options.check?.();
       try { await options.cleanup?.(view.request); }
-      catch { failed++; continue; }
+      catch (error) { failed++; options.onFailure?.(view.request, "cleanup", error); continue; }
       // The code or login may have changed while the hosting/cleanup calls were in flight.
       options.check?.();
       try {
         rmSync(this.dir(id), { recursive: true, force: true });
         removed.push(id);
-      } catch { failed++; }
+      } catch (error) { failed++; options.onFailure?.(view.request, "record", error); }
     }
     return { removed, retained, failed };
   }

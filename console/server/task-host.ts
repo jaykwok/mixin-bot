@@ -13,7 +13,12 @@ import { consoleDir, writeAtomic } from "../../ops/core/console-state.ts";
 import type { ExecutorIdentity, HostedState, TaskObservers, TaskRequest } from "../../ops/core/tasks.ts";
 import { TaskStore } from "../../ops/core/tasks.ts";
 import { processIncarnation } from "../../src/lib/darwin.ts";
+import { redactSecrets } from "../../src/lib/redact.ts";
 import { parseLaunchctlPrint, plistDocument } from "../../ops/core/launchd-host.ts";
+
+// Match Scheduler's structured missing-object error, never a translated message
+// or a suppressed access/CIM failure that merely left no task in the output.
+const WINDOWS_TASK_NOT_FOUND = "($_.CategoryInfo.Category -eq 'ObjectNotFound' -and $_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*')";
 
 // macOS: one LaunchDaemon per task in launchd's system domain, from a definition under .console/launchd. It runs once
 // (RunAtLoad, no KeepAlive) and stays loaded, not running, after it ends; reconcileTasks boots ended ones out.
@@ -60,7 +65,7 @@ export async function hostedTask(request: TaskRequest, accepted: ExecutorIdentit
   }
   if (request.mechanism === "windows-task") {
     const found = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-      "$ErrorActionPreference='Stop'; $t=Get-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -ErrorAction SilentlyContinue; if ($t) { $t.State.ToString() } else { 'absent' }"],
+      `$ErrorActionPreference='Stop'; try { $t=Get-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -ErrorAction Stop; if ($t) { $t.State.ToString() } else { 'absent' } } catch { if (${WINDOWS_TASK_NOT_FOUND}) { 'absent' } else { throw } }`],
       { MIXIN_CONSOLE_TASK: unitName(request.id), MIXIN_CONSOLE_TASK_PATH: WINDOWS_TASK_PATH });
     if (found.code !== 0) return { state: "unknown" };
     if (["Ready", "Disabled", "absent"].includes(found.stdout.trim())) return { state: "ended" };
@@ -99,10 +104,16 @@ export async function unregisterTask(request: TaskRequest, run: Runner = runComm
     return;
   }
   if (request.mechanism !== "windows-task") return; // transient services use --collect
+  // The executor normally unregisters itself before history is cleared. A missing
+  // task (including one removed concurrently) is already clean. SilentlyContinue
+  // hides that error's text but still makes powershell.exe exit with failure.
   const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-    "$ErrorActionPreference='Stop'; Unregister-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -Confirm:$false -ErrorAction SilentlyContinue"],
+    `$ErrorActionPreference='Stop'; try { Unregister-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -Confirm:$false -ErrorAction Stop } catch { if (-not ${WINDOWS_TASK_NOT_FOUND}) { throw } }; exit 0`],
     { MIXIN_CONSOLE_TASK: unitName(request.id), MIXIN_CONSOLE_TASK_PATH: WINDOWS_TASK_PATH });
-  if (result.code !== 0) throw new Error("任务已结束，但托管项尚未清除");
+  if (result.code !== 0) {
+    const detail = redactSecrets(result.stderr.trim()).slice(0, 2000);
+    throw new Error(`任务已结束，但托管项尚未清除（退出码 ${result.code}）${detail ? `：${detail}` : ""}`);
+  }
 }
 
 export interface ExecutorBundle { path: string; digest: string }

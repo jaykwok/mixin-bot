@@ -344,7 +344,7 @@ export function TasksPage({ resultsOnly = false, setup, platform }: { resultsOnl
       setSelected(previous => previous && result.removed.includes(previous) ? null : previous);
       setConfirmClear(false);
       setCleared(`已清理 ${result.removed.length} 条历史记录${result.retained ? `，保留 ${result.retained} 条执行中、待恢复或无法确认已结束的记录` : ""}。`);
-      if (result.failed) setClearError(`${result.failed} 条记录未能清理，请检查目录权限与任务收尾状态后重试。`);
+      if (result.failed) setClearError(`${result.failed} 条记录未能清理。请查看运行 bun run console 的终端中的具体错误，处理后重试。`);
     } catch (error) { if (!signal?.aborted && sentIn === epoch) setClearError(message(error)); }
     finally { clearLock.current = false; if (!signal?.aborted) { setClearing(false); refresh.current(); } }
   };

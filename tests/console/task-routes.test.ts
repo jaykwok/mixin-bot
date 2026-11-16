@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -8,11 +8,11 @@ import { guardConfig } from "../../console/server/guard.ts";
 import { PlanStore } from "../../ops/core/plans.ts";
 import { createHandler } from "../../console/server/server.ts";
 import { taskRoutes } from "../../console/server/task-routes.ts";
-import { TaskStore, type TaskObservers } from "../../ops/core/tasks.ts";
+import { TaskStore, type TaskObservers, type TaskRequest } from "../../ops/core/tasks.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const actor = { pid: 1, startedAt: "fixture" };
-async function setup() {
+async function setup(cleanup?: (request: TaskRequest) => Promise<void>) {
   const fixture = await tempFixture("console-task-http-");
   const time = { at: 1000, scope: "first", hosting: true, launches: 0, accept: true, current: true, replaceDuringHosting: false };
   const tasks = new TaskStore(join(fixture.root, ".console"), () => time.at);
@@ -24,7 +24,7 @@ async function setup() {
   const handler = createHandler({ port: 10001, guard: guardConfig(10001), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
     bundle: { index: { path: "/", type: "text/html", body: new Uint8Array() }, assets: new Map() },
     routes: taskRoutes({ tasks, plans, observers, audit: new AuditLog(join(fixture.root, ".console/audit")),
-      current: () => time.current,
+      current: () => time.current, cleanup,
       hosting: async () => { if (time.replaceDuringHosting) time.current = false; return time.hosting ? { ok: true, mechanism: "systemd-system", facts: [] } : { ok: false, reason: "没有 systemd", facts: [] }; },
       launch: async id => { time.launches++; if (time.accept) tasks.accept(id, actor); else { time.at += 20_000; tasks.abandon(id); } },
     }),
@@ -63,6 +63,37 @@ test("清理历史接口删除已结束的失败和成功记录，保留运行�
     const audit = readdirSync(auditDir).map(file => readFileSync(join(auditDir, file), "utf8")).join("");
     expect(audit).toContain('"action":"task-history-clear"');
   } finally { await h.fixture.cleanup(); }
+});
+
+test("清理部分失败保留记录并在终端给出脱敏原因，成功的记录照常清理且允许重试", async () => {
+  const phone = "447700900123", secret = "private-clear-token";
+  let blocked = true;
+  const h = await setup(async request => {
+    if (blocked && request.params.phone === phone) throw new Error(`CIM_DENIED code=5 phone=${phone} token=${secret}`);
+  });
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    h.observers.hosting = async () => ({ state: "ended" });
+    const create = (key: string, params: Record<string, unknown>) => {
+      const task = h.tasks.create({ project: h.fixture.root, mechanism: "windows-task", planId: key, operation: "stop", params }, key);
+      h.tasks.accept(task.id, actor);
+      h.tasks.finish(task.id, { outcome: "success", exitCode: 0, finalState: "stopped", message: "done" });
+      return task.id;
+    };
+    const failed = create("cannot-clean", { phone }), success = create("can-clean", {});
+    const response = await h.request("/api/tasks/clear", {});
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ removed: [success], retained: 0, failed: 1 });
+    expect(h.tasks.request(failed).id).toBe(failed);
+    expect(() => h.tasks.request(success)).toThrow();
+    expect(logged).toHaveBeenCalledTimes(1);
+    const text = logged.mock.calls.flat().join("\n");
+    expect(text).toContain(failed); expect(text).toContain("托管项或临时资料收尾"); expect(text).toContain("CIM_DENIED code=5");
+    expect(text).not.toContain(phone); expect(text).not.toContain(secret);
+    blocked = false;
+    expect(await (await h.request("/api/tasks/clear", {})).json()).toEqual({ removed: [failed], retained: 0, failed: 0 });
+    expect(logged).toHaveBeenCalledTimes(1);
+  } finally { logged.mockRestore(); await h.fixture.cleanup(); }
 });
 
 test.each(["code", "session", "cancel"])("历史清理核对期间 %s 改变时不删除记录", async change => {

@@ -85,7 +85,7 @@ wheels = [
 
 [[package]]
 name = "mixin-bot-documents"
-version = "2.1.5"
+version = "2.1.6"
 source = { virtual = "." }
 dependencies = [
     { name = "docxcompose" },

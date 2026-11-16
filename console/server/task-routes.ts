@@ -15,8 +15,8 @@ interface TaskApi {
   created?(request: TaskRequest): void;
   cleanup?(request: TaskRequest): Promise<void>;
 }
-const problem = (error: unknown): never => { throw new ApiProblem(409, "input", redactSecrets(error instanceof Error ? error.message : "管理请求被拒绝")
-  .replace(/\b1[3-9]\d{9}\b/g, value => `${value.slice(0, 3)}****${value.slice(-4)}`)); };
+const clean = (message: string) => redactSecrets(message).replace(/\b1[3-9]\d{9}\b/g, value => `${value.slice(0, 3)}****${value.slice(-4)}`);
+const problem = (error: unknown): never => { throw new ApiProblem(409, "input", clean(error instanceof Error ? error.message : "管理请求被拒绝")); };
 const record = (body: unknown, allowed: string[]): Record<string, unknown> => {
   if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => !allowed.includes(key))) throw new ApiProblem(400, "input", "请求参数无效");
   return body as Record<string, unknown>;
@@ -139,7 +139,12 @@ export function taskRoutes(api: TaskApi): Record<string, Route> {
       if (clearing) throw new ApiProblem(409, "input", "正在清理任务历史，请稍后查看结果");
       audit.write({ action: "task-history-clear", scope: "tasks", session: context.session.label, mode: "default" });
       clearing = true;
-      try { return await tasks.clearHistory(observers, { check, cleanup: api.cleanup }); }
+      try { return await tasks.clearHistory(observers, { check, cleanup: api.cleanup, onFailure: (request, stage, error) => {
+        let detail = error instanceof Error ? error.message : "未知错误";
+        const phone = request.params.phone;
+        if (typeof phone === "string" && phone.length >= 5) detail = detail.replaceAll(phone, `${phone.slice(0, 3)}****${phone.slice(-2)}`);
+        console.error(`任务历史清理失败 [${request.id}] ${stage === "cleanup" ? "托管项或临时资料收尾" : "删除记录目录"}：${clean(detail).slice(0, 4000)}`);
+      } }); }
       catch (error) { return problem(error); }
       finally { clearing = false; }
     } },
