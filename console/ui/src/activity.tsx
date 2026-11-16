@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 // What runs in the background, whichever page is open: the sheet with the progress of a task confirmed on this page, and
 // the tray in the corner that follows those tasks and the exports until each ends.
-import { useEffect } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { ExportItem, useExportJobs } from "./exports.tsx";
 import { Icon } from "./icons.tsx";
 import { forgetTask, showTask, TASK_LABELS, TASK_STATES, TaskProgress, taskEnded, taskTone, useFollowed, viewTaskInPage, type Followed } from "./tasks.tsx";
@@ -27,6 +27,7 @@ export function TaskSheet() {
 }
 
 function TaskItem({ item }: { item: Followed }) {
+  const [secondsLeft, setSecondsLeft] = useState(10);
   const look = taskTone(item.task), ended = taskEnded(item.task?.state);
   const succeeded = !item.error && item.task?.state === "succeeded" && !item.task.needsRecovery
     && item.task.result?.outcome === "success" && item.task.result.exitCode === 0;
@@ -34,8 +35,11 @@ function TaskItem({ item }: { item: Followed }) {
   // leaving this component cancels the timer; failed, uncertain and recovery-needed tasks remain until dismissed.
   useEffect(() => {
     if (!succeeded) return;
+    const deadline = Date.now() + 10_000;
+    setSecondsLeft(10);
     const timer = setTimeout(() => forgetTask(item.id), 10_000);
-    return () => clearTimeout(timer);
+    const countdown = setInterval(() => setSecondsLeft(Math.max(0, Math.ceil((deadline - Date.now()) / 1000))), 1000);
+    return () => { clearTimeout(timer); clearInterval(countdown); };
   }, [item.id, succeeded]);
   const state = item.error ? `无法读取任务状态：${item.error}` : item.task ? `${TASK_STATES[item.task.state] ?? item.task.state}${item.task.needsRecovery ? " · 需要恢复处理" : ""}` : "正在读取…";
   return (
@@ -44,7 +48,7 @@ function TaskItem({ item }: { item: Followed }) {
         <span class="activity-icon"><Icon name={ended ? look.icon : "activity"} size={16} /></span>
         <span class="activity-text">
           <span class="activity-name">{TASK_LABELS[item.operation] ?? item.operation}</span>
-          <span class="activity-state">{!ended && <Icon name="loader" size={12} class="spin" />}{state}{succeeded && " · 10 秒后自动收起"}</span>
+          <span class="activity-state">{!ended && <Icon name="loader" size={12} class="spin" />}{state}{succeeded && ` · 将于 ${secondsLeft} 秒后自动关闭`}</span>
           {!ended && <ProgressBar label="任务进度" />}
         </span>
       </button>

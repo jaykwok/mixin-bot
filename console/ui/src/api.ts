@@ -45,14 +45,14 @@ export interface CallOptions {
 export async function api<T>(path: string, options: CallOptions = {}): Promise<T> {
   const headers: Record<string, string> = { "X-Console-Request": "1" };
   if (options.intent) headers["X-Console-Intent"] = "user";
-  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (options.body !== undefined && !(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   const sentIn = generation;
   const report = (reason: "session" | "offline") => { if (!options.quiet && sentIn === generation) lost(reason); };
   let response: Response;
   try {
     response = await fetch(path, {
       method: options.method ?? "GET", headers, credentials: "same-origin", cache: "no-store", redirect: "error",
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: options.body instanceof FormData ? options.body : options.body === undefined ? undefined : JSON.stringify(options.body),
       signal: options.timeoutMs === undefined ? options.signal : options.signal
         ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs)]) : AbortSignal.timeout(options.timeoutMs),
     });

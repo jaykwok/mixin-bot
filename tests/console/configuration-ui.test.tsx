@@ -11,6 +11,41 @@ const until = async (check: () => boolean) => { const end = Date.now() + 3000; w
 const button = (root: Element, text: string) => [...root.querySelectorAll("button")].find(value => value.textContent === text)!;
 const options = (root: Element) => [...root.querySelectorAll('[role="option"]')] as HTMLElement[];
 
+test("内置与自定义模型都有全局上下文、最大输出和思考强度，修改后提交原值且可清空限制", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
+  try {
+    for (const custom of [false, true]) {
+      const calls: any[] = [];
+      const form = { kind: "models", provider: "fixture", model: "m1", thinking: "high", providers: [{ id: "fixture", custom, hasKey: true, api: "openai-completions", baseUrl: "https://fixture.invalid/v1",
+        models: custom ? [{ id: "m1", contextWindow: 128000, maxTokens: 8000 }, { id: "m2", contextWindow: 32000, maxTokens: 1000 }] : [],
+        overrides: custom ? [] : [{ id: "m1", contextWindow: 128000, maxTokens: 8000 }, { id: "m2", contextWindow: 32000, maxTokens: 1000 }] }] };
+      globalThis.fetch = (async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/catalog")) return Response.json({ providers: [{ id: "fixture" }], apis: ["openai-completions"], models: [] });
+        if (url.endsWith("/edit")) calls.push(JSON.parse(String(init?.body)).patch);
+        return Response.json({ id: "config-global", revision: 0, validated: url.endsWith("/check"), summary: [], form });
+      }) as typeof fetch;
+      await act(() => render(<ConfigurationForm kind="models" />, root)); button(root, "编辑配置").click();
+      const context = () => root.querySelector<HTMLInputElement>('[aria-label="全局上下文上限（token）"]')!;
+      await until(() => !!context() && !root.querySelector("fieldset")!.disabled);
+      expect(context().value).toBe("128000");
+      const output = root.querySelector<HTMLInputElement>('[aria-label="全局最大输出（token）"]')!, thinking = root.querySelector<HTMLSelectElement>('[aria-label="全局思考强度"]')!;
+      expect(thinking.value).toBe("high");
+      const selected = root.querySelector<HTMLInputElement>(`[aria-label="${custom ? "模型 ID" : "模型"}"]`)!;
+      await act(() => { selected.value = "m2"; selected.dispatchEvent(new Event("input", { bubbles: true })); });
+      expect(context().value).toBe("32000"); expect(output.value).toBe("1000");
+      await act(() => { selected.value = "m1"; selected.dispatchEvent(new Event("input", { bubbles: true })); });
+      expect(context().value).toBe("128000"); expect(output.value).toBe("8000");
+      await act(() => { context().value = "64000"; context().dispatchEvent(new Event("input", { bubbles: true })); });
+      await act(() => { output.value = ""; output.dispatchEvent(new Event("input", { bubbles: true })); });
+      await act(() => { thinking.value = "max"; thinking.dispatchEvent(new Event("change", { bubbles: true })); });
+      button(root, "保存草稿并校验").click(); await until(() => calls.length === 1);
+      expect(calls[0].modelLimits).toEqual({ contextWindow: 64000 }); expect(calls[0].thinking).toBe("max");
+      await until(() => !!button(root, "预览应用配置"));
+      await act(() => render(null, root));
+    }
+  } finally { await act(() => render(null, root)); root.remove(); globalThis.fetch = previous; }
+});
+
 test("自定义服务商只手填且不会切回内置；换密钥后重新读取，旧请求迟到不覆盖新列表", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
   const pending = Promise.withResolvers<Response>(), calls: any[] = [];

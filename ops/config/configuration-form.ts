@@ -91,7 +91,9 @@ export function configurationForm(snapshot: ConfigurationSnapshot): ObjectValue 
   if (snapshot.kind === "models") {
     const source = parsed(snapshot.files.models), settings = parsed(snapshot.files.settings), providers = configurationObject(source.providers ?? {});
     const string = (value: unknown) => typeof value === "string" ? value : undefined;
-    return { kind: snapshot.kind, provider: string(settings.defaultProvider), model: string(settings.defaultModel), thinking: string(settings.defaultThinkingLevel),
+    const levels = configurationObject(settings.modelThinkingLevels ?? {});
+    return { kind: snapshot.kind, provider: string(settings.defaultProvider), model: string(settings.defaultModel),
+      thinking: string(levels[`${settings.defaultProvider}/${settings.defaultModel}`]) ?? string(settings.defaultThinkingLevel),
       catalogModels: Object.entries(parsed(snapshot.files.catalog)).flatMap(([provider, raw]) => {
         if (!raw || typeof raw !== "object" || !Array.isArray((raw as ObjectValue).models)) return [];
         return ((raw as ObjectValue).models as unknown[]).flatMap(value => {
@@ -103,7 +105,8 @@ export function configurationForm(snapshot: ConfigurationSnapshot): ObjectValue 
       providers: Object.entries(providers).map(([id, raw]) => {
         const provider = configurationObject(raw);
         return { id, custom: typeof provider.baseUrl === "string", api: string(provider.api), baseUrl: publicUrl(provider.baseUrl),
-          hasKey: provider.apiKey !== undefined, models: Array.isArray(provider.models) ? provider.models.map(publicModel) : [] };
+          hasKey: provider.apiKey !== undefined, models: Array.isArray(provider.models) ? provider.models.map(publicModel) : [],
+          overrides: Object.entries(configurationObject(provider.modelOverrides ?? {})).map(([id, value]) => ({ ...publicModel(value), id })) };
       }) };
   }
   if (snapshot.kind === "app") {
@@ -181,15 +184,21 @@ export function editConfiguration(base: ConfigurationSnapshot, input: unknown): 
     for (const key of ["region", "bucket", "prefix", "forcePathStyle", "maxMB", "expireHours", "cleanupGraceMinutes"]) value[key] = patch[key];
     next.files.relay = json({ ...value, ...validateRelayConfig(value) }); return next;
   }
-  only(patch, ["provider", "mode", "api", "baseUrl", "key", "model", "thinking"]);
+  only(patch, ["provider", "mode", "api", "baseUrl", "key", "model", "thinking", "modelLimits"]);
   const source = parsed(base.files.models), { id, previous, provider, providers } = providerEntry(source, patch);
   const model = typeof patch.model === "string" ? { id: text(patch.model) } : configurationObject(patch.model);
   const modelId = text(model.id);
+  const limits = patch.modelLimits === undefined ? undefined : configurationObject(patch.modelLimits);
+  if (limits) {
+    only(limits, ["contextWindow", "maxTokens"]);
+    for (const value of Object.values(limits)) if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw new Error("全局上下文和输出上限必须为正整数，留空表示使用模型默认值");
+  }
   if (patch.mode === "custom") {
     only(model, ["id", "name", "contextWindow", "maxTokens", "input", "reasoning", "cost"]);
     const models = Array.isArray(previous.models) ? previous.models.map(configurationObject) : [];
     const before = models.find(value => value.id === modelId) ?? {};
     const edited: ObjectValue = { ...before, ...model, id: modelId, name: model.name ?? before.name ?? modelId };
+    if (limits) for (const key of ["contextWindow", "maxTokens"]) { delete edited[key]; if (limits[key] !== undefined) edited[key] = limits[key]; }
     if (model.cost !== undefined) {
       const cost = configurationObject(model.cost); only(cost, ["input", "output", "cacheRead", "cacheWrite"]);
       const oldCost = before.cost && typeof before.cost === "object" ? before.cost as ObjectValue : {};
@@ -197,7 +206,16 @@ export function editConfiguration(base: ConfigurationSnapshot, input: unknown): 
       edited.cost = same ? { ...oldCost, ...cost } : { ...cost };
     }
     provider.models = [...models.filter(value => value.id !== modelId), edited];
-  } else if (typeof patch.model !== "string") throw new Error("内置模型只需选择模型 ID");
+  } else {
+    if (typeof patch.model !== "string") throw new Error("内置模型只需选择模型 ID");
+    if (limits) {
+      const overrides = configurationObject(previous.modelOverrides ?? {});
+      const edited = { ...configurationObject(overrides[modelId] ?? {}) };
+      for (const key of ["contextWindow", "maxTokens"]) { delete edited[key]; if (limits[key] !== undefined) edited[key] = limits[key]; }
+      if (Object.keys(edited).length) overrides[modelId] = edited; else delete overrides[modelId];
+      provider.modelOverrides = overrides;
+    }
+  }
   const settings = parsed(base.files.settings), levels = configurationObject(settings.modelThinkingLevels ?? {});
   delete levels[`${id}/${modelId}`];
   const thinking = text(patch.thinking);

@@ -44,7 +44,7 @@ export function refusal(request: Request, kind: RequestKind, config: GuardConfig
 }
 
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
-  "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; " +
+  "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; " +
     "font-src 'self'; manifest-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   "Cache-Control": "no-store",
   "Referrer-Policy": "no-referrer",

@@ -5,6 +5,7 @@
 import { readFile } from "node:fs/promises";
 import { matchesInstance } from "../../src/core/health.ts";
 import type { ReadOp } from "../../src/durable/read/protocol.ts";
+import type { OperatorAttachment } from "../../src/contracts/takeover-upload.ts";
 
 /** The bot is not running, is stopping, or is not the recorded instance. */
 export class BotOffline extends Error { override name = "BotOffline"; }
@@ -20,12 +21,13 @@ export interface BotReader {
 }
 
 /** What the operator's message came to (src/durable/takeover.ts SayResult). */
-export type SayResult = { sent: "sent" | "uncertain" | "partial"; recorded: boolean; segments?: { sent: number; total: number } };
+export type { SayResult } from "../../src/durable/takeover.ts";
+import type { SayResult } from "../../src/durable/takeover.ts";
 
 /** Taking a conversation over (the bot's `/_admin/conversation/*`): a refusal is a BotReadError with the code TakeoverRefused. */
 export interface BotTakeover {
   stop(member: { space: string; phone: string }): Promise<void>;
-  say(member: { space: string; phone: string }, text: string): Promise<SayResult>;
+  say(member: { space: string; phone: string }, text: string, attachment?: OperatorAttachment): Promise<SayResult>;
 }
 
 /** A stop waits for the member's run and its tools to end (the bot allows 120 s). */
@@ -83,18 +85,21 @@ export class BotLink implements BotReader, BotTakeover {
     return this.#takeover("stop", member).then(() => {});
   }
 
-  async say(member: { space: string; phone: string }, text: string): Promise<SayResult> {
-    const body = await this.#takeover("say", { ...member, text });
-    return { sent: body.sent as SayResult["sent"], recorded: body.recorded === true, ...(body.segments ? { segments: body.segments as { sent: number; total: number } } : {}) };
+  async say(member: { space: string; phone: string }, text: string, attachment?: OperatorAttachment): Promise<SayResult> {
+    let payload: Record<string, unknown> | FormData = { ...member, text };
+    if (attachment) { payload = new FormData(); payload.set("message", JSON.stringify({ ...member, text, kind: attachment.kind })); payload.set("file", attachment.file, attachment.file.name); }
+    const body = await this.#takeover(attachment ? "attachment" : "say", payload);
+    return { sent: body.sent as SayResult["sent"], recorded: body.recorded === true, ...(body.segments ? { segments: body.segments as { sent: number; total: number } } : {}),
+      ...(body.attachment ? { attachment: body.attachment as SayResult["attachment"] } : {}) };
   }
 
   /**
    * Not counted against the read slots (a stop may wait long), and never repeated: after a refused token the operator
    * sends again. The page going away does not end it either, so the stop and the message stay one step.
    */
-  async #takeover(name: "stop" | "say", body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async #takeover(name: "stop" | "say" | "attachment", body: Record<string, unknown> | FormData): Promise<Record<string, unknown>> {
     const instance = await this.#verify();
-    const response = await this.#post(instance, `/_admin/conversation/${name}`, body, TAKEOVER_MS);
+    const response = await this.#post(instance, `/_admin/conversation/${name}`, body, name === "attachment" ? 310_000 : TAKEOVER_MS);
     const reply = response.body as Record<string, unknown> | null;
     if (response.status === 200 && reply?.status === "ok") return reply;
     if (response.status === 404 && reply?.status !== "error") {
@@ -142,8 +147,8 @@ export class BotLink implements BotReader, BotTakeover {
     let response: Response;
     try {
       response = await fetch(`http://127.0.0.1:${instance.port}${path}`, {
-        method: "POST", headers: { Authorization: `Bearer ${instance.token}`, "Content-Type": "application/json" },
-        body: JSON.stringify(body), signal: signalWith(timeoutMs, signal), redirect: "error",
+        method: "POST", headers: { Authorization: `Bearer ${instance.token}`, ...(body instanceof FormData ? {} : { "Content-Type": "application/json" }) },
+        body: body instanceof FormData ? body : JSON.stringify(body), signal: signalWith(timeoutMs, signal), redirect: "error",
       });
     } catch (error) {
       signal?.throwIfAborted();

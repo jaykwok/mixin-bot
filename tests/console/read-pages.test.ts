@@ -31,7 +31,7 @@ test("设置页按字段写中文名和可读值，不出现 JSON、摘要或环
     writeFileSync(join(fixture.root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "m1", defaultThinkingLevel: "high" }));
     writeFileSync(join(fixture.root, "data/config/runtime.json"), JSON.stringify({ BOT_PORT: "12011", BOT_HOST: "127.0.0.1", BOT_RUN_TIMEOUT_SECONDS: "1500", PI_CACHE_RETENTION: "long" }));
     const rows = Object.fromEntries((await readPage(fixture.root, "settings")).rows);
-    expect(rows).toMatchObject({ "模型": "fixture/m1", "模型 · 推理级别": "high（全局默认）", "辅助模型": "未启用", "应用机器人": "未配置", "外链": "未启用",
+    expect(rows).toMatchObject({ "模型": "fixture/m1", "模型 · 思考强度": "high（全局默认）", "模型 · 全局上下文上限": "使用模型默认值", "模型 · 全局最大输出": "使用模型默认值", "辅助模型": "未启用", "应用机器人": "未配置", "外链": "未启用",
       "运行参数 · 本机端口": "12011", "运行参数 · 监听地址": "127.0.0.1", "运行参数 · 整轮处理时限": "1500 秒", "运行参数 · 模型缓存保留": "长期" });
     expect([...Object.keys(rows), ...Object.values(rows)].join("\n")).not.toMatch(/[{}]|hash|values|BOT_|PI_CACHE/);
     writeFileSync(join(fixture.root, "data/config/runtime.json"), "{}");

@@ -1152,6 +1152,9 @@ input[type="file"]::file-selector-button:hover { background: var(--fill-hover); 
 .takeover-head { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; }
 .takeover-head > span { display: inline-flex; align-items: center; gap: 6px; }
 .takeover textarea { min-height: 64px; max-height: 30vh; }
+.takeover-attachment { display: flex; align-items: center; gap: 10px; }
+.takeover-attachment > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.takeover-attachment img { width: 64px; height: 64px; object-fit: contain; border-radius: 6px; }
 .takeover-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .takeover-actions > span { margin-right: auto; }
 .takeover-note { margin: 0; font-size: 13px; }

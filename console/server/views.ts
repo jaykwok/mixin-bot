@@ -13,6 +13,7 @@ import { groupTitles, type GroupTitles } from "./group-titles.ts";
 import { BotReadError, type BotReader, type BotTakeover } from "./bot.ts";
 import { identityOf, lookupNames, MemberCodes, opaqueKey, redactPhones, type NameInfo } from "./identity.ts";
 import { ApiProblem, input, problemOf, type Route, type RouteContext } from "./routes.ts";
+import { readTakeoverUpload, TakeoverUploadError } from "../../src/contracts/takeover-upload.ts";
 
 /** Members one space view loads; a larger space lists the first ones and says so. */
 export const MAX_VIEW_MEMBERS = 10_000;
@@ -389,6 +390,21 @@ export function conversationRoutes({ bot, audit, views, takeover, now = Date.now
         await link.stop(member);
         return { ok: true };
       }),
+    },
+
+    "POST /api/conversation/attachment": {
+      slow: 330, raw: true,
+      run: async context => {
+        try {
+          const { metadata, attachment } = await readTakeoverUpload(context.request!, context.sessionAlive);
+          return await withView({ ...context, body: metadata }, async (view, body) => {
+            const text = typeof body.text === "string" ? body.text.trim() : "";
+            if ([...text].length > TAKEOVER_TEXT_MAX) input(`一次最多发 ${TAKEOVER_TEXT_MAX} 个字，请分几次发`);
+            const { link, member } = takenOver(context, view, body, "conversation-say", Buffer.byteLength(text) + attachment.file.size);
+            return await link.say(member, text, attachment) satisfies TakeoverSayResponse;
+          });
+        } catch (error) { if (error instanceof TakeoverUploadError) input(error.message); throw error; }
+      },
     },
 
     "POST /api/conversation/say": {

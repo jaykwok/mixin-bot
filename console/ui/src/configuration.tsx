@@ -18,7 +18,7 @@ type Kind = "models" | "app" | "relay";
 type Secret = { mode: "keep" | "set" | "clear"; value?: string };
 type Model = { id: string; name?: string; contextWindow?: number; maxTokens?: number; input?: string[]; reasoning?: boolean;
   cost?: Record<string, number>; thinking?: string[] };
-type Provider = { id: string; custom?: boolean; api?: string; baseUrl?: string; hasKey?: boolean; models: Model[] };
+type Provider = { id: string; custom?: boolean; api?: string; baseUrl?: string; hasKey?: boolean; models: Model[]; overrides?: Model[] };
 interface Form { kind: Kind; provider?: string; model?: string; thinking?: string; providers?: Provider[]; appId?: string; environment?: string; bound?: boolean;
   catalogModels?: (Model & { provider: string })[];
   hasSecret?: boolean; hasAccessKey?: boolean; hasToken?: boolean; enabled?: boolean; endpoint?: string; region?: string; bucket?: string; prefix?: string;
@@ -48,7 +48,7 @@ const ENDPOINTS: Record<string, string> = {
 const listKey = (patch: Patch) => JSON.stringify([patch.mode, patch.provider, patch.api, patch.baseUrl, patch.key]);
 const titles = { models: "模型配置", app: "应用机器人凭据", relay: "外链配置" };
 const SECTIONS: Record<Kind, { title: string; icon: IconName; tint: Tint; detail: string }> = {
-  models: { title: "模型", icon: "sparkles", tint: "purple", detail: "机器人使用的服务商、模型和推理级别。" },
+  models: { title: "模型", icon: "sparkles", tint: "purple", detail: "机器人使用的服务商、模型、上下文和思考强度。" },
   app: { title: "应用机器人", icon: "bot", tint: "blue", detail: "量子密信应用机器人的 AppID、环境和密钥。" },
   relay: { title: "外链", icon: "link", tint: "indigo", detail: "大文件改用 S3 兼容存储的下载链接发送。" },
 };
@@ -57,11 +57,12 @@ const retained = (has?: boolean, optional = false): Secret => ({ mode: has ? "ke
 
 function modelPatch(form: Form, providerId: string, catalog?: Catalog): Patch {
   const provider = form.providers?.find(value => value.id === providerId), model = provider?.models.find(value => value.id === form.model) ?? provider?.models[0];
+  const selectedId = (form.provider === providerId ? form.model : undefined) ?? catalog?.models.find(value => value.provider === providerId)?.id ?? "";
   return { provider: providerId, mode: provider?.custom ? "custom" : "builtin", api: provider?.api ?? "openai-completions", baseUrl: provider?.baseUrl ?? "",
-    key: retained(provider?.hasKey), model: provider?.custom ? model ?? { id: "", contextWindow: 128000, maxTokens: 8192, input: ["text"], reasoning: false }
-      : (form.provider === providerId ? form.model : undefined) ?? catalog?.models.find(value => value.provider === providerId)?.id ?? "",
-    thinking: form.thinking ?? "off" };
+    key: retained(provider?.hasKey), model: provider?.custom ? model ?? { id: "", input: ["text"], reasoning: false } : selectedId,
+    thinking: form.thinking ?? "medium", modelLimits: modelLimits(provider?.custom ? model : provider?.overrides?.find(value => value.id === selectedId)) };
 }
+const modelLimits = (model?: Model) => ({ ...(model?.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }), ...(model?.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }) });
 function initial(form: Form, catalog?: Catalog): Patch {
   if (form.kind === "models") return modelPatch(form, form.provider ?? form.providers?.[0]?.id ?? "", catalog);
   if (form.kind === "app") return { appId: form.appId ?? "", environment: form.environment ?? "production", secret: retained(form.hasSecret) };
@@ -173,7 +174,8 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
   const modelMap = new Map([...(catalog?.models ?? []), ...(draft?.form.catalogModels ?? [])].filter(value => value.provider === patch.provider).map(value => [value.id, value as Model]));
   if (!custom) for (const value of fetched ?? []) modelMap.set(value.id, { ...modelMap.get(value.id), ...value });
   const models = [...modelMap.values()];
-  const thinking = models.find(value => value.id === model.id)?.thinking ?? ["off", "minimal", "low", "medium", "high", "xhigh"];
+  const thinking: Record<string, string> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
+  const limits = (patch.modelLimits ?? {}) as { contextWindow?: number; maxTokens?: number };
   // A custom provider's candidates: the models it already has, then what its endpoint listed.
   const saved = draft?.form.providers?.find(value => value.id === patch.provider && value.custom)?.models ?? [];
   const candidates = [...new Map([...saved, ...fetched ?? []].map(value => [value.id, value])).values()];
@@ -186,15 +188,16 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
     resetList(); setValid(false);
     if (custom) setPatch(previous => ({ ...previous, provider: value,
       key: (previous.key as Secret | undefined)?.mode === "keep" ? retained(draft?.form.providers?.find(provider => provider.id === value)?.hasKey) : previous.key }));
-    else if (draft) setPatch({ ...modelPatch(draft.form, value, catalog), mode: "builtin" });
+    else if (draft) setPatch(previous => ({ ...modelPatch(draft.form, value, catalog), mode: "builtin", thinking: previous.thinking }));
   };
   /** A picked custom model takes its saved definition, else what the list and the bundled catalogue know of it. */
   const pickCustom = (picked: Model) => {
     const own = saved.find(value => value.id === picked.id);
-    if (own) { change("model", { ...own }); return; }
+    if (own) { change("model", { ...own }); change("modelLimits", modelLimits(own)); return; }
     const known = catalog?.models.find(value => value.id === picked.id) ?? catalog?.models.find(value => value.id === picked.id.split("/").pop());
-    change("model", { ...model, id: picked.id, name: picked.name ?? known?.name ?? picked.id, contextWindow: picked.contextWindow ?? known?.contextWindow ?? model.contextWindow,
-      maxTokens: picked.maxTokens ?? known?.maxTokens ?? model.maxTokens, input: picked.input ?? known?.input ?? model.input, reasoning: known?.reasoning ?? model.reasoning });
+    const next = { id: picked.id, name: picked.name ?? known?.name ?? picked.id, contextWindow: picked.contextWindow ?? known?.contextWindow,
+      maxTokens: picked.maxTokens ?? known?.maxTokens, input: picked.input ?? known?.input ?? ["text"], reasoning: known?.reasoning ?? false };
+    change("model", next); change("modelLimits", modelLimits(next));
   };
   const listNote = custom && !listable ? "这个协议没有模型列表接口，请直接填写模型 ID。" : listing ? "正在刷新模型目录…"
     : fetched ? fetched.length ? `已获取 ${fetched.length} 个模型，可以输入关键词筛选或选择。` : "没有获取到模型，可以直接填写模型 ID。"
@@ -225,7 +228,7 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
             {secret("accessKey", "访问密钥 ID")}{secret("secret", "访问密钥")}{secret("token", "临时会话令牌", true)}</>}</>}
         {kind === "models" && <><Field group label="模型来源">
             <Segmented label="模型来源" size="small" value={patch.mode === "custom" ? "custom" : "builtin"}
-              onChange={value => { change("mode", value); change("model", value === "custom" ? { id: model.id, contextWindow: 128000, maxTokens: 8192, input: ["text"], reasoning: false } : model.id); }}
+              onChange={value => { change("mode", value); change("model", value === "custom" ? { id: model.id, input: ["text"], reasoning: false } : model.id); change("modelLimits", {}); }}
               options={[{ value: "builtin", label: "内置服务商目录" }, { value: "custom", label: "自定义模型" }]} /></Field>
           <Field group={!custom} label="服务商 ID">
             {custom ? <input type="text" aria-label="服务商 ID" autoComplete="off" spellcheck={false} placeholder="填写自定义服务商 ID"
@@ -247,10 +250,8 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
           {custom ? <>
             <Field group label="模型 ID" note={candidates.length ? "可以输入关键词筛选，也可以填写列表里没有的模型 ID。" : undefined}>
               <ModelPicker label="模型 ID" value={model.id} models={candidates} placeholder={candidates.length ? "输入关键词筛选或填写模型 ID" : "填写模型 ID"}
-                onOpen={() => void fetchModels()} onInput={value => changeModel("id", value)} onPick={pickCustom} /></Field>
+                onOpen={() => void fetchModels()} onInput={value => pickCustom({ id: value })} onPick={pickCustom} /></Field>
             <Field label="显示名称"><input value={model.name ?? ""} onInput={event => changeModel("name", event.currentTarget.value)} /></Field>
-            <Field label="上下文上限"><input type="number" min="1" value={model.contextWindow} onInput={event => changeModel("contextWindow", Number(event.currentTarget.value))} /></Field>
-            <Field label="输出上限"><input type="number" min="1" value={model.maxTokens} onInput={event => changeModel("maxTokens", Number(event.currentTarget.value))} /></Field>
             <div class="row"><Toggle label="支持推理" checked={model.reasoning ?? false} onChange={value => changeModel("reasoning", value)} /></div>
             <div class="row"><Toggle label="支持图片输入" checked={model.input?.includes("image") ?? false} onChange={value => changeModel("input", value ? ["text", "image"] : ["text"])} /></div>
             <Field label="每百万 token 单价"><span class="cost-grid">{[["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]].map(([key, label]) =>
@@ -258,8 +259,18 @@ export function ConfigurationForm({ kind, summary, deploy }: { kind: Kind; summa
                 onInput={event => changeModel("cost", { ...model.cost, [key!]: Number(event.currentTarget.value) })} /></span>)}</span></Field></>
             : <Field group label="模型" note={models.length ? `目录中有 ${models.length} 个模型，可以输入关键词筛选。` : "目录中没有这个服务商的模型；可以填写模型 ID。"}>
               <ModelPicker label="模型" value={model.id} models={models} placeholder="输入关键词筛选或选择模型"
-                onOpen={() => void fetchModels()} onInput={value => change("model", value)} onPick={picked => change("model", picked.id)} /></Field>}
-          <Field label="推理级别"><select value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>{[...new Set([String(patch.thinking), ...thinking])].map(value => <option key={value} value={value}>{value}</option>)}</select></Field></>}
+                onOpen={() => void fetchModels()} onInput={value => { change("model", value); change("modelLimits", modelLimits(draft.form.providers?.find(provider => provider.id === patch.provider)?.overrides?.find(model => model.id === value))); }}
+                onPick={picked => { change("model", picked.id); change("modelLimits", modelLimits(draft.form.providers?.find(provider => provider.id === patch.provider)?.overrides?.find(model => model.id === picked.id))); }} /></Field>}
+          <Row title="全局模型设置" detail="当前主模型供所有成员会话使用。以下设置应用到当前选中的模型；切换模型时读取那个模型的设置。" />
+          {([["contextWindow", "全局上下文上限（token）"], ["maxTokens", "全局最大输出（token）"]] as const).map(([key, label]) =>
+            <Field key={key} label={label} note={key === "contextWindow" ? "留空使用 Pi 模型默认值；按服务商实际能力填写。自动压缩也使用此上限，填写更大值不会扩展模型能力。" : "留空使用 Pi 模型默认值；不得大于上下文上限。"}>
+              <input aria-label={label} type="number" min="1" step="1" placeholder="使用模型默认值" value={limits[key] ?? ""}
+                onInput={event => { const next = { ...limits }; if (event.currentTarget.value === "") delete next[key]; else next[key] = Number(event.currentTarget.value); change("modelLimits", next); }} />
+            </Field>)}
+          <Field label="全局思考强度" note="不支持思考或该级别的模型会自动使用其支持的级别；校验结果显示实际生效值。">
+            <select aria-label="全局思考强度" value={String(patch.thinking)} onChange={event => change("thinking", event.currentTarget.value)}>
+              {Object.entries(thinking).map(([value, label]) => <option key={value} value={value}>{label}（{value}）</option>)}
+            </select></Field></>}
         {kind === "app" && !deploy && <div class="row"><Toggle label="联网验证应用凭据" detail="仅获取 token。"
           checked={network} onChange={value => { setNetwork(value); setValid(false); }} /></div>}
       </fieldset>

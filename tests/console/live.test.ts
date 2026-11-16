@@ -121,9 +121,9 @@ function consoleWith(reader: BotReader, options: { ticketMs?: number; takeover?:
   const download = (cookie: string, url: string, headers: Record<string, string> = {}, signal?: AbortSignal) =>
     handle(new Request(`http://127.0.0.1:${PORT}${url}`, { signal, headers: { host: `127.0.0.1:${PORT}`, "sec-fetch-site": "same-origin", cookie, ...headers } }));
   const request = (path: string, method: string, cookie: string, body?: unknown) => new Request(`http://127.0.0.1:${PORT}${path}`, {
-    method, body: body === undefined ? undefined : JSON.stringify(body),
+    method, body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body),
     headers: { host: `127.0.0.1:${PORT}`, "sec-fetch-site": "same-origin", "x-console-request": "1", cookie,
-      ...(method === "POST" ? { origin: `http://127.0.0.1:${PORT}`, "content-type": "application/json" } : {}) },
+      ...(method === "POST" ? { origin: `http://127.0.0.1:${PORT}`, ...(body instanceof FormData ? {} : { "content-type": "application/json" }) } : {}) },
   });
   const login = async () => {
     const response = await handle(request("/api/session/exchange", "POST", "", { token: auth.issueToken().token }));
@@ -797,6 +797,32 @@ describe("registered group names", () => {
 // After everything else: it writes to Alice's conversations.
 describe("takeover", () => {
   const SAID = "接管测试：这个问题稍后电话答复。";
+
+  test("multipart attachments cross the authenticated console and bot link; foreign sessions and anonymous views cannot send", async () => {
+    const cookie = await live.login(), foreign = await live.login();
+    const view = (await openSpace(cookie, "direct")).body;
+    const member = view.members.find(row => row.identity.name === "张三")!.identity.key;
+    const upload = (view: string, member: string, kind = "file") => {
+      const form = new FormData(); form.set("message", JSON.stringify({ view, member, text: "附件说明", kind })); form.set("file", new File(["private synthetic attachment"], "私有清单.txt")); return form;
+    };
+    const before = out.sent.length, uploaded = out.state.uploads, lines = (await auditLines()).length;
+    const said = await live.call<TakeoverSayResponse>(cookie, "POST", "/api/conversation/attachment", upload(view.view.id, member));
+    expect(said.status).toBe(200); expect(said.body).toMatchObject({ sent: "sent", recorded: true, attachment: { kind: "file", name: "私有清单.txt", sent: "sent" } });
+    expect(out.state.uploads).toBe(uploaded + 1);
+    expect(out.sent.slice(before).map(item => [item.kind, item.text])).toEqual([["reply", "附件说明"], ["file", "私有清单.txt"]]);
+    const page = await live.call<EntryPage>(cookie, "POST", "/api/conversation/entries", { view: view.view.id, member, older: true, cursor: null, upper: null });
+    expect(JSON.stringify(page.body.items)).toContain("私有清单.txt");
+    const written = (await auditLines()).slice(lines).filter(line => line.action === "conversation-say");
+    expect(written).toHaveLength(1); expect(JSON.stringify(written)).not.toContain("私有清单"); expect(JSON.stringify(written)).not.toContain("附件说明");
+    const previous = out.sent.length;
+    expect((await live.call(foreign, "POST", "/api/conversation/attachment", upload(view.view.id, member))).status).not.toBe(200);
+    const anonymous = (await openSpace(cookie, "direct", "anonymous")).body;
+    const refused = await live.call(cookie, "POST", "/api/conversation/attachment", upload(anonymous.view.id, anonymous.members[0]!.identity.key));
+    expect(refused.status).toBe(400); expect(refused.body.error).toContain("匿名模式");
+    const invalid = await live.call(cookie, "POST", "/api/conversation/attachment", upload(view.view.id, member, "image"));
+    expect(invalid.status).toBe(409); expect(invalid.body.error).toContain("无法识别图片");
+    expect(out.sent.length).toBe(previous);
+  });
 
   test("an operator's message goes out as the bot's, stays in the conversation and is audited without its text; a stop is audited too", async () => {
     const cookie = await live.login();

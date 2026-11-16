@@ -167,7 +167,7 @@ try {
       folders: path => materialFolders(materialPaths.workspaceDir, path),
     },
     // The server listens only once everything below exists.
-    takeover: { stop: (space, phone) => takeover!.stop(space, phone), say: (space, phone, text) => takeover!.say(space, phone, text) },
+    takeover: { stop: (space, phone) => takeover!.stop(space, phone), say: (space, phone, text, attachment) => takeover!.say(space, phone, text, attachment) },
     push: { settings: () => push!.settings(), saveSettings: roles => push!.saveSettings(roles), list: query => push!.list(query), detail: id => push!.detail(id),
       remind: (id, members) => push!.remind(id, members), setCc: (id, people) => push!.setCc(id, people), remove: id => push!.remove(id),
       package: (id, member, signal) => push!.package(id, member, signal), groups: () => push!.groups(), saveGroup: (id, change) => push!.saveGroup(id, change) } });

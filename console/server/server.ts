@@ -162,7 +162,7 @@ export function createHandler(options: ConsoleServerOptions): (request: Request,
       }
     }
     if (!custom) return failure(404, "没有这个接口", "not-found");
-    if (custom.slow) server?.timeout(request, SLOW_ROUTE_SECONDS);
+    if (custom.slow) server?.timeout(request, typeof custom.slow === "number" ? custom.slow : SLOW_ROUTE_SECONDS);
     let body: unknown;
     if (request.method === "POST" && !custom.raw) {
       try { body = await readJson(request, custom.maxBody); }

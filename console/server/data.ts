@@ -156,7 +156,7 @@ export async function loadRelaySummary(project = PROJECT_DIR, signal?: AbortSign
  * 模型页展示的当前模型：只读 Pi 设置里的选择，完整校验（目录、凭证）由体检和启动负责。
  * 推理级别与服务相同：先取该模型的单独设置，再取全局默认；超出模型能力时由服务启动时下调。
  */
-export interface ModelSummary { provider: string; model: string; thinking: { level: string; source: "model" | "default" } | null }
+export interface ModelSummary { provider: string; model: string; thinking: { level: string; source: "model" | "default" } | null; modelLimits?: { contextWindow?: number; maxTokens?: number } }
 
 export async function loadModelSummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<ModelSummary | null> {
   let raw: string;
@@ -177,7 +177,15 @@ export async function loadModelSummary(project = PROJECT_DIR, signal?: AbortSign
   const override = overrides[`${provider}/${model}`], fallback = text("defaultThinkingLevel");
   const thinking = typeof override === "string" && override.trim() ? { level: override, source: "model" as const }
     : fallback ? { level: fallback, source: "default" as const } : null;
-  return { provider, model, thinking };
+  const source = await readFile(join(project, "data/config/models.json"), { encoding: "utf8", signal }).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "{}"; throw error;
+  });
+  const providers = JSON.parse(source.replace(/^\uFEFF/, ""))?.providers;
+  const configured = providers && typeof providers === "object" ? providers[provider] : undefined;
+  const custom = Array.isArray(configured?.models) ? configured.models.find((entry: { id?: unknown }) => entry?.id === model) : undefined;
+  const limits = custom ?? configured?.modelOverrides?.[model] ?? {};
+  const modelLimits = Object.fromEntries(Object.entries(limits).filter(([key, amount]) => ["contextWindow", "maxTokens"].includes(key) && typeof amount === "number" && Number.isSafeInteger(amount) && amount > 0));
+  return { provider, model, thinking, ...(Object.keys(modelLimits).length ? { modelLimits } : {}) };
 }
 
 /** 辅助模型只读状态：引用的分类 / 识图模型与并发预算；文件格式错误原样报出。 */

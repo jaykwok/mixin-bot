@@ -210,7 +210,8 @@ export interface RequestView {
  * did not confirm it. partial: a long text went out in segments and a later one failed (`segments`: how many of how
  * many arrived). `recorded` false: the conversation could not keep it, so the bot will not know what was said.
  */
-export interface TakeoverSayResponse { sent: "sent" | "uncertain" | "partial"; recorded: boolean; segments?: { sent: number; total: number } }
+export interface TakeoverSayResponse { sent: "sent" | "uncertain" | "partial"; recorded: boolean; segments?: { sent: number; total: number };
+  attachment?: { name: string; kind: "image" | "file"; sent: "sent" | "uncertain" | "failed" | "not-sent" } }
 
 /** Run records still kept (closed ones are pruned after a day); mutable, read at `observedAt`. */
 export interface RequestsResponse { items: RequestView[]; total: number; observedAt: number }

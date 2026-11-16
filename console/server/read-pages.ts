@@ -28,7 +28,9 @@ function settingRows(index: number, value: Summaries[number]): [string, string][
       const model = value as Summaries[0];
       if (!model) return [["模型", "未配置"]];
       const thinking = model.thinking ? `${model.thinking.level}（${model.thinking.source === "model" ? "此模型单独设置" : "全局默认"}）` : "未设置（按模型默认）";
-      return [["模型", `${model.provider}/${model.model}`], ["模型 · 推理级别", thinking]];
+      return [["模型", `${model.provider}/${model.model}`], ["模型 · 思考强度", thinking],
+        ["模型 · 全局上下文上限", model.modelLimits?.contextWindow ? `${model.modelLimits.contextWindow} token` : "使用模型默认值"],
+        ["模型 · 全局最大输出", model.modelLimits?.maxTokens ? `${model.modelLimits.maxTokens} token` : "使用模型默认值"]];
     }
     case 1: {
       const auxiliary = value as Summaries[1];

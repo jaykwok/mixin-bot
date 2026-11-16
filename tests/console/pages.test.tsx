@@ -17,7 +17,7 @@ const { render } = await import("preact");
 const { Root } = await import("../../console/ui/src/app.tsx");
 const { Markdown } = await import("../../console/ui/src/markdown.tsx");
 
-type Call = { path: string; method: string; headers: Record<string, string>; body: Record<string, unknown> | undefined };
+type Call = { path: string; method: string; headers: Record<string, string>; body: Record<string, unknown> | undefined; file?: File };
 type Reply = { status: number; body: unknown } | "offline";
 
 let calls: Call[] = [];
@@ -30,7 +30,8 @@ const realClick = HTMLAnchorElement.prototype.click;
 beforeAll(() => {
   globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
     const call: Call = { path: String(input), method: init.method ?? "GET", headers: Object.fromEntries(Object.entries(init.headers ?? {})),
-      body: init.body ? JSON.parse(init.body as string) : undefined };
+      body: init.body instanceof FormData ? JSON.parse(init.body.get("message") as string) : init.body ? JSON.parse(init.body as string) : undefined,
+      ...(init.body instanceof FormData ? { file: init.body.get("file") as File } : {}) };
     calls.push(call);
     const reply = await routes[`${call.method} ${call.path}`]?.(call) ?? (call.method === "GET" && call.path === "/api/runtime"
       ? { status: 200, body: { current: true } } : { status: 404, body: { error: "没有这个接口", code: "not-found" } });
@@ -204,6 +205,32 @@ test("会话：命令以非零退出码结束标“退出码 N”，工具本身
   expect(rows).toEqual([["21", "", "结果"], ["22", "exited", "退出码 1"], ["23", "failed", "失败"]]);
 });
 
+test("接管对话：文件可单独发送，失败保留选择；成功后清除，文件大小在发送前检查", async () => {
+  let fail = true;
+  routes = { ...base(), "GET /api/spaces": () => ({ status: 200, body: spaces }),
+    "POST /api/views/space": () => ({ status: 200, body: viewOf("v1", "default") }),
+    "POST /api/conversation/activity": () => ({ status: 200, body: { members: viewOf("v1", "default").members, added: 0, truncated: false, observedAt: NOW } }),
+    "POST /api/conversation/entries": () => ({ status: 200, body: { items: newestFirst.items, next: null } }),
+    "POST /api/conversation/attachment": () => fail ? { status: 409, body: { error: "附件上传失败，尚未发送任何内容，请稍后重试。", code: "input" } }
+      : { status: 200, body: { sent: "sent", recorded: true, attachment: { kind: "file", name: "清单.txt", sent: "sent" } } } };
+  mount("conversations"); await until(() => container.querySelector(".space-card") !== null, "空间");
+  container.querySelector<HTMLButtonElement>(".space-card")!.click(); await shows("张三");
+  container.querySelector<HTMLButtonElement>(".member-row")!.click(); await shows("压缩后的摘要"); click("接管对话");
+  await until(() => !!container.querySelector('.takeover input[type="file"]'), "附件选择");
+  const input = container.querySelector<HTMLInputElement>('[aria-label="选择要发送的文件"]')!;
+  const choose = (file: File) => { Object.defineProperty(input, "files", { configurable: true, value: [file] }); input.dispatchEvent(new Event("change", { bubbles: true })); };
+  choose(new File(["synthetic contents"], "清单.txt")); await shows("文件：清单.txt");
+  expect(button("停止机器人并发送")!.disabled).toBe(false); click("停止机器人并发送"); await shows("附件上传失败");
+  expect(container.querySelector(".takeover-attachment")?.textContent).toContain("清单.txt");
+  const call = callsTo("/api/conversation/attachment")[0]!;
+  expect(call.body).toEqual({ view: "v1", member: "v1-a", text: "", kind: "file" }); expect(call.file?.name).toBe("清单.txt");
+  expect(call.headers["X-Console-Intent"]).toBe("user"); expect(call.headers["Content-Type"]).toBeUndefined();
+  fail = false; click("停止机器人并发送"); await shows("已发给成员");
+  expect(container.querySelector(".takeover-attachment")).toBeNull(); expect(button("停止机器人并发送")!.disabled).toBe(true);
+  const large = new File(["x"], "large.bin"); Object.defineProperty(large, "size", { value: 30 * 1024 * 1024 + 1 });
+  choose(large); await shows("单个附件不能超过 30 MB"); expect(button("停止机器人并发送")!.disabled).toBe(true);
+});
+
 test("接管对话：只停止、停止并发送；发完重读会话并显示人工回复；送达不确定、只发出一部分、被拒绝各有说明；匿名模式不能接管", async () => {
   const note: EntryView = { id: 16, kind: "mixin.operator-note", at: T, chars: 1, role: "user",
     parts: [{ type: "text", text: "[人工回复] 管理员以你的名义直接回复了这位用户，用户已经看到：\n稍后电话答复" }] };
@@ -254,7 +281,7 @@ test("接管对话：只停止、停止并发送；发完重读会话并显示�
 
   await write("第二条");
   click("停止机器人并发送");
-  await shows("平台没有确认这条消息是否送达，成员可能已经收到；确认没收到再重发。这段话没能记进会话，机器人之后回答时不知道你说过什么。");
+  await shows("平台没有确认这条消息是否送达，成员可能已经收到；确认没收到再重发。这次发送没能记进会话，机器人之后回答时不知道你发送过什么。");
   expect(box().value).toBe("");
   await write("很长的第三条");
   click("停止机器人并发送");

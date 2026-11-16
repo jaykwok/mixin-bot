@@ -8,6 +8,7 @@ import { type DirectoryScope, parseDepartmentIds, parseScopeRequest } from "../i
 import { readStatus } from "../durable/read/client.ts";
 import { parseReadOp, ReadRequestError, type ReadOp } from "../durable/read/protocol.ts";
 import type { Takeover } from "../durable/takeover.ts";
+import { readTakeoverUpload, TakeoverUploadError } from "../contracts/takeover-upload.ts";
 import { PUSH_ID } from "../push/cards.ts";
 import { PUSH_GROUPS, type PushAdmin, type PushCursor, type PushGroup } from "../push/service.ts";
 import { constantTimeEqual } from "./http.ts";
@@ -188,6 +189,21 @@ export function createApp(options: AppOptions): Hono {
     }
   });
   // The console's takeover: a refusal (TakeoverRefused) answers 409 with the reason, malformed parameters 400.
+  app.post("/_admin/conversation/attachment", async c => {
+    if (!authorized(c.req.header("Authorization")) || !options.takeover) return c.notFound();
+    keepOpen(c, 5 * 60_000);
+    try {
+      const { metadata, attachment } = await readTakeoverUpload(c.req.raw);
+      const { space, phone, text } = metadata;
+      if (typeof space !== "string" || space.length > 80 || typeof phone !== "string" || !/^[A-Za-z0-9_+-]{1,32}$/.test(phone)
+        || typeof text !== "string") return c.json({ status: "error", message: "参数无效" }, 400);
+      return c.json({ status: "ok", ...await options.takeover.say(space, phone, text, attachment) });
+    } catch (error) {
+      if (error instanceof TakeoverUploadError || (error as Error).name === "TakeoverRefused")
+        return c.json({ status: "error", code: "TakeoverRefused", message: (error as Error).message }, 409);
+      throw error;
+    }
+  });
   for (const name of ["stop", "say"] as const) {
     app.post(`/_admin/conversation/${name}`, async (c) => {
       if (!authorized(c.req.header("Authorization")) || !options.takeover) return c.notFound();

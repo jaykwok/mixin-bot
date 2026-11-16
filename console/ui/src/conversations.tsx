@@ -23,6 +23,8 @@ const PUSH_NOTE_KIND = "mixin.push-note";
 const OPERATOR_NOTE_KIND = "mixin.operator-note";
 /** The longest text an operator sends at once (console/server/views.ts TAKEOVER_TEXT_MAX). */
 const TAKEOVER_TEXT_MAX = 4_000;
+/** Early browser check; the upload contract enforces the same 30 MiB on both servers. */
+const TAKEOVER_FILE_MAX = 30 * 1024 * 1024;
 /** A stop waits for the member's run and its tools to end (console/server/bot.ts allows 130 s). */
 const TAKEOVER_WAIT_MS = 150_000;
 import { Banner, Chip, Dialog, EmptyState, Row, Section, Segmented, Spinner, type Tone } from "./ui.tsx";
@@ -438,8 +440,9 @@ function MemberReader({ view, mode, row, onProblem, jump, onBack, onRefresh }: {
 
 /** What the page says after an operator's message, by how the send ended. */
 function takeoverOutcome(result: TakeoverSayResponse): { tone: Tone; text: string; keep: boolean } {
-  const unrecorded = result.recorded ? "" : "这段话没能记进会话，机器人之后回答时不知道你说过什么。";
+  const unrecorded = result.recorded ? "" : "这次发送没能记进会话，机器人之后回答时不知道你发送过什么。";
   if (result.sent === "partial") {
+    if (result.attachment) return { tone: "warn", keep: true, text: `只发送了部分内容；附件「${result.attachment.name}」${result.attachment.sent === "not-sent" ? "尚未发送" : "发送失败"}。请核对成员已收到的文字，只重发剩余内容。${unrecorded}` };
     return { tone: "warn", keep: true, text: `只发出了前 ${result.segments?.sent ?? 0} 段（共 ${result.segments?.total ?? 0} 段），后面的没有发出去，请把剩下的内容再发一次。${unrecorded}` };
   }
   if (result.sent === "uncertain") return { tone: "warn", keep: false, text: `平台没有确认这条消息是否送达，成员可能已经收到；确认没收到再重发。${unrecorded}` };
@@ -452,10 +455,25 @@ function takeoverOutcome(result: TakeoverSayResponse): { tone: Tone; text: strin
  */
 function TakeoverBar({ view, member, onProblem, onDone, onClose }: { view: string; member: string; onProblem: Problem; onDone: () => void; onClose: () => void }) {
   const [text, setText] = useState("");
+  const [attachment, setAttachment] = useState<{ file: File; kind: "image" | "file" } | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const imageInput = useRef<HTMLInputElement>(null), fileInput = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState<"stop" | "say" | null>(null);
   const [note, setNote] = useState<{ tone: Tone; text: string } | null>(null);
+  const sending = useRef(false);
+  useEffect(() => {
+    const url = attachment?.kind === "image" ? URL.createObjectURL(attachment.file) : null;
+    setPreview(url);
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [attachment]);
+  const choose = (file: File | undefined, kind: "image" | "file") => {
+    if (!file) return;
+    if (!file.size || file.size > TAKEOVER_FILE_MAX) { setNote({ tone: "danger", text: "请选择非空文件，单个附件不能超过 30 MB。" }); return; }
+    setAttachment({ file, kind }); setNote(null);
+  };
   const length = [...text.trim()].length;
   const run = async (action: "stop" | "say") => {
+    if (sending.current) return; sending.current = true;
     setBusy(action);
     setNote(null);
     try {
@@ -463,33 +481,47 @@ function TakeoverBar({ view, member, onProblem, onDone, onClose }: { view: strin
         await api<{ ok: true }>("/api/conversation/stop", { method: "POST", intent: true, body: { view, member }, timeoutMs: TAKEOVER_WAIT_MS });
         setNote({ tone: "ok", text: "机器人已经停下：这位成员正在处理的任务和排队的消息都取消了。成员没有收到提示，可以接着发消息说明。" });
       } else {
-        const outcome = takeoverOutcome(await api<TakeoverSayResponse>("/api/conversation/say",
-          { method: "POST", intent: true, body: { view, member, text }, timeoutMs: TAKEOVER_WAIT_MS }));
-        if (!outcome.keep) setText("");
+        let body: unknown = { view, member, text };
+        if (attachment) { const form = new FormData(); form.set("message", JSON.stringify({ view, member, text, kind: attachment.kind })); form.set("file", attachment.file, attachment.file.name); body = form; }
+        const result = await api<TakeoverSayResponse>(attachment ? "/api/conversation/attachment" : "/api/conversation/say",
+          { method: "POST", intent: true, body, timeoutMs: attachment ? 330_000 : TAKEOVER_WAIT_MS });
+        const outcome = takeoverOutcome(result);
+        if (!outcome.keep) { setText(""); setAttachment(null); }
         setNote(outcome);
       }
       onDone();
     } catch (failure) {
       if (!onProblem(failure)) setNote({ tone: "danger", text: failureOf(failure).message });
-    } finally { setBusy(null); }
+    } finally { sending.current = false; setBusy(null); }
   };
   return (
     <footer class="takeover" aria-label="接管对话">
       <div class="takeover-head">
         <span><Icon name="user" size={14} />以机器人的名义回复这位成员</span>
-        <button type="button" class="btn ghost icon-btn" aria-label="收起接管" onClick={onClose}><Icon name="x" size={14} /></button>
+        <button type="button" class="btn ghost icon-btn" aria-label="收起接管" disabled={busy !== null} onClick={onClose}><Icon name="x" size={14} /></button>
       </div>
       <textarea value={text} rows={3} maxLength={TAKEOVER_TEXT_MAX * 2} disabled={busy !== null} placeholder="输入要发给成员的话，成员看到的是机器人发来的消息"
         aria-label="发给成员的内容" onInput={event => setText((event.target as HTMLTextAreaElement).value)} />
+      <input ref={imageInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden aria-label="选择要发送的图片" disabled={busy !== null}
+        onChange={event => { choose(event.currentTarget.files?.[0], "image"); event.currentTarget.value = ""; }} />
+      <input ref={fileInput} type="file" hidden aria-label="选择要发送的文件" disabled={busy !== null}
+        onChange={event => { choose(event.currentTarget.files?.[0], "file"); event.currentTarget.value = ""; }} />
+      {attachment && <div class="takeover-attachment">
+        {preview && <img src={preview} alt="待发送图片预览" />}
+        <span>{attachment.kind === "image" ? "图片" : "文件"}：{attachment.file.name} <span class="muted small">{bytes(attachment.file.size)}</span></span>
+        <button type="button" class="btn ghost small-btn" disabled={busy !== null} onClick={() => setAttachment(null)}>移除附件</button>
+      </div>}
       <div class="takeover-actions">
         <span class={`muted small${length > TAKEOVER_TEXT_MAX ? " warn-text" : ""}`}>{count(length)} / {count(TAKEOVER_TEXT_MAX)} 字</span>
+        <button type="button" class="btn small-btn" disabled={busy !== null} onClick={() => imageInput.current?.click()}>添加图片</button>
+        <button type="button" class="btn small-btn" disabled={busy !== null} onClick={() => fileInput.current?.click()}>添加文件</button>
         <button type="button" class="btn small-btn" disabled={busy !== null} onClick={() => void run("stop")}>
           {busy === "stop" ? <><Icon name="loader" size={14} class="spin" />正在停止…</> : <><Icon name="square" size={14} />只停止机器人</>}</button>
-        <button type="button" class="btn primary small-btn" disabled={busy !== null || length === 0 || length > TAKEOVER_TEXT_MAX} onClick={() => void run("say")}>
+        <button type="button" class="btn primary small-btn" disabled={busy !== null || length === 0 && !attachment || length > TAKEOVER_TEXT_MAX} onClick={() => void run("say")}>
           {busy === "say" ? <><Icon name="loader" size={14} class="spin" />正在发送…</> : <><Icon name="send" size={14} />停止机器人并发送</>}</button>
       </div>
       {note && <p class={`takeover-note ${note.tone === "danger" ? "danger-text" : note.tone === "warn" ? "warn-text" : "ok-text"}`} role="status">{note.text}</p>}
-      <p class="footnote">发送前会先停下机器人对这位成员正在进行的回答和排队的消息；发出的话会记进这段会话，机器人之后能看到。成员的下一条消息仍由机器人回答。</p>
+      <p class="footnote">一次可附一张图片或一个文件，最多 30 MB，也可只发附件。发送前会先停止这位成员的任务和排队消息；文字和附件发送记录会记进会话。成员的下一条消息仍由机器人回答。</p>
     </footer>
   );
 }

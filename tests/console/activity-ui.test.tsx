@@ -13,7 +13,7 @@ afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const success: TaskView = { id: "activity-fixture", operation: "restart", state: "succeeded", needsRecovery: false, createdAt: 1,
   result: { message: "已完成", outcome: "success", exitCode: 0, finalState: "running" } };
 
-test("后台任务确认成功后显示十秒再收起，打开详情期间不会被计时器关闭", async () => {
+test("后台任务确认成功后逐秒倒计时关闭，打开详情期间不会被计时器关闭", async () => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root);
   globalThis.fetch = (async (_url: string) => Response.json(success)) as typeof fetch;
   jest.useFakeTimers();
@@ -21,15 +21,20 @@ test("后台任务确认成功后显示十秒再收起，打开详情期间不�
     await act(() => { followTask({ ...success, state: "running", result: undefined }); showTask(null); render(<ActivityTray />, root); });
     expect(root.textContent).toContain("执行中");
     await act(async () => { jest.advanceTimersByTime(2000); }); // Server confirms completion.
-    expect(root.textContent).toContain("10 秒后自动收起");
-    await act(() => { jest.advanceTimersByTime(9000); });
+    expect(root.textContent).toContain("将于 10 秒后自动关闭");
+    for (let seconds = 9; seconds >= 1; seconds--) {
+      await act(() => { jest.advanceTimersByTime(1000); });
+      expect(root.textContent).toContain(`将于 ${seconds} 秒后自动关闭`);
+    }
     expect(root.querySelector(".activity-item") !== null).toBe(true);
     await act(() => { showTask(success.id); });
     await act(() => { jest.advanceTimersByTime(20_000); });
     await act(() => { showTask(null); });
     expect(root.textContent).toContain("已完成");
+    expect(root.textContent).toContain("将于 10 秒后自动关闭");
     await act(() => { jest.advanceTimersByTime(9999); });
     expect(root.querySelector(".activity-item") !== null).toBe(true);
+    expect(root.textContent).toContain("将于 1 秒后自动关闭");
     await act(() => { jest.advanceTimersByTime(1); });
     expect(root.querySelector(".activity-tray") === null).toBe(true);
   } finally { render(null, root); root.remove(); resetTasks(); jest.useRealTimers(); globalThis.fetch = previous; }
@@ -48,7 +53,7 @@ test("失败、中断、未知、未完成和需要恢复的后台任务不会�
       await act(() => { render(null, root); resetTasks(); current = { ...success, ...patch }; followTask(current); showTask(null); render(<ActivityTray />, root); });
       await act(async () => { jest.advanceTimersByTime(30_000); });
       expect(root.querySelector(".activity-item") !== null).toBe(true);
-      expect(root.textContent).not.toContain("自动收起");
+      expect(root.textContent).not.toContain("自动关闭");
     }
   } finally { render(null, root); root.remove(); resetTasks(); jest.useRealTimers(); globalThis.fetch = previous; }
 });

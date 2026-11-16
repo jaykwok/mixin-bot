@@ -13,6 +13,7 @@ import { AssistantEntry, type Conversation, type HarnessSettings, ProviderDoc } 
 import { openModelRuntime, openSettings } from "../../src/core/model-config.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { openModelSelection, selectModel } from "../../src/durable/models.ts";
+import { editConfiguration } from "../../ops/config/configuration-form.ts";
 import { type GroupHarness, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { scopeOf } from "../helpers/layout.ts";
@@ -118,6 +119,25 @@ async function assistants(conversation: Conversation): Promise<AssistantMessage[
 }
 
 describe("model selection and Durable settings", () => {
+  test("console model settings reach the actual request through the Durable door", async () => {
+    const next = editConfiguration({ kind: "models", binding: null, files: { models: "{}", settings: "{}", catalog: "{}" } }, {
+      provider: "console-model", mode: "custom", api: "openai-completions", baseUrl: base,
+      key: { mode: "set", value: "synthetic-console-key" }, model: { id: "tuned", reasoning: true },
+      thinking: "high", modelLimits: { contextWindow: 64000, maxTokens: 2048 },
+    });
+    const configuredPath = join(fixture.root, "console-models.json"), configuredSettings = join(fixture.root, "console-settings.json");
+    await Promise.all([writeFile(configuredPath, next.files.models!), writeFile(configuredSettings, next.files.settings!)]);
+    const selection = await openModelSelection({ modelsPath: configuredPath, modelsStorePath, settingsPath: configuredSettings });
+    const opened = await open(selection.runtime, { settings: { ...selection.harnessSettings, retry: SETTINGS.retry, stream: { ...selection.harnessSettings.stream, timeoutMs: 10000 } } });
+    try {
+      const result = await turn(opened, selection.ref, "high");
+      expect(result.settled.status).toBe("done"); expect(result.requests).toHaveLength(1);
+      expect(result.requests[0]!.body.max_completion_tokens ?? result.requests[0]!.body.max_tokens).toBe(2048);
+      expect(result.requests[0]!.body.reasoning_effort).toBe("high");
+      expect(selection.model.contextWindow).toBe(64000);
+    } finally { await opened.close(); }
+  });
+
   test("the configured model, with the project's run policy mapped onto Durable settings", async () => {
     const settingsPath = await settingsFile({
       defaultProvider: "local-key", defaultModel: "chat", defaultThinkingLevel: "high",

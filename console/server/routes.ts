@@ -17,8 +17,8 @@ export interface RouteContext {
 
 export interface Route {
   run(context: RouteContext): Promise<unknown>;
-  /** Allowed to take longer than the server's idle timeout (several bot reads in a row). */
-  slow?: boolean;
+  /** Allowed to take longer than the server's idle timeout; a number supplies the route's seconds. */
+  slow?: boolean | number;
   /** Authenticated streaming upload; the route enforces a declared byte limit before writing. */
   raw?: boolean;
   /** A larger JSON body than the server's default, for a route whose own limits allow more. */

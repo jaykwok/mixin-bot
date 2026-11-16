@@ -4,6 +4,37 @@
 
 机器人使用 Pi Durable 1.5.2。手工修改本页配置前先停止服务，保存后重新启动，启动时会校验配置。模型选择也可通过控制台「模型」页修改；辅助模型和 MCP 在该页显示配置状态，具体字段按下文填写。未配置的辅助模型和 MCP 工具不注册。
 
+## 主模型与全局设置
+
+所有成员会话共用一个主模型。控制台「模型 → 全局模型设置」使用 Pi 原生字段；手工配置的定义见 [Pi Settings](https://docs.pi.dev/latest/settings) 和 [Models Configuration](https://docs.pi.dev/latest/models-configuration)。本项目锁定 Pi 1.5.2，升级 Pi 时以安装版本的 schema 校验为准。
+
+| 设置 | 保存位置 | 生效规则 |
+| --- | --- | --- |
+| 主模型 | `data/runtime/pi/settings.json` 的 `defaultProvider`、`defaultModel` | 所有成员共用 |
+| 思考强度 | 同文件的 `defaultThinkingLevel` | `off / minimal / low / medium / high / xhigh / max`；默认 `medium`，运行时按模型能力调整 |
+| 模型单独的思考强度 | 同文件的 `modelThinkingLevels["provider/modelId"]` | 优先于默认值；控制台保存当前模型时移除此模型的覆盖，使用所选默认强度 |
+| 上下文上限 | `data/config/models.json` 中的 `contextWindow` | 按模型保存，决定上下文容量和自动压缩预算 |
+| 最大输出 | 同一模型的 `maxTokens` | 单次生成的输出上限，Pi 可按剩余上下文进一步缩小；不是回答的目标长度 |
+
+Pi 没有统一的全局上下文长度字段。内置模型通过 `providers.<provider>.modelOverrides.<modelId>` 设置上限，例如：
+
+```json
+{
+  "providers": {
+    "openai": {
+      "apiKey": "$OPENAI_API_KEY",
+      "modelOverrides": {
+        "gpt-4o": { "contextWindow": 64000, "maxTokens": 4096 }
+      }
+    }
+  }
+}
+```
+
+自定义模型则把 `contextWindow`、`maxTokens` 写在 `providers.<provider>.models[]` 的对应模型里。控制台留空会删除对应数值，内置模型恢复目录值，自定义模型使用 Pi 默认的 128000 上下文、16384 最大输出。数值是正整数 token，最大输出不得大于上下文；应按服务商实际能力填写，改大配置不会提高模型本身的容量。切换主模型时读取新模型的配置；辅助模型保留自己的定义。
+
+自动压缩仍由下面的 `settings.json.durable.compaction` 管理；Pi CLI 的顶层 `compaction` 不是机器人的运行策略入口。
+
 ## 原生运行设置
 
 `data/runtime/pi/settings.json` 使用 `format: 1`；模型选择字段 `defaultProvider / defaultModel / defaultThinkingLevel / modelThinkingLevels` 由 Pi 管理。以下是默认运行策略，可省略使用默认值：
