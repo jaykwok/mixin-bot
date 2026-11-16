@@ -7,7 +7,7 @@ import type { IdentityMode } from "../ui/src/contract.ts";
 import { dayKey } from "../../src/agent/stats-ledger.ts";
 
 export type AuditAction = "view-open" | "identity-full" | "conversation-open" | "conversation-stop" | "conversation-say" | "search"
-  | "export-request" | "export-sent" | "export-interrupted" | "export-failed" | "log-view" | "log-export" | "plan" | "task-submit" | "directory-apply"
+  | "export-request" | "export-sent" | "export-interrupted" | "export-failed" | "log-view" | "log-export" | "plan" | "task-submit" | "task-history-clear" | "directory-apply"
   | "push-settings" | "push-view" | "push-remind" | "push-cc" | "push-delete" | "push-group" | "setup-dependencies" | "setup-directory-save" | "materials-exclusions";
 
 export interface AuditRecord {

@@ -13,6 +13,7 @@ interface TaskApi {
   launch(id: string): Promise<void>;
   prepare?(operation: string, params: Record<string, unknown>, session: string): Promise<Record<string, unknown>>;
   created?(request: TaskRequest): void;
+  cleanup?(request: TaskRequest): Promise<void>;
 }
 const problem = (error: unknown): never => { throw new ApiProblem(409, "input", redactSecrets(error instanceof Error ? error.message : "管理请求被拒绝")
   .replace(/\b1[3-9]\d{9}\b/g, value => `${value.slice(0, 3)}****${value.slice(-4)}`)); };
@@ -65,6 +66,7 @@ export function taskRoutes(api: TaskApi): Record<string, Route> {
   const { tasks, plans, observers, audit } = api;
   // A first deployment being submitted (between reading the task list and creating its task).
   let installing = false;
+  let clearing = false;
   const writable = () => { if (api.current && !api.current()) throw new Error("代码已变化；若升级或回滚仍在进行，请先等待任务结束，再退出并重新运行 bun run console"); };
   const get = async (id: string | undefined) => {
     if (!id || !/^task-[a-f0-9]{32}$/.test(id)) throw new ApiProblem(400, "input", "任务编号无效");
@@ -126,6 +128,20 @@ export function taskRoutes(api: TaskApi): Record<string, Route> {
           return new Response(JSON.stringify(view), { status: 202, headers: { "Content-Type": "application/json" } });
         } finally { if (plan.operation === "install") installing = false; }
       } catch (error) { return problem(error); }
+    } },
+    "POST /api/tasks/clear": { slow: true, run: async context => {
+      record(context.body, []);
+      const check = () => {
+        writable();
+        if (context.signal.aborted || context.sessionAlive?.() === false) throw new Error("登录已失效或清理已取消，请重新查看任务记录");
+      };
+      try { check(); } catch (error) { return problem(error); }
+      if (clearing) throw new ApiProblem(409, "input", "正在清理任务历史，请稍后查看结果");
+      audit.write({ action: "task-history-clear", scope: "tasks", session: context.session.label, mode: "default" });
+      clearing = true;
+      try { return await tasks.clearHistory(observers, { check, cleanup: api.cleanup }); }
+      catch (error) { return problem(error); }
+      finally { clearing = false; }
     } },
     "GET /api/tasks": { run: async () => ({ tasks: (await tasks.list(observers)).map(display) }) },
     "GET /api/tasks/:id": { run: async context => display(await get(context.params?.id)) },

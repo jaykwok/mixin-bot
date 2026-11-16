@@ -242,6 +242,67 @@ test("清理仅删结束超过 30 天且不在最近 50 个中的任务，键保
   } finally { await fixture.cleanup(); }
 });
 
+test("手动清理成功、失败、未接单和已恢复的中断任务，保留活跃或不确定的记录以及防重放索引", async () => {
+  const fixture = await tempFixture("console-tasks-clear-");
+  try {
+    let at = 1000;
+    const store = new TaskStore(fixture.root, () => at), names = new Map<string, string>(), ids: Record<string, string> = {};
+    const make = (name: string, accepted = true) => {
+      const id = store.create({ ...input(fixture.root), planId: `plan-${name}` }, `plan:plan-${name}`).id;
+      store.bindKey(`submit-${name}`, id); names.set(id, name); ids[name] = id;
+      if (accepted) store.accept(id, actor);
+      return id;
+    };
+    for (const name of ["success", "failed", "refused", "finishing", "recovery", "cleanup-error", "interrupted", "running", "unknown", "broken"]) make(name);
+    make("not-accepted", false);
+    for (const name of ["success", "finishing", "cleanup-error"]) store.finish(ids[name]!, done);
+    store.finish(ids.failed!, { ...done, outcome: "failed", exitCode: 1 });
+    store.finish(ids.refused!, { ...done, outcome: "refused", exitCode: 1 });
+    store.finish(ids.recovery!, { ...done, outcome: "failed", exitCode: 1, leftRecovery: true });
+    store.eventWriter(ids.success!)("phase", "completed log");
+    writeFileSync(join(store.dir(ids.broken!), "request.json"), "{broken");
+    at += 20_000; make("queued", false);
+    let recovery = true;
+    const observed: TaskObservers = {
+      hosting: async request => ["finishing", "running"].includes(names.get(request.id)!) ? { state: "running", executor: actor }
+        : names.get(request.id) === "unknown" ? { state: "unknown" } : { state: "ended" },
+      needsRecovery: async request => request.id === ids.recovery && recovery,
+    };
+    const cleared = await store.clearHistory(observed, { cleanup: async request => { if (request.id === ids["cleanup-error"]) throw new Error("cleanup failed"); } });
+    expect(cleared.removed.map(id => names.get(id)).sort()).toEqual(["failed", "interrupted", "not-accepted", "refused", "success"]);
+    expect(cleared.retained).toBe(6); expect(cleared.failed).toBe(1);
+    for (const id of cleared.removed) expect(existsSync(store.dir(id))).toBe(false);
+    for (const name of ["finishing", "recovery", "cleanup-error", "running", "unknown", "broken", "queued"]) expect(existsSync(store.dir(ids[name]!))).toBe(true);
+    expect(store.lookupSubmission("submit-success")).toBe(ids.success!);
+    expect(store.lookupPlan("plan-success")).toBe(ids.success!);
+    expect(() => store.create({ ...input(fixture.root), planId: "plan-success" }, "plan:plan-success")).toThrow("缺失");
+    recovery = false;
+    const again = await store.clearHistory(observed);
+    expect(again.removed.sort()).toEqual([ids.recovery!, ids["cleanup-error"]!].sort());
+    const next = make("next", false);
+    expect(cleared.removed).not.toContain(next);
+    expect((await store.list(observed)).some(task => task.id === next)).toBe(true);
+  } finally { await fixture.cleanup(); }
+});
+
+test("清理在异步状态核对后重新检查许可，核对失败或仍需恢复时保留记录", async () => {
+  const fixture = await tempFixture("console-tasks-clear-check-");
+  try {
+    const store = new TaskStore(fixture.root), { id } = store.create(input(fixture.root), "check");
+    store.accept(id, actor); store.finish(id, { ...done, outcome: "failed", exitCode: 1, leftRecovery: true });
+    let allowed = true, cleaned = 0;
+    const observed: TaskObservers = { hosting: async () => { allowed = false; return { state: "ended" }; }, needsRecovery: async () => false };
+    await expect(store.clearHistory(observed, {
+      check: () => { if (!allowed) throw new Error("code changed"); }, cleanup: async () => { cleaned++; },
+    })).rejects.toThrow("code changed");
+    expect(cleaned).toBe(0); expect(store.request(id).id).toBe(id);
+    expect(await store.clearHistory({ ...observed, needsRecovery: async () => { throw new Error("unreadable"); } }))
+      .toEqual({ removed: [], retained: 1, failed: 0 });
+    expect(await store.clearHistory({ ...observed, hosting: async () => { throw new Error("offline"); } }))
+      .toEqual({ removed: [], retained: 1, failed: 0 });
+  } finally { await fixture.cleanup(); }
+});
+
 test("目录不可写时提交失败；日志和结果写失败后状态不是成功", async () => {
   const fixture = await tempFixture("console-tasks-disk-");
   try {

@@ -79,3 +79,51 @@ test("真实控制台进程固定页面和后端：替换源文件后继续显�
     await fixture.cleanup();
   }
 }, 45_000);
+
+test.each([false, true])("终端 Enter 换发登录链接并沿用启动时的浏览器规则（no-open=%s）", async noOpen => {
+  const fixture = await tempFixture("console-enter-");
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  try {
+    await Promise.all(["console", "ops", "scripts", "src", "package.json"].map(name => cp(join(project, name), join(fixture.root, name), { recursive: true })));
+    // Only the browser launcher is replaced. The real entry, readline handler and login exchange run in the child.
+    await writeFile(join(fixture.root, "console/server/open.ts"), `
+      export async function openBrowser(url: string) { console.log("TEST_BROWSER_OPEN " + url); }
+      export function sshForwardHint() { return { command: "fixture-forward", guessed: false }; }
+    `);
+    await writeFile(join(fixture.root, "terminal.ts"), `
+      Object.defineProperty(process.stdin, "isTTY", { value: true });
+      await import("./console/server/start.ts");
+    `);
+    const port = freePort(), origin = `http://127.0.0.1:${port}`;
+    child = Bun.spawn([process.execPath, "--no-env-file", join(fixture.root, "terminal.ts"), "--port", String(port), ...(noOpen ? ["--no-open"] : [])], {
+      cwd: fixture.root, stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, BOT_PORT: "1011", SSH_CONNECTION: "" },
+    });
+    let output = "";
+    const errors = new Response(child.stderr as ReadableStream<Uint8Array>).text();
+    const reading = (async () => {
+      const reader = (child!.stdout as ReadableStream<Uint8Array>).getReader(), decoder = new TextDecoder();
+      try { for (;;) { const chunk = await reader.read(); if (chunk.done) break; output += decoder.decode(chunk.value, { stream: true }); } }
+      finally { reader.releaseLock(); }
+    })();
+    const until = async (check: () => boolean) => {
+      const deadline = Date.now() + 20_000;
+      while (!check() && Date.now() < deadline && child!.exitCode === null) await Bun.sleep(20);
+      expect(check(), child!.exitCode === null ? "终端没有按时输出" : await errors).toBe(true);
+    };
+    await until(() => output.includes("按 Enter"));
+    const first = /登录链接\s+(http:\/\/[^\s]+)/.exec(output)![1]!;
+    (child.stdin as import("bun").FileSink).write("\n");
+    await (child.stdin as import("bun").FileSink).flush();
+    await until(() => output.includes("新登录链接"));
+    const next = /新登录链接\s+(http:\/\/[^\s]+)/.exec(output)![1]!;
+    expect(next).not.toBe(first);
+    const autoOpen = !noOpen && ["win32", "darwin"].includes(process.platform);
+    if (autoOpen) await until(() => output.includes(`TEST_BROWSER_OPEN ${next}`));
+    expect(output.split("\n").filter(line => line.startsWith("TEST_BROWSER_OPEN ")).map(line => line.trim().slice("TEST_BROWSER_OPEN ".length)))
+      .toEqual(autoOpen ? [first, next] : []);
+    const exchange = (url: string) => fetch(origin + "/api/session/exchange", { method: "POST",
+      headers: { Origin: origin, "X-Console-Request": "1", "Content-Type": "application/json" }, body: JSON.stringify({ token: new URL(url).hash.slice("#login=".length) }) });
+    expect((await exchange(first)).status).toBe(401); expect((await exchange(next)).status).toBe(200);
+    child.kill(); await child.exited; await reading;
+  } finally { if (child && child.exitCode === null) { child.kill(); await child.exited; } await fixture.cleanup(); }
+}, 60_000);

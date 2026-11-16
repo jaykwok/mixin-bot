@@ -68,6 +68,8 @@ test("上传验证 WAL 缺失、大小、跨会话、过期及部分失败；任
       if (terminal === "done") { tasks.accept(task.id, actor); tasks.finish(task.id, { outcome: "success", exitCode: 0, finalState: "stopped", message: "完成" }); }
       else { now += 60_000; tasks.abandon(task.id); }
       await uploads.prune(tasks, observers); expect(existsSync(join(uploads.root, file.id))).toBe(false);
+      // Manual history cleanup may finalize the same upload after the executor or automatic sweep already did.
+      expect(() => uploads.finish(tasks.request(task.id))).not.toThrow();
     }
     const expired = uploads.create("s", bytes.length); now += 3600_001;
     await uploads.prune(tasks, observers); expect(existsSync(join(uploads.root, expired.id))).toBe(false);

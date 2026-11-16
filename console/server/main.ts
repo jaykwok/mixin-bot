@@ -32,7 +32,7 @@ import { loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
 import { fileRoutes } from "./files.ts";
 import { lifecycleRoutes } from "./lifecycle-routes.ts";
 import { upgradeRoutes } from "./upgrade-routes.ts";
-import { buildExecutor, launchTask, pruneUnusedRuntimes, reconcileTasks, taskObservers } from "./task-host.ts";
+import { buildExecutor, launchTask, pruneUnusedRuntimes, reconcileTasks, taskObservers, unregisterTask } from "./task-host.ts";
 import { taskRoutes } from "./task-routes.ts";
 import { openBrowser, sshForwardHint } from "./open.ts";
 import { assertNoBotConflict, choosePort, parsePort } from "../../ops/core/console-port.ts";
@@ -152,6 +152,16 @@ async function main(argv: string[]): Promise<number | undefined> {
     routes: { ...conversationRoutes({ bot, audit, views, takeover: bot }), ...statsRoutes({ bot, audit, views, root: data }), ...exporter.routes(), ...readRoutes(PROJECT_DIR, audit), ...forms.routes(), ...pushes.routes(), ...pushPage.routes(), ...materialsRoutes(PROJECT_DIR, audit), ...uploads.routes(), ...backups.routes(), ...configurationRoutes(configurations), ...lifecycleRoutes(PROJECT_DIR), ...upgradeRoutes(PROJECT_DIR), ...deploymentDirectory.routes(), ...setup.routes(), ...fileRoutes(PROJECT_DIR),
       ...taskRoutes({ tasks, plans, observers, audit, hosting: hostingCheck, current: () => fence.current(), prepare: operationPreparer(PROJECT_DIR, views, undefined, uploads, backups, forms, configurations, deploymentDirectory),
         created: request => { uploads.bind(request); backups.bind(request); for (const { draft, digest } of taskDrafts(request)) configurations.bind(draft, digest, request.id); },
+        cleanup: async request => {
+          // A failed executor cleanup must not leave private drafts/uploads with no task record to reconcile.
+          await unregisterTask(request);
+          uploads.finish(request);
+          for (const { draft } of taskDrafts(request)) {
+            if (configurations.task(draft) !== request.id) continue;
+            configurations.finish(draft, request.id);
+            if (configurations.task(draft) === request.id) throw new Error("配置草稿仍需恢复，已保留任务记录");
+          }
+        },
         launch: id => launchTask(tasks, id, executorBundle) }) },
     download: (ticket, context) => ticket.startsWith("push-") ? pushPage.download(ticket, context) : exporter.download(ticket, context),
   });
@@ -198,19 +208,24 @@ async function main(argv: string[]): Promise<number | undefined> {
       if (hint.guessed) console.log("    （主机地址取自本次 SSH 连接；经跳板、NAT 或别名登录时换成你平时使用的地址）");
     }
     const first = link();
+    const autoOpen = (info.platform === "windows" || info.platform === "macos") && !remote && !values["no-open"];
+    const open = (url: string) => {
+      if (!autoOpen) return;
+      void openBrowser(url).then(() => console.log("  已在默认浏览器打开登录链接；没有打开时复制上面的链接。"),
+        error => console.log(`  无法自动打开浏览器（${(error as Error).message}），请复制上面的链接。`));
+    };
     console.log(`  登录链接  ${first}`);
     console.log("            5 分钟内有效，只能使用一次。");
-    console.log("  按 Enter 生成新的登录链接（旧链接随即失效），按 Ctrl+C 退出控制台。");
-    if ((info.platform === "windows" || info.platform === "macos") && !remote && !values["no-open"]) {
-      openBrowser(first).then(() => console.log("  已在默认浏览器打开登录链接；没有打开时复制上面的链接。"),
-        error => console.log(`  无法自动打开浏览器（${(error as Error).message}），请复制上面的链接。`));
-    }
+    console.log(`  按 Enter 生成新的登录链接${autoOpen ? "并打开浏览器" : ""}（旧链接随即失效），按 Ctrl+C 退出控制台。`);
+    open(first);
 
     if (process.stdin.isTTY) {
       const input = createInterface({ input: process.stdin });
       input.on("line", () => {
         if (closing) return;
-        console.log(`  新登录链接  ${link()}   5 分钟内有效，只能使用一次。`);
+        const next = link();
+        console.log(`  新登录链接  ${next}   5 分钟内有效，只能使用一次。`);
+        open(next);
       });
       input.on("SIGINT", () => shutdown("Ctrl+C"));
     }

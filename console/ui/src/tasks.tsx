@@ -91,6 +91,12 @@ export function forgetTask(id: string) {
   clearTimeout(timers.get(id)); timers.delete(id);
   followed = followed.filter(item => item.id !== id); if (shown === id) shown = null; emit();
 }
+/** Deleted history no longer has a detail view or a tray item to follow. */
+function forgetHistory(ids: string[]) {
+  for (const id of ids) forgetTask(id);
+  if (recent && ids.includes(recent)) recent = null;
+  if (handoff && ids.includes(handoff)) handoff = null;
+}
 /** Forgets every followed task (the session ended): stops polling; the tasks themselves run on. */
 export function resetTasks() {
   epoch++; for (const timer of timers.values()) clearTimeout(timer); timers.clear();
@@ -303,16 +309,47 @@ export function TaskProgress({ id, recoveryAllowed, inSheet = false }: { id: str
  */
 export function TasksPage({ resultsOnly = false, setup, platform }: { resultsOnly?: boolean; setup?: ComponentChildren; platform?: ConsoleInfo["platform"] }) {
   const [tasks, setTasks] = useState<TaskView[]>([]), [selected, setSelected] = useState<string | null>(recent), [error, setError] = useState(""), [loaded, setLoaded] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false), [clearing, setClearing] = useState(false), [clearError, setClearError] = useState(""), [cleared, setCleared] = useState("");
+  const clearLock = useRef(false), revision = useRef(0), refresh = useRef(() => {}), controller = useRef<AbortController | null>(null), history = useRef<string[]>([]);
   // The task in the sheet opens here once the sheet closes (one subscription per task).
   const { shown: inSheet } = useFollowed();
   useEffect(() => {
-    const controller = new AbortController(); let busy = false;
-    const load = async () => { if (busy) return; busy = true; try { const value = await api<{ tasks: TaskView[] }>("/api/tasks", { signal: controller.signal }); if (!controller.signal.aborted) { setTasks(value.tasks); setError(""); setLoaded(true); } }
-      catch (error) { if (!controller.signal.aborted) setError(message(error)); } finally { busy = false; } };
+    const page = new AbortController(); controller.current = page; let busy = false;
+    const load = async () => { if (busy || clearLock.current) return; busy = true; const sentIn = revision.current;
+      const known = [...new Set([...history.current, ...followed.map(item => item.id)])];
+      try {
+        const value = await api<{ tasks: TaskView[] }>("/api/tasks", { signal: page.signal });
+        if (!page.signal.aborted && sentIn === revision.current) {
+          const ids = new Set(value.tasks.map(task => task.id)), removed = known.filter(id => !ids.has(id));
+          forgetHistory(removed); history.current = [...ids];
+          setSelected(previous => previous && removed.includes(previous) ? null : previous);
+          setTasks(value.tasks); setError(""); setLoaded(true);
+        }
+      }
+      catch (error) { if (!page.signal.aborted && sentIn === revision.current) setError(message(error)); } finally { busy = false; } };
+    refresh.current = () => void load();
     const choose = (event: globalThis.Event) => { setSelected((event as CustomEvent<string>).detail); void load(); };
     void load(); const timer = setInterval(() => void load(), 5000); window.addEventListener("console-task", choose);
-    return () => { controller.abort(); clearInterval(timer); window.removeEventListener("console-task", choose); };
+    return () => { page.abort(); clearInterval(timer); window.removeEventListener("console-task", choose); };
   }, []);
+  const clearHistory = async () => {
+    if (clearLock.current || resultsOnly) return;
+    clearLock.current = true; revision.current++; setClearing(true); setClearError(""); setCleared("");
+    const sentIn = epoch, signal = controller.current?.signal;
+    try {
+      const result = await api<{ removed: string[]; retained: number; failed: number }>("/api/tasks/clear", { method: "POST", body: {}, intent: true, signal, timeoutMs: 120_000 });
+      if (signal?.aborted || sentIn !== epoch) return;
+      forgetHistory(result.removed);
+      setTasks(previous => previous.filter(task => !result.removed.includes(task.id)));
+      setSelected(previous => previous && result.removed.includes(previous) ? null : previous);
+      setConfirmClear(false);
+      setCleared(`已清理 ${result.removed.length} 条历史记录${result.retained ? `，保留 ${result.retained} 条执行中、待恢复或无法确认已结束的记录` : ""}。`);
+      if (result.failed) setClearError(`${result.failed} 条记录未能清理，请检查目录权限与任务收尾状态后重试。`);
+    } catch (error) { if (!signal?.aborted && sentIn === epoch) setClearError(message(error)); }
+    finally { clearLock.current = false; if (!signal?.aborted) { setClearing(false); refresh.current(); } }
+  };
+  const clearable = tasks.some(task => !task.needsRecovery && ["succeeded", "failed", "not-accepted", "interrupted"].includes(task.state));
+  const closeClear = () => { if (!clearLock.current) { setConfirmClear(false); setClearError(""); } };
   return <>
     <PageHeader title="维护" description={resultsOnly ? "查看后台任务及断线前的进度。" : setup ? "在这里完成首次部署，查看后台任务及断线前的进度。"
       : "启停、更新和重新部署机器人，查看后台任务及断线前的进度。"} />
@@ -329,22 +366,34 @@ export function TasksPage({ resultsOnly = false, setup, platform }: { resultsOnl
       <UpgradeForm />
       <DeployForm />
     </>}
-    <Section title="后台任务" aside={<span class="muted small">每 5 秒刷新</span>}>
+    <Section title="后台任务" aside={<><span class="muted small">每 5 秒刷新</span>
+      {!resultsOnly && <button type="button" class="btn small-btn destructive" disabled={!loaded || !clearable || clearing}
+        onClick={() => { setClearError(""); setCleared(""); setConfirmClear(true); }}>清理历史记录</button>}</>}>
       {error && <div class="group-note form-error" role="alert">{error}</div>}
+      {cleared && <div class="group-note" role="status">{cleared}</div>}
+      {clearError && !confirmClear && <div class="group-note form-error" role="alert">{clearError}</div>}
       {!tasks.length && !error && <div class="group-note">{loaded ? "暂无任务记录。" : <Spinner label="正在读取任务…" />}</div>}
-      {tasks.length > 0 && <ul class="task-list">{tasks.map(task => {
+      {tasks.length > 0 && <ul class="task-list">{tasks.map((task, index) => {
         const look = taskTone(task), open = selected === task.id && inSheet !== task.id;
         return <li key={task.id}>
           <button type="button" class="task-row" aria-expanded={open} onClick={() => { if (inSheet === task.id) showTask(null); setSelected(open ? null : task.id); }}>
             <span class={`glyph tint-${look.tint}`} aria-hidden="true"><Icon name={look.icon} size={15} class={look.icon === "loader" ? "spin" : undefined} /></span>
             <span class="row-text"><span class="row-title">{TASK_LABELS[task.operation] ?? task.operation}</span>
-              <span class="row-detail">{TASK_STATES[task.state] ?? task.state}{task.needsRecovery ? " · 需要恢复" : ""} · {dateTime(task.createdAt)}</span></span>
+              <span class="row-detail">#{tasks.length - index} · {TASK_STATES[task.state] ?? task.state}{task.needsRecovery ? " · 需要恢复" : ""} · {dateTime(task.createdAt)}</span></span>
             <Icon name="chevronRight" size={15} class="chevron-go" />
           </button>
           {open && <div class="task-row-body"><TaskProgress key={task.id} id={task.id} recoveryAllowed={!resultsOnly} /></div>}
         </li>;
       })}</ul>}
     </Section>
+    {!resultsOnly && confirmClear && <Dialog title="清理后台任务历史" icon="alert" onClose={closeClear} footer={<>
+      <button type="button" class="btn" disabled={clearing} onClick={closeClear}>取消</button>
+      <button type="button" class="btn danger" disabled={clearing} onClick={() => void clearHistory()}>{clearing ? "正在清理…" : "确认清理"}</button>
+    </>}>
+      <p>清理全部已结束且无需恢复的任务记录和任务日志，包括成功、失败、未接单及修复后已结束的中断任务。清理后无法查看或导出这些任务日志。</p>
+      <p>执行中、待恢复及无法确认状态的任务保留。清理后列表重新编号，全部清空后下一个任务从 1 开始。</p>
+      {clearError && <p role="alert" class="form-error">{clearError}</p>}
+    </Dialog>}
     {!resultsOnly && !setup && <>
       <BackupCleanup />
       <Section title="危险操作">

@@ -102,7 +102,13 @@ export class UploadStore {
   }
   finish(request: TaskRequest): void {
     const id = request.params.upload; if (typeof id !== "string") return;
-    const value = this.read(id); if (value.task === request.id) this.remove(id);
+    let value: Upload;
+    try { value = this.read(id); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(join(this.root, id))) return;
+      throw error;
+    }
+    if (value.task === request.id) this.remove(id);
   }
   async prune(tasks: TaskStore, observers: TaskObservers): Promise<void> {
     for (const id of readdirSync(this.root).filter(id => ID.test(id))) {

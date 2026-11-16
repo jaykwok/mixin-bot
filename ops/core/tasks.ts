@@ -297,6 +297,38 @@ export class TaskStore {
     return removed;
   }
 
+  /** Clear ended tasks on request. Submission keys survive, so an old submission cannot run again. */
+  async clearHistory(observers: TaskObservers, options: {
+    check?(): void;
+    /** Finish cleanup that still needs the request before removing its record. */
+    cleanup?(request: TaskRequest): Promise<void>;
+  } = {}): Promise<{ removed: string[]; retained: number; failed: number }> {
+    const removed: string[] = [];
+    let retained = 0, failed = 0;
+    for (const id of readdirSync(this.root).filter(id => ID.test(id))) {
+      options.check?.();
+      const view = await this.view(id, observers);
+      if (!view.request || view.needsRecovery || !["succeeded", "failed", "not-accepted", "interrupted"].includes(view.state)) { retained++; continue; }
+      try {
+        const claim = read(join(this.dir(id), "claim"));
+        if (!validClaim(claim)) { retained++; continue; }
+        // A published result can precede the executor's cleanup. A stale heartbeat is not proof of exit either.
+        if (claim.kind === "executor" && (await observers.hosting(view.request, claim.executor)).state !== "ended") { retained++; continue; }
+        if ((view.state === "interrupted" || view.result?.leftRecovery) && await observers.needsRecovery(view.request)) { retained++; continue; }
+      } catch { retained++; continue; }
+      options.check?.();
+      try { await options.cleanup?.(view.request); }
+      catch { failed++; continue; }
+      // The code or login may have changed while the hosting/cleanup calls were in flight.
+      options.check?.();
+      try {
+        rmSync(this.dir(id), { recursive: true, force: true });
+        removed.push(id);
+      } catch { failed++; }
+    }
+    return { removed, retained, failed };
+  }
+
   events(id: string, after = 0): TaskEvent[] {
     return this.eventReader(id, after)();
   }

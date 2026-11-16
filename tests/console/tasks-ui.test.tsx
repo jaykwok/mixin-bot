@@ -4,7 +4,9 @@ import { GlobalRegistrator } from "../helpers/dom.tsx";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
-const { TaskAction, TasksPage, readTaskEvents, resetTasks, useFollowed, RecoveryActions, UpgradeForm, DeployForm } = await import("../../console/ui/src/tasks.tsx");
+const { TaskAction, TasksPage, readTaskEvents, resetTasks, useFollowed, RecoveryActions, UpgradeForm, DeployForm, followTask, showTask } = await import("../../console/ui/src/tasks.tsx");
+const { ActivityTray } = await import("../../console/ui/src/activity.tsx");
+import type { TaskView } from "../../console/ui/src/tasks.tsx";
 const { DirectoryForm, RuntimeForm } = await import("../../console/ui/src/write-forms.tsx");
 const { adoptServerTime } = await import("../../console/ui/src/clock.ts");
 // These views mount without the login flow; earlier page tests may have adopted their fixture's server clock.
@@ -12,6 +14,74 @@ beforeEach(() => { const now = Date.now(); adoptServerTime(now, now, { login: tr
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const until = async (check: () => boolean) => { const limit = Date.now() + 3000; while (!check() && Date.now() < limit) await Bun.sleep(10); expect(check()).toBe(true); };
 const find = (root: Element, text: string) => [...root.querySelectorAll("button")].find(button => button.textContent === text)!;
+
+test("清理历史同步移除失败任务提示与详情，保留活跃任务并重新编号，旧列表响应不会把记录加回来", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root); resetTasks();
+  const done: TaskView = { id: "done", operation: "start", state: "succeeded", needsRecovery: false, createdAt: 1,
+    result: { message: "完成", outcome: "success", exitCode: 0, finalState: "running" } };
+  const failed: TaskView = { ...done, id: "failed", operation: "restart", state: "failed", createdAt: 2, result: { ...done.result!, outcome: "failed", exitCode: 1 } };
+  const recovery: TaskView = { ...failed, id: "recovery", operation: "repair", needsRecovery: true, createdAt: 3 };
+  const running: TaskView = { ...done, id: "running", operation: "document-check", state: "running", result: undefined, createdAt: 4 };
+  let tasks = [running, recovery, failed, done], clears = 0, delayList = false;
+  let late: (() => void) | undefined;
+  globalThis.fetch = (async (url: string) => {
+    if (String(url) === "/api/tasks") {
+      const snapshot = [...tasks];
+      if (delayList) { delayList = false; return new Promise<Response>(resolve => { late = () => resolve(Response.json({ tasks: snapshot })); }); }
+      return Response.json({ tasks: snapshot });
+    }
+    if (String(url) === "/api/tasks/clear") { clears++; tasks = [running, recovery]; return Response.json({ removed: [failed.id, done.id], retained: 2, failed: 0 }); }
+    if (String(url).endsWith("/events")) return new Response("");
+    const task = tasks.find(task => String(url) === `/api/tasks/${task.id}`);
+    if (task) return Response.json(task);
+    throw new Error("unexpected " + url);
+  }) as typeof fetch;
+  try {
+    followTask(failed); showTask(null);
+    render(<><TasksPage setup={<span />} /><ActivityTray /></>, root);
+    await until(() => root.querySelectorAll(".task-list > li").length === 4 && !!root.querySelector(".activity-item"));
+    expect(root.querySelector(".task-list .row-detail")!.textContent).toContain("#4");
+    find(root, "清理历史记录").click(); await until(() => !!find(root, "确认清理"));
+    find(root, "取消").click(); await until(() => !find(root, "确认清理")); expect(clears).toBe(0);
+    delayList = true; window.dispatchEvent(new CustomEvent("console-task", { detail: failed.id })); await until(() => !!late);
+    find(root, "清理历史记录").click(); await until(() => !!find(root, "确认清理"));
+    find(root, "确认清理").click(); await until(() => root.querySelectorAll(".task-list > li").length === 2);
+    late!(); await Bun.sleep(50);
+    expect(root.querySelectorAll(".task-list > li").length).toBe(2);
+    expect(root.querySelector(".activity-item")).toBeNull(); expect(root.querySelector(".task-detail")).toBeNull();
+    expect(root.textContent).toContain("已清理 2 条历史记录");
+    expect([...root.querySelectorAll(".task-list .row-detail")].map(row => row.textContent!.split(" · ")[0])).toEqual(["#2", "#1"]);
+    expect(clears).toBe(1);
+  } finally { late?.(); render(null, root); root.remove(); globalThis.fetch = previous; resetTasks(); }
+});
+
+test("清理失败可重试，全部清空后的新任务从 1 开始，只读结果页没有清理入口", async () => {
+  const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root); resetTasks();
+  const task: TaskView = { id: "old", operation: "stop", state: "failed", needsRecovery: false, createdAt: 1 };
+  let tasks = [task], attempts = 0;
+  globalThis.fetch = (async (url: string, options?: RequestInit) => {
+    if (String(url) === "/api/tasks") return Response.json({ tasks });
+    if (String(url) === "/api/tasks/clear") {
+      expect(options?.method).toBe("POST"); expect(JSON.parse(String(options?.body))).toEqual({});
+      if (++attempts === 1) return Response.json({ error: "目录权限不足", code: "input" }, { status: 409 });
+      tasks = []; return Response.json({ removed: [task.id], retained: 0, failed: 0 });
+    }
+    if (String(url).endsWith("/events")) return new Response("");
+    return Response.json(tasks[0]);
+  }) as typeof fetch;
+  try {
+    render(<TasksPage setup={<span />} />, root); await until(() => !find(root, "清理历史记录")?.disabled);
+    find(root, "清理历史记录").click(); await until(() => !!find(root, "确认清理")); find(root, "确认清理").click();
+    await until(() => root.textContent!.includes("目录权限不足")); expect(root.querySelectorAll(".task-list > li")).toHaveLength(1);
+    find(root, "确认清理").click(); await until(() => root.textContent!.includes("暂无任务记录"));
+    expect(find(root, "清理历史记录").disabled).toBe(true);
+    const next = { ...task, id: "new", state: "running", createdAt: 2 }; tasks = [next]; followTask(next); showTask(null);
+    await until(() => !!root.querySelector(".task-list .row-detail"));
+    expect(root.querySelector(".task-list .row-detail")!.textContent).toContain("#1 · 执行中");
+    render(<TasksPage resultsOnly setup={<span />} />, root); await until(() => !find(root, "清理历史记录"));
+    expect(attempts).toBe(2);
+  } finally { render(null, root); root.remove(); globalThis.fetch = previous; resetTasks(); }
+});
 
 test.each(["history-clear", "stat-import", "tmp-purge", "tmp-reclaim", "tmp-discard", "configuration-apply", "configuration-restore", "runtime-configure", "backup-clean", "relay-test", "relay-purge"])("中断 %s 任务可预览恢复且不重复提交原动作；只读结果页不提供恢复写入口", async operation => {
   const previous = globalThis.fetch, root = document.createElement("div"); document.body.append(root); resetTasks();

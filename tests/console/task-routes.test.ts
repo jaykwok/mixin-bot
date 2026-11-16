@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AuditLog } from "../../console/server/audit.ts";
 import { Auth } from "../../console/server/auth.ts";
@@ -8,7 +8,7 @@ import { guardConfig } from "../../console/server/guard.ts";
 import { PlanStore } from "../../ops/core/plans.ts";
 import { createHandler } from "../../console/server/server.ts";
 import { taskRoutes } from "../../console/server/task-routes.ts";
-import { TaskStore } from "../../ops/core/tasks.ts";
+import { TaskStore, type TaskObservers } from "../../ops/core/tasks.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const actor = { pid: 1, startedAt: "fixture" };
@@ -18,7 +18,7 @@ async function setup() {
   const tasks = new TaskStore(join(fixture.root, ".console"), () => time.at);
   const plans = new PlanStore(join(fixture.root, ".console"), async () => ({ facts: { project: fixture.root, platform: process.platform,
     identity: "test", head: "head", protocol: 1, runState: "stopped", scope: time.scope }, summary: ["停止机器人"] }), () => time.at);
-  const observers = { hosting: async () => ({ state: "running" as const, executor: actor }), needsRecovery: async () => false };
+  const observers: TaskObservers = { hosting: async () => ({ state: "running", executor: actor }), needsRecovery: async () => false };
   const auth = new Auth({ exchangeMs: 60_000, idleMs: 30_000, absoluteMs: 999_999 }, () => time.at);
   const login = auth.exchange(auth.issueToken().token)!;
   const handler = createHandler({ port: 10001, guard: guardConfig(10001), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
@@ -34,8 +34,53 @@ async function setup() {
     headers: { Host: "127.0.0.1:10001", Origin: "http://127.0.0.1:10001", "X-Console-Request": "1", "Content-Type": "application/json", cookie: `${auth.cookieName}=${login.sessionId}`, ...headers },
   }));
   const plan = async () => (await (await request("/api/plans", { operation: "stop", params: {} })).json()) as { id: string };
-  return { fixture, time, tasks, request, plan, auth };
+  return { fixture, time, tasks, request, plan, auth, observers };
 }
+
+test("清理历史接口删除已结束的失败和成功记录，保留运行任务，写入审计并阻止旧提交重放", async () => {
+  const h = await setup();
+  try {
+    const firstPlan = await h.plan();
+    const first = await (await h.request("/api/tasks", { plan: firstPlan.id, key: "clear-success" })).json() as { id: string };
+    const second = await (await h.request("/api/tasks", { plan: (await h.plan()).id, key: "clear-failed" })).json() as { id: string };
+    const running = await (await h.request("/api/tasks", { plan: (await h.plan()).id, key: "clear-running" })).json() as { id: string };
+    h.tasks.finish(first.id, { outcome: "success", exitCode: 0, finalState: "stopped", message: "done" });
+    h.tasks.finish(second.id, { outcome: "failed", exitCode: 1, finalState: "stopped", message: "failed" });
+    h.observers.hosting = async request => request.id === running.id ? { state: "running", executor: actor } : { state: "ended" };
+    expect((await h.request("/api/tasks/clear", { id: first.id })).status).toBe(400);
+    expect((await h.request("/api/tasks/clear", {}, { Origin: "http://example.invalid" })).status).toBe(403);
+    expect((await h.request("/api/tasks/clear", {}, { cookie: "" })).status).toBe(401);
+    const response = await h.request("/api/tasks/clear", {});
+    expect(response.status).toBe(200);
+    const cleared = await response.json() as { removed: string[]; retained: number; failed: number };
+    expect(cleared.removed.sort()).toEqual([first.id, second.id].sort()); expect(cleared.retained).toBe(1); expect(cleared.failed).toBe(0);
+    const remaining = await (await h.request("/api/tasks")).json() as { tasks: { id: string }[] };
+    expect(remaining.tasks.map(task => task.id)).toEqual([running.id]);
+    expect((await h.request("/api/tasks", { plan: firstPlan.id, key: "clear-success" })).status).toBe(409);
+    expect((await h.request("/api/tasks", { plan: firstPlan.id, key: "clear-new-key" })).status).toBe(409);
+    expect(h.time.launches).toBe(3);
+    const auditDir = join(h.fixture.root, ".console/audit");
+    const audit = readdirSync(auditDir).map(file => readFileSync(join(auditDir, file), "utf8")).join("");
+    expect(audit).toContain('"action":"task-history-clear"');
+  } finally { await h.fixture.cleanup(); }
+});
+
+test.each(["code", "session", "cancel"])("历史清理核对期间 %s 改变时不删除记录", async change => {
+  const h = await setup();
+  try {
+    const task = await (await h.request("/api/tasks", { plan: (await h.plan()).id, key: "clear-guarded" })).json() as { id: string };
+    h.tasks.finish(task.id, { outcome: "success", exitCode: 0, finalState: "stopped", message: "done" });
+    const controller = new AbortController();
+    h.observers.hosting = async () => {
+      if (change === "code") h.time.current = false;
+      if (change === "session") h.auth.revokeAll();
+      if (change === "cancel") controller.abort();
+      return { state: "ended" };
+    };
+    expect((await h.request("/api/tasks/clear", {}, {}, controller.signal)).status).toBe(409);
+    expect(h.tasks.request(task.id).id).toBe(task.id);
+  } finally { await h.fixture.cleanup(); }
+});
 
 test("HTTP 双击和两个标签页同一计划只启动一次；重试在计划过期后仍返回原任务", async () => {
   const h = await setup();
