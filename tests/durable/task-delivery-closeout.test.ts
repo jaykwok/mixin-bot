@@ -903,7 +903,9 @@ test("saved drafts: the newest per name in three names at most, outside the mode
 });
 
 test("send_file takes a registered deliverable by name: its best version, whatever the source file has become; an unknown name lists what there is", async () => {
-  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp) });
+  // Allow the ten model turns and their file/SQLite commits to finish on a loaded CI runner.
+  const f = await setup(), service = new DurableService({ ...f.options, extensions: buildFixture(f.temp),
+    limits: { ...f.options.limits, runTimeoutMs: 60_000 } });
   const results: string[] = [];
   /** The text of the tool result the model is answering. */
   const seen = (transcript: { messages: readonly { role: string; content: unknown }[] }) => {
@@ -923,7 +925,8 @@ test("send_file takes a registered deliverable by name: its best version, whatev
   ]);
   try {
     await service.admit(f.message("send the report"));
-    await until(() => f.out.sent.some(x => x.kind === "reply" && x.text.includes("都发了")), "the reply");
+    await until(() => f.out.sent.some(x => x.kind === "reply"), "the reply");
+    expect(f.out.sent.find(x => x.kind === "reply")!.text).toContain("都发了");
     // The checked version although the source has changed since; the saved draft under the name the call gave.
     expect(f.uploads).toEqual(["report.txt:checked version", "交付方案.txt:built"]);
     expect(JSON.parse(results[0]!)).toMatchObject({ slot: "report", status: "draft", message: '已登记。发送：send_file 的 deliverable 填 "report"' });
