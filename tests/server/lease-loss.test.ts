@@ -121,8 +121,17 @@ describe("service lease loss", () => {
           if (Date.now() > end) throw new Error("no service heartbeat within 10 s");
           await Bun.sleep(20);
         }
+        const previousMtime = statSync(lockDir).mtime.getTime();
         rmSync(lockDir, { recursive: true, force: true });
-        takeover = await acquireLease("test", join(fixture.root, "data/state/service"), { retries: 0 });
+        // proper-lockfile compares whole milliseconds. A directory created in the heartbeat's millisecond can look
+        // like the old lock; its next heartbeat would then overwrite ours. Give the replacement a distinct timestamp.
+        for (const end = Date.now() + 1000; ;) {
+          takeover = await acquireLease("test", join(fixture.root, "data/state/service"), { retries: 0 });
+          if (statSync(lockDir).mtime.getTime() !== previousMtime) break;
+          await takeover(); takeover = undefined;
+          if (Date.now() > end) throw new Error("replacement lease still has the old heartbeat's timestamp");
+          await Bun.sleep(20);
+        }
         await service.line("服务租约丢失", 15_000);
         // The callback has run: release the task, the maintenance and the archive, as if the service had carried on.
         writeFileSync(join(fixture.root, "gate.open"), "");
