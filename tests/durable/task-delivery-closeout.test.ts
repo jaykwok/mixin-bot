@@ -9,14 +9,14 @@ import * as deliverables from "../../src/agent/deliverables.ts";
 import { completeFile, deliverableCandidates, deliverableNamed, fallbackSlots, fileDigest, freezeFile, registerAutoDraft, registerDeliverable, releasableSnapshots }
   from "../../src/agent/deliverables.ts";
 import { InboxDoc } from "../../src/durable/inbox.ts";
-import { createSession, defineExtension, Harness } from "@earendil-works/pi-durable";
+import { createSession, defineExtension, Harness, type ToolRegistration } from "@earendil-works/pi-durable";
 import { obj } from "@earendil-works/pi-schema";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { IdentityDoc, MemberDirectory } from "../../src/durable/identity.ts";
 import { activeRequest, closeoutExtension, deliverableTool, UNRENDERED } from "../../src/durable/closeout.ts";
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
-import type { MemberCall, MemberTool } from "../../src/durable/tools.ts";
+import type { MemberCall } from "../../src/durable/tools.ts";
 import { sendTools } from "../../src/agent/send-tools.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { fileDelivery } from "../../src/durable/file-delivery.ts";
@@ -66,7 +66,7 @@ async function setup(alias?: "case" | "link") {
   // The bytes each upload carried: a file message only names the file.
   out.outbound.upload = async (source, signal) => { uploads.push(`${source.fileName}:${await readFile(source.path, "utf8")}`); return upload(source, signal); };
   const options: DurableServiceOptions = { layout: appLayout(root), modules: [], relay: null, materials: false, outbound: out.outbound,
-    closeout: timing, limits: { runTimeoutMs: 3000, modelIdleMs: 3000, modelResponseMs: 3000, tickMs: 10, deliveryRetryMs: [100] },
+    closeout: timing, limits: { runTimeoutMs: 3000, modelIdleMs: 3000, modelResponseMs: 3000, deliveryRetryMs: [100] },
     selection: { runtime: models as never, settings: undefined as never, ref: model, model: models.getModel(model.provider, model.modelId)!, thinkingLevel: "off",
       harnessSettings: { retry: { maxRetries: 0 } } } };
   const service = new DurableService(options);
@@ -93,8 +93,8 @@ function fakeRun(requestId: string, startedAt = Date.now()) {
 }
 
 /** deliverable_register as Durable calls it in the fake run; an error result rejects with its text. */
-async function register(tool: MemberTool, params: object, run: ReturnType<typeof fakeRun>) {
-  const result = await tool.registration.execute(params, run.api as never, context);
+async function register(tool: ToolRegistration, params: object, run: ReturnType<typeof fakeRun>) {
+  const result = await tool.execute(params, run.api as never, context);
   if (result.isError) throw new Error(result.output?.map((part) => part.type === "text" ? part.text : "").join(""));
   return result;
 }
@@ -263,7 +263,7 @@ test.each(["task_timeout", "model_idle", "model_response_timeout"])("watchdog %s
   // Every limit also covers the first model call, which registers the draft; a CI stall there longer than the
   // limit would abort before any draft exists. Give the limit under test that headroom and keep the others out of reach.
   const limit = (kind: string) => reason === kind ? 1500 : 30_000, logs: string[] = [];
-  const service = new DurableService({ ...f.options, onLog: line => logs.push(line), limits: { runTimeoutMs: limit("task_timeout"), tickMs: 10,
+  const service = new DurableService({ ...f.options, onLog: line => logs.push(line), limits: { runTimeoutMs: limit("task_timeout"),
     modelIdleMs: limit("model_idle"), modelResponseMs: limit("model_response_timeout") },
     closeout: { closeoutMs: 250, reserveMs: 100, fallbackMs: 2000 } });
   f.faux.setResponses([f.register(), (_t, options) => new Promise(resolve => {

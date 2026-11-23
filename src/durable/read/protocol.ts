@@ -31,8 +31,10 @@ export type ReadOp =
 
 // Between the client (main thread) and the read worker. `cancel` holds one flag per in-flight slot; the worker checks
 // it, and the deadline, between statements.
-export type WorkerInit = { conversations: string; state: string; cancel: SharedArrayBuffer };
+export type WorkerInit = { conversations: string; state: string; cancel: SharedArrayBuffer; connectionIdleMs: number };
 export type ReadMessage = { request: number; slot: number; deadline: number; op: ReadOp };
+export type WorkerControlMessage = { request: number; release: true };
+export type WorkerMessage = ReadMessage | WorkerControlMessage;
 
 /** Names of the worker errors the route answers specially. */
 export const READ_ERRORS = { expired: "ReadExpired", cancelled: "ReadCancelled", changed: "SpaceChanged", absent: "SpaceAbsent" } as const;

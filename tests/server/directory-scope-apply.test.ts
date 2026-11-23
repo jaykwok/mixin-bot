@@ -42,7 +42,7 @@ test("once a smaller scope is in effect a member outside it cannot start a reque
   faux.setResponses([fauxAssistantMessage("答复一"), gated.step, fauxAssistantMessage("答复三")]);
   const out = recordingOutbound();
   const service = new DurableService({ layout: appLayout(fixture.root), modules: [], relay: null, materials: false, outbound: out.outbound,
-    limits: { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: 4 },
+    limits: { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, activeRequests: 4 },
     selection: { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)!, ref: model,
       thinkingLevel: "off", harnessSettings: {} } });
   const router = new InboundRouter({ service, outbound: out.outbound, signal: controller.signal, onUnknown: () => {}, directory });

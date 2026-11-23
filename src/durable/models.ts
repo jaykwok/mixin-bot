@@ -10,6 +10,7 @@ import type { Context } from "@earendil-works/chord/context";
 import type { Api, CacheRetention, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { type ConversationId, type Harness, type HarnessSettings, type ModelRef, ProviderDoc } from "@earendil-works/pi-durable";
+import { enginePolicy } from "../core/engine-policy.ts";
 import { MODEL_CONFIG_ENTRY, openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
 import { conversationIds } from "./conversations.ts";
 import { RequestDoor, VIRTUAL_MODEL_API, type DoorOptions, type SessionBinding } from "./door.ts";
@@ -24,6 +25,8 @@ export interface ModelSelection {
   ref: ModelRef;
   thinkingLevel: ModelThinkingLevel;
   harnessSettings: HarnessSettings;
+  /** Optional cap on tool rounds per run (`durable.maxTurns`), configured on every member conversation. */
+  maxTurns?: number;
 }
 
 export interface ModelSelectionOptions {
@@ -59,8 +62,12 @@ export async function selectModel(runtime: ModelRuntime, settings: SettingsManag
     const slash = key.indexOf("/");
     return slash > 0 ? runtime.getModel(key.slice(0, slash), key.slice(slash + 1))?.contextWindow : undefined;
   };
+  const policy = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);
   const harnessSettings = durableSettings(settings, model, options.cacheRetention, windowOf);
-  return { runtime, settings, model, ref: { provider: model.provider, modelId: model.id }, thinkingLevel, harnessSettings };
+  return {
+    runtime, settings, model, ref: { provider: model.provider, modelId: model.id }, thinkingLevel, harnessSettings,
+    ...(policy.maxTurns === undefined ? {} : { maxTurns: policy.maxTurns }),
+  };
 }
 
 /**

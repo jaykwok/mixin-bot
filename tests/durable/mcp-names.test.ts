@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CodemodeSandbox, toCodemodeIdentifier } from "@earendil-works/pi-codemode";
-import { mcpMemberTools, mcpToolNames } from "../../src/durable/mcp.ts";
+import { mcpExtensions, mcpToolNames } from "../../src/durable/mcp.ts";
 import { spaceDoor } from "../../src/durable/models.ts";
 import { McpTools, type McpCatalogueTool } from "../../src/integrations/mcp.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -36,26 +36,42 @@ test("two tools of one MCP server whose names normalize alike remain independent
     const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string; name?: string } };
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     let result: unknown;
-    if (rpc.method === "initialize") result = { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "docs", version: "1" }, capabilities: { tools: {} } };
+    if (rpc.method === "initialize") result = { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "docs", version: "1" }, capabilities: { tools: {} }, instructions: "Ignored when configured description exists\nSecond line" };
     // One of them without `type` or `properties`, as servers may send it.
     else if (rpc.method === "tools/list") result = { tools: [{ name: "search-a", inputSchema: { type: "object", properties: {} } }, { name: "search_a", inputSchema: {} }] };
     else if (rpc.method === "tools/call") { dispatched.push(rpc.params!.name!); result = { content: [{ type: "text", text: rpc.params!.name }] }; }
     else throw new Error("unexpected RPC");
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
   } });
-  const manager = new McpTools({ servers: [{ name: "docs", description: "产品文档库", transport: "http", tools: ["search-a", "search_a"], url: `http://127.0.0.1:${server.port}/mcp` }] },
-    join(f.root, "discovery"));
+  const notesServer = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
+    if (rpc.id === undefined) return new Response(null, { status: 202 });
+    const result = rpc.method === "initialize"
+      ? { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "notes", version: "1" }, capabilities: { tools: {} }, instructions: "Search meeting notes\nIgnored second line" }
+      : { tools: [{ name: "find", inputSchema: { type: "object", properties: {} } }] };
+    return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+  } });
+  const manager = new McpTools({ servers: [
+    { name: "docs", description: "产品文档库", transport: "http", tools: ["search-a", "search_a"], url: `http://127.0.0.1:${server.port}/mcp` },
+    { name: "notes-hub", transport: "http", tools: ["find"], url: `http://127.0.0.1:${notesServer.port}/mcp` },
+  ] }, join(f.root, "discovery"));
   const door = spaceDoor({}), signal = new AbortController().signal;
   const member = { scope: scopeOf("group"), phone: "alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "tmp") };
   let sandbox: CodemodeSandbox | undefined;
   try {
     await mkdir(member.workspaceDir); await mkdir(member.tempDir); await manager.initialize(signal);
-    const adapters = mcpMemberTools({ layout: appLayout(f.root), scope: member.scope }, manager, door);
-    expect(adapters.map(adapter => adapter.registration.name.slice(0, -9))).toEqual(["mcp__docs__search_a", "mcp__docs__search_a"]);
-    // One namespace for the server's tools, with the administrator's description; every schema is an object schema.
-    expect(adapters.map(adapter => adapter.namespace)).toEqual(Array(2).fill({ name: "mcp__docs", description: "产品文档库（管理员批准的外部工具）" }));
-    expect(adapters.map(adapter => adapter.registration.parameters)).toEqual(Array(2).fill({ type: "object", properties: {} }));
-    const tools = adapters.map((adapter, i) => ({ name: adapter.registration.name,
+    const extensions = mcpExtensions({ layout: appLayout(f.root), scope: member.scope }, manager, door);
+    expect(extensions.map(ext => ext.name)).toEqual(["mixin.mcp.docs", "mixin.mcp.notes-hub"]);
+    // One extension & namespace per server: configured description wins, else the first line of server instructions (mcpServerSummary).
+    expect(extensions.map(ext => ext.namespace)).toEqual([
+      { name: "mcp__docs", description: "产品文档库（管理员批准的外部工具）" },
+      { name: "mcp__notes_hub", description: "Search meeting notes（管理员批准的外部工具）" },
+    ]);
+    const adapters = extensions[0]!.tools!;
+    expect(adapters.map(adapter => adapter.name.slice(0, -9))).toEqual(["mcp__docs__search_a", "mcp__docs__search_a"]);
+    expect(adapters.map(adapter => adapter.parameters)).toEqual(Array(2).fill({ type: "object", properties: {} }));
+    const tools = adapters.map((adapter, i) => ({ name: adapter.name,
       execute: (args: unknown) => manager.call(manager.catalogue[i]!, member, args as Record<string, unknown>, signal, dispatch => dispatch()),
     }));
     sandbox = new CodemodeSandbox({ tools });
@@ -63,5 +79,5 @@ test("two tools of one MCP server whose names normalize alike remain independent
     const output = await sandbox.execute(`return [await tools.${names[0]}({}), await tools.${names[1]}({})];`);
     expect(output.ok).toBe(true);
     expect(dispatched).toEqual(["search-a", "search_a"]);
-  } finally { await sandbox?.close(); await manager.close(); await door.close(); await server.stop(true); await f.cleanup(); }
+  } finally { await sandbox?.close(); await manager.close(); await door.close(); await server.stop(true); await notesServer.stop(true); await f.cleanup(); }
 }, 15000);

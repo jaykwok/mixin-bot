@@ -6,10 +6,11 @@
 //
 // Every send goes to the reply context of the invocation's own request (its run record), never to a later message of
 // the member. Relay link notes and file send states are written to that run record in the invocation's commits.
+import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { relayMaxBytes, type RelayConfig } from "../integrations/relay.ts";
 import type { SendOutcome } from "../integrations/open-platform/messages.ts";
 import { sendTools, SendNotConfirmed, type SendChannel, type SendContext } from "../agent/send-tools.ts";
-import { type BaseToolsOptions, type Member, type MemberCall, memberTool, type MemberTool } from "./tools.ts";
+import { type BaseToolsOptions, type Member, type MemberCall, memberTool } from "./tools.ts";
 import { fileDelivery } from "./file-delivery.ts";
 import { activeRequest } from "./closeout.ts";
 import { type Outbound, sendFileMessage, sendImageMessage } from "./outbound.ts";
@@ -71,6 +72,6 @@ async function sendContext(options: SendToolsOptions, member: Member, call: Memb
 }
 
 /** The two send tools; `mixin.send` declares them to the model (./registry.ts). */
-export function sendMemberTools(options: SendToolsOptions): MemberTool[] {
+export function sendMemberTools(options: SendToolsOptions): ToolRegistration[] {
   return sendTools(options.relay, (member, call) => sendContext(options, member, call)).map((spec) => memberTool(spec, options));
 }

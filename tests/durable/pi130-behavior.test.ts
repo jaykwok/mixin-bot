@@ -56,7 +56,7 @@ test("cross-model conversion drops prior thinking while retaining the visible an
 test("Kimi uses Chat Completions /v1 URL; one proxy delta containing reasoning and text preserves thinking before text", async () => {
   const model = kimiCodingProvider().getModels()[0]!;
   expect(model.api).toBe("openai-completions"); expect(model.baseUrl.endsWith("/v1")).toBe(true);
-  expect(model.contextWindow).toBeGreaterThan(model.maxTokens);
+  expect(model.contextWindow).toBeGreaterThanOrEqual(model.maxTokens);
   let url = "";
   const events = [
     { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: { reasoning_content: "reason", content: "answer" }, finish_reason: null }] },

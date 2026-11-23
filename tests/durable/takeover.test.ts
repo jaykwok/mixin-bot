@@ -75,7 +75,7 @@ function harness() {
   };
   const service = new DurableService({
     layout, selection: selection(models, model), modules: [], relay: null, materials: false,
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 }, outbound,
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 }, outbound,
   });
   const people = new Map([[ALICE, { phone: ALICE, name: "张三", imUserId: `im-${ALICE}` }]]);
   const abort = new AbortController();

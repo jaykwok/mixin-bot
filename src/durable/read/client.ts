@@ -4,7 +4,7 @@
 // worker has let go of it. A worker that stops answering is replaced; the write thread is never involved.
 import { Worker } from "node:worker_threads";
 import { decodeError, type RemoteError } from "../sqlite-protocol.ts";
-import { READ_ERRORS, type ReadMessage, type ReadOp, type WorkerInit } from "./protocol.ts";
+import { READ_ERRORS, type ReadMessage, type ReadOp, type WorkerControlMessage, type WorkerInit } from "./protocol.ts";
 
 export class ReadBusy extends Error { override name = "ReadBusy"; }
 export class ReadUnavailable extends Error { override name = "ReadUnavailable"; }
@@ -20,6 +20,8 @@ export type ReadChannelOptions = {
   stuckMs?: number;
   /** An idle worker stops after this long. */
   idleMs?: number;
+  /** Cached read-only SQLite connections inside the worker close after this long without use (0 disables caching). */
+  connectionIdleMs?: number;
 };
 
 type Reply = { request: number; ok: true; value: unknown } | { request: number; ok: false; error: RemoteError };
@@ -38,12 +40,15 @@ export class ReadChannel {
   #worker?: Worker;
   #flags?: Int32Array;
   readonly #pending = new Map<number, Pending>();
+  readonly #controls = new Map<number, PromiseWithResolvers<void>>();
+  /** Workers currently terminating in the background; `release()` and `close()` wait for them to actually exit. */
+  readonly #stopping = new Set<Promise<void>>();
   #next = 0;
   #idle?: ReturnType<typeof setTimeout>;
   #closed = false;
 
   constructor(options: ReadChannelOptions) {
-    this.#options = { slots: 4, deadlineMs: 20_000, stuckMs: 30_000, idleMs: 120_000, ...options };
+    this.#options = { slots: 4, deadlineMs: 20_000, stuckMs: 30_000, idleMs: 120_000, connectionIdleMs: 5_000, ...options };
   }
 
   /** The longest a caller waits for an answer (the route's HTTP limit builds on it). */
@@ -82,6 +87,36 @@ export class ReadChannel {
     return result.promise;
   }
 
+  /**
+   * Close all cached read-only database handles inside the worker without stopping the worker thread.
+   * Resolves only after the active worker confirms every handle is closed AND any previously stopped worker has
+   * finished terminating; rejects with `ReadExpired` on timeout so callers never assume handles are free early.
+   */
+  async release(timeoutMs = this.#options.deadlineMs): Promise<void> {
+    if (this.#closed) throw new ReadUnavailable("读取通道已关闭");
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    const worker = this.#worker;
+    if (worker) {
+      const request = ++this.#next;
+      const done = Promise.withResolvers<void>();
+      this.#controls.set(request, done);
+      worker.postMessage({ request, release: true } satisfies WorkerControlMessage);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          done.promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new ReadExpired("释放只读连接超时，请稍后重试")), Math.max(1, deadline - Date.now()));
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+        this.#controls.delete(request);
+      }
+    }
+    await this.#awaitStopping(Math.max(1, deadline - Date.now()));
+  }
+
   /** Stops new work, cancels what is in flight at its next statement, waits for that (bounded), then stops the worker. */
   async close(): Promise<void> {
     this.#closed = true;
@@ -92,7 +127,20 @@ export class ReadChannel {
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([released, new Promise(resolve => { timer = setTimeout(resolve, this.#options.stuckMs); })]);
     clearTimeout(timer);
+    // Ask the worker to close cached read-only SQLite handles cleanly before terminate().
+    const worker = this.#worker;
+    if (worker) {
+      const request = ++this.#next;
+      const done = Promise.withResolvers<void>();
+      this.#controls.set(request, done);
+      try { worker.postMessage({ request, release: true } satisfies WorkerControlMessage); } catch { done.resolve(); }
+      let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([done.promise.catch(() => {}), new Promise<void>(resolve => { releaseTimer = setTimeout(resolve, 500); })]);
+      clearTimeout(releaseTimer);
+      this.#controls.delete(request);
+    }
     this.#stop(new ReadUnavailable("读取通道已关闭"));
+    await this.#awaitStopping();
   }
 
   #start(): Worker {
@@ -100,8 +148,14 @@ export class ReadChannel {
     const cancel = new SharedArrayBuffer(4 * this.#options.slots);
     this.#flags = new Int32Array(cancel);
     const worker = new Worker(new URL("./worker.ts", import.meta.url),
-      { workerData: { conversations: this.#options.conversations, state: this.#options.state, cancel } satisfies WorkerInit });
+      { workerData: { conversations: this.#options.conversations, state: this.#options.state, cancel, connectionIdleMs: this.#options.connectionIdleMs } satisfies WorkerInit });
     worker.on("message", (reply: Reply) => {
+      const control = this.#controls.get(reply.request);
+      if (control && this.#worker === worker) {
+        this.#controls.delete(reply.request);
+        if (reply.ok) control.resolve(); else control.reject(decodeError(reply.error));
+        return;
+      }
       const entry = this.#pending.get(reply.request);
       if (!entry || this.#worker !== worker) return;
       this.#pending.delete(reply.request);
@@ -116,14 +170,37 @@ export class ReadChannel {
     return this.#worker = worker;
   }
 
+  /** Wait for every terminating worker thread to actually exit (optionally bounded by `timeoutMs`). */
+  async #awaitStopping(timeoutMs?: number): Promise<void> {
+    if (!this.#stopping.size) return;
+    const drain = (async () => {
+      while (this.#stopping.size) await Promise.all([...this.#stopping]);
+    })();
+    if (timeoutMs === undefined) { await drain; return; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        drain,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new ReadExpired("等待旧读取线程退出超时，请稍后重试")), Math.max(1, timeoutMs));
+        }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+
   /** Answers everything in flight with `error` and lets the worker go (terminate itself waits for a running statement). */
   #stop(error = new ReadUnavailable("读取线程空闲退出")): void {
     const worker = this.#worker;
     this.#worker = undefined; this.#flags = undefined;
     clearTimeout(this.#idle);
+    for (const control of this.#controls.values()) control.reject(error);
+    this.#controls.clear();
     for (const entry of this.#pending.values()) { clearTimeout(entry.timer); entry.answer({ error }); entry.released.resolve(); }
     this.#pending.clear();
-    void worker?.terminate();
+    if (!worker) return;
+    const exiting = worker.terminate().then(() => {}, () => {});
+    this.#stopping.add(exiting);
+    void exiting.finally(() => this.#stopping.delete(exiting));
   }
 }
 

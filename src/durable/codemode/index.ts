@@ -5,7 +5,7 @@
 // door and run as their own tool tasks with their own replay policy. Scripts call the direct tools the conversation is
 // offered and the script-only tools of the extensions it selects; never model-only tools (send_*) or codemode itself.
 // `models.*` stays off. The `codemode` prompt section lists the callable tools (deferred ones, MCP, are found with
-// `searchTools()`); namespaces come from the member tools (src/durable/tools.ts `MemberTool.namespace`).
+// `searchTools()`); namespaces come from each extension's `namespace` (pi-durable 1.6.0).
 //
 // What this adapter adds around each call:
 // - Identity: the calling member is resolved first; a conversation without a member of this group runs nothing.
@@ -33,19 +33,21 @@ import { copyJson, type JsonValue } from "@earendil-works/chord/json";
 import type { Usage } from "@earendil-works/pi-ai";
 import { CodemodeSandbox, type CodemodeResult, type CodemodeRun, type CodemodeRunOptions, type CodemodeSandboxBase } from "@earendil-works/pi-codemode";
 import {
-  defineExtension, type Extension, type JsonObject, LiveDoc, type LiveState, NestedCallDoc, type NestedCallState, type NestedToolExecutionResult,
-  type TaskDocToken, type TaskId, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration, type Tx,
+  defineExtension, type Extension, type JsonObject, LiveDoc, type LiveState, NestedCallDoc, type NestedCallState,
+  type NestedToolCall, type NestedToolExecutionResult, type TaskDocToken, type TaskId, type ToolExecutionApi,
+  type ToolExecutionResult, type ToolPark, type ToolRegistration, type Tx,
 } from "@earendil-works/pi-durable";
 import {
-  type CodemodeNamespace, type CodemodeNestedCall, CodemodeStoreDoc, type CodemodeToolDetails,
+  type CodemodeNestedCall, CodemodeStoreDoc, type CodemodeToolDetails,
   createCodemodeExtension, createCodemodeTool,
 } from "@earendil-works/pi-durable/codemode";
 import { err, type ExecutionEnv, FileError, ok } from "@earendil-works/pi-durable/env";
 import { resultRegistration } from "../results/ownership.ts";
 import { ResultFiles, resultsDirName } from "../results/files.ts";
-import { type BaseToolsOptions, type MemberTool, resolveMember } from "../tools.ts";
+import { type BaseToolsOptions, resolveMember } from "../tools.ts";
+import { sumUsage } from "../usage.ts";
 import { isScriptResult, RUN_DOC_KIND, type RunState, type ScriptResult } from "./protocol.ts";
-import { codemodeWorkers } from "./workers.ts";
+import { codemodeWorkers, type CodemodeWorkers, type WorkerReservation } from "./workers.ts";
 
 import { checkStoreLimits } from "./store.ts";
 export { CodemodeStoreDoc };
@@ -69,34 +71,28 @@ export type CodemodeDetails = Omit<CodemodeToolDetails, "calls"> & {
 export interface CodemodeOptions {
   /** Identity and places, as for the base tools. */
   readonly members: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">;
-  /** The registry's tools: their namespaces group them in the `codemode` section and for `searchTools()`. */
-  readonly tools: readonly MemberTool[];
   /** Estimated tokens of the tool declarations in the `codemode` section; default CODEMODE_INLINE_BUDGET. */
   readonly inlineBudget?: number;
-  /** Runs the scripts; default a `CodemodeSandbox` (a worker and VM per run) with CODEMODE_MEMORY_LIMIT_BYTES. */
+  /** Runs the scripts; default a per-run `CodemodeSandbox` gated by `workers` (FIFO queue) with CODEMODE_MEMORY_LIMIT_BYTES. */
   readonly sandbox?: CodemodeSandboxBase;
-}
-
-/** One namespace per namespaced tool, by its exact name: the tools say which of them belong together. */
-function namespacesOf(tools: readonly MemberTool[]): CodemodeNamespace[] {
-  return tools.flatMap(({ registration, namespace }) => namespace === undefined ? [] : [{ ...namespace, prefix: registration.name }]);
+  /** Worker pool for default sandboxes (ignored when `sandbox` is provided); default process-wide `codemodeWorkers`. */
+  readonly workers?: CodemodeWorkers;
 }
 
 /** `mixin.codemode`: the official codemode tool, run for the calling member, and the `codemode` prompt section. */
 export function codemodeExtension(options: CodemodeOptions): Extension {
-  const sandbox = options.sandbox ?? new CodemodeSandbox({ memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
-    acquireWorker: codemodeWorkers.acquireWorker, onWorkerStarted: codemodeWorkers.onWorkerStarted });
+  // Metadata/section template only when no custom sandbox is injected; each real run gets its own reserved sandbox.
+  const template = options.sandbox ?? new CodemodeSandbox({ memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES });
   const official = {
-    namespaces: namespacesOf(options.tools),
     inlineBudget: options.inlineBudget ?? CODEMODE_INLINE_BUDGET,
     models: false,
   };
-  const extension = createCodemodeExtension({ ...official, sandbox });
-  const declared = createCodemodeTool({ ...official, sandbox });
+  const extension = createCodemodeExtension({ ...official, sandbox: template });
+  const declared = createCodemodeTool({ ...official, sandbox: template });
   const tool: ToolRegistration = {
     ...declared,
     execute: (args, api, context) => runCodemode(options, (attempt) => createCodemodeTool({ ...official, sandbox: attempt }),
-      sandbox, args as { code: string }, api, context),
+      args as { code: string }, api, context),
   };
   return defineExtension({ name: "mixin.codemode", tools: [tool],
     ...(extension.sections ? { sections: extension.sections } : {}) });
@@ -107,7 +103,7 @@ function message(error: unknown): string {
 }
 
 async function runCodemode(options: CodemodeOptions, build: (sandbox: CodemodeSandboxBase) => ToolRegistration,
-  sandbox: CodemodeSandboxBase, args: { code: string }, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult> {
+  args: { code: string }, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult | ToolPark> {
   let member;
   try {
     member = await resolveMember(options.members, { api, context });
@@ -116,6 +112,23 @@ async function runCodemode(options: CodemodeOptions, build: (sandbox: CodemodeSa
     if (context.abortSignal?.aborted) throw error;
     return { output: [{ type: "text", text: message(error) }], isError: true };
   }
+  let reservation: WorkerReservation | undefined;
+  let ownedSandbox: CodemodeSandbox | undefined;
+  if (options.sandbox === undefined) {
+    const workers = options.workers ?? codemodeWorkers;
+    try {
+      reservation = await workers.reserve(context.abortSignal);
+    } catch (error) {
+      if (context.abortSignal?.aborted) throw error;
+      return { output: [{ type: "text", text: message(error) }], isError: true };
+    }
+    ownedSandbox = new CodemodeSandbox({
+      memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
+      acquireWorker: reservation.acquireWorker,
+      onWorkerStarted: reservation.onWorkerStarted,
+    });
+  }
+  const sandbox = options.sandbox ?? ownedSandbox!;
   const name = resultsDirName(api.taskId as number, api.callId);
   const files = new ResultFiles(member.places.tempDir, name, resultRegistration(api, context, member.phone, name));
   const attempt = new Attempt(api, context, files);
@@ -125,37 +138,16 @@ async function runCodemode(options: CodemodeOptions, build: (sandbox: CodemodeSa
     return attempt.finish(result);
   } finally {
     attempt.end();
+    await ownedSandbox?.close().catch(() => {});
+    reservation?.release();
     await files.release();
   }
-}
-
-export function combineUsage(first: Usage, second: Usage): Usage {
-  return {
-    input: first.input + second.input,
-    output: first.output + second.output,
-    cacheRead: first.cacheRead + second.cacheRead,
-    cacheWrite: first.cacheWrite + second.cacheWrite,
-    ...(first.cacheWrite1h !== undefined || second.cacheWrite1h !== undefined
-      ? { cacheWrite1h: (first.cacheWrite1h ?? 0) + (second.cacheWrite1h ?? 0) } : {}),
-    ...(first.reasoning !== undefined || second.reasoning !== undefined
-      ? { reasoning: (first.reasoning ?? 0) + (second.reasoning ?? 0) } : {}),
-    totalTokens: first.totalTokens + second.totalTokens,
-    cost: {
-      input: first.cost.input + second.cost.input,
-      output: first.cost.output + second.cost.output,
-      cacheRead: first.cost.cacheRead + second.cost.cacheRead,
-      cacheWrite: first.cost.cacheWrite + second.cost.cacheWrite,
-      total: first.cost.total + second.cost.total,
-    },
-  };
 }
 
 function totalUsage(...sources: ReadonlyMap<string, Usage>[]): Usage | undefined {
   const byKey = new Map<string, Usage>();
   for (const source of sources) for (const [key, usage] of source) if (!byKey.has(key)) byKey.set(key, usage);
-  let total: Usage | undefined;
-  for (const usage of byKey.values()) total = total === undefined ? usage : combineUsage(total, usage);
-  return total;
+  return sumUsage(byKey.values());
 }
 
 /**
@@ -214,11 +206,19 @@ class Attempt {
   #ended = false;
 
   constructor(private readonly base: ToolExecutionApi, private readonly context: Context, private readonly files: ResultFiles) {
+    const executeTool: ToolExecutionApi["executeTool"] = ((
+      name: string,
+      args: JsonObject,
+      callContext: Context,
+      options?: { readonly key?: string; readonly progress?: boolean; readonly wait?: boolean },
+    ) => options?.wait === false
+      ? this.#executeTool(name, args, callContext, { ...options, wait: false })
+      : this.#executeTool(name, args, callContext, options as { readonly key?: string; readonly progress?: boolean; readonly wait?: true })) as ToolExecutionApi["executeTool"];
     this.api = {
       ...base,
       env: this.#env(),
       commit: <T>(change: (tx: Tx) => T | Promise<T>, commitContext: Context) => this.#commit(change, commitContext),
-      executeTool: (name, args, callContext, options) => this.#executeTool(name, args, callContext, options),
+      executeTool,
     };
   }
 
@@ -240,7 +240,8 @@ class Attempt {
    * The result the official tool returned, with the details as stored when this attempt stored the outcome (an outcome
    * the official tool decided returns without them, or without the usage), else with this attempt's nested usage.
    */
-  finish(result: ToolExecutionResult): ToolExecutionResult {
+  finish(result: ToolExecutionResult | ToolPark): ToolExecutionResult | ToolPark {
+    if (result.sleep !== undefined || result.wait !== undefined) return result;
     const own = result.details as CodemodeDetails | undefined;
     const details = own ?? this.#decided;
     if (details === undefined || !Array.isArray(details.calls)) return result;
@@ -397,22 +398,47 @@ class Attempt {
     return names;
   }
 
-  async #executeTool(name: string, args: JsonObject, context: Context, options?: { readonly key?: string; readonly progress?: boolean }): Promise<NestedToolExecutionResult> {
+  #executeTool(name: string, args: JsonObject, context: Context, options?: {
+    readonly key?: string; readonly progress?: boolean; readonly wait?: true;
+  }): Promise<NestedToolExecutionResult>;
+  #executeTool(name: string, args: JsonObject, context: Context, options: {
+    readonly key?: string; readonly progress?: boolean; readonly wait: false;
+  }): Promise<NestedToolCall>;
+  async #executeTool(name: string, args: JsonObject, context: Context, options?: {
+    readonly key?: string; readonly progress?: boolean; readonly wait?: boolean;
+  }): Promise<NestedToolExecutionResult | NestedToolCall> {
     const key = options?.key ?? "";
     const id = /^c\d+$/.test(key) ? Number(key.slice(1)) : this.#rows.size + 1;
     const row: Pick<CodemodeNestedCall, "id" | "name" | "status"> = { id, name, status: "running" };
     this.#rows.set(key, row);
     this.#publish();
-    try {
-      const result = await this.base.executeTool(name, args, context, options);
+    const record = (result: NestedToolExecutionResult): NestedToolExecutionResult => {
       if (result.usage !== undefined) this.#usage.set(key, result.usage);
       row.status = result.isError ? "error" : "ok";
-      return result;
-    } catch (error) {
-      row.status = "cancelled";
-      throw error;
-    } finally {
       this.#publish();
+      return result;
+    };
+    const cancelled = (error: unknown): never => {
+      row.status = "cancelled";
+      this.#publish();
+      throw error;
+    };
+    if (options?.wait === false) {
+      let call: NestedToolCall;
+      try {
+        call = await this.base.executeTool(name, args, context, { ...options, wait: false });
+      } catch (error) {
+        return cancelled(error);
+      }
+      return {
+        taskId: call.taskId,
+        result: (waitContext) => call.result(waitContext).then(record, cancelled),
+      };
+    }
+    try {
+      return record(await this.base.executeTool(name, args, context, options as { readonly key?: string; readonly progress?: boolean; readonly wait?: true }));
+    } catch (error) {
+      return cancelled(error);
     }
   }
 

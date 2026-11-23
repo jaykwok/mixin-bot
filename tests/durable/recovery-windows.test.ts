@@ -21,7 +21,7 @@ const fixture = await tempFixture("durable-recovery-windows-");
 afterAll(() => fixture.cleanup());
 const spec = (path: string) => JSON.stringify(import.meta.resolve(path));
 const group = "100", phone = "13800000001";
-const limits = { runTimeoutMs: 600_000, modelIdleMs: 600_000, modelResponseMs: 600_000, tickMs: 20 };
+const limits = { runTimeoutMs: 600_000, modelIdleMs: 600_000, modelResponseMs: 600_000 };
 
 /**
  * Kill points: before-partial (the model call is open), retry (a retry is scheduled), usage (the bill is recorded, the

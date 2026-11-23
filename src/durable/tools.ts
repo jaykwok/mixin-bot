@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 import { type Context } from "@earendil-works/chord/context";
 import { copyJson, type JsonValue } from "@earendil-works/chord/json";
 import { defineExtension, type Extension, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
-import type { CodemodeNamespace } from "@earendil-works/pi-durable/codemode";
 import type { Static } from "@earendil-works/pi-schema";
 import { documentTools } from "../agent/document-extract.ts";
 import { nativeBaseTools } from "./base-tools.ts";
@@ -70,9 +69,6 @@ export interface MemberCall {
 /** The calling member, resolved from the conversation's identity. */
 export interface Member { phone: string; places: MemberPlaces; conversationId: MemberCall["api"]["conversationId"] }
 
-/** Groups tools in the `codemode` section and for `searchTools()` (./codemode/index.ts); the tool's name is the prefix. */
-export type ToolNamespace = Omit<CodemodeNamespace, "prefix">;
-
 /**
  * What a member tool returns: Durable's result, with `structuredOutput` and `details` any JSON data (copied, undefined
  * properties dropped). `structuredOutput` is kept only for a tool that declares `structuredOutputSchema`.
@@ -88,15 +84,8 @@ export type MemberToolResult = Omit<ToolExecutionResult, "structuredOutput" | "d
  * and failures, which become an error result.
  */
 export type MemberToolSpec<P extends object = object> = Omit<ToolRegistration<P>, "execute" | "replay" | "outputLimits"> & {
-  readonly namespace?: ToolNamespace;
   run(args: Static<P>, member: Member, call: MemberCall): Promise<MemberToolResult>;
 };
-
-/** A tool as the registry installs it, with the namespace the `codemode` section groups it by. */
-export interface MemberTool {
-  readonly registration: ToolRegistration;
-  readonly namespace?: ToolNamespace;
-}
 
 function json(value: unknown): JsonValue | undefined {
   return value === undefined ? undefined : copyJson(value as JsonValue, { omitUndefinedProperties: true }) as JsonValue;
@@ -151,11 +140,11 @@ async function sequentialTurn(key: string, signal: AbortSignal | undefined): Pro
  * resolves the member's places, then runs the tool for that member under the command log's label. `structuredOutput`
  * is what scripts get from a tool with `structuredOutputSchema` (a schema-less tool's scripts get its output).
  */
-export function memberTool<P extends object>(spec: MemberToolSpec<P>, options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">): MemberTool {
-  const { namespace, run, ...fields } = spec;
+export function memberTool<P extends object>(spec: MemberToolSpec<P>, options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">): ToolRegistration {
+  const { run, ...fields } = spec;
   const schema = spec.structuredOutputSchema;
   const sequential = spec.executionMode === "sequential";
-  const registration: ToolRegistration = {
+  return {
     ...fields as Omit<ToolRegistration, "execute">,
     ...POLICY[spec.name] ?? OTHER_POLICY,
     async execute(args, api, context) {
@@ -188,33 +177,33 @@ export function memberTool<P extends object>(spec: MemberToolSpec<P>, options: P
       } finally { release?.(); }
     },
   };
-  return { registration, ...(namespace === undefined ? {} : { namespace }) };
 }
 
 /** document_environment and document_extract (`mixin.base`). */
-export function documentMemberTools(options: BaseToolsOptions): MemberTool[] {
+export function documentMemberTools(options: BaseToolsOptions): ToolRegistration[] {
   return documentTools().map((spec) => memberTool(spec, options));
 }
 
 /** The four tools for the space's members, in catalogue order. */
-export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
-  return nativeBaseTools().map(official => {
-    const registration: ToolRegistration = { ...official, ...POLICY[official.name]!, async execute(args, api, context) {
+export function baseMemberTools(options: BaseToolsOptions): ToolRegistration[] {
+  return nativeBaseTools().map(official => ({
+    ...official,
+    ...POLICY[official.name]!,
+    async execute(args, api, context) {
       const { phone, places } = await resolveMember(options, { api, context });
       const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, scope: options.scope,
         resourceReadDirs: options.resourceReadDirs, inputPaths: (args as { input_paths?: string[] }).input_paths });
       const label = memberTaskText(options.scope, phone);
       const scope = { tool: official.name, toolTask: api.taskId as number, describe: async () => label };
       return commandScope.run(scope, () => official.execute(args, { ...api, env }, context));
-    } };
-    return { registration };
-  });
+    },
+  }));
 }
 
 /**
  * `mixin.base`: the four official tools, then `extra` (the space registry adds document_environment and
  * document_extract, src/durable/registry.ts).
  */
-export function baseExtension(options: BaseToolsOptions, extra: readonly MemberTool[] = []): Extension {
-  return defineExtension({ name: "mixin.base", tools: [...baseMemberTools(options), ...extra].map((tool) => tool.registration) });
+export function baseExtension(options: BaseToolsOptions, extra: readonly ToolRegistration[] = []): Extension {
+  return defineExtension({ name: "mixin.base", tools: [...baseMemberTools(options), ...extra] });
 }

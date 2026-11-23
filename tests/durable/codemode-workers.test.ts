@@ -15,6 +15,77 @@ test("synchronous shared reservations survive cancellation until exit; release i
   first(); exit.resolve(); await pending; expect(workers.reserved).toBe(0);
 });
 
+test("reserve() queues callers in strict FIFO order, supports abort/timeout/queue bounds, and releases unclaimed reservations", async () => {
+  const workers = new CodemodeWorkers({ limit: 1, maxWaiters: 2, waitTimeoutMs: 5_000 });
+  const first = await workers.reserve();
+  expect(workers.reserved).toBe(1); expect(workers.queued).toBe(0);
+
+  const order: string[] = [];
+  const abortMe = new AbortController();
+  const second = workers.reserve().then(reservation => { order.push("second"); return reservation; });
+  const aborted = workers.reserve(abortMe.signal);
+  expect(workers.queued).toBe(2);
+  await expect(workers.reserve()).rejects.toThrow("等待队列已满");
+
+  abortMe.abort(new Error("caller gone"));
+  await expect(aborted).rejects.toThrow("caller gone");
+  expect(workers.queued).toBe(1);
+
+  const third = workers.reserve().then(reservation => { order.push("third"); return reservation; });
+  const timedOut = new CodemodeWorkers({ limit: 1, waitTimeoutMs: 40 });
+  const hold = await timedOut.reserve();
+  await expect(timedOut.reserve()).rejects.toThrow("超时");
+  hold.release(); expect(timedOut.reserved).toBe(0);
+
+  // Unclaimed reservation releases on release() and wakes the next FIFO waiter.
+  first.release();
+  const gotSecond = await second;
+  expect(order).toEqual(["second"]);
+  // Claimed reservation stays held across release() until the worker callback runs.
+  const releaseSecondWorker = gotSecond.acquireWorker();
+  gotSecond.release();
+  expect(workers.reserved).toBe(1);
+  expect(workers.queued).toBe(1);
+  releaseSecondWorker();
+  const gotThird = await third;
+  expect(order).toEqual(["second", "third"]);
+  // stop() rejects any newly queued waiters immediately.
+  const waitingAtStop = workers.reserve();
+  workers.stop();
+  await expect(waitingAtStop).rejects.toThrow("关闭");
+  gotThird.release();
+  expect(workers.reserved).toBe(0);
+});
+
+test("queued real CodemodeSandbox runs wait in FIFO order and execute once the active worker exits", async () => {
+  const workers = new CodemodeWorkers({ limit: 1, waitTimeoutMs: 10_000 });
+  const firstReservation = await workers.reserve();
+  const firstSandbox = new CodemodeSandbox({ acquireWorker: firstReservation.acquireWorker, onWorkerStarted: firstReservation.onWorkerStarted });
+  const called = Promise.withResolvers<void>();
+  const firstRun = firstSandbox.start("await tools.wait({}); return 1;", {
+    startedAt: Date.now(), seed: 1, tools: [{ name: "wait" }], onCall: () => called.resolve(),
+  });
+  await called.promise;
+
+  // Second caller queues instead of failing immediately.
+  const secondReserved = workers.reserve();
+  expect(workers.queued).toBe(1);
+  firstRun.deliver(1, Date.now(), 1, { ok: true, value: null });
+  expect(await firstRun.result).toMatchObject({ ok: true, value: 1 });
+  const secondReservation = await secondReserved;
+  const secondSandbox = new CodemodeSandbox({ acquireWorker: secondReservation.acquireWorker, onWorkerStarted: secondReservation.onWorkerStarted });
+  try {
+    const secondRun = secondSandbox.start("return 2;", { startedAt: Date.now(), seed: 2, onCall: () => {} });
+    expect(await secondRun.result).toMatchObject({ ok: true, value: 2 });
+  } finally {
+    await Promise.all([firstSandbox.close(), secondSandbox.close()]);
+    firstReservation.release();
+    secondReservation.release();
+    await workers.drain();
+    expect(workers.reserved).toBe(0);
+  }
+}, 20000);
+
 test("two independent group sandboxes share official admission and release on real exit, including worker construction failure", async () => {
   const workers = new CodemodeWorkers(1);
   const options = { acquireWorker: workers.acquireWorker, onWorkerStarted: workers.onWorkerStarted };

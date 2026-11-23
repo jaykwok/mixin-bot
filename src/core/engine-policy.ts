@@ -8,6 +8,8 @@ export interface EnginePolicy {
   compaction: Omit<CompactionPolicy, "backgroundTokens"> & { backgroundTokens?: number; modelOverrides?: Record<string, Budgets> };
   progress: ProgressPolicy;
   contextRetentionMs: number;
+  /** Optional cap on tool rounds per run (Pi 1.6.0 `AgentState.maxTurns`, 1–200). Unset means unlimited. */
+  maxTurns?: number;
 }
 
 const object = (value: unknown, path: string): Record<string, unknown> => {
@@ -31,7 +33,7 @@ function boolean(value: unknown, fallback: boolean, path: string): boolean {
 /** A single Durable policy; no AgentSession/provider retry multiplication at runtime. */
 export function enginePolicy(value: unknown): EnginePolicy {
   const policy = object(value ?? {}, "durable");
-  keys(policy, ["retry", "stream", "compaction", "progress", "contextRetentionMs"], "durable");
+  keys(policy, ["retry", "stream", "compaction", "progress", "contextRetentionMs", "maxTurns"], "durable");
   const retry = object(policy.retry ?? {}, "durable.retry");
   keys(retry, ["enabled", "maxRetries", "baseDelayMs", "maxAgentDelayMs"], "durable.retry");
   const stream = object(policy.stream ?? {}, "durable.stream");
@@ -50,6 +52,11 @@ export function enginePolicy(value: unknown): EnginePolicy {
   keys(progress, ["partialIntervalMs", "outputIntervalMs", "persistWithinMs"], "durable.progress");
   const timeoutMs = integer(stream.timeoutMs, 120000, "durable.stream.timeoutMs", 600000);
   if (timeoutMs === 0) throw new Error("durable.stream.timeoutMs 必须大于 0");
+  let maxTurns: number | undefined;
+  if (policy.maxTurns !== undefined) {
+    maxTurns = integer(policy.maxTurns, 1, "durable.maxTurns", 200);
+    if (maxTurns < 1) throw new Error("durable.maxTurns 必须是 1 到 200 的整数");
+  }
   return {
     retry: { enabled: boolean(retry.enabled, true, "durable.retry.enabled"), maxRetries: integer(retry.maxRetries, 3, "durable.retry.maxRetries", 10),
       baseDelayMs: integer(retry.baseDelayMs, 1000, "durable.retry.baseDelayMs", 60000), maxAgentDelayMs: integer(retry.maxAgentDelayMs, 5000, "durable.retry.maxAgentDelayMs", 60000) },
@@ -65,6 +72,7 @@ export function enginePolicy(value: unknown): EnginePolicy {
       outputIntervalMs: integer(progress.outputIntervalMs, 20, "durable.progress.outputIntervalMs", 10000),
       persistWithinMs: integer(progress.persistWithinMs, 1000, "durable.progress.persistWithinMs", 60000) },
     contextRetentionMs: integer(policy.contextRetentionMs, 600000, "durable.contextRetentionMs", 600000),
+    ...(maxTurns === undefined ? {} : { maxTurns }),
   };
 }
 

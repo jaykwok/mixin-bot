@@ -34,16 +34,19 @@
 // every member's storage identity is checked and delivery parts left `sending` become uncertain; then the controls run
 // again, the workers start and open delivery parts are sent (failed ones when their retry is due).
 import { randomUUID } from "node:crypto";
-import { access, lstat } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
-import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Models, TextContent } from "@earendil-works/pi-ai";
 import {
   AssistantEntry, CompactionEntry, InboxDoc as PiInboxDoc, type Conversation, type ConversationId, createRegistry, defineExtension, type EntryDraft, type Extension,
-  GenerationTask, type Harness, type HarnessOptions, type HarnessSettings, hook, LiveDoc, type LiveState, type Report, type SettledSubmissionRecord, type Submission,
+  GenerationTask, type Harness, type HarnessOptions, type HarnessSettings, hook, LiveDoc, type LiveState, type Observation, type Report, type SettledSubmissionRecord,
+  type Submission, type ToolSlot, type UserInput,
 } from "@earendil-works/pi-durable";
+import { fitImage } from "@earendil-works/pi-durable/images/fit";
+import { imageLimits } from "@earendil-works/pi-durable/tools";
 import { canonicalCommand, HELP_TEXT, unknownCommandText } from "../agent/commands.ts";
 import { clearRunning, markRunning } from "./running-requests.ts";
 import { deleteSnapshots, fallbackSlots, fileDigest, releasableSnapshots } from "../agent/deliverables.ts";
@@ -76,6 +79,7 @@ import { ResultMaintenance } from "./results/maintenance.ts";
 import { requestMemberExpiry } from "./results/ownership.ts";
 import { resultReferences } from "./results/references.ts";
 import { countAsk, syncMemberStats } from "./projection.ts";
+import { nodeImages } from "./base-tools.ts";
 import { spaceExtensions } from "./registry.ts";
 import type { DurableStorageFailure } from "./storage-failure.ts";
 import { memberPlaces } from "./tools.ts";
@@ -83,7 +87,9 @@ import { conversationIds, idleSpaceReferences } from "./conversations.ts";
 import { lateMinutes, type Outbound, replyMessage, replySegments, sendNotice, targetOf } from "./outbound.ts";
 import { sendChannel } from "./send.ts";
 import { ATTACHMENT_LIMITS, AttachmentDownloads, type AttachmentEvent, type AttachmentLimits, type AttachmentSource, arrivedBefore, attachmentLabel,
-  attachmentPrompt, bindAttachments, expireAttachments, type HeldDecision, newAttachmentId, removeAttachmentFiles, type SettledAttachment, settleHeld, unconsumed, voidWhere } from "./attachments.ts";
+  attachmentPrompt, bindAttachments, expireAttachments, type HeldDecision, newAttachmentId,
+  readOwnAttachmentBytes, removeAttachmentFiles, type SettledAttachment, settleHeld, unconsumed, verifyOwnAttachment, voidWhere } from "./attachments.ts";
+import { inspectImageBeforeDecode, MAX_IMAGE_BYTES } from "./image-guard.ts";
 import {
   type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, fileSendOutcome, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
   pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
@@ -95,6 +101,12 @@ const ACKNOWLEDGED = "收到，正在处理。等得久的话可以发 /status �
 /** How long a model request waits for a materials index scan before it goes ahead without it. */
 const MATERIALS_WAIT_MS = 3000;
 const CAPACITY_FULL = "⚠️ 现在处理不过来，这条消息没有收下，也不会自动处理，请过一会儿再发。";
+/** Direct-chat images inlined directly into a user message when the active model supports vision. */
+const MAX_INLINE_IMAGES = 4;
+/** Process-wide cap on concurrent inline image reads + Photon WASM decodes to bound peak memory and CPU. */
+const INLINE_IMAGE_SLOTS = new AsyncSemaphore(2);
+/** Independent per-member startup preparation workers during space open (`#prepare`). */
+const PREPARE_CONCURRENCY = 4;
 
 export interface ServiceLimits {
   /** Ordinary requests from admission through cleanup, including queued messages. */
@@ -104,8 +116,6 @@ export interface ServiceLimits {
   modelResponseMs: number;
   /** Messages waiting behind the running one. */
   queue: number;
-  /** Watchdog tick. */
-  tickMs: number;
   /** A running task is logged this often ("任务仍在运行"). */
   heartbeatMs: number;
   /** Codemode result directories older than this are removed by maintenance (idle members only). */
@@ -133,7 +143,7 @@ export interface DurableServiceOptions {
   mcp?: McpTools;
   /** The document environment (BOT_DOCUMENT_ENV); default the layout's shared one. */
   venvDir?: string;
-  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs" | "deliveryRetryMs" | "deliveryWindowMs" | "slowOpenMs"> & Partial<ServiceLimits>;
+  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs" | "deliveryRetryMs" | "deliveryWindowMs" | "slowOpenMs"> & Partial<ServiceLimits>;
   /** Production supplies validated runtime settings; tiny lifecycle fixtures can omit closeout. */
   closeout?: CloseoutTiming;
   /**
@@ -233,6 +243,8 @@ type MemberState = {
   withdrawals: number;
   /** Automatic and recovered delivery share one send boundary. */
   delivery: AsyncSemaphore;
+  /** Listeners waiting on bound attachments so a control gate wakes `#awaitAttachments` immediately. */
+  attachmentWaiters: Set<() => void>;
   /** Public operations and automatic delivery still using this state. */
   uses: number;
   lastUsed: number;
@@ -309,7 +321,7 @@ export class DurableService {
   constructor(options: DurableServiceOptions) {
     this.#options = options;
     this.#auxiliaryBudget = new AuxiliaryBudget(options.auxiliary?.maxConcurrent ?? 2);
-    this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, tickMs: 1000, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000,
+    this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000,
       memberIdleMs: MEMBER_IDLE_MS, deliveryRetryMs: DELIVERY_RETRY_DELAYS_MS, deliveryWindowMs: DELIVERY_WINDOW_MS, slowOpenMs: 1_000, ...options.limits };
     if (!Number.isSafeInteger(this.#limits.activeRequests) || this.#limits.activeRequests < 1) throw new Error("普通请求总容量必须是正整数");
     this.#outbound = options.outbound;
@@ -844,6 +856,7 @@ export class DurableService {
     const previous = member.gate;
     const gate = previous === undefined ? promise : Promise.all([previous, promise]).then(() => {});
     member.gate = gate;
+    for (const wake of [...member.attachmentWaiters]) wake();
     let released = false;
     return () => {
       if (released) return;
@@ -955,27 +968,111 @@ export class DurableService {
    * process. True when it waited (the caller reads its inbox again); a control arriving meanwhile ends the wait.
    */
   async #awaitAttachments(harness: Harness, member: MemberState, requestId: string): Promise<boolean> {
-    for (let waited = false; ; waited = true) {
-      const records = await memberRecords(harness, member.phone, this.#context);
-      if (!Object.values(records.attachments).some(attachment => attachment.boundTo === requestId && attachment.state === "pending")) return waited;
-      const now = Date.now();
-      let deadline = this.#attachmentWaits.get(requestId);
-      if (deadline === undefined) this.#attachmentWaits.set(requestId, deadline = now + (this.#downloads?.limits ?? ATTACHMENT_LIMITS).waitMs);
-      if (now >= deadline || member.gate !== undefined || this.#closing.signal.aborted) return waited;
-      await Bun.sleep(Math.min(200, deadline - now));
+    let dirty = false;
+    let wakeNow: (() => void) | undefined;
+    const notify = () => {
+      dirty = true;
+      const fn = wakeNow;
+      wakeNow = undefined;
+      fn?.();
+    };
+    const offDownload = this.#downloads?.onChange(member.scope, member.phone, notify);
+    member.attachmentWaiters.add(notify);
+    this.#closing.signal.addEventListener("abort", notify);
+    try {
+      for (let waited = false; ; waited = true) {
+        dirty = false;
+        const records = await memberRecords(harness, member.phone, this.#context);
+        if (!Object.values(records.attachments).some(attachment => attachment.boundTo === requestId && attachment.state === "pending")) return waited;
+        const now = Date.now();
+        let deadline = this.#attachmentWaits.get(requestId);
+        if (deadline === undefined) this.#attachmentWaits.set(requestId, deadline = now + (this.#downloads?.limits ?? ATTACHMENT_LIMITS).waitMs);
+        if (now >= deadline || member.gate !== undefined || this.#closing.signal.aborted) return waited;
+        if (dirty) continue;
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(() => { wakeNow = undefined; resolve(); }, Math.max(0, deadline! - now));
+          timer.unref?.();
+          wakeNow = () => { clearTimeout(timer); resolve(); };
+          if (dirty || member.gate !== undefined || this.#closing.signal.aborted) {
+            clearTimeout(timer);
+            wakeNow = undefined;
+            resolve();
+          }
+        });
+      }
+    } finally {
+      offDownload?.();
+      member.attachmentWaiters.delete(notify);
+      this.#closing.signal.removeEventListener("abort", notify);
     }
   }
 
-  /** The member's text and what the request bound; a ready file that is gone is reported as such. */
-  async #requestContent(records: Readonly<MemberRecords>, item: InboxItem): Promise<string> {
+  /**
+   * The member's text and what the request bound; a ready file that is gone or fails ownership checks is reported as
+   * such. When the active model supports image input, up to `MAX_INLINE_IMAGES` ready images inside the member's own
+   * `received` directory are read once through a verified non-symlink handle, checked against pre-decode pixel limits
+   * under a process-wide concurrency semaphore, and fitted through Pi's `fitImage` into the user message directly,
+   * while keeping their local paths in text for tools (`send_image`, scripts).
+   */
+  async #requestContent(member: MemberState, records: Readonly<MemberRecords>, item: InboxItem): Promise<UserInput> {
     const bound = Object.values(records.attachments).filter(attachment => attachment.boundTo === item.requestId && attachment.state !== "void")
       .sort((a, b) => a.epoch - b.epoch || a.receivedAt - b.receivedAt);
-    const shown = await Promise.all(bound.map(async attachment => {
-      if (attachment.state !== "ready") return attachment;
-      try { await access(attachment.path!); return attachment; }
-      catch { return { ...attachment, state: "failed" as const, error: "文件已被清理" }; }
-    }));
-    return item.content + attachmentPrompt(shown);
+    const layout = this.#options.layout;
+    const model = this.#options.selection.model;
+    const canInlineImages = model.input.includes("image");
+    const limits = canInlineImages ? imageLimits(model) : undefined;
+    const inlinedImages: ImageContent[] = [];
+    const inlinedIds = new Set<string>();
+    const deferredIds = new Set<string>();
+    const unreadableImages = new Map<string, string>();
+    const shown: Attachment[] = [];
+    for (const attachment of bound) {
+      if (attachment.state !== "ready") { shown.push(attachment); continue; }
+      const tryInline = canInlineImages && attachment.kind === "image" && inlinedImages.length < MAX_INLINE_IMAGES;
+      if (!tryInline) {
+        const check = await verifyOwnAttachment(layout, member.scope, member.phone, attachment.path!);
+        if (check === "ok") {
+          shown.push(attachment);
+          if (canInlineImages && attachment.kind === "image") deferredIds.add(attachment.id);
+        } else {
+          shown.push({ ...attachment, state: "failed" as const, error: check === "missing" ? "文件已被清理" : "附件文件不可用" });
+        }
+        continue;
+      }
+      const release = await INLINE_IMAGE_SLOTS.acquire(this.#closing.signal);
+      try {
+        const loaded = await readOwnAttachmentBytes(layout, member.scope, member.phone, attachment.path!, MAX_IMAGE_BYTES);
+        if (loaded.kind === "missing") { shown.push({ ...attachment, state: "failed" as const, error: "文件已被清理" }); continue; }
+        if (loaded.kind === "untrusted") { shown.push({ ...attachment, state: "failed" as const, error: "附件文件不可用" }); continue; }
+        shown.push(attachment);
+        if (loaded.kind === "too_large") { unreadableImages.set(attachment.id, "超过图片安全大小上限"); continue; }
+        // Pre-decode pixel/dimension check prevents high-resolution decompression bombs from reaching Photon WASM.
+        const inspected = inspectImageBeforeDecode(loaded.bytes);
+        if (!inspected.ok) {
+          unreadableImages.set(attachment.id, inspected.reason === "dimension_limit" || inspected.reason === "pixel_limit"
+            ? "超过图片安全像素上限" : "图片格式不受支持或已损坏");
+          continue;
+        }
+        try {
+          const fitted = await fitImage(loaded.bytes, inspected.mimeType, limits!, nodeImages);
+          if (fitted.kind === "fitted") {
+            inlinedImages.push(fitted.image);
+            inlinedIds.add(attachment.id);
+          } else {
+            unreadableImages.set(attachment.id, "图片无法安全解析");
+          }
+        } catch {
+          // Unreadable/corrupt image is omitted from inline content so it never poisons the transcript; its path stays in text.
+          unreadableImages.set(attachment.id, "图片无法安全解析");
+        }
+      } finally {
+        release();
+      }
+    }
+    const text = item.content + attachmentPrompt(shown, { inlined: inlinedIds, deferred: deferredIds, unreadable: unreadableImages });
+    if (inlinedImages.length === 0) return text;
+    const blocks: (TextContent | ImageContent)[] = [{ type: "text", text }, ...inlinedImages];
+    return blocks;
   }
 
   /** Run one inbox item; `submitted` is called once its submission exists (or nothing will be submitted). */
@@ -1031,7 +1128,7 @@ export class DurableService {
     let settled: SettledSubmissionRecord;
     try {
       // Durable admits a known requestId once: after a crash this finds the same submission.
-      const content = await this.#requestContent(records, item);
+      const content = await this.#requestContent(member, records, item);
       const submission = await conversation.submit({ type: "input", content, requestId: item.requestId }, this.#context);
       submitted();
       settled = await this.#watch(harness, conversation, member, submission, item.cancelled === true ? undefined : startedAt);
@@ -1039,50 +1136,137 @@ export class DurableService {
     } finally { member.current = undefined; clearRunning(member.scope, member.phone, taskNumber(item.requestId)); }
   }
 
-  /** Wait for the submission to settle, aborting the run when a limit is reached. */
+  /** Wait for the submission to settle, aborting the run immediately when a deadline or idle limit expires. */
   async #watch(harness: Harness, conversation: Conversation, member: MemberState, submission: Submission,
     startedAt: number | undefined): Promise<SettledSubmissionRecord> {
     const waiting = submission.wait(this.#context);
+    const submissionId = submission.id.toString();
+    const requestId = member.current?.requestId ?? "";
+    const task = taskNumber(requestId);
+    let finished = false;
+    let sawAdvance = false;
+    let latestLive: Readonly<LiveState> | undefined;
     let attempt: { key: string; since: number; progress: string; changed: number } | undefined;
-    let beat = Date.now();
-    const task = taskNumber(member.current?.requestId ?? "");
-    for (;;) {
-      const expired = this.#totalTimeout(member.current?.requestId ?? "", startedAt);
-      if (expired && !member.aborted.has(submission.id.toString())) {
-        this.#markAborted(member, submission.id.toString(), expired, startedAt!);
-        await conversation.abort(this.#context);
+    let totalTimer: ReturnType<typeof setTimeout> | undefined;
+    let responseTimer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let observation: Observation<Readonly<LiveState>> | undefined;
+    let aborting: Promise<void> | undefined;
+
+    const clearModelTimers = () => {
+      if (responseTimer !== undefined) { clearTimeout(responseTimer); responseTimer = undefined; }
+      if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; }
+    };
+    const clearAllTimers = () => {
+      clearModelTimers();
+      if (totalTimer !== undefined) { clearTimeout(totalTimer); totalTimer = undefined; }
+      if (heartbeatTimer !== undefined) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
+    };
+    const triggerAbort = (reason: AbortReason) => {
+      if (finished || startedAt === undefined || member.aborted.has(submissionId)) return;
+      this.#markAborted(member, submissionId, reason, startedAt);
+      clearModelTimers();
+      if (totalTimer !== undefined) { clearTimeout(totalTimer); totalTimer = undefined; }
+      // Defer off observeDoc's synchronous advance callback: observers must never call Session inline.
+      aborting ??= Promise.resolve().then(() => conversation.abort(this.#context)).catch(error => {
+        if (!this.#closing.signal.aborted) this.#report(error);
+      });
+    };
+    const armDeadline = (targetAt: number, assign: (timer: ReturnType<typeof setTimeout>) => void, onExpire: () => void) => {
+      const schedule = () => {
+        const delay = Math.max(0, targetAt - Date.now());
+        const timer = setTimeout(() => {
+          if (finished || member.aborted.has(submissionId)) return;
+          if (Date.now() < targetAt) { schedule(); return; }
+          onExpire();
+        }, delay);
+        timer.unref?.();
+        assign(timer);
+      };
+      schedule();
+    };
+    const reconcile = (live: Readonly<LiveState> | undefined) => {
+      latestLive = live;
+      if (finished || startedAt === undefined || member.aborted.has(submissionId)) {
+        clearModelTimers();
+        return;
       }
-      const tick = Bun.sleep(this.#limits.tickMs).then(() => undefined);
-      const settled = await Promise.race([waiting, tick]);
-      if (settled !== undefined) {
-        // A fast terminal response can win the race after the deadline, before the next watchdog tick.
-        const expired = this.#totalTimeout(member.current?.requestId ?? "", startedAt);
-        if (expired) this.#markAborted(member, submission.id.toString(), expired, startedAt!);
-        return settled;
-      }
-      if (startedAt === undefined || member.aborted.has(submission.id.toString())) continue;
       const now = Date.now();
-      let reason: AbortReason | undefined;
-      const live = await harness.snapshot(LiveDoc, conversation.id, this.#context);
+      const expired = this.#totalTimeout(requestId, startedAt);
+      if (expired) { triggerAbort(expired); return; }
       const model = modelActivity(live);
-      if (now - beat >= this.#limits.heartbeatMs) {
-        beat = now;
-        this.#log(`任务仍在运行 - ${taskText(member, member.current?.requestId ?? "")}, 已用: ${Math.floor((now - startedAt) / 1000)}秒, 阶段: ${livePhase(live)}`);
+      if (model === undefined) {
+        attempt = undefined;
+        clearModelTimers();
+        return;
       }
-      if (model === undefined) attempt = undefined;
-      else {
-        if (attempt?.key !== model.key) attempt = { key: model.key, since: now, progress: model.progress, changed: now };
-        else if (attempt.progress !== model.progress) { attempt.progress = model.progress; attempt.changed = now; }
-        if (now - attempt.since > this.#limits.modelResponseMs) {
-          reason = { kind: "model_response_timeout", error: new RequestStopped(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`, "model_response_timeout") };
-        } else if (now - attempt.changed > this.#limits.modelIdleMs) {
-          reason = { kind: "model_idle", error: new RequestStopped(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`, "model_idle") };
-        }
+      const responseReason = (): AbortReason => ({
+        kind: "model_response_timeout",
+        error: new RequestStopped(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`, "model_response_timeout"),
+      });
+      const idleReason = (): AbortReason => ({
+        kind: "model_idle",
+        error: new RequestStopped(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`, "model_idle"),
+      });
+      if (attempt?.key !== model.key) {
+        attempt = { key: model.key, since: now, progress: model.progress, changed: now };
+      } else if (attempt.progress !== model.progress) {
+        attempt.progress = model.progress;
+        attempt.changed = now;
+      } else {
+        return;
       }
-      if (reason !== undefined) {
-        this.#markAborted(member, submission.id.toString(), reason, startedAt);
-        await conversation.abort(this.#context);
-      }
+      const responseAt = attempt.since + this.#limits.modelResponseMs;
+      if (now >= responseAt) { triggerAbort(responseReason()); return; }
+      const idleAt = attempt.changed + this.#limits.modelIdleMs;
+      if (now >= idleAt) { triggerAbort(idleReason()); return; }
+      clearModelTimers();
+      armDeadline(responseAt, timer => { responseTimer = timer; }, () => triggerAbort(responseReason()));
+      armDeadline(idleAt, timer => { idleTimer = timer; }, () => triggerAbort(idleReason()));
+    };
+
+    if (startedAt !== undefined && !member.aborted.has(submissionId)) {
+      const expired = this.#totalTimeout(requestId, startedAt);
+      if (expired) triggerAbort(expired);
+      else armDeadline(startedAt + this.#limits.runTimeoutMs, timer => { totalTimer = timer; }, () => {
+        const due = this.#totalTimeout(requestId, startedAt);
+        if (due) triggerAbort(due);
+      });
+      heartbeatTimer = setInterval(() => {
+        if (finished || member.aborted.has(submissionId)) return;
+        const now = Date.now();
+        this.#log(`任务仍在运行 - ${taskText(member, requestId)}, 已用: ${Math.floor((now - startedAt) / 1000)}秒, 阶段: ${livePhase(latestLive)}`);
+      }, this.#limits.heartbeatMs);
+      heartbeatTimer.unref?.();
+    }
+
+    const observing = harness.observeDoc(LiveDoc, conversation.id, {
+      advance: (call) => {
+        if (finished || call.kind !== "value") return;
+        sawAdvance = true;
+        reconcile(call.value);
+      },
+      end: () => {},
+    }, this.#context).then((obs) => {
+      if (finished) { obs?.detach(); return; }
+      observation = obs;
+      if (!sawAdvance) reconcile(obs?.value);
+    }).catch((error) => {
+      if (!finished && !this.#closing.signal.aborted) this.#report(error);
+    });
+
+    try {
+      const settled = await waiting;
+      // A fast terminal response can win the race right after the deadline, before the total timer fires.
+      const expired = this.#totalTimeout(requestId, startedAt);
+      if (expired) this.#markAborted(member, submissionId, expired, startedAt!);
+      return settled;
+    } finally {
+      finished = true;
+      clearAllTimers();
+      observation?.detach();
+      await Promise.allSettled([observing, aborting]);
     }
   }
 
@@ -1230,6 +1414,9 @@ export class DurableService {
       const page = await conversation.entries({}, 20, undefined, this.#context);
       const last = page.items.find((entry) => AssistantEntry.is(entry))?.model?.[0] as AssistantMessage | undefined;
       if (last?.errorMessage) return modelRequestError(last.errorMessage, [last], this.#options.selection.model.contextWindow);
+    }
+    if (reason === "turn_limit") {
+      return new RequestStopped(detail === undefined ? "达到单次运行最大工具轮次上限" : `达到单次运行最大工具轮次上限（${detail}）`, "turn_limit");
     }
     // Any other reason says what ended the run (`interrupted`: the host stopped while the model answered, more often than
     // the retries; `restart_limit`: the run was cut off restartLimit times; `no_model`, `faulted`, `orphaned`, …).
@@ -1486,7 +1673,11 @@ export class DurableService {
         const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
         if (member.gate !== undefined) phase = "正在执行 /stop 或 /clear";
         else if (member.workerRetry !== undefined) phase = "等待自动重试";
-        else if (live?.run !== undefined) phase = live.tools?.some((slot) => slot.status === "running") ? "执行工具中" : "执行中";
+        else if (live?.run !== undefined) {
+          phase = live.tools?.some((slot) => slot.status === "running") ? "执行工具中"
+            : live.tools?.some((slot) => slot.status === "sleeping" || slot.status === "waiting") ? "等待工具中"
+              : "执行中";
+        }
         else if (items.length) phase = "准备中";
         waiting = Math.max(0, items.length - (member.current === undefined ? 0 : 1));
         const running = runningTools(live);
@@ -1719,31 +1910,41 @@ export class DurableService {
     const deliveries: { member: MemberState; requestId: string }[] = [];
     const downloads: { phone: string; id: string }[] = [];
     const members = await timed("members", () => this.#memberList(harness));
-    if (members.length) await timed("identity", () => ensureStorageIdentities(this.#options.layout, scope, members.map(member => member.phone), this.#options.stateDb));
-    for (const { phone, conversationId } of members) {
-      await timed("office", () => recoverOfficeProfiles(userTmp(this.#options.layout, scope, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error)));
-      const member = this.#member(scope, phone);
-      member.conversationId = conversationId;
-      // Usage committed since the last sync (a background compaction, a run before a crash) counts from here.
-      await timed("stats", () => this.#syncStats(harness, member));
-      const items = await timed("inbox", () => inboxItems(harness, conversationId, context));
-      for (const item of items) this.#addRequest(item.requestId, member.key);
-      const head = items[0];
-      if (head?.startedAt !== undefined && head.cancelled !== true) {
-        member.current = { requestId: head.requestId, startedAt: head.startedAt };
-        markRunning(member.scope, member.phone, taskNumber(head.requestId));
-      }
-      if (head !== undefined) kicks.push(member);
-      const records = await timed("records", async () => {
-        // Parts an ended process left `sending` may have reached the platform: uncertain, counted as sent.
-        const records = await memberRecords(harness, phone, context);
-        if (Object.values(records.requests).some(record => record.delivery?.parts.some(part => part.state === "sending") || record.files.some(file => file.state === "sending"))) {
-          await harness.commit(async tx => { settleInterrupted(await recordsOf(tx, phone)); }, context);
+    if (members.length) {
+      await timed("identity", () => ensureStorageIdentities(this.#options.layout, scope, members.map(member => member.phone), this.#options.stateDb));
+      // Pre-seed timing keys in fixed display order before bounded concurrent member preparation.
+      for (const part of ["office", "stats", "inbox", "records"] as const) parts.set(part, 0);
+      let cursor = 0;
+      const workerCount = Math.min(PREPARE_CONCURRENCY, members.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (cursor < members.length) {
+          const { phone, conversationId } = members[cursor++]!;
+          await timed("office", () => recoverOfficeProfiles(userTmp(this.#options.layout, scope, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error)));
+          const member = this.#member(scope, phone);
+          member.conversationId = conversationId;
+          // Usage committed since the last sync (a background compaction, a run before a crash) counts from here.
+          await timed("stats", () => this.#syncStats(harness, member));
+          const items = await timed("inbox", () => inboxItems(harness, conversationId, context));
+          for (const item of items) this.#addRequest(item.requestId, member.key);
+          const head = items[0];
+          if (head?.startedAt !== undefined && head.cancelled !== true) {
+            member.current = { requestId: head.requestId, startedAt: head.startedAt };
+            markRunning(member.scope, member.phone, taskNumber(head.requestId));
+          }
+          if (head !== undefined) kicks.push(member);
+          const records = await timed("records", async () => {
+            // Parts an ended process left `sending` may have reached the platform: uncertain, counted as sent.
+            let records = await memberRecords(harness, phone, context);
+            if (Object.values(records.requests).some(record => record.delivery?.parts.some(part => part.state === "sending") || record.files.some(file => file.state === "sending"))) {
+              await harness.commit(async tx => { settleInterrupted(await recordsOf(tx, phone)); }, context);
+              records = await memberRecords(harness, phone, context);
+            }
+            for (const record of pendingDeliveries(records)) deliveries.push({ member, requestId: record.requestId });
+            return records;
+          });
+          for (const attachment of Object.values(records.attachments)) if (attachment.state === "pending") downloads.push({ phone, id: attachment.id });
         }
-        for (const record of pendingDeliveries(await memberRecords(harness, phone, context))) deliveries.push({ member, requestId: record.requestId });
-        return records;
-      });
-      for (const attachment of Object.values(records.attachments)) if (attachment.state === "pending") downloads.push({ phone, id: attachment.id });
+      }));
     }
     runtime.prepared = { members: members.length, parts };
     // Every restored head's original deadline is visible to the door before any task is scheduled.
@@ -1837,7 +2038,12 @@ export class DurableService {
     const extensions = optional?.size
       ? this.#options.memberExtensions!.selected(member.scope, member.phone).flatMap(name => optional.get(name) ?? []) : undefined;
     const { conversation } = await memberConversation(harness, member.scope, member.phone,
-      { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel, ...(extensions ? { extensions } : {}) }, this.#context);
+      {
+        model: this.#options.selection.ref,
+        thinkingLevel: this.#options.selection.thinkingLevel,
+        ...(this.#options.selection.maxTurns === undefined ? {} : { maxTurns: this.#options.selection.maxTurns }),
+        ...(extensions ? { extensions } : {}),
+      }, this.#context);
     member.conversationId = conversation.id;
     await this.#runtimes.get(scopeKey(member.scope))?.door.bind(conversation.id, this.#context);
     return conversation;
@@ -1866,7 +2072,7 @@ export class DurableService {
     let member = this.#members.get(key);
     if (member === undefined) {
       member = { key, scope, phone, again: false, deciding: new Set(), controls: Promise.resolve(), workProgress: 0, aborted: new Map(), withdrawals: 0,
-        admission: new AsyncSemaphore(1), delivery: new AsyncSemaphore(1), uses: 0, lastUsed };
+        admission: new AsyncSemaphore(1), delivery: new AsyncSemaphore(1), attachmentWaiters: new Set(), uses: 0, lastUsed };
       this.#members.set(key, member);
     }
     return member;
@@ -2013,24 +2219,70 @@ function compactionReasonText(reason: string): string {
   return reason === "overflow" ? "上下文溢出时压缩" : reason === "threshold" ? "达到阈值时压缩" : reason === "manual" ? "手动压缩" : reason;
 }
 
-/** The running tool calls, each with the nested calls it runs (a script's tool calls): `codemode（read、bash）`. */
+function isActiveTool(status: ToolSlot["status"]): boolean {
+  return status === "running" || status === "sleeping" || status === "waiting";
+}
+
+function formatToolSlot(slot: Pick<ToolSlot, "name" | "status">): string {
+  return slot.status === "sleeping" ? `${slot.name}（休眠等待）` : slot.status === "waiting" ? `${slot.name}（等待事件）` : slot.name;
+}
+
+/** The active tool calls (running or parked), each with the active nested calls it runs: `codemode（read、bash）`. */
 function runningTools(live: Readonly<LiveState> | undefined): string[] {
-  const nested = live?.nestedTools?.filter((slot) => slot.status === "running") ?? [];
-  return (live?.tools?.filter((slot) => slot.status === "running") ?? []).map((slot) => {
-    const children = nested.filter((child) => child.parentTaskId === slot.taskId).map((child) => child.name);
-    return children.length ? `${slot.name}（${children.join("、")}）` : slot.name;
+  const nested = live?.nestedTools?.filter((slot) => isActiveTool(slot.status)) ?? [];
+  return (live?.tools?.filter((slot) => isActiveTool(slot.status)) ?? []).map((slot) => {
+    const base = formatToolSlot(slot);
+    const children = nested.filter((child) => child.parentTaskId === slot.taskId).map((child) => formatToolSlot(child));
+    return children.length ? `${base}（${children.join("、")}）` : base;
   });
 }
 
 /** What a running task is doing, for the heartbeat log. */
 function livePhase(live: Readonly<LiveState> | undefined): string {
-  const running = runningTools(live);
-  if (running.length) return "执行工具 " + running.join("、");
+  const active = live?.tools?.filter((slot) => isActiveTool(slot.status)) ?? [];
+  if (active.length) {
+    const label = active.some((slot) => slot.status === "running") ? "执行工具 " : "等待工具 ";
+    return label + runningTools(live).join("、");
+  }
   if (live?.compactions?.some((compaction) => compaction.blocking)) return "压缩会话历史";
   const generation = live?.generation;
   if (generation?.retry !== undefined) return "等待重试";
   if (generation !== undefined) return "等待或接收模型输出";
   return "准备中";
+}
+
+/** Lightweight structural size of a tool-call argument object so progress tracking never serializes giant text blocks. */
+function approxValueSize(value: unknown, depth = 0): number {
+  if (value === null || value === undefined) return 1;
+  if (typeof value === "string") return value.length + 2;
+  if (typeof value === "number" || typeof value === "boolean") return String(value).length;
+  if (depth >= 8) return 1;
+  if (Array.isArray(value)) {
+    let total = 2;
+    for (const item of value) total += approxValueSize(item, depth + 1);
+    return total;
+  }
+  if (typeof value === "object") {
+    let total = 2;
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) total += key.length + approxValueSize(item, depth + 1);
+    return total;
+  }
+  return 1;
+}
+
+/** O(blocks) progress signature of the current streamed assistant message (avoids `JSON.stringify` on large outputs). */
+function modelProgress(message: AssistantMessage | undefined): string {
+  if (message === undefined) return "";
+  let textLen = 0, thinkingLen = 0, toolCount = 0, toolSize = 0;
+  for (const part of message.content ?? []) {
+    if (part.type === "text") textLen += part.text.length;
+    else if (part.type === "thinking") thinkingLen += part.thinking.length;
+    else if (part.type === "toolCall") {
+      toolCount++;
+      toolSize += part.id.length + part.name.length + approxValueSize(part.arguments);
+    }
+  }
+  return `${message.content?.length ?? 0}:${textLen}:${thinkingLen}:${toolCount}:${toolSize}:${message.stopReason ?? ""}:${message.usage?.totalTokens ?? 0}`;
 }
 
 /** The model's current attempt when the model is what the run waits for, with its committed progress. */
@@ -2040,5 +2292,5 @@ function modelActivity(live: Readonly<LiveState> | undefined): { key: string; pr
   if (generation.retry !== undefined || generation.deferred !== undefined) return undefined;
   if (live.tools !== undefined && live.tools.length > 0) return undefined;
   if (live.compactions?.some((compaction) => compaction.blocking)) return undefined;
-  return { key: `${live.run.taskId}:${generation.attempt}`, progress: JSON.stringify(generation.message ?? null) };
+  return { key: `${live.run.taskId}:${generation.attempt}`, progress: modelProgress(generation.message as AssistantMessage | undefined) };
 }

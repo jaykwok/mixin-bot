@@ -19,7 +19,7 @@ type WindowOf = (key: string) => number | undefined;
  * `Infinity`): a tool call with an error result, a run with `restart_limit`, which the member is told (service.ts).
  */
 export function durableSettings(settings: SettingsManager, model: Model<Api>, cacheRetention?: CacheRetention, windowOf?: WindowOf): HarnessSettings {
-  const policy = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);
+  const { maxTurns: _maxTurns, ...policy } = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);
   const { modelOverrides, backgroundTokens, ...ordinary } = policy.compaction;
   const background = (budgets: typeof ordinary, window: number) => backgroundTokens ?? compactionPolicy(budgets, window).backgroundTokens;
   const own = `${model.provider}/${model.id}`;

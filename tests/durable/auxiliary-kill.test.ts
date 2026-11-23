@@ -26,7 +26,7 @@ models.setProvider({...faux.provider,id:'aux',name:'aux',getModels:()=>[],getAll
 faux.setResponses(phase==='start' ? [fauxAssistantMessage([fauxToolCall('document_route',{text:'page'},{id:'route-kill'})],{stopReason:'toolUse'})] : [fauxAssistantMessage('after recovery')]);
 const holder={}, door=spaceDoor(holder), registry=createRegistry();
 const tools=auxiliaryMemberTools({layout:appLayout(root),scope:groupScope('group-a')},door,{format:1,classifier:{provider:'aux',modelId:'route'},maxConcurrent:1,classifierRetries:0},new AuxiliaryBudget(1));
-registry.install(defineExtension({name:'mixin.auxiliary',tools:tools.map(tool=>tool.registration)}));
+registry.install(defineExtension({name:'mixin.auxiliary',tools}));
 const harness=await Harness.open(await openGroupStorage(path),{registry,models:door.wrap(models),settings:{retry:{maxRetries:0},compaction:{enabled:false}}},context);
 holder.harness=harness; await claimSpace(harness,groupScope('group-a'),context);
 const {conversation}=await memberConversation(harness,groupScope('group-a'),'alice',{model},context);

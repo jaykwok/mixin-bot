@@ -30,7 +30,7 @@ function setup() {
     layout: appLayout(join(fixture.root, String(++sequence))), modules: [], relay: null, materials: false,
     selection: { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)!,
       ref: model, thinkingLevel: "off" as const, harnessSettings: {} },
-    limits: { runTimeoutMs: 30000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 1000, activeRequests: 1 },
+    limits: { runTimeoutMs: 30000, modelIdleMs: 120000, modelResponseMs: 120000, activeRequests: 1 },
     outbound: out.outbound,
   } satisfies DurableServiceOptions;
   return { common, faux, models, model, out };
@@ -237,7 +237,7 @@ test("a deadline crossed during auth is checked at final dispatch and the unsent
   f.models.setProvider({ ...f.faux.provider, auth: { apiKey: { name: "Synthetic auth", resolve: async () => {
     authenticating.resolve(); await release.promise; return { auth: { apiKey: "synthetic" } };
   } } } });
-  const service = new DurableService({ ...f.common, limits: { ...f.common.limits, runTimeoutMs: 500, tickMs: 5000 } });
+  const service = new DurableService({ ...f.common, limits: { ...f.common.limits, runTimeoutMs: 500 } });
   try {
     await service.admit(f.out.message(GROUP, PHONE, "question")); await authenticating.promise;
     await Bun.sleep(600); release.resolve();

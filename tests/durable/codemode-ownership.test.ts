@@ -162,7 +162,7 @@ async function run(points: Point[]): Promise<Run> {
   const { models, faux, model } = fauxModels();
   const root = join(fixture.root, `run-${++databases}`);
   const members = { layout: appLayout(join(root, "data")), scope: groupScope(GROUP) };
-  const open = () => openGroupHarness(join(root, "db.sqlite"), models, { extensions: [pausing, codemodeExtension({ members, tools: [] })] });
+  const open = () => openGroupHarness(join(root, "db.sqlite"), models, { extensions: [pausing, codemodeExtension({ members })] });
   let group = await open();
   const { conversation } = await memberConversation(group.harness, scopeOf(GROUP), PHONE, { model }, context);
   const id = "cm-files";

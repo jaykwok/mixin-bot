@@ -45,6 +45,7 @@ import { assertLocalConfigurationWrite } from "../../src/core/maintenance-state.
 import { withModelConfigurationDraft, withStagedModelConfiguration, type ModelConfigurationDraft } from "./model-config-draft.ts";
 import { configureAppBot, stageAppBot } from "./configure-app-bot.ts";
 import { stageName } from "./configuration-stage.ts";
+import { isListableApi, listModels, type ListedModel } from "./model-list.ts";
 
 
 type JsonObject = Record<string, unknown>;
@@ -92,43 +93,38 @@ async function askApiKey(): Promise<string> {
 }
 
 /**
- * 让端点自己报出可用模型。OpenAI 兼容服务是 GET {baseUrl}/models，Anthropic 是
- * GET {baseUrl}/v1/models。这一步只为省去手抄 id，拿不到就退回手填。
+ * 让端点自己报出可用模型，复用统一的有界、禁重定向、分页模型清单实现（model-list.ts）。
+ * 不支持模型列表接口的协议直接返回空数组，调用方退回手填 id。
  */
-export async function discoverModelIds(api: string, baseUrl: string, apiKey: string): Promise<string[]> {
-  const anthropic = api === "anthropic-messages";
-  const url = new URL(`${baseUrl.replace(/\/+$/, "")}/${anthropic ? "v1/models" : "models"}`);
-  const headers: Record<string, string> = anthropic
-    ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" }
-    : { authorization: `Bearer ${apiKey}` };
-  const response = await fetch(url, { headers, signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  const body = await response.json() as { data?: { id?: unknown }[]; models?: { name?: unknown }[] };
-  const ids = [
-    // OpenAI 与 Anthropic 都是 data[].id；Google 是 models[].name，带 "models/" 前缀。
-    ...(body.data ?? []).map((entry) => entry.id),
-    ...(body.models ?? []).map((entry) => typeof entry.name === "string" ? entry.name.replace(/^models\//, "") : entry.name),
-  ];
-  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0))].sort();
+export async function discoverModels(api: string, baseUrl: string, apiKey: string): Promise<ListedModel[]> {
+  if (!isListableApi(api)) return [];
+  return listModels(api, baseUrl, { apiKey }, { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
 }
 
 /** 自定义端点的模型 id：优先让端点自己列，列不出来就手填。 */
-async function askCustomModelId(api: string, baseUrl: string, apiKey: string, previous?: string): Promise<string> {
-  let ids: string[] = [];
-  try {
-    ids = await discoverModelIds(api, baseUrl, apiKey);
-    if (ids.length === 0) log.warn("端点返回的模型清单为空，请手动填写模型 id。");
-  } catch (error) {
-    log.warn(`未能从端点获取模型清单（${error instanceof Error ? error.message : String(error)}），请手动填写模型 id。`);
+async function askCustomModelId(api: string, baseUrl: string, apiKey: string, previous?: string): Promise<{ id: string; listed?: ListedModel }> {
+  let listed: ListedModel[] = [];
+  if (isListableApi(api)) {
+    try {
+      listed = await discoverModels(api, baseUrl, apiKey);
+      if (listed.length === 0) log.warn("端点返回的模型清单为空，请手动填写模型 id。");
+    } catch (error) {
+      log.warn(`未能从端点获取模型清单（${error instanceof Error ? error.message : String(error)}），请手动填写模型 id。`);
+    }
   }
-  if (ids.length === 0) return askText("模型 id", previous, requireText);
+  if (listed.length === 0) return { id: await askText("模型 id", previous, requireText) };
   const MANUAL = "\u0000manual";
+  const byId = new Map(listed.map((item) => [item.id, item]));
   const picked = bail<string>(await select({
     message: "模型（来自端点返回的清单）",
-    initialValue: previous && ids.includes(previous) ? previous : ids[0]!,
-    options: [...ids.map((id) => ({ value: id, label: id })), { value: MANUAL, label: "手动填写其他 id" }],
+    initialValue: previous && byId.has(previous) ? previous : listed[0]!.id,
+    options: [
+      ...listed.map((item) => ({ value: item.id, label: item.name ? `${item.id}（${item.name}）` : item.id })),
+      { value: MANUAL, label: "手动填写其他 id" },
+    ],
   }));
-  return picked === MANUAL ? await askText("模型 id", previous, requireText) : picked;
+  if (picked === MANUAL) return { id: await askText("模型 id", previous, requireText) };
+  return { id: picked, listed: byId.get(picked) };
 }
 
 /**
@@ -156,9 +152,14 @@ export function catalogDefaults(source: Model<Api>): JsonObject {
 
 /** 手填模型资料。每个字段都是 models.json 的官方字段，向导不替 Pi 猜任何一个。 */
 async function describeCustomModel(
-  runtime: ModelRuntime, modelId: string, previous: JsonObject | undefined
+  runtime: ModelRuntime, modelId: string, previous: JsonObject | undefined, listed?: ListedModel
 ): Promise<JsonObject> {
-  let defaults: JsonObject = previous?.id === modelId ? { ...previous } : {};
+  let defaults: JsonObject = previous?.id === modelId ? { ...previous } : {
+    ...(listed?.name ? { name: listed.name } : {}),
+    ...(listed?.contextWindow !== undefined ? { contextWindow: listed.contextWindow } : {}),
+    ...(listed?.maxTokens !== undefined ? { maxTokens: listed.maxTokens } : {}),
+    ...(listed?.input ? { input: [...listed.input] } : {}),
+  };
   const matches = catalogMatches(runtime, modelId);
   if (matches.length > 0) {
     const KEEP = -1;
@@ -320,9 +321,10 @@ async function main(draft: ModelConfigurationDraft, stage?: string): Promise<voi
     const sameEndpoint = previousEntry?.baseUrl === baseUrl && previousEntry?.api === api;
     const previousModels = sameEndpoint ? (previousEntry?.models as JsonObject[] | undefined) ?? [] : [];
     const previousId = providerId === previousProviderId ? previousModelId : undefined;
-    declaredModelId = await askCustomModelId(api, baseUrl, apiKey, previousId ?? previousModels[0]?.id as string | undefined);
+    const picked = await askCustomModelId(api, baseUrl, apiKey, previousId ?? previousModels[0]?.id as string | undefined);
+    declaredModelId = picked.id;
     const previousModel = previousModels.find((item) => item.id === declaredModelId);
-    const model = await describeCustomModel(runtime, declaredModelId, previousModel);
+    const model = await describeCustomModel(runtime, declaredModelId, previousModel, picked.listed);
     // The same endpoint keeps the whole entry and its other models; native fields (headers may hold credentials) never
     // follow the provider to another endpoint.
     if (previousEntry && !sameEndpoint) log.warn("服务地址或协议已变，原有的 headers、compat、authHeader、modelOverrides 等字段不带到新端点；需要时请重新添加。");

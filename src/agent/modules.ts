@@ -1,4 +1,5 @@
 import type { loadSkills } from "@earendil-works/pi-coding-agent";
+import type { ToolNamespace } from "@earendil-works/pi-durable";
 import type { MemberToolSpec } from "../durable/tools.ts";
 
 /**
@@ -8,6 +9,8 @@ import type { MemberToolSpec } from "../durable/tools.ts";
 export interface AgentModuleDefinition {
   /** Short name; the Durable extension is `mixin.<name>`. */
   name: string;
+  /** Code-mode namespace declared on the module's Durable extension. */
+  namespace?: ToolNamespace;
   tools: MemberToolSpec[];
   skills: ReturnType<typeof loadSkills>;
   readOnlyDirs: string[];

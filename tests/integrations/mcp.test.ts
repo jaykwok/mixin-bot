@@ -4,15 +4,17 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mcpNamespace, validateMcpServerConfig } from "@earendil-works/pi-mcp";
-import { authorizeMcp } from "@earendil-works/pi-mcp/oauth";
+import { authorizeMcp, McpOAuthProvider, startMcpSignIn } from "@earendil-works/pi-mcp/oauth";
 import { expandVariables, MCP_LIMITS, readMcpConfig, type McpServerConfig } from "../../src/core/mcp-config.ts";
 import { McpTools, officialEntry, type McpMember } from "../../src/integrations/mcp.ts";
-import { mcpOAuth } from "../../src/integrations/mcp-oauth.ts";
+import { clearPendingMcpChallenge, loadPendingMcpChallenge, mcpAuthProvider, mcpOAuthClient, mcpOAuthStore } from "../../src/integrations/mcp-oauth.ts";
+import { buildSignInChallenge, parseMcpLoginArgs } from "../../ops/tools/mcp-admin.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const f = await tempFixture("mcp-"); afterAll(() => f.cleanup());
 const fixtureServer = fileURLToPath(new URL("../helpers/mcp-fixture.ts", import.meta.url));
 const supervisor = fileURLToPath(new URL("../../src/lib/process-supervisor.ts", import.meta.url));
+const mcpAdminScript = fileURLToPath(new URL("../../ops/tools/mcp-admin.ts", import.meta.url));
 let n = 0;
 const GROUP_ID = "群-A";
 const member: McpMember = { scope: { kind: "group", groupId: GROUP_ID }, phone: "+86 alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "alice") };
@@ -136,33 +138,36 @@ test("MCP close cancels a transport waiting at a gate even when its caller stays
 });
 
 test("MCP close reuses the last token even if OAuth credentials change after the response", async () => {
-  const h = http(); h.config.oauth = { callbackPort: 43127, clientId: "fixture-client" };
-  const { provider } = mcpOAuth(h.config);
-  await provider.saveTokens({ access_token: "before", token_type: "Bearer", expires_in: 1 });
-  const manager = new McpTools({ servers: [h.config] }, join(f.root, `discovery-${n}`));
+  const h = http(), oauthStateDir = join(f.root, `oauth-${++n}`);
+  h.config.oauth = { callbackPort: 43127, clientId: "fixture-client" };
+  const store = mcpOAuthStore(h.config, oauthStateDir);
+  await store.save({ serverUrl: h.config.url!, tokens: { access_token: "before", token_type: "Bearer", expires_in: 3600 }, tokensExpireAt: Date.now() + 3_600_000 });
+  const manager = new McpTools({ servers: [h.config] }, join(f.root, `discovery-${n}`), { oauthStateDir });
   try {
     await manager.initialize(new AbortController().signal);
-    h.state.onCall = () => provider.saveTokens({ access_token: "after", token_type: "Bearer" });
+    h.state.onCall = async () => { await store.save({ serverUrl: h.config.url!, tokens: { access_token: "after", token_type: "Bearer" } }); };
     await manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work());
     expect(h.state.requests.findLast(request => request.method === "DELETE")!.token).toBe("Bearer before");
-    expect((await provider.tokens())!.access_token).toBe("after");
+    expect((await store.load())!.tokens!.access_token).toBe("after");
   } finally { await manager.close(); await h.close(); }
 });
 
-test("OAuth discovery observes cancellation through the official transport and saves no grant", async () => {
-  const h = http(); h.config.oauth = { callbackPort: 43128, clientId: "fixture-client" }; h.state.discovery = true;
-  const manager = new McpTools({ servers: [h.config] }, join(f.root, `discovery-${n}`)), controller = new AbortController();
+test("OAuth server without stored refresh token refuses immediately without discovery and saves no grant", async () => {
+  const h = http(), oauthStateDir = join(f.root, `oauth-${++n}`);
+  h.config.oauth = { callbackPort: 43128, clientId: "fixture-client" }; h.state.discovery = true;
+  const manager = new McpTools({ servers: [h.config] }, join(f.root, `discovery-${n}`), { oauthStateDir });
   try {
-    const work = manager.initialize(controller.signal), failed = expect(work).rejects.toThrow();
-    await h.state.started.promise; controller.abort(new Error("cancel login discovery")); await failed;
-    expect(await mcpOAuth(h.config).provider.tokens()).toBeUndefined();
+    await expect(manager.initialize(new AbortController().signal)).rejects.toThrow(`bun run mcp login ${h.config.name}`);
+    expect(await mcpOAuthStore(h.config, oauthStateDir).load()).toBeUndefined();
   } finally { await manager.close(); await h.close(); }
 });
 
-// A call cancelled while the official provider refreshes after a 401: the refresh request is cancelled with the call,
-// the call never reaches the server again, and the stored grant survives for the next call, which refreshes and retries.
-test("HTTP MCP cancelled during a 401 refresh sends no retry and keeps the grant for the next call", async () => {
-  const toolCalls: (string | null)[] = [], refreshes: string[] = [], refreshing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+// createMcpAuthProvider deduplicates concurrent 401 refreshes under its refresh lock and never aborts an in-flight
+// token exchange when one caller cancels (protecting rotated refresh tokens); the cancelled call sends no retry,
+// concurrent/later calls share the refreshed token, and manager.close() awaits auth.settled() before returning.
+test("HTTP MCP 401 refresh deduplicates concurrent calls, skips retry on cancelled call, and persists rotated token across close()", async () => {
+  const toolCalls: (string | null)[] = [], refreshes: string[] = [];
+  let refreshing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), rotation = 0;
   let hold = true;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
     const origin = `http://127.0.0.1:${server.port}`, path = new URL(request.url).pathname;
@@ -172,8 +177,9 @@ test("HTTP MCP cancelled during a 401 refresh sends no retry and keeps the grant
       token_endpoint: `${origin}/token`, response_types_supported: ["code"] });
     if (path === "/token") {
       refreshes.push(new URLSearchParams(await request.text()).get("refresh_token") ?? "");
-      if (hold) { refreshing.resolve(); await Promise.race([release.promise, new Promise(resolve => request.signal.addEventListener("abort", resolve, { once: true }))]); }
-      return Response.json({ access_token: "fresh", token_type: "Bearer", refresh_token: "refresh-1" });
+      if (hold) { refreshing.resolve(); await release.promise; }
+      rotation++;
+      return Response.json({ access_token: `fresh-${rotation}`, token_type: "Bearer", refresh_token: `refresh-${rotation + 1}` });
     }
     if (path !== "/mcp") return new Response(null, { status: 404 });
     const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
@@ -182,31 +188,60 @@ test("HTTP MCP cancelled during a 401 refresh sends no retry and keeps the grant
     if (rpc.method === "initialize") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "refresh", version: "1" }, capabilities: { tools: {} } } }, { headers });
     if (rpc.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [{ name: "echo", inputSchema: { type: "object", properties: {} } }] } }, { headers });
     toolCalls.push(request.headers.get("authorization"));
-    if (request.headers.get("authorization") !== "Bearer fresh") return new Response(null, { status: 401, headers: { "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"` } });
-    return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: "ok" }] } }, { headers });
+    if (request.headers.get("authorization") !== `Bearer fresh-${Math.max(1, rotation)}`) {
+      return new Response(null, { status: 401, headers: { "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"` } });
+    }
+    return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: `ok-${rotation}` }] } }, { headers });
   } });
-  const config: McpServerConfig = { name: `refresh${++n}`, transport: "http", url: `http://127.0.0.1:${server.port}/mcp`, tools: ["echo"], oauth: { callbackPort: 43132, clientId: "fixture-client" } };
-  const { provider } = mcpOAuth(config);
-  await provider.saveTokens({ access_token: "stale", token_type: "Bearer", refresh_token: "refresh-1" });
-  const manager = new McpTools({ servers: [config] }, join(f.root, `discovery-${n}`)), controller = new AbortController();
+  const oauthStateDir = join(f.root, `oauth-${++n}`);
+  const config: McpServerConfig = { name: `refresh${n}`, transport: "http", url: `http://127.0.0.1:${server.port}/mcp`, tools: ["echo"], oauth: { callbackPort: 43132, clientId: "fixture-client" } };
+  const store = mcpOAuthStore(config, oauthStateDir);
+  await store.save({ serverUrl: config.url!, tokens: { access_token: "stale", token_type: "Bearer", refresh_token: "refresh-1" } });
+  const manager = new McpTools({ servers: [config] }, join(f.root, `discovery-${n}`), { oauthStateDir }), controller = new AbortController();
   try {
     await manager.initialize(new AbortController().signal);
-    const failed = expect(manager.call(manager.catalogue[0]!, member, {}, controller.signal, work => work())).rejects.toThrow();
-    await refreshing.promise; controller.abort(new Error("cancelled during refresh")); await failed;
-    expect(toolCalls).toEqual(["Bearer stale"]); expect(refreshes).toEqual(["refresh-1"]);
-    expect(await provider.tokens()).toMatchObject({ access_token: "stale", refresh_token: "refresh-1" });
-    hold = false;
-    const output = await manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work());
-    expect(output.content).toEqual([{ type: "text", text: "ok" }]);
-    expect(toolCalls).toEqual(["Bearer stale", "Bearer stale", "Bearer fresh"]); expect(refreshes).toEqual(["refresh-1", "refresh-1"]);
-    expect((await provider.tokens())!.access_token).toBe("fresh");
+    const first = expect(manager.call(manager.catalogue[0]!, member, {}, controller.signal, work => work())).rejects.toThrow();
+    await refreshing.promise;
+    // A second call hits 401 while the refresh is in flight; both share one /token exchange.
+    const second = manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work());
+    controller.abort(new Error("cancelled during refresh"));
+    await first;
+    release.resolve();
+    const output = await second;
+    expect(output.content).toEqual([{ type: "text", text: "ok-1" }]);
+    expect(refreshes).toEqual(["refresh-1"]);
+    // Call 1 never retried after cancellation; Call 2 awaited the in-flight refresh in token() and went straight out with fresh-1.
+    expect(toolCalls).toEqual(["Bearer stale", "Bearer fresh-1"]);
+    expect((await store.load())!.tokens).toMatchObject({ access_token: "fresh-1", refresh_token: "refresh-2" });
+
+    // Closing while a refresh is in flight waits for auth.settled() so the rotated refresh token is saved cleanly.
+    await store.save({ serverUrl: config.url!, tokens: { access_token: "stale-2", token_type: "Bearer", refresh_token: "refresh-2" } });
+    refreshing = Promise.withResolvers<void>(); release = Promise.withResolvers<void>();
+    const third = expect(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work())).rejects.toThrow();
+    await refreshing.promise;
+    let closed = false;
+    const closing = manager.close().then(() => { closed = true; });
+    await third;
+    await Bun.sleep(30);
+    expect(closed).toBe(false);
+    release.resolve();
+    await closing;
+    expect((await store.load())!.tokens).toMatchObject({ access_token: "fresh-2", refresh_token: "refresh-3" });
   } finally { release.resolve(); await manager.close(); await server.stop(true); }
 });
 
 test("administrator OAuth login aborts its discovery and scopes persisted credentials to the exact server", async () => {
   const state = join(f.root, "auth"), controller = new AbortController(), started = Promise.withResolvers<void>();
   const server: McpServerConfig = { name: "login", transport: "http", tools: ["echo"], url: "http://127.0.0.1:43129/mcp", oauth: { callbackPort: 43130, clientId: "fixture" } };
-  const { provider } = mcpOAuth(server, () => { throw new Error("unexpected redirect"); }, state);
+  const client = mcpOAuthClient(server, state);
+  const provider = new McpOAuthProvider({
+    serverUrl: client.serverUrl,
+    redirectUrl: `http://127.0.0.1:${server.oauth!.callbackPort}/callback`,
+    clientMetadata: { client_name: client.clientName },
+    clientId: client.settings.clientId,
+    store: client.store,
+    onRedirect: () => { throw new Error("unexpected redirect"); },
+  });
   const work = authorizeMcp(provider, { serverUrl: server.url!, signal: controller.signal, fetch: async (_url, init) => {
     init?.signal?.throwIfAborted();
     started.resolve(); return new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true }));
@@ -214,8 +249,395 @@ test("administrator OAuth login aborts its discovery and scopes persisted creden
   const failed = expect(work).rejects.toThrow(); await started.promise; controller.abort(new Error("cancelled login")); await failed;
   expect(await provider.tokens()).toBeUndefined();
   await provider.saveTokens({ access_token: "fixture-secret", token_type: "Bearer" });
-  expect((await mcpOAuth(server, undefined, state).provider.tokens())!.access_token).toBe("fixture-secret");
-  expect(await mcpOAuth({ ...server, url: "http://127.0.0.1:43129/another" }, undefined, state).provider.tokens()).toBeUndefined();
+  expect(await mcpAuthProvider(server, { stateRoot: state }).token()).toBe("fixture-secret");
+  expect(await mcpAuthProvider({ ...server, url: "http://127.0.0.1:43129/another" }, { stateRoot: state }).token()).toBeUndefined();
+});
+
+test("HTTP MCP insufficient_scope persists the challenge so mcp login steps up scope instead of refreshing the old grant", async () => {
+  const oauthStateDir = join(f.root, `oauth-stepup-${++n}`);
+  let tokenRefreshes = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
+    const origin = `http://127.0.0.1:${server.port}`, path = new URL(request.url).pathname;
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    if (path === "/.well-known/oauth-protected-resource") return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin] });
+    if (path === "/.well-known/oauth-authorization-server") {
+      return Response.json({
+        issuer: origin,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      });
+    }
+    if (path === "/token") {
+      tokenRefreshes++;
+      return Response.json({ access_token: "still-under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" });
+    }
+    if (path !== "/mcp") return new Response(null, { status: 404 });
+    const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
+    if (rpc.id === undefined) return new Response(null, { status: 202 });
+    const headers = { "mcp-session-id": "stepup-session" };
+    if (rpc.method === "initialize") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "stepup", version: "1" }, capabilities: { tools: {} } } }, { headers });
+    if (rpc.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [{ name: "write_doc", inputSchema: { type: "object", properties: {} } }] } }, { headers });
+    return new Response(null, {
+      status: 403,
+      headers: { "www-authenticate": `Bearer error="insufficient_scope", scope="docs:write", resource_metadata="${origin}/.well-known/oauth-protected-resource"` },
+    });
+  } });
+  const config: McpServerConfig = {
+    name: `stepup${n}`, transport: "http", url: `http://127.0.0.1:${server.port}/mcp`, tools: ["write_doc"],
+    oauth: { callbackPort: 43133, clientId: "fixture-client", scope: "docs:read" },
+  };
+  const store = mcpOAuthStore(config, oauthStateDir);
+  await store.save({
+    serverUrl: config.url!,
+    tokens: { access_token: "under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" },
+    tokensExpireAt: Date.now() + 3_600_000,
+  });
+  const manager = new McpTools({ servers: [config] }, join(f.root, `discovery-${n}`), { oauthStateDir });
+  try {
+    await manager.initialize(new AbortController().signal);
+    await expect(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()))
+      .rejects.toThrow(`MCP ${config.name} 权限不足（需要 scope：docs:write），请管理员执行 bun run mcp login ${config.name}`);
+
+    const pending = await loadPendingMcpChallenge(config, oauthStateDir);
+    expect(pending).toMatchObject({ error: "insufficient_scope", scope: "docs:write" });
+    expect(pending?.resourceMetadataUrl?.href).toBe(`http://127.0.0.1:${server.port}/.well-known/oauth-protected-resource`);
+    // Scoped strictly to exact server URL: another URL ignores the challenge.
+    expect(await loadPendingMcpChallenge({ ...config, url: `http://127.0.0.1:${server.port}/other` }, oauthStateDir)).toBeUndefined();
+
+    // Passing the persisted challenge into startMcpSignIn skips refresh-token reuse and initiates browser step-up.
+    const client = mcpOAuthClient(config, oauthStateDir);
+    const challenge = buildSignInChallenge(pending, {});
+    const authorization = await startMcpSignIn({ ...client, redirectUrl: "http://127.0.0.1:43133/callback", challenge });
+    expect(tokenRefreshes).toBe(0);
+    expect(authorization.kind).toBe("redirect");
+    if (authorization.kind === "redirect") {
+      const requestedScopes = new URL(authorization.authorizationUrl).searchParams.get("scope")?.split(/\s+/) ?? [];
+      expect(requestedScopes).toContain("docs:read");
+      expect(requestedScopes).toContain("docs:write");
+    }
+
+    // Explicit --reauth / --scope CLI helpers force browser step-up even without a stored challenge.
+    expect(parseMcpLoginArgs(["login", "docs", "--reauth", "--scope", "admin:write"])).toEqual({ name: "docs", reauth: true, scope: "admin:write" });
+    expect(buildSignInChallenge(undefined, { reauth: true, scope: "admin:write" })).toEqual({ error: "insufficient_scope", scope: "admin:write" });
+    await clearPendingMcpChallenge(config, oauthStateDir);
+    expect(await loadPendingMcpChallenge(config, oauthStateDir)).toBeUndefined();
+  } finally { await manager.close(); await server.stop(true); }
+});
+
+test("HTTP MCP insufficient_scope and 401 scope challenges emit safe --scope / --reauth / --prompt-scope recovery commands when challenge persistence fails", async () => {
+  const oauthStateDir = join(f.root, `oauth-unwritable-${++n}`);
+  let tokenRefreshes = 0;
+  let challengeStatus = 403;
+  let challengeHeader = 'Bearer error="insufficient_scope", scope="docs:write"';
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
+    const origin = `http://127.0.0.1:${server.port}`, path = new URL(request.url).pathname;
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    if (path === "/.well-known/oauth-protected-resource") return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin] });
+    if (path === "/.well-known/oauth-authorization-server") {
+      return Response.json({
+        issuer: origin,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      });
+    }
+    if (path === "/token") {
+      tokenRefreshes++;
+      return Response.json({ access_token: "still-under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" });
+    }
+    if (path !== "/mcp") return new Response(null, { status: 404 });
+    const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
+    if (rpc.id === undefined) return new Response(null, { status: 202 });
+    const headers = { "mcp-session-id": "unwritable-session" };
+    if (rpc.method === "initialize") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "stepup", version: "1" }, capabilities: { tools: {} } } }, { headers });
+    if (rpc.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [{ name: "write_doc", inputSchema: { type: "object", properties: {} } }] } }, { headers });
+    return new Response(null, { status: challengeStatus, headers: { "www-authenticate": challengeHeader } });
+  } });
+  const config: McpServerConfig = {
+    name: `unwritable${n}`, transport: "http", url: `http://127.0.0.1:${server.port}/mcp`, tools: ["write_doc"],
+    oauth: { callbackPort: 43134, clientId: "fixture-client", scope: "docs:read" },
+  };
+  const store = mcpOAuthStore(config, oauthStateDir);
+  await store.save({
+    serverUrl: config.url!,
+    tokens: { access_token: "under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" },
+    tokensExpireAt: Date.now() + 3_600_000,
+  });
+  // Block writing `${config.name}.challenge.json` deterministically across Windows, Linux (incl. root), and macOS.
+  await mkdir(join(oauthStateDir, `${config.name}.challenge.json`), { recursive: true });
+  const manager = new McpTools({ servers: [config] }, join(f.root, `discovery-${n}`), { oauthStateDir });
+  const expectRejectedError = (work: Promise<unknown>): Promise<Error> =>
+    work.then(() => { throw new Error("expected call to reject"); }, error => error as Error);
+  try {
+    await manager.initialize(new AbortController().signal);
+    const withScopeError = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+    expect(withScopeError).toBeInstanceOf(Error);
+    expect(withScopeError.message).toContain(`MCP ${config.name} 权限不足（需要 scope：docs:write）`);
+    expect(withScopeError.message).toContain("未能保存权限挑战");
+    expect(withScopeError.message).toContain(`bun run mcp login ${config.name} --scope "docs:write"`);
+
+    // Following the printed --scope command initiates browser step-up without needing the challenge file on disk.
+    const client = mcpOAuthClient(config, oauthStateDir);
+    const parsedWithScope = parseMcpLoginArgs(["login", config.name, "--scope", "docs:write"]);
+    const authWithScope = await startMcpSignIn({
+      ...client,
+      redirectUrl: "http://127.0.0.1:43134/callback",
+      challenge: buildSignInChallenge(undefined, parsedWithScope),
+    });
+    expect(tokenRefreshes).toBe(0);
+    expect(authWithScope.kind).toBe("redirect");
+    if (authWithScope.kind === "redirect") {
+      const requestedScopes = new URL(authWithScope.authorizationUrl).searchParams.get("scope")?.split(/\s+/) ?? [];
+      expect(requestedScopes).toContain("docs:write");
+    }
+
+    // Without a specific scope in WWW-Authenticate, the recovery command falls back to --reauth.
+    challengeHeader = 'Bearer error="insufficient_scope"';
+    const withoutScopeError = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+    expect(withoutScopeError).toBeInstanceOf(Error);
+    expect(withoutScopeError.message).toContain(`MCP ${config.name} 权限不足`);
+    expect(withoutScopeError.message).toContain("未能保存权限挑战");
+    expect(withoutScopeError.message).toContain(`bun run mcp login ${config.name} --reauth`);
+
+    const parsedReauth = parseMcpLoginArgs(["login", config.name, "--reauth"]);
+    const authReauth = await startMcpSignIn({
+      ...client,
+      redirectUrl: "http://127.0.0.1:43134/callback",
+      challenge: buildSignInChallenge(undefined, parsedReauth),
+    });
+    expect(tokenRefreshes).toBe(0);
+    expect(authReauth.kind).toBe("redirect");
+
+    // Remote scopes with shell metacharacters ($, backticks, %, semicolons, quotes) are NEVER interpolated into
+    // copyable --scope commands (both on 403 insufficient_scope and on 401 without refresh token).
+    for (const unsafeScope of ["docs:write $(touch /tmp/pwn)", "docs:write `id`", "docs:write $HOME", "docs:write %COMSPEC%"]) {
+      challengeStatus = 403;
+      challengeHeader = `Bearer error="insufficient_scope", scope="${unsafeScope}"`;
+      const err403 = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+      expect(err403.message).not.toContain("--scope ");
+      expect(err403.message).toContain(JSON.stringify(unsafeScope));
+      expect(err403.message).toContain(`bun run mcp login ${config.name} --reauth --prompt-scope`);
+    }
+
+    // Drop refresh_token so a 401 with scope hits the non-insufficient_scope authorization-required branch too.
+    await store.save({
+      serverUrl: config.url!,
+      tokens: { access_token: "under-scoped", token_type: "Bearer", scope: "docs:read" },
+      tokensExpireAt: Date.now() + 3_600_000,
+    });
+    challengeStatus = 401;
+    challengeHeader = 'Bearer error="invalid_token", scope="docs:write $(whoami)"';
+    const err401Unsafe = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+    expect(err401Unsafe.message).not.toContain("--scope ");
+    expect(err401Unsafe.message).toContain(JSON.stringify("docs:write $(whoami)"));
+    expect(err401Unsafe.message).toContain(`bun run mcp login ${config.name} --reauth --prompt-scope`);
+
+    challengeHeader = 'Bearer error="invalid_token", scope="docs:write"';
+    const err401Safe = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+    expect(err401Safe.message).toContain(`bun run mcp login ${config.name} --scope "docs:write"`);
+
+    // 401 with resource_metadata only (no scope) when challenge persistence fails also instructs --reauth directly.
+    challengeHeader = `Bearer resource_metadata="http://127.0.0.1:${server.port}/.well-known/oauth-protected-resource"`;
+    const err401MetadataOnly = await expectRejectedError(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work()));
+    expect(err401MetadataOnly.message).toContain("未能保存授权挑战");
+    expect(err401MetadataOnly.message).toContain(`bun run mcp login ${config.name} --reauth`);
+
+    expect(parseMcpLoginArgs(["login", "docs", "--reauth", "--prompt-scope"])).toEqual({ name: "docs", reauth: true, promptScope: true });
+  } finally { await manager.close(); await server.stop(true); }
+}, 30000);
+
+test("mcp-admin CLI recovers with --scope, --reauth and --prompt-scope even when the challenge path is EISDIR, and distinguishes saved credentials from cleanup failure", async () => {
+  const cliDir = join(f.root, `mcp-cli-${++n}`);
+  const stateDir = join(cliDir, "data", "runtime", "mcp");
+  const serverName = `cli${n}`;
+  let tokenRefreshes = 0;
+  let codeExchanges = 0;
+  const oauthServer = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
+    const origin = `http://127.0.0.1:${oauthServer.port}`, path = new URL(request.url).pathname;
+    if (path === "/.well-known/oauth-protected-resource") return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin] });
+    if (path === "/.well-known/oauth-authorization-server") {
+      return Response.json({
+        issuer: origin,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      });
+    }
+    if (path === "/token") {
+      const form = new URLSearchParams(await request.text());
+      if (form.get("grant_type") === "refresh_token") {
+        tokenRefreshes++;
+        return Response.json({ access_token: "still-under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" });
+      }
+      codeExchanges++;
+      return Response.json({ access_token: `cli-fresh-${codeExchanges}`, token_type: "Bearer", refresh_token: `refresh-new-${codeExchanges}` });
+    }
+    return new Response(null, { status: 404 });
+  } });
+
+  // Reserve an ephemeral free loopback port for the CLI's loopback callback listener.
+  const portProbe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+  const callbackPort = portProbe.port!;
+  await portProbe.stop(true);
+
+  const serverConfig: McpServerConfig = {
+    name: serverName,
+    transport: "http",
+    url: `http://127.0.0.1:${oauthServer.port}/mcp`,
+    tools: ["write_doc"],
+    oauth: { callbackPort, clientId: "fixture-client", scope: "docs:read" },
+  };
+  await mkdir(join(cliDir, "data", "config"), { recursive: true });
+  await writeFile(join(cliDir, "data", "config", "mcp.json"), JSON.stringify({
+    mcpServers: {
+      [serverName]: {
+        url: serverConfig.url,
+        tools: serverConfig.tools,
+        oauth: serverConfig.oauth,
+      },
+    },
+  }));
+  const store = mcpOAuthStore(serverConfig, stateDir);
+  const resetUnderScopedTokens = () => store.save({
+    serverUrl: serverConfig.url!,
+    tokens: { access_token: "under-scoped", token_type: "Bearer", refresh_token: "refresh-valid", scope: "docs:read" },
+    tokensExpireAt: Date.now() + 3_600_000,
+  });
+  await resetUnderScopedTokens();
+  // Same EISDIR directory obstacle at `<name>.challenge.json`.
+  await mkdir(join(stateDir, `${serverName}.challenge.json`), { recursive: true });
+
+  const runCli = async (args: string[], options: { stdin?: string; completeBrowser?: boolean } = {}) => {
+    const child = Bun.spawn([process.execPath, mcpAdminScript, ...args], {
+      cwd: cliDir,
+      stdin: options.stdin !== undefined ? new Response(options.stdin) : "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      windowsHide: true,
+    });
+    const stderrPromise = new Response(child.stderr).text();
+    let stdout = "";
+    let authorizationUrl: string | undefined;
+    let callbackStatus: number | undefined;
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    const watchdog = setTimeout(() => child.kill(), 20_000);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value, { stream: true });
+        if (options.completeBrowser && !authorizationUrl) {
+          const match = /请在浏览器打开：(http:\/\/\S+)/.exec(stdout);
+          if (match) {
+            authorizationUrl = match[1]!;
+            const parsed = new URL(authorizationUrl);
+            const redirectUri = parsed.searchParams.get("redirect_uri")!;
+            const state = parsed.searchParams.get("state")!;
+            const res = await fetch(`${redirectUri}?code=cli-code-${codeExchanges + 1}&state=${encodeURIComponent(state)}`);
+            callbackStatus = res.status;
+          }
+        }
+      }
+      stdout += decoder.decode();
+      const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+      return { exitCode, stdout, stderr, authorizationUrl, callbackStatus };
+    } finally {
+      clearTimeout(watchdog);
+      child.kill();
+    }
+  };
+
+  try {
+    // 1) Plain `login <name>` (no explicit recovery flags) refuses to silently ignore an unreadable challenge path.
+    const plain = await runCli(["login", serverName]);
+    expect(plain.exitCode).not.toBe(0);
+    expect(tokenRefreshes).toBe(0);
+    expect(plain.stderr).toContain(`无法读取 MCP ${serverName} 的权限挑战文件`);
+    expect(plain.stderr).toContain("--reauth");
+
+    // 2) Explicit `--scope docs:write` proceeds despite EISDIR, completes browser step-up, saves credentials,
+    //    and clearly distinguishes saved credentials from challenge cleanup failure.
+    const withScope = await runCli(["login", serverName, "--scope", "docs:write"], { completeBrowser: true });
+    expect(withScope.exitCode).toBe(0);
+    expect(withScope.callbackStatus).toBe(200);
+    expect(tokenRefreshes).toBe(0);
+    expect(withScope.authorizationUrl).toBeDefined();
+    const scopeTokens = new URL(withScope.authorizationUrl!).searchParams.get("scope")?.split(/\s+/) ?? [];
+    expect(scopeTokens).toContain("docs:read");
+    expect(scopeTokens).toContain("docs:write");
+    expect(withScope.stdout).toContain(`MCP ${serverName} 授权已保存`);
+    expect(withScope.stderr).toContain(`警告：无法读取 MCP ${serverName} 的权限挑战文件`);
+    expect(withScope.stderr).toContain(`警告：MCP ${serverName} 凭据已保存，但未能清理旧的权限挑战文件`);
+    expect((await store.load())?.tokens?.access_token).toBe("cli-fresh-1");
+
+    // 3) Explicit `--reauth` also succeeds despite EISDIR and skips refresh-token reuse.
+    await resetUnderScopedTokens();
+    const withReauth = await runCli(["login", serverName, "--reauth"], { completeBrowser: true });
+    expect(withReauth.exitCode).toBe(0);
+    expect(withReauth.callbackStatus).toBe(200);
+    expect(tokenRefreshes).toBe(0);
+    expect(withReauth.stdout).toContain(`MCP ${serverName} 授权已保存`);
+    expect(withReauth.stderr).toContain(`警告：MCP ${serverName} 凭据已保存，但未能清理旧的权限挑战文件`);
+    expect((await store.load())?.tokens?.access_token).toBe("cli-fresh-2");
+
+    // 4) Interactive `--reauth --prompt-scope` reads scope containing shell metacharacters directly from stdin
+    //    without shell expansion and passes them verbatim into the OAuth authorization request.
+    await resetUnderScopedTokens();
+    const withPrompt = await runCli(["login", serverName, "--reauth", "--prompt-scope"], {
+      stdin: "docs:write $(not-executed)\n",
+      completeBrowser: true,
+    });
+    expect(withPrompt.exitCode).toBe(0);
+    expect(withPrompt.callbackStatus).toBe(200);
+    expect(tokenRefreshes).toBe(0);
+    const promptedScopes = new URL(withPrompt.authorizationUrl!).searchParams.get("scope")?.split(/\s+/) ?? [];
+    expect(promptedScopes).toContain("docs:write");
+    expect(promptedScopes).toContain("$(not-executed)");
+    expect(withPrompt.stdout).toContain(`MCP ${serverName} 授权已保存`);
+    expect((await store.load())?.tokens?.access_token).toBe("cli-fresh-3");
+  } finally {
+    await oauthServer.stop(true);
+  }
+}, 60000);
+
+test.each([false, true])("pending insufficient_scope challenge survives an unrelated stale 401 (overlap=%s) and accumulates scopes", async (overlap) => {
+  const oauthStateDir = join(f.root, `oauth-race-${++n}-${overlap}`);
+  const server: McpServerConfig = {
+    name: `docs${n}`, url: "https://fixture.invalid/mcp", transport: "http", tools: ["docs"],
+    oauth: { clientId: "test", callbackPort: 43128 },
+  };
+  await mcpOAuthStore(server, oauthStateDir).save({
+    serverUrl: server.url!,
+    tokens: { token_type: "Bearer", access_token: "current", scope: "docs:read" },
+  });
+  const auth = mcpAuthProvider(server, { stateRoot: oauthStateDir });
+  const makeContext = (header: string, status: number) => ({
+    token: "older",
+    serverUrl: new URL(server.url!),
+    fetch: async () => { throw new Error("Unexpected network request"); },
+    response: new Response(null, { status, headers: { "www-authenticate": header } }),
+  });
+  const stepUpWrite = auth.onUnauthorized!(makeContext('Bearer error="insufficient_scope", scope="docs:write"', 403));
+  if (!overlap) {
+    await expect(stepUpWrite).rejects.toThrow();
+    expect((await loadPendingMcpChallenge(server, oauthStateDir))?.scope).toBe("docs:write");
+  }
+  const [first, second] = await Promise.allSettled([
+    stepUpWrite,
+    auth.onUnauthorized!(makeContext('Bearer error="invalid_token"', 401)),
+  ]);
+  expect(first.status).toBe("rejected");
+  expect(second.status).toBe("fulfilled");
+  expect(await loadPendingMcpChallenge(server, oauthStateDir)).toMatchObject({ error: "insufficient_scope", scope: "docs:write" });
+
+  // A second under-scoped tool merges its scope instead of overwriting the first one.
+  await expect(auth.onUnauthorized!(makeContext('Bearer error="insufficient_scope", scope="sheets:read"', 403))).rejects.toThrow();
+  expect(await loadPendingMcpChallenge(server, oauthStateDir)).toMatchObject({ error: "insufficient_scope", scope: "docs:write sheets:read" });
 });
 
 test("stdio MCP inherits only selected environment and uses the member's cwd", async () => {

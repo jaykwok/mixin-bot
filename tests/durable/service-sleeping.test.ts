@@ -43,7 +43,7 @@ function open(root: string, models: Models, ref: ModelRef, settings: HarnessSett
   const reports: string[] = [], logs: string[] = [];
   const service = new DurableService({
     layout: appLayout(root), selection: selection(models, ref, settings), modules: [], relay: null, materials: false,
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, tickMs: 20, heartbeatMs: 100 },
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, heartbeatMs: 100 },
     outbound: out.outbound, onReport: (error) => reports.push(String(error)), onLog: (line) => logs.push(line), ...options,
   });
   return { service, reports, logs };

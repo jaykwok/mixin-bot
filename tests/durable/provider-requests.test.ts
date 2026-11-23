@@ -71,7 +71,7 @@ const model = (id: string, compat?: Record<string, boolean>) => ({ id, name: id,
 
 /** The member tools as the service registers them, optionally without some. */
 function memberTools(base: BaseToolsOptions, without: string[] = []): Extension {
-  return defineExtension({ name: "mixin.base", tools: baseMemberTools(base).map((tool) => tool.registration).filter((tool) => !without.includes(tool.name)) });
+  return defineExtension({ name: "mixin.base", tools: baseMemberTools(base).filter((tool) => !without.includes(tool.name)) });
 }
 
 async function turn(path: string, runtime: unknown, extensions: Extension[], ref: { provider: string; modelId: string }, content: string) {

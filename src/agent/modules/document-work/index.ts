@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { loadSkills } from "@earendil-works/pi-coding-agent";
 import type { AgentModuleDefinition, DocumentTemplates } from "../../modules.ts";
-import { documentWorkTools } from "./tools.ts";
+import { DOCUMENT_WORK_NAMESPACE, documentWorkTools } from "./tools.ts";
 
 /** Application-owned resources only; group material never participates in discovery. */
 export function documentWorkModule(templates: DocumentTemplates = {}): AgentModuleDefinition {
@@ -12,7 +12,7 @@ export function documentWorkModule(templates: DocumentTemplates = {}): AgentModu
   }
   const configured = [templates.pptx ? "PPT" : "", templates.docx ? "Word" : ""].filter(Boolean);
   return {
-    name: "document-work", tools: documentWorkTools(templates), skills, readOnlyDirs: [skillRoot],
+    name: "document-work", namespace: DOCUMENT_WORK_NAMESPACE, tools: documentWorkTools(templates), skills, readOnlyDirs: [skillRoot],
     // One point per line: which skill to read first, the four paths, where the tools can be called, how to look and
     // send. The details are in the skill.
     prompt: ["## 文档加工",

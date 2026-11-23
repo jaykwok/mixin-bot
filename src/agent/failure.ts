@@ -37,7 +37,7 @@ export function modelRequestError(errorMessage: string, messages: readonly unkno
  * 不是模型报错、而是这次运行被结束的几种情况：本服务的时限检查（三种时限，以及重启后只知道“被时限检查中止”）、
  * 运行正常结束却没有任何回复、Durable 结束运行的两种原因（`pi.live.runFailure` 的 `interrupted` 与 `restart_limit`）。
  */
-export type StopKind = "model_response_timeout" | "model_idle" | "task_timeout" | "watchdog_restart" | "no_reply" | "interrupted" | "restart_limit";
+export type StopKind = "model_response_timeout" | "model_idle" | "task_timeout" | "watchdog_restart" | "no_reply" | "interrupted" | "restart_limit" | "turn_limit";
 
 /** 运行被结束。结论按 `kind` 给出，不从报错文字里猜：文字是写给管理员看的原文，改了措辞也不影响结论。 */
 export class RequestStopped extends Error {
@@ -56,6 +56,7 @@ const STOP_HINTS: Record<StopKind, string> = {
   interrupted: "回答到一半时服务意外停了，这次没有答完。请再发一次问题；总是这样的话请联系管理员。",
   // 生成任务连续 restartLimit 次被异常中断。
   restart_limit: "这个任务接连几次被意外打断，不再继续了。请再发一次问题；总是这样的话请联系管理员。",
+  turn_limit: "这次处理涉及的工具调用轮次超过了上限，先停下了。请把任务拆小再试，或联系管理员调整上限。",
   no_reply: "模型这次没有给出回复。请再发一次问题；还是没有的话请联系管理员。",
 };
 

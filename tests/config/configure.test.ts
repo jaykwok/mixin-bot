@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { catalogDefaults, catalogMatches, discoverModelIds } from "../../ops/config/configure.ts";
+import { catalogDefaults, catalogMatches, discoverModels } from "../../ops/config/configure.ts";
 
 /** 只读 Pi 随包目录，不碰仓库里的 data/ 和网络。 */
 function builtinRuntime(): Promise<ModelRuntime> {
@@ -61,49 +61,76 @@ describe("端点模型清单", () => {
     }
   }
 
-  test("OpenAI 兼容端点：GET {baseUrl}/models，Bearer 鉴权，去重排序", async () => {
+  test("OpenAI 兼容端点：GET {baseUrl}/models，Bearer 鉴权，去重排序并带回端点声明的上限", async () => {
     let seen: { path: string; auth: string | null } | undefined;
     await withEndpoint((request) => {
       const url = new URL(request.url);
       seen = { path: url.pathname, auth: request.headers.get("authorization") };
-      return Response.json({ data: [{ id: "b-model" }, { id: "a-model" }, { id: "a-model" }, { id: 7 }, { id: "  " }] });
+      return Response.json({
+        data: [
+          { id: "b-model", context_length: 65536, max_completion_tokens: 8192 },
+          { id: "a-model" },
+          { id: "a-model" },
+          { id: 7 },
+          { id: "  " },
+        ],
+      });
     }, async (baseUrl) => {
-      expect(await discoverModelIds("openai-responses", baseUrl, "k")).toEqual(["a-model", "b-model"]);
+      expect(await discoverModels("openai-responses", baseUrl, "k")).toEqual([
+        { id: "a-model" },
+        { id: "b-model", contextWindow: 65536, maxTokens: 8192 },
+      ]);
     });
     expect(seen).toEqual({ path: "/v1/models", auth: "Bearer k" });
   });
 
-  test("Anthropic 端点：GET {baseUrl}/v1/models，x-api-key 鉴权", async () => {
-    let seen: { path: string; key: string | null; version: string | null } | undefined;
+  test("Anthropic 端点：GET {baseUrl}/v1/models，x-api-key 鉴权并支持分页", async () => {
+    const seen: { path: string; after: string | null; key: string | null; version: string | null }[] = [];
     await withEndpoint((request) => {
       const url = new URL(request.url);
-      seen = {
-        path: url.pathname, key: request.headers.get("x-api-key"),
+      const after = url.searchParams.get("after_id");
+      seen.push({
+        path: url.pathname, after, key: request.headers.get("x-api-key"),
         version: request.headers.get("anthropic-version"),
-      };
-      return Response.json({ data: [{ id: "claude-test" }] });
+      });
+      if (!after) return Response.json({ data: [{ id: "claude-b" }], has_more: true, last_id: "claude-b" });
+      return Response.json({ data: [{ id: "claude-a" }], has_more: false });
     }, async (baseUrl) => {
       // Anthropic 的 baseUrl 不带 /v1，这里故意传一个带尾斜杠的地址确认不会拼出双斜杠。
-      expect(await discoverModelIds("anthropic-messages", `${baseUrl}/`, "k")).toEqual(["claude-test"]);
+      expect((await discoverModels("anthropic-messages", `${baseUrl}/`, "k")).map(item => item.id)).toEqual(["claude-a", "claude-b"]);
     });
-    expect(seen).toEqual({ path: "/v1/v1/models", key: "k", version: "2023-06-01" });
+    expect(seen).toEqual([
+      { path: "/v1/v1/models", after: null, key: "k", version: "2023-06-01" },
+      { path: "/v1/v1/models", after: "claude-b", key: "k", version: "2023-06-01" },
+    ]);
   });
 
-  test("Google 风格的 models[].name 去掉前缀", async () => {
-    await withEndpoint(() => Response.json({ models: [{ name: "models/gemini-test" }] }), async (baseUrl) => {
-      expect(await discoverModelIds("google-generative-ai", baseUrl, "k")).toEqual(["gemini-test"]);
+  test("Google 端点：x-goog-api-key 鉴权，models[].name 去掉前缀", async () => {
+    const seen: { key: string | null } = { key: null };
+    await withEndpoint((request) => {
+      seen.key = request.headers.get("x-goog-api-key");
+      return Response.json({ models: [{ name: "models/gemini-test", inputTokenLimit: 1000000, outputTokenLimit: 8192 }] });
+    }, async (baseUrl) => {
+      expect(await discoverModels("google-generative-ai", baseUrl, "k")).toEqual([
+        { id: "gemini-test", contextWindow: 1000000, maxTokens: 8192 },
+      ]);
     });
+    expect(seen.key).toBe("k");
   });
 
-  test("端点报错时抛出，由调用方退回手填", async () => {
+  test("不支持列表接口的协议返回空数组，不发请求", async () => {
+    expect(await discoverModels("bedrock-converse-stream", "http://127.0.0.1:1", "k")).toEqual([]);
+  });
+
+  test("端点报错、重定向或返回非清单 JSON 时抛出，由调用方退回手填", async () => {
     await withEndpoint(() => new Response("nope", { status: 403, statusText: "Forbidden" }), async (baseUrl) => {
-      expect(discoverModelIds("openai-completions", baseUrl, "k")).rejects.toThrow("403");
+      expect(discoverModels("openai-completions", baseUrl, "k")).rejects.toThrow("403");
     });
-  });
-
-  test("没有清单字段时返回空数组，而不是编一个模型出来", async () => {
+    await withEndpoint(() => new Response(null, { status: 302, headers: { location: "https://other.invalid/models" } }), async (baseUrl) => {
+      expect(discoverModels("openai-completions", baseUrl, "k")).rejects.toThrow("重定向");
+    });
     await withEndpoint(() => Response.json({ object: "list" }), async (baseUrl) => {
-      expect(await discoverModelIds("openai-completions", baseUrl, "k")).toEqual([]);
+      expect(discoverModels("openai-completions", baseUrl, "k")).rejects.toThrow("不是模型列表");
     });
   });
 });

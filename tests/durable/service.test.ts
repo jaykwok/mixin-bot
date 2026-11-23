@@ -72,7 +72,7 @@ function open(where: Fixture, models: Models, ref: ModelRef, outbound: Outbound,
   const reports: unknown[] = [];
   const service = new DurableService({
     layout: appLayout(where.root), selection: selection(models, ref), modules: [], relay: null, materials: false,
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 },
     outbound, onReport: (error) => reports.push(error), ...options,
   });
   return { service, reports };
@@ -107,7 +107,7 @@ const notices = (sent: Sent[]) => sent.filter((item) => item.kind === "notice").
 
 /** The reply texts of a member's records that still wait for delivery. */
 /** Default limits with retries of failed deliveries 100 ms apart. */
-const RETRY_LIMITS = { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, deliveryRetryMs: [100] };
+const RETRY_LIMITS = { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, deliveryRetryMs: [100] };
 
 async function pending(service: DurableService, phone = ALICE, group = GROUP): Promise<string[]> {
   return pendingDeliveries(await service.records(scopeOf(group), phone))
@@ -685,7 +685,7 @@ describe("durable service: watchdog", () => {
     const out = recordingOutbound();
     const held = gate("太慢了");
     faux.setResponses([held.step]);
-    const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 300, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 } });
+    const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 300, modelIdleMs: 60_000, modelResponseMs: 60_000 } });
     try {
       await service.admit(out.message(GROUP, ALICE, "慢任务"));
       await until(() => failures(out.sent).length === 1, "the timeout text");
@@ -702,7 +702,7 @@ describe("durable service: watchdog", () => {
     faux.setResponses([held.step]);
     const logs: string[] = [];
     const { service } = open(where, models, model, out.outbound, {
-      limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, heartbeatMs: 100 },
+      limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, heartbeatMs: 100 },
       onLog: (line) => logs.push(line),
     });
     try {
@@ -726,7 +726,7 @@ describe("durable service: watchdog", () => {
     const out = recordingOutbound();
     faux.setResponses([fauxAssistantMessage("第一次"), fauxAssistantMessage("第二次")]);
     const logs: string[] = [];
-    const options = { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, slowOpenMs: 0 }, onLog: (line: string) => logs.push(line) };
+    const options = { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, slowOpenMs: 0 }, onLog: (line: string) => logs.push(line) };
     const first = open(where, models, model, out.outbound, options);
     try {
       await first.service.admit(out.message(GROUP, ALICE, "问题"));
@@ -751,7 +751,7 @@ describe("durable service: watchdog", () => {
     const out = recordingOutbound();
     const held = gate("不会到");
     faux.setResponses([held.step]);
-    const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, tickMs: 20 } });
+    const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000 } });
     try {
       await service.admit(out.message(GROUP, ALICE, "卡住"));
       await until(() => failures(out.sent).length === 1, "the idle text");
@@ -773,7 +773,7 @@ describe("durable service: watchdog", () => {
     const base = selection(models, model);
     const { service } = open(where, models, model, out.outbound, {
       selection: { ...base, harnessSettings: { ...base.harnessSettings, progress: { ...PROJECT_PROGRESS, persistWithinMs: 60_000 } } },
-      limits: { runTimeoutMs: 60_000, modelIdleMs: 600, modelResponseMs: 60_000, tickMs: 20 },
+      limits: { runTimeoutMs: 60_000, modelIdleMs: 600, modelResponseMs: 60_000 },
     });
     /** Whether any stored row of the group's database holds streamed text. */
     const stored = () => {
@@ -835,7 +835,7 @@ describe("durable service: threshold compaction", () => {
     const { service, reports } = open(where, models, model, out.outbound, {
       selection: { ...base, harnessSettings: { ...base.harnessSettings,
         compaction: { enabled: true, reserveTokens: 128_000 - 8_000, keepRecentTokens: 100, backgroundTokens: 0 } } },
-      limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, tickMs: 20, heartbeatMs: 100 },
+      limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, heartbeatMs: 100 },
       onLog: (line) => logs.push(line),
     });
     try {
@@ -1501,7 +1501,7 @@ test("a /clear after the member's in-memory state was dropped as idle still rese
     return fauxAssistantMessage("answer");
   }));
   const { service } = open(where, models, model, out.outbound,
-    { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, memberIdleMs: 1 } });
+    { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, memberIdleMs: 1 } });
   try {
     await service.admit(out.message(GROUP, ALICE, "before"));
     await until(() => replies(out.sent).length === 1, "the first answer");
@@ -1512,5 +1512,76 @@ test("a /clear after the member's in-memory state was dropped as idle still rese
     await service.admit(out.message(GROUP, ALICE, "after"));
     await until(() => replies(out.sent).length === 2, "the second answer");
     expect(users).toEqual([1, 1]);
+  } finally { await service.close(); }
+});
+
+test("durable.maxTurns stops a multi-round tool run with turn_limit and tells the member", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  let calls = 0;
+  const ext = () => [defineExtension({
+    name: "test.ping",
+    tools: [{
+      name: "ping",
+      description: "ping",
+      parameters: obj({}),
+      execute: async () => { calls++; return { output: [{ type: "text", text: `pong ${calls}` }] }; },
+    }],
+  })];
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("ping", {}, { id: "call_ping_1" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("ping", {}, { id: "call_ping_2" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("unreachable"),
+  ]);
+  const { service } = open(where, models, model, out.outbound, {
+    selection: { ...selection(models, model), maxTurns: 1 },
+    extensions: ext,
+  });
+  try {
+    await service.admit(out.message(GROUP, ALICE, "循环调工具"));
+    await until(() => failures(out.sent).length === 1, "the turn_limit reply");
+    expect(calls).toBe(1);
+    expect(failures(out.sent)[0]).toContain("工具调用轮次超过了上限");
+    expect(replies(out.sent)).toEqual([]);
+  } finally { await service.close(); }
+});
+
+test("a parked sleeping tool shows 等待工具中 in /status and 等待工具 in heartbeats without triggering model idle abort", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  const logs: string[] = [];
+  const parked = Promise.withResolvers<void>();
+  const ext = () => [defineExtension({
+    name: "test.nap",
+    tools: [{
+      name: "nap",
+      description: "nap",
+      parameters: obj({}),
+      execute: async (_args, api) => {
+        if (api.checkpoint === undefined) {
+          parked.resolve();
+          return { sleep: { checkpoint: true, until: Date.now() + 500 } };
+        }
+        return { output: [{ type: "text", text: "awake" }] };
+      },
+    }],
+  })];
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("nap", {}, { id: "call_nap_1" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("醒来了"),
+  ]);
+  const { service } = open(where, models, model, out.outbound, {
+    extensions: ext,
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 150, modelResponseMs: 60_000, heartbeatMs: 80 },
+    onLog: (line) => logs.push(line),
+  });
+  try {
+    await service.admit(out.message(GROUP, ALICE, "休息一下"));
+    await parked.promise;
+    await until(() => logs.some((line) => line.startsWith("任务仍在运行") && line.includes("阶段: 等待工具 nap（休眠等待）")), "a parked heartbeat");
+    const status = await service.control(out.message(GROUP, ALICE, "/status"));
+    expect(status).toContain("状态：等待工具中");
+    expect(status).toContain("nap（休眠等待）");
+    await until(() => replies(out.sent).length === 1, "the final reply after waking");
+    expect(replies(out.sent)).toEqual(["醒来了"]);
+    expect(failures(out.sent)).toEqual([]);
   } finally { await service.close(); }
 });

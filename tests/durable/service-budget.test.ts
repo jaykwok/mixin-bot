@@ -39,7 +39,7 @@ function setup(max = 1, options: Partial<DurableServiceOptions> = {}) {
   const { faux, models, model } = fauxModels();
   const root = join(fixture.root, String(++sequence));
   const out = recordingOutbound();
-  const limits = { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: max };
+  const limits = { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, activeRequests: max };
   const selection = { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)!,
     ref: model, thinkingLevel: "off" as const, harnessSettings: {} };
   const service = new DurableService({ layout: appLayout(root), modules: [], relay: null, materials: false, limits, selection, outbound: out.outbound, ...options });
@@ -178,7 +178,7 @@ test("cold recovery bounds old running tasks after a lower limit and stop can ca
 }, 60000);
 
 test("a refused reply survives maintenance with no idle groups kept, and its retry sends it once", async () => {
-  const f = setup(1, { maxIdleSpaces: 0, limits: { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: 1,
+  const f = setup(1, { maxIdleSpaces: 0, limits: { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, activeRequests: 1,
     deliveryRetryMs: [500] } });
   f.faux.setResponses([fauxAssistantMessage("answer")]);
   let attempts = 0;

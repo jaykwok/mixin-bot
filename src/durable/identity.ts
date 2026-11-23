@@ -71,6 +71,8 @@ export async function databaseSpace(reader: DocumentReader, context: Context): P
 export interface AgentSetup {
   model: ModelRef;
   thinkingLevel?: ModelThinkingLevel;
+  /** Optional cap on tool rounds per run (`AgentState.maxTurns`); undefined leaves it unlimited (clearing any prior cap). */
+  maxTurns?: number;
   /**
    * Member extensions the conversation adds to the default selection (DurableService `memberExtensions`); undefined
    * leaves the stored selection as it is.
@@ -115,13 +117,24 @@ export async function memberConversation(harness: Harness, scope: Scope, phone: 
       const stored = await tx.doc(AgentDoc, id);
       const thinkingLevel = agent.thinkingLevel ?? "off";
       const selection = selectionChange(stored.extensions, agent);
-      if (stored.model?.provider !== agent.model.provider || stored.model?.modelId !== agent.model.modelId || stored.thinkingLevel !== thinkingLevel) {
-        await configure(tx, id, { model: agent.model, thinkingLevel, ...selection });
-      } else if (selection) await configure(tx, id, selection);
+      const modelChanged = stored.model?.provider !== agent.model.provider || stored.model?.modelId !== agent.model.modelId || stored.thinkingLevel !== thinkingLevel;
+      const maxTurnsChanged = stored.maxTurns !== agent.maxTurns;
+      if (modelChanged || maxTurnsChanged || selection) {
+        await configure(tx, id, {
+          ...(modelChanged ? { model: agent.model, thinkingLevel } : {}),
+          ...(maxTurnsChanged ? { maxTurns: agent.maxTurns ?? null } : {}),
+          ...selection,
+        });
+      }
       return { id, created: false };
     }
     const record = await tx.createConversation({ ownership: { kind: "ownerless" } });
-    await configure(tx, record.id, { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off", ...selectionChange(undefined, agent) });
+    await configure(tx, record.id, {
+      model: agent.model,
+      thinkingLevel: agent.thinkingLevel ?? "off",
+      ...(agent.maxTurns === undefined ? {} : { maxTurns: agent.maxTurns }),
+      ...selectionChange(undefined, agent),
+    });
     const identity = await tx.doc(IdentityDoc, record.id);
     identity.space = key;
     identity.phone = phone;

@@ -49,7 +49,7 @@ const service = new DurableService({
   layout, modules: [], relay: null, materials: false, outbound: out.outbound, onReport: () => {},
   selection: { runtime: models as never, settings: undefined as never, model: { ...m, contextWindow: 128000 } as never, ref: model, thinkingLevel: "off",
     harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } },
-  limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
+  limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 },
 });
 let channel: ReadChannel;
 let bot: ReturnType<typeof Bun.serve>;

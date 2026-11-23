@@ -50,6 +50,16 @@ describe("Pi 原生设置视图", () => {
     } finally { await files.cleanup(); }
   });
 
+  test("支持可选 durable.maxTurns（1-200）并拒绝越界或非整数值", () => {
+    expect(enginePolicy({}).maxTurns).toBeUndefined();
+    expect(enginePolicy({ maxTurns: 1 }).maxTurns).toBe(1);
+    expect(enginePolicy({ maxTurns: 30 }).maxTurns).toBe(30);
+    expect(enginePolicy({ maxTurns: 200 }).maxTurns).toBe(200);
+    for (const bad of [0, -1, 201, 1.5, "10", null]) {
+      expect(() => enginePolicy({ maxTurns: bad })).toThrow(/durable\.maxTurns/);
+    }
+  });
+
   test("真实 SDK 资源重载和只读设置写入后仍保留原生 Durable 策略", async () => {
     const files = await tempFixture("pi-settings-");
     try {

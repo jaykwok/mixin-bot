@@ -207,7 +207,7 @@ function replySpecs(push: PushTools, scope: Scope): MemberToolSpec[] {
 /** A space's push extensions: all three for the direct space, the reply one for a group. */
 export function pushExtensions(push: PushTools, scope: Scope, options: { layout: Layout; venvDir?: string }): Extension[] {
   const places = { layout: options.layout, scope, ...(options.venvDir ? { venvDir: options.venvDir } : {}) };
-  const tools = (specs: readonly MemberToolSpec[]) => specs.map(spec => memberTool(spec, places).registration);
+  const tools = (specs: readonly MemberToolSpec[]) => specs.map(spec => memberTool(spec, places));
   const answering = defineExtension({ name: PUSH_REPLY_EXTENSION, tools: tools(replySpecs(push, scope)),
     sections: [section("push-reply", () => scope.kind === "direct" ? REPLY_PROMPT : GROUP_REPLY_PROMPT)],
     hooks: [hook(GenerationTask, {

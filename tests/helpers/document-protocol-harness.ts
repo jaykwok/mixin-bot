@@ -17,6 +17,7 @@ delete process.env.BOT_DOCUMENT_OFFICE_PATH;
 const { calls, controls, requests } = await stubDocumentPython();
 const { documentTools } = await import("../../src/agent/document-extract.ts");
 const { documentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
+const { documentWorkModule } = await import("../../src/agent/modules/document-work/index.ts");
 const { sendTools } = await import("../../src/agent/send-tools.ts");
 const { application } = await import("../../src/core/lifecycle.ts");
 
@@ -187,11 +188,10 @@ if (removalNeedsPermit()) {
   for (const name of added) assert.equal(JSON.parse(await readFile(join(tempDir, name, ".reclamation.json"), "utf8")).status, "deferred");
 } else assert.deepEqual(await jobs(), jobsBefore);
 
-// One namespace for the module, short descriptions, the long guidance in the namespace and the skill.
-const namespace = moduleTools[0]!.namespace!;
+// One namespace on the module extension, short descriptions, the long guidance in the namespace and the skill.
+const namespace = documentWorkModule().namespace!;
 assert.equal(namespace.name, "document_work");
 for (const tool of moduleTools) {
-  assert.equal(tool.namespace, namespace, `${tool.name} has its own namespace object`);
   assert.ok(tool.description.length <= 320, `${tool.name} description is ${tool.description.length} chars`);
   assert.ok(!tool.description.includes("<!-- cards"), `${tool.name} still carries the Markdown guide`);
 }
@@ -202,7 +202,6 @@ const guide = await readFile(new URL("../../src/agent/modules/document-work/skil
 for (const phrase of ["<!-- notes:", "<!-- cards -->", "<!-- timeline -->", "```mermaid", "width=8cm", "`---`", "build.layouts", "build.attention", "keepSlides", "build.defaultTemplate"]) {
   assert.ok(guide.includes(phrase), `references/build.md lacks ${phrase}`);
 }
-assert.equal(tools[0]!.namespace, undefined, "document_extract stays outside the module namespace");
 
 // The send tools are declared to the model but not callable from scripts.
 const send =sendTools(null, () => ({ channel: { file: async () => {}, image: async () => {} }, workspaceDir: workspace, tempDir,

@@ -1,10 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { McpClient, StdioTransport, StreamableHttpTransport, validateMcpServerConfig, type AuthProvider, type CallToolResult, type McpTransport, type McpTransportSendOptions,
+import { McpClient, StdioTransport, StreamableHttpTransport, validateMcpServerConfig, type CallToolResult, type McpTransport, type McpTransportSendOptions,
   type Tool } from "@earendil-works/pi-mcp";
+import { McpOAuthAuthorizationRequiredError, type McpAuthProvider } from "@earendil-works/pi-mcp/oauth";
 import { expandVariables, type McpConfig, type McpServerConfig } from "../core/mcp-config.ts";
-import { mcpOAuth } from "./mcp-oauth.ts";
+import { loadPendingMcpChallenge, mcpAuthProvider, McpOAuthAuthorizationDetailError, type McpOAuthChallenge } from "./mcp-oauth.ts";
 import type { Scope } from "../core/layout.ts";
 import { APP_VERSION } from "../core/version.ts";
 import { SUPERVISOR_ENV } from "../lib/process.ts";
@@ -17,6 +18,51 @@ export interface McpCatalogueTool { server: McpServerConfig; tool: Tool }
 export interface McpTimeouts { requestMs: number; callMs: number }
 const supervisor = fileURLToPath(new URL("../lib/process-supervisor.ts", import.meta.url));
 const sameSchema = (a: Tool, b: Tool) => JSON.stringify(a.inputSchema) === JSON.stringify(b.inputSchema) && JSON.stringify(a.outputSchema) === JSON.stringify(b.outputSchema);
+
+/** Strictly shell-safe OAuth scopes across Bash, Zsh, PowerShell, and cmd.exe (no $, `, %, quotes, controls, or leading '-'). */
+const SAFE_CLI_SCOPE = /^[A-Za-z0-9_.:/][A-Za-z0-9_.:/-]*(?: [A-Za-z0-9_.:/][A-Za-z0-9_.:/-]*)*$/;
+const MAX_SAFE_CLI_SCOPE_LENGTH = 256;
+
+function isSafeCliScope(scope: string): boolean {
+  return scope.length > 0 && scope.length <= MAX_SAFE_CLI_SCOPE_LENGTH && SAFE_CLI_SCOPE.test(scope);
+}
+
+/** Display a remote scope safely (escaping control/special characters whenever it is not strictly CLI-safe). */
+function displayScope(scope: string): string {
+  return isSafeCliScope(scope) ? scope : JSON.stringify(scope);
+}
+
+/**
+ * Format an operator-facing OAuth authorization error.
+ * When persisting the server's challenge failed, only strictly shell-safe scopes are placed into a copyable `--scope`
+ * command; all other remote scopes are displayed separately and entered interactively via `--prompt-scope`.
+ */
+function formatMcpOAuthError(serverName: string, challenge: McpOAuthChallenge | undefined, persistError: Error | undefined): string {
+  const loginBase = `bun run mcp login ${serverName}`;
+  const isStepUp = challenge?.error === "insufficient_scope";
+  const scope = challenge?.scope;
+  if (!persistError) {
+    if (isStepUp) {
+      const scopeDetail = scope ? `（需要 scope：${displayScope(scope)}）` : "";
+      return `MCP ${serverName} 权限不足${scopeDetail}，请管理员执行 ${loginBase}`;
+    }
+    return `MCP ${serverName} 需要管理员执行 ${loginBase}`;
+  }
+  if (scope) {
+    if (isSafeCliScope(scope)) {
+      const prefix = isStepUp
+        ? `MCP ${serverName} 权限不足（需要 scope：${scope}）`
+        : `MCP ${serverName} 需要重新授权（需要 scope：${scope}）`;
+      return `${prefix}，且未能保存权限挑战（${persistError.message}），请管理员执行 ${loginBase} --scope "${scope}"`;
+    }
+    const prefix = isStepUp ? `MCP ${serverName} 权限不足` : `MCP ${serverName} 需要重新授权`;
+    return `${prefix}，且未能保存权限挑战（${persistError.message}）；远端要求的 scope 为 ${displayScope(scope)}（包含不可安全粘贴到命令行的字符），请管理员执行 ${loginBase} --reauth --prompt-scope 后在交互提示中手动输入上述 scope`;
+  }
+  if (isStepUp) {
+    return `MCP ${serverName} 权限不足，且未能保存权限挑战（${persistError.message}），请管理员执行 ${loginBase} --reauth`;
+  }
+  return `MCP ${serverName} 需要重新授权，且未能保存授权挑战（${persistError.message}），请管理员执行 ${loginBase} --reauth`;
+}
 
 /** A server as pi-mcp's `mcpServers` shape has it (the administrator's file, without this service's `tools`). */
 export function officialEntry(server: McpServerConfig): Record<string, unknown> {
@@ -32,16 +78,19 @@ export class McpTools {
   readonly #clientClose = new WeakMap<McpClient, Promise<void>>();
   readonly #closing = new AbortController();
   readonly #scope = new AsyncLocalStorage<{ signal: AbortSignal; gate?: ExternalGate }>();
-  readonly #auth = new Map<string, AuthProvider>();
+  readonly #auth = new Map<string, McpAuthProvider>();
+  readonly #oauthStateDir: string | undefined;
+  readonly #instructions = new Map<string, string>();
   readonly #timeouts: McpTimeouts;
   constructor(private readonly config: McpConfig, private readonly discoveryDir = "data/runtime/mcp/discovery",
-    timeouts: Partial<McpTimeouts> = {}) {
+    timeouts: Partial<McpTimeouts> & { oauthStateDir?: string } = {}) {
     this.#timeouts = { requestMs: 30000, callMs: 120000, ...timeouts };
+    this.#oauthStateDir = timeouts.oauthStateDir;
     for (const server of config.servers) {
       // The file was checked by this service's rules (src/core/mcp-config.ts); pi-mcp's own check must agree on every entry.
       const official = validateMcpServerConfig(server.name, officialEntry(server));
       if (official.kind !== server.transport) throw new Error(`MCP ${server.name} 配置无效：${official.kind === "invalid" ? official.error : "传输方式不符"}`);
-      if (server.oauth) this.#auth.set(server.name, mcpOAuth(server).auth);
+      if (server.oauth) this.#auth.set(server.name, mcpAuthProvider(server, { stateRoot: timeouts.oauthStateDir }));
     }
   }
 
@@ -55,7 +104,11 @@ export class McpTools {
     try {
       await mkdir(this.discoveryDir, { recursive: true, mode: 0o700 });
       for (const server of this.config.servers) {
-        const tools = await this.#use(server, undefined, signal, undefined, client => client.listTools({ signal, timeoutMs: this.#limits(server).requestMs }));
+        const { tools, instructions } = await this.#use(server, undefined, signal, undefined, async client => ({
+          tools: await client.listTools({ signal, timeoutMs: this.#limits(server).requestMs }),
+          instructions: client.instructions,
+        }));
+        if (instructions) this.#instructions.set(server.name, instructions);
         const names = new Set<string>();
         for (const tool of tools) {
           if (names.has(tool.name)) throw new Error(`MCP ${server.name} 返回重复工具名称`);
@@ -66,6 +119,9 @@ export class McpTools {
       }
     } catch (error) { await this.close(); throw error; }
   }
+
+  /** Instructions the server returned in `initialize`, if any. */
+  serverInstructions(name: string): string | undefined { return this.#instructions.get(name); }
 
   async call(entry: McpCatalogueTool, member: McpMember, args: Record<string, unknown>, signal: AbortSignal, gate: ExternalGate): Promise<CallToolResult> {
     const { requestMs, callMs } = this.#limits(entry.server);
@@ -95,6 +151,14 @@ export class McpTools {
         await client.connect(transport);
         requestSignal.throwIfAborted();
         return await work(client);
+      } catch (error) {
+        if (error instanceof McpOAuthAuthorizationRequiredError) {
+          const detail = error instanceof McpOAuthAuthorizationDetailError ? error : undefined;
+          const challenge = detail?.challenge
+            ?? (server.oauth ? await loadPendingMcpChallenge(server, this.#oauthStateDir).catch(() => undefined) : undefined);
+          throw new Error(formatMcpOAuthError(server.name, challenge, detail?.persistError), { cause: error });
+        }
+        throw error;
       } finally {
         requestSignal.removeEventListener("abort", abort);
         try { await this.#close(client); } finally { this.#clients.delete(client); }
@@ -141,9 +205,14 @@ export class McpTools {
     for (const name of Object.keys(headers)) if (["x-mixin-chat", "x-mixin-group", "x-mixin-member"].includes(name.toLowerCase())) delete headers[name];
     if (member) Object.assign(headers, { "x-mixin-chat": member.scope.kind, "x-mixin-member": encodeURIComponent(member.phone),
       ...(member.scope.kind === "group" ? { "x-mixin-group": encodeURIComponent(member.scope.groupId) } : {}) });
+    const endpoint = new URL(server.url!).href;
     return new StreamableHttpTransport({ url: server.url!, headers, authProvider: this.#auth.get(server.name),
       maxMessageBytes: 8 * 1024 * 1024, openGetStream: false,
       fetch: (url, init) => {
+        const target = new URL(typeof url === "string" ? url : url.href).href;
+        // OAuth discovery / refresh requests run under createMcpAuthProvider's single-flight lock and pi-mcp's timedFetch;
+        // never couple them to one caller's abort signal or request door gate, or a cancelled call could drop a rotated token.
+        if (target !== endpoint) return fetch(url, init);
         const scope = this.#scope.getStore();
         // Session DELETE and cancellation must still reach the server after a tool's cancellation.
         let method: string | undefined;
@@ -166,7 +235,10 @@ export class McpTools {
 
   async close(): Promise<void> {
     this.#closing.abort();
-    const results = await Promise.allSettled([...this.#clients].map(client => this.#close(client)));
+    const results = await Promise.allSettled([
+      ...[...this.#clients].map(client => this.#close(client)),
+      ...[...this.#auth.values()].map(auth => auth.settled()),
+    ]);
     const failed = results.filter(result => result.status === "rejected");
     if (failed.length) throw new AggregateError(failed.map(result => (result as PromiseRejectedResult).reason), "MCP 会话关闭失败");
   }

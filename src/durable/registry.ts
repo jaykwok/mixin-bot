@@ -6,10 +6,12 @@
 // - `mixin.materials-search`: materials_find, materials_grep (src/agent/materials-search.ts);
 // - `mixin.send`: send_image, send_file and, with the closeout, deliverable_register, model-only (./send.ts, ./closeout.ts);
 // - `mixin.auxiliary`: configured classifier and image tools (./auxiliary.ts);
-// - `mixin.mcp`: configured remote MCP tools, deferred: scripts find them with `searchTools()` (./mcp.ts);
+// - `mixin.mcp.<server>`: configured remote MCP tools per server, deferred: scripts find them with `searchTools()` (./mcp.ts);
 // - `mixin.<module>` for each enabled module: its tools, script-only; selecting it turns the module on for the
 //   conversation: its tools become callable from scripts and its prompt text and skills appear;
-// - `mixin.codemode`: the codemode tool over all of the above (./codemode/index.ts).
+// - `mixin.codemode`: the codemode tool over all of the above (./codemode/index.ts);
+// - `fit-images`: official afterTool image fitter so images returned by any tool (generate_image, MCP, codemode `image()`)
+//   conform to the conversation model's limits before entering the transcript.
 //
 // Every tool is registered with who may call it (`callers`, `deferred`): the model sees the ones it may call, in that
 // order; scripts call the others through `executeTool()`, so the request door's wraps and the Harness's checks apply to
@@ -18,18 +20,20 @@
 // relay configuration is read once at service start (src/integrations/relay.ts), so a change needs a restart anyway.
 import { resolve } from "node:path";
 import { defineExtension, type Extension } from "@earendil-works/pi-durable";
+import { createFitImagesExtension } from "@earendil-works/pi-durable/images/fit";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
-import { auxiliaryMemberTools, type AuxiliaryBudget } from "./auxiliary.ts";
+import { AUXILIARY_NAMESPACE, auxiliaryMemberTools, type AuxiliaryBudget } from "./auxiliary.ts";
+import { nodeImages } from "./base-tools.ts";
 import type { RequestDoor } from "./door.ts";
 import type { McpTools } from "../integrations/mcp.ts";
-import { mcpMemberTools } from "./mcp.ts";
+import { mcpExtensions } from "./mcp.ts";
 import { relayMaxBytes, type RelayConfig } from "../integrations/relay.ts";
 import { codemodeExtension } from "./codemode/index.ts";
 import { moduleExtensionName, promptExtension } from "./prompt.ts";
 import { sendMemberTools } from "./send.ts";
 import type { Outbound } from "./outbound.ts";
-import { baseExtension, documentMemberTools, memberTool, type MemberTool } from "./tools.ts";
+import { baseExtension, documentMemberTools, memberTool } from "./tools.ts";
 import { deliverableTool } from "./closeout.ts";
 import { materialsTools } from "../agent/materials-search.ts";
 import type { Layout, Scope } from "../core/layout.ts";
@@ -65,18 +69,22 @@ export function spaceExtensions(options: SpaceRegistryOptions): Extension[] {
   const send = sendMemberTools({ ...members, relay: options.relay, outbound: options.outbound });
   if (options.closeout) send.push(deliverableTool(members, options.relay ? relayMaxBytes(options.relay) : undefined));
   const auxiliary = options.auxiliary ? auxiliaryMemberTools(members, options.auxiliary.door, options.auxiliary.config, options.auxiliary.budget) : [];
-  const mcp = options.mcp ? mcpMemberTools(members, options.mcp.manager, options.mcp.door) : [];
+  const mcp = options.mcp ? mcpExtensions(members, options.mcp.manager, options.mcp.door) : [];
   const modules = options.modules.map((module) => ({ module, tools: module.tools.map((spec) => memberTool(spec, members)) }));
-  const registrations = (tools: readonly MemberTool[]) => tools.map((tool) => tool.registration);
   return [
     promptExtension({ layout: options.layout, modules: options.modules, relayEnabled: options.relay !== null,
       isolatedTasks: configuredRootlessTasks() !== undefined }),
     baseExtension(members, documents),
-    defineExtension({ name: "mixin.materials-search", tools: registrations(searchTools) }),
-    defineExtension({ name: "mixin.send", tools: registrations(send) }),
-    ...(auxiliary.length ? [defineExtension({ name: "mixin.auxiliary", tools: registrations(auxiliary) })] : []),
-    ...(mcp.length ? [defineExtension({ name: "mixin.mcp", tools: registrations(mcp) })] : []),
-    ...modules.map(({ module, tools }) => defineExtension({ name: moduleExtensionName(module), tools: registrations(tools) })),
-    codemodeExtension({ members, tools: [...documents, ...searchTools, ...send, ...auxiliary, ...mcp, ...modules.flatMap(({ tools }) => tools)] }),
+    defineExtension({ name: "mixin.materials-search", tools: searchTools }),
+    defineExtension({ name: "mixin.send", tools: send }),
+    ...(auxiliary.length ? [defineExtension({ name: "mixin.auxiliary", namespace: AUXILIARY_NAMESPACE, tools: auxiliary })] : []),
+    ...mcp,
+    ...modules.map(({ module, tools }) => defineExtension({
+      name: moduleExtensionName(module),
+      ...(module.namespace ? { namespace: module.namespace } : {}),
+      tools,
+    })),
+    codemodeExtension({ members }),
+    createFitImagesExtension(nodeImages),
   ];
 }

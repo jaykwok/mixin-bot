@@ -69,7 +69,7 @@ function model(answers: ((messages: Message[]) => ReturnType<FauxResponseFactory
 function open(where: string, m: ReturnType<typeof model>, outbound: Outbound, options: Partial<DurableServiceOptions> = {}) {
   return new DurableService({
     layout: appLayout(where), selection: selection(m.models, m.ref), modules: [], relay: null, materials: false,
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 },
     outbound, attachments: { source: download, limits: { memberCount: 1 } }, ...options,
   });
 }

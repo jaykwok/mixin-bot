@@ -2,11 +2,11 @@
 
 [返回开发指南](development.md) · [部署与配置](deployment.md) · [运维手册](operations.md)
 
-机器人使用 Pi Durable 1.5.2。手工修改本页配置前先停止服务，保存后重新启动，启动时会校验配置。模型选择也可通过控制台「模型」页修改；辅助模型和 MCP 在该页显示配置状态，具体字段按下文填写。未配置的辅助模型和 MCP 工具不注册。
+机器人使用 Pi Durable 1.6.0。手工修改本页配置前先停止服务，保存后重新启动，启动时会校验配置。模型选择也可通过控制台「模型」页修改；辅助模型和 MCP 在该页显示配置状态，具体字段按下文填写。未配置的辅助模型和 MCP 工具不注册。
 
 ## 主模型与全局设置
 
-所有成员会话共用一个主模型。控制台「模型 → 全局模型设置」使用 Pi 原生字段；手工配置的定义见 [Pi Settings](https://docs.pi.dev/latest/settings) 和 [Models Configuration](https://docs.pi.dev/latest/models-configuration)。本项目锁定 Pi 1.5.2，升级 Pi 时以安装版本的 schema 校验为准。
+所有成员会话共用一个主模型。控制台「模型 → 全局模型设置」使用 Pi 原生字段；手工配置的定义见 [Pi Settings](https://docs.pi.dev/latest/settings) 和 [Models Configuration](https://docs.pi.dev/latest/models-configuration)。本项目锁定 Pi 1.6.0，升级 Pi 时以安装版本的 schema 校验为准。
 
 | 设置 | 保存位置 | 生效规则 |
 | --- | --- | --- |
@@ -59,6 +59,8 @@ Pi 没有统一的全局上下文长度字段。内置模型通过 `providers.<p
 `progress` 管运行中的进度：`partialIntervalMs` 是模型正在生成的回答两次提交之间的最短间隔，`outputIntervalMs` 是工具运行输出两次提交之间的最短间隔，范围都是 0–10,000 毫秒；服务内的看门狗和 `/status` 立即看到这些进度。`persistWithinMs`（0–60,000 毫秒）是这些进度最迟写入会话库的时间，阶段结束时（模型答完、工具返回）立即写入；服务异常退出时最多丢失这段时间的流式进度，已完成的回答和工具结果不受影响。控制台从会话库读取，运行中的进度最多晚这么久显示。
 
 `contextRetentionMs` 范围 0–600,000 毫秒，是官方任务上下文缓存的闲置保留时间；0 在任务闲置后释放。它减少历史条目读取，但增加内存占用，且不限制活跃成员数量。多成员大历史部署可设 0。运维端通过 `Conversation.context()` 查询历史时仍需读取会话库，不使用任务上下文缓存。
+
+`maxTurns` 为可选字段（整数 1–200，未配置则不限），对应 Pi Durable 1.6.0 的 `AgentState.maxTurns`，限制单次运行最多执行的工具调用轮次；达到上限后运行以 `turn_limit` 结束并提示成员。
 
 ## 文档分流与图片生成
 
@@ -118,7 +120,7 @@ Pi 没有统一的全局上下文长度字段。内置模型通过 `providers.<p
 
 **本机程序**：`command` 必须是该主机上的绝对路径，参数不经 shell 展开，不接受 `cwd`。子进程只继承必要的 PATH/系统/临时目录变量和显式配置的 `env`（值里可以用 `${变量名}` 引用服务的环境变量），另带 `MIXIN_CHAT_KIND / MIXIN_GROUP_ID / MIXIN_MEMBER_PHONE`（单聊时 `MIXIN_CHAT_KIND` 为 `direct`）；工作目录是成员 tmp。进程监督负责取消、stdin 关闭和父进程死亡后的后代回收。MCP roots 表达共享资料只读与成员 tmp 的使用约定，**不构成 OS 文件系统隔离**；stdio 程序仍具有服务用户权限，只配置可信程序。
 
-**HTTP OAuth**：在服务器上加 `"oauth": { "callbackPort": 43127, "clientId": "registered-client" }`。`callbackPort` 必填，登录时在本机这个端口接收回调，回调地址是 `http://127.0.0.1:<端口>/callback`；省略 `clientId` 时采用官方动态注册流程；保密客户端用 `"clientSecret": "${变量名}"` 引用环境变量；还可以写 `scope`（要申请的权限，空格分隔）和 `clientName`（动态注册时的客户端名称）。停机后执行 `bun run mcp login documents`，按输出链接在浏览器授权；回调仅监听 `127.0.0.1`，登录期限两分钟，可取消。凭证按服务器名称和精确 URL 保存在 `data/runtime/mcp/`；备份应按秘密配置保护。服务启动不自动打开登录流程。
+**HTTP OAuth**：在服务器上加 `"oauth": { "callbackPort": 43127, "clientId": "registered-client" }`。`callbackPort` 必填，登录时在本机这个端口接收回调，回调地址是 `http://127.0.0.1:<端口>/callback`；省略 `clientId` 时采用官方动态注册流程；保密客户端用 `"clientSecret": "${变量名}"` 引用环境变量；还可以写 `scope`（要申请的权限，空格分隔）和 `clientName`（动态注册时的客户端名称）。停机后执行 `bun run mcp login documents`（需要强制重新走浏览器授权或追加权限时可加 `--reauth`、`--scope "<权限列表>"` 或交互输入 `--prompt-scope`），通过 `@earendil-works/pi-mcp/oauth` 官方登录流程按输出链接在浏览器授权；回调仅监听 `127.0.0.1`，登录期限两分钟，可取消。凭证按服务器名称和精确 URL 保存在 `data/runtime/mcp/`，运行时通过 `createMcpAuthProvider` 复用单飞刷新并加跨进程文件锁保护刷新令牌轮换；遇到服务端返回 `insufficient_scope` 时会持久化该次权限挑战，供下次 `mcp login` 自动跳过旧令牌刷新并申请增补权限，关机前等待在途刷新落盘；备份应按秘密配置保护。服务启动不自动打开登录流程。
 
 发现只读取工具目录；每次调用重查参数与结果 schema，目录变化会拒绝执行并要求管理员复核重启。工具经 codemode 按需发现，保持 unsafe、不自动重试、成员身份和取消边界，不能调用 model-only 的 `send_*`。结果文字超过 20 KB 时模型看到开头和结尾，完整文字和图片按成员归属落盘，纳入现有 `/clear` 和保留清理。单条传输最多 8 MiB，活跃会话最多八个。
 
@@ -129,6 +131,6 @@ bun run history context <群号>|--direct <成员号码> [条目编号] [--group
 bun run history timings <群号>|--direct <成员号码> [--group-id|--storage-segment]
 ```
 
-诊断使用数据库的一致只读快照，在快照上打开暂停的 Harness，不创建分叉或模型请求。允许源库正在写 WAL，不写入源会话、配置或费用；SQLite 自身的读锁与共享内存由 SQLite 管理。空间库不超过 256 MiB 时快照放在内存中；更大的空间库用 `VACUUM INTO` 复制到 `data/state/reclamation/snapshots/` 私有目录（与数据在同一卷，不占服务容器的 64 MiB `/tmp`），诊断结束即删除，数据备份不包含该目录。复制需要与空间库相当的空闲磁盘空间。
+诊断使用数据库的一致只读快照，在快照上打开只读且暂停的 Harness（`readOnly: true`），不创建分叉或模型请求。允许源库正在写 WAL，不写入源会话、配置或费用；SQLite 自身的读锁与共享内存由 SQLite 管理。空间库不超过 256 MiB 时快照放在内存中；更大的空间库用 `VACUUM INTO` 复制到 `data/state/reclamation/snapshots/` 私有目录（与数据在同一卷，不占服务容器的 64 MiB `/tmp`），诊断结束即删除，数据备份不包含该目录。复制需要与空间库相当的空闲磁盘空间。
 
 响应和普通工具使用官方 `durationMs`，任务用 `startedAt / endedAt`；任务跨度包含等待、重试和恢复，单次响应耗时以对应的 `durationMs` 为准。记录缺少耗时字段时返回未知值和缺失数量，不补零。原始历史顺序保持不变；官方请求上下文仅在 system 之前都是 user 消息时把它前移，压缩后的历史仍需按实际上下文判断。

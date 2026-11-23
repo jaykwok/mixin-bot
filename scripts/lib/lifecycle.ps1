@@ -135,13 +135,13 @@ function Save-DeploymentFiles([string]$ProjectRoot, [string]$Snapshot, [string[]
 }
 
 function Protect-ProjectSecretPath([string]$Path) {
-    # A PowerShell 7 caller can pass its module path to Windows PowerShell 5.1.
-    Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
     $item = Get-Item -LiteralPath $Path -ErrorAction Stop
     $isDirectory = $item.PSIsContainer
-    $security = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    # Build a fresh canonical DACL instead of mutating Get-Acl: a parent folder (such as %TEMP% on some Windows
+    # setups) can carry a non-canonical inherited DACL that .NET refuses to modify in place.
+    $security = if ($isDirectory) { New-Object System.Security.AccessControl.DirectorySecurity }
+        else { New-Object System.Security.AccessControl.FileSecurity }
     $security.SetAccessRuleProtection($true, $false)
-    foreach ($existing in @($security.Access)) { $security.RemoveAccessRuleSpecific($existing) }
     $identities = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544') | Select-Object -Unique
     foreach ($id in $identities) {
         $sid = New-Object Security.Principal.SecurityIdentifier($id)

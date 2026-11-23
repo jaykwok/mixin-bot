@@ -25,7 +25,7 @@ afterAll(() => fixture.cleanup());
 const resolve = (specifier: string) => JSON.stringify(import.meta.resolve(specifier));
 const GROUP = "100";
 const ALICE = "13800000001";
-const LIMITS = { runTimeoutMs: 600_000, modelIdleMs: 600_000, modelResponseMs: 600_000, tickMs: 20 };
+const LIMITS = { runTimeoutMs: 600_000, modelIdleMs: 600_000, modelResponseMs: 600_000 };
 
 // The child admits one message; its answer streams at 20 one-character tokens a second, so it never finishes. Once the
 // request has streamed for a while it prints READY with the time and waits to be killed.

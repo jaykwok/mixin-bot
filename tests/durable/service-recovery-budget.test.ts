@@ -28,7 +28,7 @@ function setup(extensions?: (scope: Scope) => Extension[], maxIdleSpaces = 16) {
       ref: model, thinkingLevel: "off" as const, harnessSettings: {} },
     outbound: out.outbound,
   } satisfies Omit<DurableServiceOptions, "limits">;
-  const limits = { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: 2 };
+  const limits = { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, activeRequests: 2 };
   return { common, limits, faux, out, replies: () => replyTexts(out.sent) };
 }
 function safeTools() {

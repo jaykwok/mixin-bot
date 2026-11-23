@@ -202,7 +202,7 @@ try {
     selection: { runtime: models as never, settings: undefined as never, model: { ...model, contextWindow: 128000 } as never,
       ref: { provider: model.provider, modelId: model.id }, thinkingLevel: "off",
       harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, progress: PROJECT_PROGRESS } },
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 },
   });
   cleanups.push(() => service.close());
   const ask = async (space: string, name: string, text: string, answers: Parameters<typeof faux.setResponses>[0]) => {

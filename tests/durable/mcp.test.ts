@@ -4,12 +4,12 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { McpTools } from "../../src/integrations/mcp.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
 import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { claimSpace, memberConversation } from "../../src/durable/identity.ts";
-import { mcpMemberTools } from "../../src/durable/mcp.ts";
+import { mcpExtensions } from "../../src/durable/mcp.ts";
 import { spaceDoor } from "../../src/durable/models.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
@@ -47,18 +47,21 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
   let harness: Harness | undefined;
   try {
     await mkdir(members.layout.data); await manager.initialize(new AbortController().signal);
-    const tools = mcpMemberTools(members, manager, door), registry = createRegistry();
-    expect(tools[0]!.registration).toMatchObject({ name: "mcp__reports__report", callers: ["tools"], deferred: true, replay: "unsafe" });
-    expect(tools[0]!.namespace).toEqual({ name: "mcp__reports", description: "管理员批准的外部工具" });
-    registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map((tool) => tool.registration) }));
-    registry.install(codemodeExtension({ members, tools }));
+    const extensions = mcpExtensions(members, manager, door), registry = createRegistry();
+    expect(extensions).toHaveLength(1);
+    expect(extensions[0]!.name).toBe("mixin.mcp.reports");
+    expect(extensions[0]!.namespace).toEqual({ name: "mcp__reports", description: "管理员批准的外部工具" });
+    const tool = extensions[0]!.tools![0]!;
+    expect(tool).toMatchObject({ name: "mcp__reports__report", callers: ["tools"], deferred: true, replay: "unsafe" });
+    for (const extension of extensions) registry.install(extension);
+    registry.install(codemodeExtension({ members }));
     harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
     holder.harness = harness; await claimSpace(harness, scopeOf("group-a"), context);
     if (isolated) await handoffFullResults(harness);
     for (const phone of ["alice", "bob"]) {
       const { conversation } = await memberConversation(harness, scopeOf("group-a"), phone, { model }, context);
       const callId = `report-${phone}`;
-      faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `return await tools.${tools[0]!.registration.name}({});` }, { id: callId })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+      faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `return await tools.${tool.name}({});` }, { id: callId })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
       await (await conversation.submit({ type: "input", content: "report" }, context)).wait(context);
       const output = (await conversation.entries({}, 200, undefined, context)).items.flatMap(entry => entry.model ?? [])
         .find(message => message.role === "toolResult" && message.toolCallId === callId) as ToolResultMessage;

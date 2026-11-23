@@ -145,9 +145,9 @@ async function group() {
   const members = baseMemberTools(base);
   const tools = [memberTool(probeLong, base)];
   const extensions = [
-    defineExtension({ name: "mixin.base", tools: members.map((tool) => tool.registration) }),
-    defineExtension({ name: "fixture.module", tools: tools.map((tool) => tool.registration) }),
-    codemodeExtension({ members: base, tools: [...members, ...tools] }),
+    defineExtension({ name: "mixin.base", tools: members }),
+    defineExtension({ name: "fixture.module", tools }),
+    codemodeExtension({ members: base }),
   ];
   const opened = await openGroupHarness(join(root, `db-${n}.sqlite`), models, { scope: GROUP, extensions, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } } });
   const alice = (await memberConversation(opened.harness, GROUP, ALICE, { model: { provider: model.provider, modelId: model.id } }, context)).conversation;

@@ -1,13 +1,14 @@
 import { mkdir } from "node:fs/promises";
-import type { ClassifierContext, ClassifierResult, ImageContent, Usage } from "@earendil-works/pi-ai";
+import type { ClassifierContext, ClassifierResult, ImageContent } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
-import type { ModelRef } from "@earendil-works/pi-durable";
+import type { ModelRef, ToolNamespace, ToolRegistration } from "@earendil-works/pi-durable";
 import { arr, lit, num, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import type { RequestDoor } from "./door.ts";
 import { resultRegistration } from "./results/ownership.ts";
 import { ResultFiles, resultsDirName } from "./results/files.ts";
-import { memberTool, type BaseToolsOptions, type MemberCall, type MemberTool, type MemberToolSpec } from "./tools.ts";
+import { memberTool, type BaseToolsOptions, type MemberCall, type MemberToolSpec } from "./tools.ts";
+import { sumUsage } from "./usage.ts";
 
 /** One instance per service, shared by all groups; queued calls are bounded and abort without a request. */
 export class AuxiliaryBudget {
@@ -32,22 +33,9 @@ export class AuxiliaryBudget {
   }
 }
 
-/** The usage the provider returned for every attempt of one call: the tool result carries it into `pi.usage.tools`. */
-function sumUsage(results: readonly { usage?: Usage }[]): Usage | undefined {
-  let total: Usage | undefined;
-  for (const { usage } of results) {
-    if (usage === undefined) continue;
-    if (total === undefined) { total = structuredClone(usage); continue; }
-    for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) total[field] += usage[field];
-    for (const field of ["cacheWrite1h", "reasoning"] as const) if (usage[field] !== undefined) total[field] = (total[field] ?? 0) + usage[field];
-    for (const field of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) total.cost[field] += usage.cost[field];
-  }
-  return total;
-}
-
 const IMAGE = obj({ type: lit("image"), data: str({ maxLength: 12 * 1024 * 1024 }),
   mimeType: oneOf(["image/png", "image/jpeg", "image/webp", "image/gif"]) }, { open: true });
-const MODELS = { name: "models", description: "管理员配置的辅助模型" };
+export const AUXILIARY_NAMESPACE: ToolNamespace = { name: "models", description: "管理员配置的辅助模型" };
 const routeParams = obj({ text: str({ maxLength: 32768 }), images: opt(arr(IMAGE, { maxItems: 4 })) }, { open: true });
 const routeOutput = obj({ route: oneOf(["text", "ocr", "layout"]), confidence: num() }, { open: true });
 const imageParams = obj({ prompt: str({ minLength: 1, maxLength: 32768 }), images: opt(arr(IMAGE, { maxItems: 4 })) }, { open: true });
@@ -66,7 +54,7 @@ type Budgeted = <T>(call: MemberCall, work: () => Promise<T>) => Promise<T>;
 /** document_route: the configured classifier picks a processing route; transient errors are retried `retries` times. */
 function routeTool(ref: ModelRef, retries: number, run: Budgeted): MemberToolSpec<typeof routeParams> {
   return {
-    name: "document_route", namespace: MODELS,
+    name: "document_route",
     description: "Classify a document or page as text extraction, OCR, or layout processing with the configured classifier. Images use image blocks returned by read. This starts a billed model request; use once for a representative page when the route is uncertain.",
     parameters: routeParams, structuredOutputSchema: routeOutput,
     async run(args, _member, call) {
@@ -94,7 +82,7 @@ function routeTool(ref: ModelRef, retries: number, run: Budgeted): MemberToolSpe
         }
       });
       call.signal?.throwIfAborted();
-      const usage = sumUsage(attempts);
+      const usage = sumUsage(attempts.map(attempt => attempt.usage));
       const charged = usage === undefined ? {} : { usage };
       if (result.stopReason !== "stop") return { output: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, ...charged };
       const answer = result.answers.route;
@@ -108,7 +96,7 @@ function routeTool(ref: ModelRef, retries: number, run: Budgeted): MemberToolSpe
 /** generate_image: the configured image model; its images are saved in the member's results directory. */
 function imageTool(ref: ModelRef, run: Budgeted): MemberToolSpec<typeof imageParams> {
   return {
-    name: "generate_image", namespace: MODELS,
+    name: "generate_image",
     description: "Generate an image with the configured image model and save it into your own tmp. Starts a billed request. Supply a prompt and optional image blocks; send_image remains a separate model-only tool.",
     parameters: imageParams,
     async run(args, { phone, places }, call) {
@@ -139,7 +127,7 @@ function imageTool(ref: ModelRef, run: Budgeted): MemberToolSpec<typeof imagePar
 }
 
 /** The configured auxiliary model tools (document_route, generate_image), script-callable like any direct tool. */
-export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoor, config: AuxiliaryConfig, budget: AuxiliaryBudget): MemberTool[] {
+export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoor, config: AuxiliaryConfig, budget: AuxiliaryBudget): ToolRegistration[] {
   const run: Budgeted = (call, work) => {
     if (!call.signal) return Promise.reject(new Error("辅助模型需要可取消的任务"));
     return budget.run(call.signal, () => door.withToolModels(call.api, call.context, call.callId, call.signal!, work));

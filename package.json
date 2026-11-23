@@ -1,6 +1,6 @@
 {
   "name": "mixin-bot",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
@@ -27,13 +27,13 @@
   },
   "dependencies": {
     "@clack/prompts": "1.7.0",
-    "@earendil-works/chord": "1.5.2",
-    "@earendil-works/pi-ai": "1.5.2",
-    "@earendil-works/pi-codemode": "1.5.2",
-    "@earendil-works/pi-coding-agent": "1.5.2",
-    "@earendil-works/pi-durable": "1.5.2",
-    "@earendil-works/pi-mcp": "1.5.2",
-    "@earendil-works/pi-schema": "1.5.2",
+    "@earendil-works/chord": "1.6.0",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-codemode": "1.6.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-durable": "1.6.0",
+    "@earendil-works/pi-mcp": "1.6.0",
+    "@earendil-works/pi-schema": "1.6.0",
     "fs-extra": "11.4.0",
     "hono": "4.13.18",
     "marked": "18.0.5",
@@ -54,7 +54,6 @@
     "brace-expansion": "5.0.12",
     "image-size": "2.0.4",
     "smol-toml": "1.9.0",
-    "undici": "8.12.3",
     "zod": "4.6.6"
   }
 }

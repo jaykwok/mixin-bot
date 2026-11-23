@@ -130,7 +130,7 @@ function png(width: number, height: number): Buffer {
 describe("Durable base tools", () => {
   test("registrations: the catalogue equals the member's tools; replay, output limits, constrained sampling", async () => {
     const options: BaseToolsOptions = { layout: appLayout(join(fixture.root, "目录")), scope: SPACE };
-    const registered = baseMemberTools(options).map((tool) => tool.registration);
+    const registered = baseMemberTools(options);
     expect(registered.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
     const limits = { maxBytes: 64 * 1024, maxLines: 2200 };
     expect(Object.fromEntries(registered.map((tool) => [tool.name, { replay: tool.replay, outputLimits: tool.outputLimits }]))).toEqual({
@@ -170,10 +170,12 @@ describe("Durable base tools", () => {
         const id = `png_${vision}`;
         const t = await turn(group, conversation, [fauxToolCall("read", { path: "资料/联系表.png" }, { id })]);
         const result = t.results[id]!;
-        // The official read keeps the image in its result and notes a text-only model; pi-ai leaves it out of the request.
+        // The official read keeps the image in its result and records `imageUnsupportedByModel` in details (pi-durable 1.6.0);
+        // pi-ai omits/replaces the image per request for text-only models without polluting the transcript text.
         expect(result.isError).toBe(false);
         expect(result.content.some((item) => item.type === "image")).toBe(true);
-        expect(result.text.includes("does not support images")).toBe(!vision);
+        expect(result.text.includes("does not support images")).toBe(false);
+        expect(result.details?.imageUnsupportedByModel).toBe(vision ? undefined : group.model.modelId);
         const payload = JSON.stringify(convertMessages({ ...group.faux.getModel(), api: "openai-completions" } as never, { messages: t.request } as never, {} as never));
         expect(payload.includes("image_url")).toBe(vision);
         expect(getCurrentTools(t.request).map((tool) => [tool.name, tool.constrainedSampling]))
@@ -348,7 +350,7 @@ describe("Durable base tools", () => {
     const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
     markRunning(SPACE, BOB, "original");
     try {
-      const { registration } = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
+      const registration = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
         markRunning(SPACE, BOB, "next");
         await timedCommand(async () => ({ exitCode: 0 }));
         return { output: [{ type: "text", text: "ok" }] };
@@ -366,7 +368,7 @@ describe("Durable base tools", () => {
     const lines: string[] = [];
     const info = spyOn(log, "info").mockImplementation(line => { if (line.startsWith("命令耗时")) lines.push(line); });
     try {
-      const { registration } = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
+      const registration = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
         await runProcess({ command: process.execPath, args: ["-e", "1"], cwd: process.cwd(), timeoutMs: 30000 });
         return { output: [{ type: "text", text: "ok" }] };
       } }, { layout: appLayout(join(fixture.root, "probe")), scope: SPACE });

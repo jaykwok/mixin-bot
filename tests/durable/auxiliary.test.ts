@@ -7,7 +7,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/provid
 import { createRegistry, defineExtension, Harness, UsageDoc, type Conversation } from "@earendil-works/pi-durable";
 import { obj } from "@earendil-works/pi-schema";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
-import { AuxiliaryBudget, auxiliaryMemberTools } from "../../src/durable/auxiliary.ts";
+import { AUXILIARY_NAMESPACE, AuxiliaryBudget, auxiliaryMemberTools } from "../../src/durable/auxiliary.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
 import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { claimSpace, memberConversation } from "../../src/durable/identity.ts";
@@ -55,8 +55,8 @@ async function setup(options: { credentials?: boolean; vision?: boolean; budget?
   if (options.waitForStart) tools.push(memberTool({ name: "wait_for_auxiliary_start", description: "Wait for the synthetic provider dispatch.",
     parameters: obj({}, { open: true }), async run() { await options.waitForStart!(); return { output: [{ type: "text", text: "ready" }] }; } }, members));
   const registry = createRegistry();
-  registry.install(defineExtension({ name: "mixin.auxiliary", tools: tools.map((tool) => tool.registration) }));
-  registry.install(codemodeExtension({ members, tools }));
+  registry.install(defineExtension({ name: "mixin.auxiliary", namespace: AUXILIARY_NAMESPACE, tools }));
+  registry.install(codemodeExtension({ members }));
   const view = door.wrap(models), path = join(f.root, `db-${n}.sqlite`);
   const harness = await Harness.open(await openGroupStorage(path), { registry, models: view, settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
   holder.harness = harness; await claimSpace(harness, scopeOf("group-a"), context);

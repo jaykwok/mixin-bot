@@ -3,6 +3,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { deflateSync } from "node:zlib";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import {
   createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemPrompt,
@@ -227,4 +228,49 @@ describe("Durable group registry", () => {
       expect(unsupported).toMatchObject({ isError: true, text: "仅支持 PDF、DOCX、PPTX、XLSX；扫描件需要 OCR" });
     } finally { await group.opened.close(); }
   });
+
+  test("fit-images shrinks oversized images returned by non-read tools before committing them to the transcript", async () => {
+    const chunk = (type: string, data: Uint8Array) => {
+      const body = Buffer.concat([Buffer.from(type, "ascii"), Buffer.from(data)]);
+      let crc = ~0;
+      for (const byte of body) { crc ^= byte; for (let k = 0; k < 8; k++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1)); }
+      const out = Buffer.alloc(8 + data.length + 4);
+      out.writeUInt32BE(data.length, 0);
+      body.copy(out, 4);
+      out.writeUInt32BE(~crc >>> 0, 8 + data.length);
+      return out;
+    };
+    const widePng = (width: number, height: number) => {
+      const header = Buffer.alloc(13);
+      header.writeUInt32BE(width, 0);
+      header.writeUInt32BE(height, 4);
+      header.set([8, 2, 0, 0, 0], 8);
+      const rows = Buffer.alloc((width * 3 + 1) * height, 120);
+      for (let y = 0; y < height; y++) rows[y * (width * 3 + 1)] = 0;
+      return Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), chunk("IHDR", header), chunk("IDAT", deflateSync(rows)), chunk("IEND", new Uint8Array())]);
+    };
+    const group = await openGroup();
+    try {
+      const alice = await member(group, ALICE);
+      const raw = widePng(3000, 1000).toString("base64");
+      const id = `fit-${++counter}`;
+      let committedImage: { mimeType: string; data: string } | undefined;
+      group.faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("codemode", { code: `image({ type: "image", mimeType: "image/png", data: ${JSON.stringify(raw)} });` }, { id })], { stopReason: "toolUse" }),
+        (transcript) => {
+          const result = transcript.messages.findLast((each) => each.role === "toolResult" && each.toolCallId === id);
+          if (result?.role === "toolResult") {
+            const img = result.content.find((item) => item.type === "image");
+            if (img?.type === "image") committedImage = { mimeType: img.mimeType, data: img.data };
+          }
+          return fauxAssistantMessage("好的");
+        },
+      ]);
+      await (await alice.submit({ type: "input", content: "生成大图" }, context)).wait(context);
+      expect(committedImage).toBeDefined();
+      const bytes = Buffer.from(committedImage!.data, "base64");
+      expect(bytes.readUInt32BE(16)).toBeLessThan(3000);
+      expect(bytes.readUInt32BE(20)).toBeLessThan(1000);
+    } finally { await group.opened.close(); }
+  }, 30_000);
 });

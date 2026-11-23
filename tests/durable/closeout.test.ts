@@ -43,7 +43,7 @@ function setup() {
   const root = join(fixture.root, `root-${++counter}`), { faux, models, model } = fauxModels(), out = recordingOutbound(), reports: unknown[] = [];
   const replies = () => out.sent.filter(item => item.kind === "reply").map(item => item.text);
   const open = () => new DurableService({ layout: appLayout(root), modules: [], relay: null, materials: false, outbound: out.outbound,
-    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 10, resultRetentionMs: 1 },
+    limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, resultRetentionMs: 1 },
     selection: { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)! as never,
       ref: model, thinkingLevel: "off", harnessSettings: { compaction: { enabled: false, keepRecentTokens: 1 },
         ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } }, onReport: error => reports.push(error) });

@@ -1,15 +1,18 @@
-// The administrator's MCP tools as member tools, named and shaped the way pi-mcp names and shapes them for models and code
-// mode scripts: `mcp__<server>__<tool>` in the namespace `mcp__<server>`, object input schemas, and model-facing text cut
-// in the middle beyond pi-mcp's limit with the full text saved among the member's results.
+// The administrator's MCP tools as per-server Durable extensions, named and shaped the way pi-mcp names and shapes them
+// for models and code mode scripts: `mcp__<server>__<tool>` in extension `mixin.mcp.<server>` with namespace
+// `mcp__<server>`, object input schemas, and model-facing text cut in the middle beyond pi-mcp's limit with the full
+// text saved among the member's results.
 import { mkdir } from "node:fs/promises";
-import { createMcpToolName, limitMcpContent, mcpNamespace, normalizeMcpInputSchema, toLlmContent } from "@earendil-works/pi-mcp";
+import { defineExtension, type Extension, type ToolRegistration } from "@earendil-works/pi-durable";
+import { createMcpToolName, limitMcpContent, mcpNamespace, mcpServerSummary, normalizeMcpInputSchema, toLlmContent } from "@earendil-works/pi-mcp";
 import type { McpCatalogueTool, McpTools } from "../integrations/mcp.ts";
 import type { RequestDoor } from "./door.ts";
-import { memberTool, type BaseToolsOptions, type MemberTool } from "./tools.ts";
+import { memberTool, type BaseToolsOptions } from "./tools.ts";
 import { ResultFiles, resultsDirName } from "./results/files.ts";
 import { resultRegistration } from "./results/ownership.ts";
 
 const IMAGES_MAX = 4;
+const SERVER_SUMMARY_MAX = 200;
 
 /**
  * The model-facing name of each catalogue tool. Two tools whose names come out alike (`a-b` and `a_b` of one server) both
@@ -21,15 +24,24 @@ export function mcpToolNames(catalogue: readonly McpCatalogueTool[]): string[] {
   return catalogue.map((entry, at) => shared.has(plain[at]!) ? createMcpToolName(entry.server.name, entry.tool.name, () => true) : plain[at]!);
 }
 
-export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, door: RequestDoor): MemberTool[] {
+function serverDescription(description: string | undefined, instructions: string | undefined): string {
+  const approved = "管理员批准的外部工具";
+  const summary = mcpServerSummary(description, instructions).slice(0, SERVER_SUMMARY_MAX).trim();
+  return summary ? `${summary}（${approved}）` : approved;
+}
+
+/** One Durable extension per configured MCP server with allowed tools, so each server keeps its own code-mode namespace. */
+export function mcpExtensions(options: BaseToolsOptions, manager: McpTools, door: RequestDoor): Extension[] {
   const names = mcpToolNames(manager.catalogue);
-  return manager.catalogue.map((entry, at) => {
-    const approved = "管理员批准的外部工具";
-    return memberTool({
+  const byServer = new Map<string, { server: McpCatalogueTool["server"]; tools: ToolRegistration[] }>();
+  for (let at = 0; at < manager.catalogue.length; at++) {
+    const entry = manager.catalogue[at]!;
+    let group = byServer.get(entry.server.name);
+    if (!group) { group = { server: entry.server, tools: [] }; byServer.set(entry.server.name, group); }
+    group.tools.push(memberTool({
       name: names[at]!, description: entry.tool.description ?? `Call ${entry.tool.name} on ${entry.server.name}.`,
       parameters: normalizeMcpInputSchema(entry.tool.inputSchema),
       ...(entry.tool.outputSchema ? { structuredOutputSchema: entry.tool.outputSchema } : {}),
-      namespace: { name: mcpNamespace(entry.server.name), description: entry.server.description ? `${entry.server.description}（${approved}）` : approved },
       callers: ["tools"], deferred: true,
       async run(args, { phone, places }, call) {
         if (!call.signal) throw new Error("MCP 工具需要可取消的任务");
@@ -54,6 +66,11 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
             ...(result.structuredContent !== undefined ? { structuredOutput: result.structuredContent } : {}), ...(result.isError ? { isError: true } : {}) };
         } finally { await files.release(); }
       },
-    }, options);
-  });
+    }, options));
+  }
+  return [...byServer.values()].map(({ server, tools }) => defineExtension({
+    name: `mixin.mcp.${server.name}`,
+    namespace: { name: mcpNamespace(server.name), description: serverDescription(server.description, manager.serverInstructions(server.name)) },
+    tools,
+  }));
 }

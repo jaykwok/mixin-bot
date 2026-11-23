@@ -5,8 +5,9 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
+import type { ToolNamespace } from "@earendil-works/pi-durable";
 import { arr, bool, int, lit, nullable, num, obj, oneOf, opt, str, union, unknown } from "@earendil-works/pi-schema";
-import type { MemberToolSpec, ToolNamespace } from "../../../durable/tools.ts";
+import type { MemberToolSpec } from "../../../durable/tools.ts";
 import { AsyncSemaphore } from "../../../core/async-semaphore.ts";
 import { application } from "../../../core/lifecycle.ts";
 import { log } from "../../../core/log.ts";
@@ -355,7 +356,7 @@ const MARKDOWN_HINT = "Markdown：#/## 标题（PPT 中起新页）、段落、*
  * 工具描述只写用途和调用时必须知道的约束；用法细节放在命名空间说明（codemode 脚本用 describeNamespace 读取）
  * 和 document-work skill 里。
  */
-const NAMESPACE: ToolNamespace = {
+export const DOCUMENT_WORK_NAMESPACE: ToolNamespace = {
   name: "document_work",
   description: "Word/PPT 文档加工：检查结构、局部修改、选编组装、按模板生成、渲染预览、提取图片素材。",
   instructions: [
@@ -412,7 +413,7 @@ const imagesParams = obj({
 /** The six document tools, run in the calling member's places; `templates` are the administrator's default templates. */
 export function documentWorkTools(templates: DocumentTemplates = {}): MemberToolSpec[] {
   const inspect: MemberToolSpec<typeof inspectParams> = {
-    name: "document_inspect", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: inspectOutput,
+    name: "document_inspect", callers: SCRIPT_ONLY, structuredOutputSchema: inspectOutput,
     description: "检查 DOCX/PPTX 内部引用，返回内容清单路径、摘要和数量。清单包含可定位的段落、Word 正文块、PPT 实际页序。outline=true 时直接返回大纲：PPT 每页标题、文字量、图片/表格数与版式，Word 标题层级与可用样式，用于选页、选章节或选模板；完整段落仍在清单文件中，用 read 按需读取。",
     parameters: inspectParams,
     async run(params, { places }, { signal }) {
@@ -424,7 +425,7 @@ export function documentWorkTools(templates: DocumentTemplates = {}): MemberTool
     },
   };
   const patch: MemberToolSpec<typeof patchParams> = {
-    name: "document_patch", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: producedOutput,
+    name: "document_patch", callers: SCRIPT_ONLY, structuredOutputSchema: producedOutput,
     description: "在新副本中替换 DOCX/PPTX 指定段落文字，保留未修改的文件部件。digest 和位置来自 document_inspect；before 在目标段落须唯一，可跨文字片段匹配；只改实际变化的字符，其余保留原格式，新文字格式无法确定时报错。输出仍需检查实际版式。",
     parameters: patchParams,
     async run(params, { places }, { signal }) {
@@ -438,7 +439,7 @@ export function documentWorkTools(templates: DocumentTemplates = {}): MemberTool
     },
   };
   const compose: MemberToolSpec<typeof composeParams> = {
-    name: "document_compose", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: composeOutput,
+    name: "document_compose", callers: SCRIPT_ONLY, structuredOutputSchema: composeOutput,
     description: "按 items 顺序组装同一格式的资料，可混合复用与新增：{source, slides} 选 PPT 实际页码（1 起始，保留来源母版）；{source, start, end} 选 Word 正文块闭区间（省略为全文）；{content} 用 Markdown 在第一份来源的母版/样式上生成新页或新章节。第一项必须是文件，提供页眉页脚、母版及主样式。PPT 含 content 项时，build 按输出页码列出新生成页、实际排成的图示和需重点看图的页。" + SKILL_POINTER,
     parameters: composeParams,
     async run(params, { places }, { signal }) {
@@ -514,7 +515,7 @@ export function documentWorkTools(templates: DocumentTemplates = {}): MemberTool
     },
   };
   const build: MemberToolSpec<typeof buildParams> = {
-    name: "document_build", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: buildOutput,
+    name: "document_build", callers: SCRIPT_ONLY, structuredOutputSchema: buildOutput,
     description: "用 Markdown 内容在资料库或用户提供的模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT；无模板时用管理员默认模板，未配置则用默认中文版式。PPT 中 #/## 起新页，keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。build.layouts 列出新生成页中实际排成图示的页，描述新页版式时以它为准；build.attention 列出需要重点看图的页。生成后仍需 document_render 检查。" + SKILL_POINTER,
     parameters: buildParams,
     async run(params, { places }, { signal }) {
@@ -545,7 +546,7 @@ export function documentWorkTools(templates: DocumentTemplates = {}): MemberTool
     },
   };
   const render: MemberToolSpec<typeof renderParams> = {
-    name: "document_render", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: renderOutput,
+    name: "document_render", callers: SCRIPT_ONLY, structuredOutputSchema: renderOutput,
     description: "将 DOCX/PPTX/PDF 渲染为单页 PNG 和联系表，返回图片路径供 read 查看。Office 需要 LibreOffice。默认前 20 页，pages 可指定至多 50 页；明确返回未渲染页。渲染成功不代表已视觉检查。",
     parameters: renderParams,
     async run(params, { places }, { signal }) {
@@ -559,7 +560,7 @@ export function documentWorkTools(templates: DocumentTemplates = {}): MemberTool
     },
   };
   const images: MemberToolSpec<typeof imagesParams> = {
-    name: "document_images", namespace: NAMESPACE, callers: SCRIPT_ONLY, structuredOutputSchema: imagesOutput,
+    name: "document_images", callers: SCRIPT_ONLY, structuredOutputSchema: imagesOutput,
     description: "从 PDF、PPTX、DOCX 提取位图素材。DOCX 默认返回图片序号、段落、标题路径、图注和前后文；先 extract:false 配合 match 关键词查图，再按 orders 提取，next 非空时传 after 翻页。重复图片只保存一次并列出最多三处出现位置。PDF/PPTX 用 pages 分页，矢量图用 crops 截图。每次最多 60 张。",
     parameters: imagesParams,
     async run(params, { places }, { signal }) {

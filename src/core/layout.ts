@@ -148,9 +148,16 @@ export function spaceTmp(layout: Pick<Layout, "tmp">, scope: Scope): string {
   return join(layout.tmp, spacePath(scope));
 }
 
+/** Relative directory segments below `layout.tmp` leading to a member's tmp directory. */
+export function userTmpSegments(scope: Scope, phone: string): readonly string[] {
+  return scope.kind === "direct"
+    ? ["direct", userSegment(phone)]
+    : ["groups", groupSegment(scope.groupId), userSegment(phone)];
+}
+
 /** A member's tmp: inbound attachments, the managed task/result directories and one directory per request. */
 export function userTmp(layout: Pick<Layout, "tmp">, scope: Scope, phone: string): string {
-  return join(spaceTmp(layout, scope), userSegment(phone));
+  return join(layout.tmp, ...userTmpSegments(scope, phone));
 }
 
 /** The model's working and output directory for one durable request. */

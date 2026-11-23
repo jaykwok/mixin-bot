@@ -58,10 +58,21 @@ export interface NewFile {
   close(remove?: boolean): Promise<void>;
 }
 
+/** Bounded binary read outcome through a held directory handle. */
+export type HeldReadBytesResult =
+  | { kind: "ok"; bytes: Buffer }
+  | { kind: "missing" }
+  | { kind: "untrusted" }
+  | { kind: "too_large"; size: number };
+
 /** The entries of a held directory, reached through it. */
 export interface Entries {
   /** Read a regular file through this held entity; refuse links. Missing means undefined. */
   read(name: string): Promise<string | undefined>;
+  /** Read a regular file relative to this held directory up to `maxBytes`; refuse links and non-regular files. */
+  readBytes(name: string, maxBytes: number): Promise<HeldReadBytesResult>;
+  /** Verify `name` inside this held directory is a non-symlink regular file without reading its contents. */
+  verifyFile(name: string): Promise<"ok" | "missing" | "untrusted">;
   names(): Promise<string[]>;
   /** Create `name` new (0600) and open it for writing; with `append`, every write goes to its end. */
   create(name: string, append?: boolean): Promise<NewFile>;
@@ -146,6 +157,28 @@ function codeOf(error: unknown): string {
   return (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error));
 }
 
+function isPlainEntryName(name: string): boolean {
+  return name.length > 0 && name !== "." && name !== ".." && !/[\\/\0]/.test(name);
+}
+
+/** Read at most `maxBytes` from an already-verified regular file handle (never reopens by path). */
+async function readBoundedHandle(file: FileHandle, maxBytes: number): Promise<HeldReadBytesResult> {
+  const info = await file.stat({ bigint: true });
+  if (!info.isFile()) return { kind: "untrusted" };
+  if (info.size > BigInt(maxBytes)) return { kind: "too_large", size: Number(info.size) };
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const buf = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+    const { bytesRead } = await file.read(buf, 0, buf.length, null);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+    if (total > maxBytes) return { kind: "too_large", size: total };
+    chunks.push(buf.subarray(0, bytesRead));
+  }
+  return { kind: "ok", bytes: Buffer.concat(chunks, total) };
+}
+
 // Linux.
 
 async function holdLinux(base: string, names: readonly string[], create: boolean): Promise<HeldDirectory> {
@@ -181,6 +214,8 @@ async function holdLinux(base: string, names: readonly string[], create: boolean
     const entry = (name: string) => `/proc/self/fd/${fd}/${name}`;
     return new HeldDirectory({ dev: info.dev, ino: info.ino }, {
       read: (name) => readLinux(entry(name)),
+      readBytes: (name, maxBytes) => readLinuxBytes(entry, name, maxBytes),
+      verifyFile: (name) => verifyLinuxFile(entry, name),
       names: () => readdir(entry(".")),
       create: (name, append) => createLinux(entry, directory, name, append),
       removeDirectories: (policy) => removeLinuxDirectories(final, directory, policy),
@@ -320,6 +355,24 @@ async function readLinux(path: string): Promise<string | undefined> {
   } finally { await file.close(); }
 }
 
+async function readLinuxBytes(entry: (name: string) => string, name: string, maxBytes: number): Promise<HeldReadBytesResult> {
+  if (!isPlainEntryName(name)) return { kind: "untrusted" };
+  let file: FileHandle;
+  try { file = await open(entry(name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) { return codeOf(error) === "ENOENT" ? { kind: "missing" } : { kind: "untrusted" }; }
+  try { return await readBoundedHandle(file, maxBytes); }
+  finally { await file.close(); }
+}
+
+async function verifyLinuxFile(entry: (name: string) => string, name: string): Promise<"ok" | "missing" | "untrusted"> {
+  if (!isPlainEntryName(name)) return "untrusted";
+  let file: FileHandle;
+  try { file = await open(entry(name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) { return codeOf(error) === "ENOENT" ? "missing" : "untrusted"; }
+  try { return (await file.stat({ bigint: true })).isFile() ? "ok" : "untrusted"; }
+  finally { await file.close(); }
+}
+
 // macOS.
 
 const DARWIN_DIRECTORY = O.RDONLY | O.DIRECTORY | O.NOFOLLOW;
@@ -350,6 +403,8 @@ async function holdDarwin(base: string, names: readonly string[], create: boolea
     const directory = path;
     return new HeldDirectory({ dev: info.dev, ino: info.ino }, {
       read: async (name) => readDarwin(fd, name, join(directory, name)),
+      readBytes: (name, maxBytes) => readDarwinBytes(fd, name, maxBytes),
+      verifyFile: async (name) => verifyDarwinFile(fd, name),
       names: async () => namesAt(fd),
       create: (name, append) => createDarwin(fd, directory, name, append),
       removeDirectories: (policy) => removeDarwinDirectories(fd, directory, policy),
@@ -379,6 +434,31 @@ async function readDarwin(dir: number, name: string, path: string): Promise<stri
   const file = await darwinHandle(fd, constants.O_RDONLY);
   try { return await file.readFile("utf8"); }
   finally { await file.close(); }
+}
+
+async function readDarwinBytes(dir: number, name: string, maxBytes: number): Promise<HeldReadBytesResult> {
+  if (!isPlainEntryName(name)) return { kind: "untrusted" };
+  let fd: number;
+  try { fd = openAt(dir, name, O.RDONLY | O.NOFOLLOW | O.NONBLOCK); }
+  catch (error) { return codeOf(error) === "ENOENT" ? { kind: "missing" } : { kind: "untrusted" }; }
+  try {
+    const info = fstat(fd);
+    if (!isFile(info)) { close(fd); return { kind: "untrusted" }; }
+    if (info.size > BigInt(maxBytes)) { close(fd); return { kind: "too_large", size: Number(info.size) }; }
+  } catch { close(fd); return { kind: "untrusted" }; }
+  const file = await darwinHandle(fd, constants.O_RDONLY);
+  try { return await readBoundedHandle(file, maxBytes); }
+  finally { await file.close(); }
+}
+
+function verifyDarwinFile(dir: number, name: string): "ok" | "missing" | "untrusted" {
+  if (!isPlainEntryName(name)) return "untrusted";
+  let fd: number;
+  try { fd = openAt(dir, name, O.RDONLY | O.NOFOLLOW | O.NONBLOCK); }
+  catch (error) { return codeOf(error) === "ENOENT" ? "missing" : "untrusted"; }
+  try { return isFile(fstat(fd)) ? "ok" : "untrusted"; }
+  catch { return "untrusted"; }
+  finally { close(fd); }
 }
 
 async function createDarwin(dir: number, directory: string, name: string, append = false): Promise<NewFile> {
@@ -698,6 +778,8 @@ async function holdWindows(base: string, names: readonly string[], create: boole
     const final = path;
     return new HeldDirectory(describe(directory, final).identity, {
       read: (name) => readWindows(directory, final, name),
+      readBytes: (name, maxBytes) => readWindowsBytes(directory, final, name, maxBytes),
+      verifyFile: (name) => verifyWindowsFile(directory, final, name),
       names: () => readdir(final),
       create: (name, append) => createWindows(directory, final, name, append),
       removeDirectories: (policy) => removeWindowsDirectories(directory, final, policy),
@@ -816,6 +898,48 @@ async function readWindows(directory: WindowsHandle, directoryPath: string, name
     return await file.readFile("utf8");
   } catch (error) { failure = error; throw error; }
   finally { await finishWindows([() => file?.close(), () => native.close()], failure); }
+}
+
+async function readWindowsBytes(directory: WindowsHandle, directoryPath: string, name: string, maxBytes: number): Promise<HeldReadBytesResult> {
+  if (!isPlainEntryName(name)) return { kind: "untrusted" };
+  const path = join(directoryPath, name);
+  let native: WindowsHandle | undefined;
+  try { native = existingWindowsEntry(directory, name, path, false); }
+  catch { return { kind: "untrusted" }; }
+  if (native === undefined) return { kind: "missing" };
+  let file: FileHandle | undefined;
+  let failure: unknown;
+  try {
+    const { attributes, identity } = describe(native, path);
+    if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !== 0) return { kind: "untrusted" };
+    file = await open(path, "r");
+    const info = await file.stat({ bigint: true });
+    if (!sameIdentity(info, identity)) return { kind: "untrusted" };
+    return await readBoundedHandle(file, maxBytes);
+  } catch (error) {
+    if (codeOf(error) === "ENOENT") return { kind: "missing" };
+    failure = error;
+    return { kind: "untrusted" };
+  } finally {
+    await finishWindows([() => file?.close(), () => native.close()], failure).catch(() => {});
+  }
+}
+
+async function verifyWindowsFile(directory: WindowsHandle, directoryPath: string, name: string): Promise<"ok" | "missing" | "untrusted"> {
+  if (!isPlainEntryName(name)) return "untrusted";
+  const path = join(directoryPath, name);
+  let native: WindowsHandle | undefined;
+  try { native = existingWindowsEntry(directory, name, path, false); }
+  catch { return "untrusted"; }
+  if (native === undefined) return "missing";
+  try {
+    const { attributes } = describe(native, path);
+    return (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) === 0 ? "ok" : "untrusted";
+  } catch {
+    return "untrusted";
+  } finally {
+    await finishWindows([() => native.close()]).catch(() => {});
+  }
 }
 
 async function createWindows(directory: WindowsHandle, directoryPath: string, name: string, append = false): Promise<NewFile> {

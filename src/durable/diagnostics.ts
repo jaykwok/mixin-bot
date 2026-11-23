@@ -54,7 +54,7 @@ export async function withSpaceSnapshot<T>(path: string, read: (harness: Harness
     for (const status of ["queued", "placed"] as const) {
       if ((await storage.scanSubmissions({ status }, 1, undefined, context)).items.length) liveWork = true;
     }
-    harness = await Harness.open(storage, { models: createModels(), registry: createRegistry() }, context);
+    harness = await Harness.open(storage, { models: createModels(), registry: createRegistry(), readOnly: true }, context);
   } catch (error) { try { await adapter.close(); } finally { source.close(); await discard(scratch); } throw error; }
   try {
     // Only explicit offline settlement uses the source session. Harness recovery remains in memory.

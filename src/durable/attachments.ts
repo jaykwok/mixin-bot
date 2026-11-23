@@ -17,12 +17,13 @@
 //   request ran): no control voids it and its record outlives the request's, until the push releases it.
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
+import { holdDirectory, sameIdentity, type HeldDirectory, type HeldReadBytesResult } from "../core/held-directory.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import type { DownloadResult } from "../integrations/open-platform/files.ts";
 import type { Attachment, MemberRecords, ReplyContext } from "./records.ts";
-import type { Scope } from "../core/layout.ts";
+import { scopeKey, userTmpSegments, type Layout, type Scope } from "../core/layout.ts";
 
 export const ATTACHMENT_LIMITS = {
   memberCount: 10,
@@ -144,20 +145,41 @@ export function expireAttachments(records: MemberRecords, now: number, retention
 }
 
 /** The lines the model sees after the member's text. */
-export function attachmentPrompt(attachments: readonly Attachment[]): string {
+export function attachmentPrompt(attachments: readonly Attachment[], options: {
+  inlined?: ReadonlySet<string>;
+  deferred?: ReadonlySet<string>;
+  unreadable?: ReadonlyMap<string, string>;
+} = {}): string {
   if (!attachments.length) return "";
+  const inlined = options.inlined;
+  const deferred = options.deferred;
+  const unreadable = options.unreadable;
   const lines = attachments.map(attachment => {
     const label = attachmentLabel(attachment);
     switch (attachment.state) {
-      case "ready": return `- ${label}，${formatBytes(attachment.actualSize ?? 0)}${attachment.mimeType ? `，类型 ${attachment.mimeType}` : ""}：${attachment.path!.replace(/\\/g, "/")}`;
+      case "ready": {
+        const path = attachment.path!.replace(/\\/g, "/");
+        const blockedReason = unreadable?.get(attachment.id);
+        const suffix = inlined?.has(attachment.id)
+          ? `（图片已附在本条消息中，可直接查看；原文件路径：${path}）`
+          : deferred?.has(attachment.id)
+            ? `（超出单条自动附带上限，可尝试用 read 查看；原文件路径：${path}）`
+            : blockedReason !== undefined
+              ? `（${blockedReason}，未自动附带，也无法用 read 查看；原文件路径：${path}）`
+              : `：${path}`;
+        return `- ${label}，${formatBytes(attachment.actualSize ?? 0)}${attachment.mimeType ? `，类型 ${attachment.mimeType}` : ""}${suffix}`;
+      }
       case "pending": return `- ${label}：等待下载超时，本次无法使用`;
       case "rejected": return `- ${label}：未接收，${attachment.error ?? "服务未接收"}`;
       case "failed": return `- ${label}：下载失败，${attachment.error ?? "原因未知"}`;
       default: return `- ${label}：已作废`;
     }
   });
-  const images = attachments.some(attachment => attachment.state === "ready" && attachment.kind === "image") ? "图片可以用 read 工具查看。" : "";
-  return `\n\n[用户在这条消息之前发送的附件]\n${lines.join("\n")}${images ? `\n${images}` : ""}`;
+  const uncheckedImages = attachments.some(attachment =>
+    attachment.state === "ready" && attachment.kind === "image"
+    && !inlined?.has(attachment.id) && !deferred?.has(attachment.id) && !unreadable?.has(attachment.id));
+  const hint = uncheckedImages ? "\n图片可尝试用 read 工具查看。" : "";
+  return `\n\n[用户在这条消息之前发送的附件]\n${lines.join("\n")}${hint}`;
 }
 
 /** Remove an attachment's files (`<id>.part`, `<id>-*`) inside the member's own `received` directory; missing is fine. */
@@ -169,6 +191,64 @@ export async function removeAttachmentFiles(tempDir: string, ids: readonly strin
   for (const name of names) {
     if (ids.some(id => name === `${id}.part` || name.startsWith(`${id}-`))) await rm(join(dir, name), { force: true });
   }
+}
+
+type AttachmentFileCheck = "ok" | "missing" | "untrusted";
+
+function samePathString(a: string, b: string): boolean {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * Hold the member's `received` directory starting from the deployment's trusted `layout.tmp` root, verifying every
+ * intermediate space, member, and `received` component against symlinks/junctions and parent swaps, then verify
+ * `attachmentPath` names a direct child of THAT held directory and run `work` strictly relative to the held handle.
+ */
+async function withHeldReceivedEntry<T>(layout: Pick<Layout, "tmp">, scope: Scope, phone: string, attachmentPath: string,
+  onStatus: (status: "missing" | "untrusted") => T,
+  work: (held: HeldDirectory, name: string) => Promise<T>): Promise<T> {
+  const name = basename(attachmentPath);
+  if (!isAbsolute(attachmentPath) || !name || name === "." || name === ".." || /[\\/\0]/.test(name)) return onStatus("untrusted");
+  if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(attachmentPath)) return onStatus("untrusted");
+  let tmpReal: string;
+  try { tmpReal = await realpath(layout.tmp); }
+  catch (error) { return onStatus((error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "untrusted"); }
+  const segments = [...userTmpSegments(scope, phone), "received"];
+  let held: HeldDirectory;
+  try { held = await holdDirectory(tmpReal, segments, false); }
+  catch (error) { return onStatus((error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "untrusted"); }
+  try {
+    const parent = resolve(dirname(attachmentPath));
+    const expectedReal = join(tmpReal, ...segments);
+    const expectedLogical = join(resolve(layout.tmp), ...segments);
+    if (!samePathString(parent, expectedReal) && !samePathString(parent, expectedLogical)) {
+      return onStatus("untrusted");
+    }
+    let dirStat;
+    try { dirStat = await lstat(parent, { bigint: true }); }
+    catch (error) { return onStatus((error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "untrusted"); }
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory() || !sameIdentity(dirStat, held.identity)) {
+      return onStatus("untrusted");
+    }
+    return await work(held, name);
+  } finally {
+    await held.release().catch(() => {});
+  }
+}
+
+/** Verify an attachment is a non-symlink regular file reached directly through the held `received` directory handle. */
+export function verifyOwnAttachment(layout: Pick<Layout, "tmp">, scope: Scope, phone: string, attachmentPath: string): Promise<AttachmentFileCheck> {
+  return withHeldReceivedEntry(layout, scope, phone, attachmentPath, status => status,
+    (held, name) => held.use(entries => entries.verifyFile(name)));
+}
+
+/**
+ * Open and read at most `maxBytes` of a direct-chat attachment strictly relative to the held `received` directory
+ * handle anchored at `layout.tmp`, refusing symlinks/junctions along the member path and never reopening by path.
+ */
+export function readOwnAttachmentBytes(layout: Pick<Layout, "tmp">, scope: Scope, phone: string, attachmentPath: string, maxBytes: number): Promise<HeldReadBytesResult> {
+  return withHeldReceivedEntry<HeldReadBytesResult>(layout, scope, phone, attachmentPath, kind => ({ kind }),
+    (held, name) => held.use(entries => entries.readBytes(name, maxBytes)));
 }
 
 /** The member's `received` directory, refused when it is not a plain directory inside the member's tmp. */
@@ -199,10 +279,23 @@ export class AttachmentDownloads {
   readonly #slots: AsyncSemaphore;
   readonly #active = new Map<string, Active>();
   readonly #work = new Set<Promise<void>>();
+  readonly #listeners = new Map<string, Set<() => void>>();
 
   constructor(private readonly source: AttachmentSource, private readonly host: DownloadHost, private readonly signal: AbortSignal,
     readonly limits: AttachmentLimits = ATTACHMENT_LIMITS) {
     this.#slots = new AsyncSemaphore(limits.concurrency);
+  }
+
+  /** Subscribe to download settlement events for one member; returns an unsubscribe callback. */
+  onChange(space: Scope, phone: string, listener: () => void): () => void {
+    const key = `${scopeKey(space)}\u0000${phone}`;
+    let listeners = this.#listeners.get(key);
+    if (!listeners) { listeners = new Set(); this.#listeners.set(key, listeners); }
+    listeners.add(listener);
+    return () => {
+      listeners!.delete(listener);
+      if (listeners!.size === 0) this.#listeners.delete(key);
+    };
   }
 
   /** Start (or keep) the download of a pending attachment. */
@@ -211,9 +304,18 @@ export class AttachmentDownloads {
     const active: Active = { controller: new AbortController(), space, phone };
     this.#active.set(id, active);
     const work = this.#run(id, active).catch(error => { if (!this.signal.aborted) this.host.report(error); })
-      .finally(() => { if (this.#active.get(id) === active) this.#active.delete(id); });
+      .finally(() => {
+        if (this.#active.get(id) === active) this.#active.delete(id);
+        this.#notifyChange(space, phone);
+      });
     this.#work.add(work);
     void work.finally(() => this.#work.delete(work));
+  }
+
+  #notifyChange(space: Scope, phone: string): void {
+    const listeners = this.#listeners.get(`${scopeKey(space)}\u0000${phone}`);
+    if (!listeners) return;
+    for (const listener of [...listeners]) { try { listener(); } catch {} }
   }
 
   /** A voided attachment: stop its download (the record is already void, so nothing it finishes is kept). */

@@ -16,7 +16,7 @@ import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { CODEMODE_SOURCE_GRAMMAR, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "@earendil-works/pi-codemode";
 import {
   configure, type Conversation, DEFAULT_PROGRESS_POLICY, defineExtension, type Extension, type HarnessSettings, LiveDoc, type ModelRef,
-  type ProgressPolicy, type Storage, type ToolExecutionApi, type ToolRegistration, UsageDoc,
+  type ProgressPolicy, type Storage, type ToolExecutionApi, type ToolNamespace, type ToolRegistration, UsageDoc,
 } from "@earendil-works/pi-durable";
 import { obj, str } from "@earendil-works/pi-schema";
 import { openModelRuntime } from "../../src/core/model-config.ts";
@@ -27,7 +27,7 @@ import { memberConversation } from "../../src/durable/identity.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { syncMemberStats } from "../../src/durable/projection.ts";
 import {
-  baseMemberTools, type BaseToolsOptions, type MemberCall, memberPlaces, memberTool, type MemberTool, type MemberToolResult, type MemberToolSpec,
+  baseMemberTools, type BaseToolsOptions, type MemberCall, memberPlaces, memberTool, type MemberToolResult, type MemberToolSpec,
 } from "../../src/durable/tools.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -45,7 +45,7 @@ let counter = 0;
 /** A fixture tool (see probe); `replay` overrides its registration's (member tools besides the official four are unsafe). */
 type Probe = MemberToolSpec & { readonly replay?: "safe" };
 /** A fixture extension of member tools (registered as the registry registers them, for the group's places). */
-type Module = { name: string; tools: Probe[] };
+type Module = { name: string; namespace?: ToolNamespace; tools: Probe[] };
 type Setup = {
   /** Fixture extensions of member tools, installed after mixin.base; their tools are the codemode adapter's too. */
   modules?: Module[];
@@ -87,16 +87,20 @@ async function openGroup(setup: Setup = {}): Promise<Group> {
   const model = faux.getModel();
   const base: BaseToolsOptions = { layout: appLayout(join(fixture.root, `群数据-${n}`)), scope: groupScope(setup.toolsGroup ?? GROUP) };
   const members = baseMemberTools(base);
-  const install = ({ replay, ...spec }: Probe): MemberTool => {
+  const install = ({ replay, ...spec }: Probe): ToolRegistration => {
     const tool = memberTool(spec, base);
-    return replay === undefined ? tool : { ...tool, registration: { ...tool.registration, replay } };
+    return replay === undefined ? tool : { ...tool, replay };
   };
-  const modules = (setup.modules ?? []).map((module) => ({ name: module.name, tools: module.tools.map(install) }));
+  const modules = (setup.modules ?? []).map((module) => ({ name: module.name, namespace: module.namespace, tools: module.tools.map(install) }));
   const extensions = [
-    defineExtension({ name: "mixin.base", tools: members.map((tool) => tool.registration) }),
-    ...modules.map((module) => defineExtension({ name: module.name, tools: module.tools.map((tool) => tool.registration) })),
+    defineExtension({ name: "mixin.base", tools: members }),
+    ...modules.map((module) => defineExtension({
+      name: module.name,
+      ...(module.namespace === undefined ? {} : { namespace: module.namespace }),
+      tools: module.tools,
+    })),
     ...setup.extensions ?? [],
-    codemodeExtension({ members: base, tools: [...members, ...modules.flatMap((module) => module.tools)] }),
+    codemodeExtension({ members: base }),
   ];
   const path = join(fixture.root, `db-${n}.sqlite`);
   const open = () => openGroupHarness(path, models, {
@@ -289,7 +293,7 @@ function png(width: number, height: number): Buffer {
   return Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), chunk("IHDR", header), chunk("IDAT", deflateSync(rows)), chunk("IEND", new Uint8Array())]);
 }
 
-const NAMESPACE = { name: "fixture_ns", description: "Fixture tools for the codemode tests.", instructions: "Call probe_echo first." };
+const NAMESPACE: ToolNamespace = { name: "fixture_ns", description: "Fixture tools for the codemode tests.", instructions: "Call probe_echo first." };
 let echoRuns = 0;
 const echo = probe("probe_echo", ({ text: value }) => {
   echoRuns++;
@@ -298,14 +302,14 @@ const echo = probe("probe_echo", ({ text: value }) => {
   description: "Echo the given text back as a structured value.",
   parameters: obj({ text: str({ description: "Text to echo back" }) }, { open: true }),
   structuredOutputSchema: obj({ echo: str() }, { open: true }),
-  namespace: NAMESPACE,
 });
+const echoModule: Module = { name: "fixture.module", namespace: NAMESPACE, tools: [echo] };
 const send = probe("send_probe", () => text("sent"), { callers: ["model"], description: "Send something (model only)." });
 const sendModule: Module = { name: "fixture.send", tools: [send] };
 
 describe("Durable codemode: declarations and scope", () => {
   test("declarations: the official grammar tool, replay safe; plain direct tools; the codemode section lists what scripts can call", async () => {
-    const group = await openGroup({ modules: [module(echo), sendModule] });
+    const group = await openGroup({ modules: [echoModule, sendModule] });
     try {
       const codemode = group.extension("mixin.codemode").tools![0]!;
       expect(codemode.name).toBe("codemode");
@@ -316,7 +320,7 @@ describe("Durable codemode: declarations and scope", () => {
       // No models: the official description of the variant without models.* globals.
       expect(codemode.description).not.toContain("models.");
 
-      const original = Object.fromEntries(baseMemberTools(group.base).map(({ registration }) => [registration.name, registration.description]));
+      const original = Object.fromEntries(baseMemberTools(group.base).map((tool) => [tool.name, tool.description]));
       const request = await ask(group, await member(group));
       const declared = Object.fromEntries(getCurrentTools(request).map((tool) => [tool.name, tool]));
       // Script-only tools are not offered to the model; direct tools keep their own descriptions.
@@ -348,7 +352,8 @@ describe("Durable codemode: declarations and scope", () => {
     const weather = probe("probe_weather", () => text("晴"), { callers: ["tools"], deferred: true, description: "查询城市的天气预报。" });
     const off = probe("probe_off", () => text("off"));
     const offModule: Module = { name: "fixture.off", tools: [off] };
-    const group = await openGroup({ modules: [module(echo, deferred, weather), offModule, sendModule] });
+    const deferredModule: Module = { name: "fixture.deferred", tools: [deferred, weather] };
+    const group = await openGroup({ modules: [echoModule, deferredModule, offModule, sendModule] });
     try {
       const alice = await member(group);
       await alice.configure({ extensions: { remove: [group.extension("fixture.off")] } }, context);

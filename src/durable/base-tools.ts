@@ -4,8 +4,10 @@ import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { arr, str } from "@earendil-works/pi-schema";
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { configuredRootlessTasks } from "../core/task-backend.ts";
+import { guardImageProcessor } from "./image-guard.ts";
 
-const images = await createNodePhotonImages();
+/** Shared Photon image processor guarded by pre-decode size/pixel bounds and process-wide concurrency limits. */
+export const nodeImages = guardImageProcessor(await createNodePhotonImages());
 export function bashToolNote(isolated = configuredRootlessTasks() !== undefined): string {
   return ` Default timeout is ${BASH_DEFAULT_TIMEOUT} seconds, maximum 3600. The workspace is reference material: only write to your own temp directory. All child processes are stopped when this command completes or is cancelled.`
     + (isolated ? " Each command runs isolated with a fresh PI_USER_TMP. List existing temp files or directories in input_paths to read them at their original paths; no temp history is copied by default. Workspace and materials remain readable without input_paths." : "");
@@ -18,7 +20,7 @@ export function nativeBaseTools(): ToolRegistration[] {
   const parameters = configuredRootlessTasks() ? { ...bash.parameters, properties: { ...bash.parameters.properties as object,
     input_paths: arr(str({ minLength: 1 }), { maxItems: 128,
       description: "Existing inputs under your own tmp. Only these inputs are copied into an isolated command." }) } } : bash.parameters;
-  return [createReadTool({ images }), { ...bash, parameters, description: bash.description + bashToolNote(),
+  return [createReadTool({ images: nodeImages }), { ...bash, parameters, description: bash.description + bashToolNote(),
     execute: (args, api, context) => {
       const input = args as { command: string; timeout?: number };
       return bash.execute({ ...input, timeout: input.timeout ?? BASH_DEFAULT_TIMEOUT }, api, context);

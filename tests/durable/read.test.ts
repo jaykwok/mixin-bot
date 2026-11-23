@@ -30,7 +30,7 @@ const service = new DurableService({
   layout, modules: [], relay: null, materials: false, outbound: out.outbound, onReport: () => {},
   selection: { runtime: models as never, settings: undefined as never, model: { ...m, contextWindow: 128000 } as never, ref: model, thinkingLevel: "off",
     harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } },
-  limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
+  limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000 },
 });
 let channel: ReadChannel;
 let serviceOpen = true;
@@ -274,6 +274,75 @@ describe("read channel against a running service", () => {
     // The channel keeps working afterwards.
     expect(((await read<Spaces>({ op: "spaces" })).spaces.length)).toBe(2);
   });
+
+  test("re-checks durable_schema on every cached connection transaction", async () => {
+    const op = { op: "members", ...direct, after: 0, limit: 10 } as const;
+    const file = join(layout.conversations, "direct", "durable.sqlite");
+    const db = new Database(file);
+    try {
+      // Warm up the cached read-only connection inside the worker.
+      await channel.run(op);
+      db.exec("UPDATE durable_schema SET version = 999 WHERE singleton = 1");
+      await expect(channel.run(op)).rejects.toThrow("schema 999");
+    } finally {
+      db.exec("UPDATE durable_schema SET version = 2 WHERE singleton = 1");
+      db.close();
+    }
+    // After restoring schema version, the channel works again cleanly.
+    expect((await channel.run(op) as Members).items.length).toBeGreaterThan(0);
+  });
+
+  test("release() waits for worker confirmation and rejects with ReadExpired on timeout instead of reporting success", async () => {
+    const held = new ReadChannel({ conversations: layout.conversations, state: statePath, deadlineMs: 5_000 });
+    let spy: ReturnType<typeof spyOn> | undefined;
+    try {
+      // Start the worker and warm one cached connection.
+      await held.run({ op: "members", ...direct, after: 0, limit: 10 });
+      const original = Worker.prototype.postMessage;
+      // Hold back the release message so the worker never confirms before the short timeout.
+      spy = spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, message: unknown) {
+        if (typeof message === "object" && message !== null && "release" in message) return;
+        return original.call(this, message);
+      });
+      const error = await held.release(40).catch((err: Error) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("ReadExpired");
+      spy.mockRestore(); spy = undefined;
+      // Once messages reach the worker normally, release() resolves only after worker confirmation.
+      await held.release();
+    } finally {
+      spy?.mockRestore();
+      await held.close();
+    }
+  });
+
+  test("release() waits for an already-terminating worker to finish exiting before returning", async () => {
+    const channelWithIdle = new ReadChannel({ conversations: layout.conversations, state: statePath, idleMs: 30, deadlineMs: 5_000 });
+    const terminateStarted = Promise.withResolvers<void>();
+    const allowExit = Promise.withResolvers<void>();
+    const originalTerminate = Worker.prototype.terminate;
+    const spy = spyOn(Worker.prototype, "terminate").mockImplementation(function (this: Worker) {
+      terminateStarted.resolve();
+      return allowExit.promise.then(() => originalTerminate.call(this));
+    });
+    try {
+      await channelWithIdle.run({ op: "members", ...direct, after: 0, limit: 10 });
+      // Wait until the idle timer calls #stop(), clearing #worker while terminate() is still in flight.
+      await terminateStarted.promise;
+      // Retrying release() while the old worker is still exiting must NOT resolve early.
+      const error = await channelWithIdle.release(40).catch((err: Error) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("ReadExpired");
+      // Once terminate() finishes, release() resolves cleanly.
+      const pendingRelease = channelWithIdle.release(5_000);
+      allowExit.resolve();
+      await pendingRelease;
+    } finally {
+      allowExit.resolve();
+      spy.mockRestore();
+      await channelWithIdle.close();
+    }
+  });
 });
 
 describe("read route", () => {
@@ -298,18 +367,28 @@ describe("read route", () => {
 });
 
 describe("read-only", () => {
-  test("never changes a database file, and the service's close still truncates the log", async () => {
+  test("never changes a database file, releases idle cached handles, and the service's close still truncates the log", async () => {
     const file = join(layout.conversations, "groups", "100", "durable.sqlite");
     await service.close(); serviceOpen = false;
     const before = await readFile(file);
-    const spaces = await read<Spaces>({ op: "spaces" });
-    const group = spaces.spaces.find(space => space.space === "groups/100")!;
-    const conversations = (await read<Members>({ op: "members", space: "groups/100", generation: group.generation!, after: 0, limit: 10 })).items;
-    await read({ op: "entries", space: "groups/100", generation: group.generation!, conversation: conversations[0]!.conversationId, older: true, cursor: null, upper: null, limit: 50 });
-    expect(Buffer.compare(before, await readFile(file))).toBe(0);
-    // No connection is kept between operations: no read transaction outlives its request.
-    expect((await stat(file + "-wal").catch(() => undefined))?.size ?? 0).toBe(0);
-    await rm(file + "-wal", { force: true }); await rm(file + "-shm", { force: true });
+    const shortIdle = new ReadChannel({ conversations: layout.conversations, state: statePath, connectionIdleMs: 120 });
+    try {
+      const spaces = await shortIdle.run({ op: "spaces" }) as Spaces;
+      const group = spaces.spaces.find(space => space.space === "groups/100")!;
+      const conversations = (await shortIdle.run({ op: "members", space: "groups/100", generation: group.generation!, after: 0, limit: 10 }) as Members).items;
+      // Second read reuses the cached read-only handle within the idle TTL, still in its own short read transaction.
+      await shortIdle.run({ op: "entries", space: "groups/100", generation: group.generation!, conversation: conversations[0]!.conversationId, older: true, cursor: null, upper: null, limit: 50 });
+      expect(Buffer.compare(before, await readFile(file))).toBe(0);
+      expect((await stat(file + "-wal").catch(() => undefined))?.size ?? 0).toBe(0);
+      // Cached handles auto-close after connectionIdleMs so even Windows -shm files are unlocked while idle.
+      await Bun.sleep(250);
+      await rm(file + "-wal", { force: true }); await rm(file + "-shm", { force: true });
+
+      // Explicit release() closes cached handles immediately too.
+      await shortIdle.run({ op: "members", space: "groups/100", generation: group.generation!, after: 0, limit: 10 });
+      await shortIdle.release();
+      await rm(file + "-wal", { force: true }); await rm(file + "-shm", { force: true });
+    } finally { await shortIdle.close(); }
   });
 
   test("rejects space names outside the conversations root", () => {
